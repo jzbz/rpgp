@@ -13,7 +13,6 @@ use sequoia_openpgp::packet::Signature;
 use sequoia_openpgp::packet::signature::SignatureBuilder;
 use sequoia_openpgp::types::SignatureType;
 
-use crate::cert::CertSummary;
 use crate::error::{Error, Result};
 use crate::policy;
 use crate::store::Store;
@@ -202,6 +201,33 @@ pub fn certify(store: &Store, request: &CertifyRequest) -> Result<Cert> {
     Ok(certified)
 }
 
+/// The primary user ID, chosen exactly as [`crate::cert::CertSummary::from_cert`]
+/// chooses it: the policy-valid primary user ID, else the first user ID present,
+/// else a placeholder. Duplicated from that function deliberately and kept in step
+/// with it by hand — building a whole summary per signature to read one field
+/// also walks every key for capabilities, computes revocation status and
+/// allocates a String per user ID, all of which is then dropped.
+fn primary_user_id(cert: &Cert) -> String {
+    let policy = policy();
+    let now = SystemTime::now();
+    let valid = cert.with_policy(&policy, now).ok();
+    valid
+        .as_ref()
+        .and_then(|vc| vc.primary_userid().ok())
+        .map(|ua| String::from_utf8_lossy(ua.userid().value()).into_owned())
+        .or_else(|| match valid.as_ref() {
+            Some(vc) => vc
+                .userids()
+                .next()
+                .map(|ua| String::from_utf8_lossy(ua.userid().value()).into_owned()),
+            None => cert
+                .userids()
+                .next()
+                .map(|ua| String::from_utf8_lossy(ua.userid().value()).into_owned()),
+        })
+        .unwrap_or_else(|| "(no user ID)".to_string())
+}
+
 /// Every third-party certification on `cert`, verified where possible.
 pub fn certifications(store: &Store, cert: &Cert) -> Result<Vec<Certification>> {
     let mut out = Vec::new();
@@ -244,7 +270,7 @@ pub fn certifications(store: &Store, cert: &Cert) -> Result<Vec<Certification>> 
                 };
 
                 let fingerprint = certifier.fingerprint().to_hex();
-                entry.certifier = CertSummary::from_cert(&certifier).primary_user_id;
+                entry.certifier = primary_user_id(&certifier);
                 entry.by_me = store.has_secret(&fingerprint);
                 entry.certifier_fingerprint = Some(fingerprint);
                 let certifier_key = certifier.primary_key().key();

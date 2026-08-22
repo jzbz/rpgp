@@ -25,8 +25,11 @@ sequoia-openpgp = { version = "2.4", default-features = false, features = [
     "allow-variable-time-crypto",
     "compression-deflate",
 ] }
-# default-features = false drops `keyserver`, which pulls in sequoia-net,
-# tokio and reqwest. Re-enable deliberately when keyserver lookup lands.
+# default-features = false drops `keyserver`, which pulls in sequoia-net and
+# tokio. Leave it off: lookup landed hand-rolled in keyserver.rs over plain
+# reqwest precisely because sequoia-net hardcodes hyper-tls and a
+# dnssec-openssl resolver, and OpenSSL is what this build avoids everywhere
+# else. Re-enabling the feature would pull it back in.
 sequoia-cert-store = { version = "0.7", default-features = false }
 # Web-of-trust authentication. Depends on the same sequoia-openpgp 2.x and
 # cert-store 0.7 we already use, and forces no crypto backend of its own.

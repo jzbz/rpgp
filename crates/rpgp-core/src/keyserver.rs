@@ -395,12 +395,30 @@ fn post(url: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         let status = response.status();
         // Bounded like get(): a JSON status reply is a few hundred bytes, and
         // an upload endpoint is no more entitled to an unbounded read.
+        //
+        // A read that fails or overruns the cap is remembered rather than
+        // returned here. The status check below explains a refusal out of
+        // whatever body arrived, which is more use than a transport error;
+        // only a reply claiming success has to be whole, so that is where the
+        // failure surfaces. Ending the loop silently, as this once did,
+        // reported a dropped connection as unexpected data.
         let mut raw = Vec::new();
-        while let Ok(Some(chunk)) = response.chunk().await {
-            if raw.len() + chunk.len() > MAX_REPLY {
-                break;
+        let mut incomplete: Option<Error> = None;
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if raw.len() + chunk.len() > MAX_REPLY {
+                        incomplete = Some(Error::invalid("the reply is too large"));
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    incomplete = Some(Error::invalid(format!("reading the reply failed: {e}")));
+                    break;
+                }
             }
-            raw.extend_from_slice(&chunk);
         }
         let text = String::from_utf8_lossy(&raw).into_owned();
         if !status.is_success() {
@@ -410,6 +428,9 @@ fn post(url: &str, body: serde_json::Value) -> Result<serde_json::Value> {
                 "the keyserver refused the upload ({status}): {}",
                 text.trim()
             )));
+        }
+        if let Some(e) = incomplete {
+            return Err(e);
         }
         serde_json::from_str(&text)
             .map_err(|e| Error::invalid(format!("the keyserver replied with unexpected data: {e}")))
@@ -497,9 +518,11 @@ mod tests {
     ///
     /// Serial with the other env-var tests by way of a mutex: RPGP_KEYSERVER
     /// is process-wide state.
+    /// RPGP_KEYSERVER is process-wide, so every test that sets it takes this.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn a_lookup_refuses_an_oversized_reply_and_a_downgrade() {
-        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
         // (1) An announced length past the cap is refused before a byte of
@@ -539,6 +562,40 @@ mod tests {
         assert!(
             err.contains("lookup failed") || err.contains("redirect"),
             "a non-HTTPS redirect should not be followed: {err}"
+        );
+
+        unsafe { std::env::remove_var("RPGP_KEYSERVER") };
+    }
+
+    /// A reply that stops mid-body must say the read failed, not that the
+    /// keyserver sent something unexpected.
+    ///
+    /// `post` ended its read loop on `Err` exactly as silently as on
+    /// end-of-body, so a dropped connection surfaced as "the keyserver replied
+    /// with unexpected data" — the one diagnosis that rules out what actually
+    /// happened. Publishing is irreversible, and this message is the user's
+    /// only signal that the upload's fate is unknown rather than rejected.
+    #[test]
+    fn a_truncated_upload_reply_reports_the_read_failure() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Announce a full body, send a fragment, then drop the connection.
+        let mut reply =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n"
+                .to_vec();
+        reply.extend_from_slice(br#"{"key_fpr":"AAAA","token":"t"#);
+        unsafe { std::env::set_var("RPGP_KEYSERVER", serve_once(reply)) };
+
+        let cert = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Demo <demo@example.invalid>",
+        ))
+        .unwrap()
+        .cert;
+        let err = publish(&cert).unwrap_err().to_string();
+
+        assert!(
+            err.contains("reading the reply failed"),
+            "a dropped connection must not be reported as bad data: {err}"
         );
 
         unsafe { std::env::remove_var("RPGP_KEYSERVER") };

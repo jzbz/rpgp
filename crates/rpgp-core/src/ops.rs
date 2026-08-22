@@ -1,7 +1,7 @@
 //! Message operations: encrypt, decrypt, sign, verify.
 
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use sequoia_openpgp::crypto::{Password, SessionKey};
@@ -62,6 +62,21 @@ pub fn encrypt(
     plaintext: &[u8],
     sink: impl Write + Send + Sync,
 ) -> Result<()> {
+    encrypt_stream(recipients, passwords, signer, &mut &plaintext[..], sink)
+}
+
+/// [`encrypt`], reading the plaintext as it goes instead of taking it whole.
+///
+/// Same packet sequence either way — sequoia's writers serialize identically
+/// regardless of how the bytes arrive — so the output is byte-for-byte what the
+/// buffered form produced.
+fn encrypt_stream(
+    recipients: &[Cert],
+    passwords: &[String],
+    signer: Option<(&Cert, Option<&str>)>,
+    source: &mut dyn Read,
+    sink: impl Write + Send + Sync,
+) -> Result<()> {
     let passwords: Vec<&String> = passwords.iter().filter(|p| !p.is_empty()).collect();
     if recipients.is_empty() && passwords.is_empty() {
         return Err(Error::invalid(
@@ -109,7 +124,7 @@ pub fn encrypt(
     };
 
     let mut message = LiteralWriter::new(message).build()?;
-    message.write_all(plaintext)?;
+    std::io::copy(source, &mut message)?;
     message.finalize()?;
     Ok(())
 }
@@ -199,6 +214,16 @@ pub fn sign_detached(
     data: &[u8],
     sink: impl Write + Send + Sync,
 ) -> Result<()> {
+    sign_detached_stream(signer, password, &mut &data[..], sink)
+}
+
+/// [`sign_detached`], reading the signed data as it goes.
+fn sign_detached_stream(
+    signer: &Cert,
+    password: Option<&str>,
+    source: &mut dyn Read,
+    sink: impl Write + Send + Sync,
+) -> Result<()> {
     let keypair = signing_keypair(signer, password)?;
 
     let message = Message::new(sink);
@@ -206,7 +231,7 @@ pub fn sign_detached(
         .kind(sequoia_openpgp::armor::Kind::Signature)
         .build()?;
     let mut message = Signer::new(message, keypair)?.detached().build()?;
-    message.write_all(data)?;
+    std::io::copy(source, &mut message)?;
     message.finalize()?;
     Ok(())
 }
@@ -523,7 +548,6 @@ pub enum InputKind {
     NotOpenPgp,
 }
 
-/// Decide what `data` is, so the UI knows whether to ask for a second file.
 /// [`classify`] for a file, reading only as much of it as the answer needs.
 ///
 /// The armor check looks at the first kilobyte and the binary check at the
@@ -546,6 +570,7 @@ pub fn classify_file(path: &Path) -> InputKind {
     classify(&head)
 }
 
+/// Decide what `data` is, so the UI knows whether to ask for a second file.
 pub fn classify(data: &[u8]) -> InputKind {
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack
@@ -663,14 +688,40 @@ pub fn encrypt_file(
     input: &Path,
     output: &Path,
 ) -> Result<()> {
-    let plaintext = read(input)?;
-    // Buffered and written only on success, as decrypt_file does. Creating
-    // the output first meant a wrong passphrase or a recipient with no
-    // encryption key truncated whatever was already at that path and left an
-    // empty or partial file in its place.
-    let mut ciphertext = Vec::new();
-    encrypt(recipients, passwords, signer, &plaintext, &mut ciphertext)?;
-    write(output, &ciphertext)
+    // Streamed in both directions rather than buffered. The property being
+    // preserved is the one the buffering used to provide: nothing is left at
+    // the output path when encryption fails, because a wrong passphrase or a
+    // recipient with no encryption key otherwise truncated whatever was
+    // already there. The reason for changing how is that the plaintext is
+    // caller-supplied and unbounded and the armored ciphertext is about a
+    // third larger again, so holding both made peak memory a multiple of a
+    // file the user picked — a multi-gigabyte archive was an out-of-memory
+    // kill rather than a slow encrypt.
+    //
+    // Staged exactly as decrypt_file stages, free_name included: the naive
+    // `output.with_extension("part")` turned notes.txt.asc into notes.part and
+    // truncated a file the user may well own, which is what free_name and
+    // append_extension exist to prevent.
+    let mut source =
+        fs::File::open(input).map_err(|e| Error::io(format!("reading {}", input.display()), e))?;
+    let staging = free_name(append_extension(output, "part"));
+    {
+        let file = fs::File::create(&staging)
+            .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
+        let mut sink = BufWriter::new(file);
+        match encrypt_stream(recipients, passwords, signer, &mut source, &mut sink) {
+            Ok(()) => sink
+                .flush()
+                .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?,
+            Err(e) => {
+                let _ = fs::remove_file(&staging);
+                return Err(e);
+            }
+        }
+    }
+    fs::rename(&staging, output)
+        .map_err(|e| Error::io(format!("writing {}", output.display()), e))?;
+    Ok(())
 }
 
 pub fn sign_detached_file(
@@ -679,9 +730,12 @@ pub fn sign_detached_file(
     input: &Path,
     output: &Path,
 ) -> Result<()> {
-    let data = read(input)?;
+    // Only the signature is held — a few hundred bytes — so peak memory does
+    // not follow the size of the file being signed.
+    let mut source =
+        fs::File::open(input).map_err(|e| Error::io(format!("reading {}", input.display()), e))?;
     let mut signature = Vec::new();
-    sign_detached(signer, password, &data, &mut signature)?;
+    sign_detached_stream(signer, password, &mut source, &mut signature)?;
     write(output, &signature)
 }
 
@@ -738,8 +792,21 @@ pub fn verify_detached_files(
     data_path: &Path,
 ) -> Result<VerifyResult> {
     let signature = read(signature_path)?;
-    let data = read(data_path)?;
-    verify_detached(store, &signature, &data)
+    // The signed file is streamed rather than read whole: it is unbounded and
+    // caller-supplied, while the signature beside it is a few hundred bytes.
+    // verify_file reaches the same verdict as verify_bytes; this writes
+    // nothing, so there is no output to keep intact.
+    let policy = policy();
+    let helper = Helper::new(store, &[]);
+    let mut verifier =
+        DetachedVerifierBuilder::from_bytes(&signature)?.with_policy(&policy, None, helper)?;
+    verifier.verify_file(data_path)?;
+
+    let helper = verifier.into_helper();
+    Ok(VerifyResult {
+        signatures: helper.signatures,
+        decrypted_with: None,
+    })
 }
 
 fn read(path: &Path) -> Result<Vec<u8>> {
@@ -914,6 +981,57 @@ mod tests {
 
     /// The staging file must not land on a name the user already owns.
     ///
+    /// encrypt_file stages like decrypt_file now, so it inherits the same
+    /// hazard: a staging name derived from the output must not land on a file
+    /// the user owns, and must not survive a failure.
+    #[test]
+    fn encrypting_stages_without_destroying_an_unrelated_file() {
+        let (dir, _store) = scratch_store();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+
+        let input = dir.path().join("notes.txt");
+        std::fs::write(&input, b"hello").unwrap();
+        let output = dir.path().join("notes.txt.asc");
+
+        // What the substituting name would have collided with.
+        let bystander = dir.path().join("notes.part");
+        std::fs::write(&bystander, b"someone else's file").unwrap();
+
+        encrypt_file(std::slice::from_ref(&alice), &[], None, &input, &output).unwrap();
+
+        assert!(output.exists(), "the encrypted output should exist");
+        assert_eq!(
+            std::fs::read(&bystander).unwrap(),
+            b"someone else's file",
+            "encrypting destroyed an unrelated file"
+        );
+        assert!(
+            !append_extension(&output, "part").exists(),
+            "the staging file outlived a successful encrypt"
+        );
+
+        // And a failure leaves neither a staging file nor a damaged output.
+        std::fs::write(&output, b"PRECIOUS").unwrap();
+        assert!(
+            encrypt_file(
+                std::slice::from_ref(&alice),
+                &[],
+                Some((&alice, Some("wrong"))),
+                &input,
+                &output
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"PRECIOUS");
+        assert!(
+            !append_extension(&output, "part").exists(),
+            "a failed encrypt left its staging file behind"
+        );
+        assert_eq!(std::fs::read(&bystander).unwrap(), b"someone else's file");
+    }
+
     /// `output.with_extension("part")` substituted rather than appended, so
     /// decrypting `notes.txt.asc` next to an unrelated `notes.part` truncated
     /// that file on create and then renamed it away — the exact destruction
@@ -954,8 +1072,6 @@ mod tests {
         );
     }
 
-    /// The bounded read must reach the same verdict as reading everything,
-    /// including on a file far larger than the prefix.
     /// The derived name steps aside rather than destroying an unrelated file
     /// that happens to be sitting there.
     #[test]
@@ -994,6 +1110,8 @@ mod tests {
         );
     }
 
+    /// The bounded read must reach the same verdict as reading everything,
+    /// including on a file far larger than the prefix.
     #[test]
     fn classify_file_agrees_with_classify_on_a_large_file() {
         let (dir, store) = scratch_store();

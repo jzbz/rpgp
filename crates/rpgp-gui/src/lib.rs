@@ -2692,24 +2692,38 @@ fn survey_agent_and_secrets(ui: &AppWindow, state: &Shared, store: std::sync::Ar
             };
 
             if !agent_keys.is_empty() {
+                // Of the two fields the survey sets, only card_serial can reach
+                // a row: CertRow carries card-serial, while agent_backed is read
+                // straight off State when the certify and sign dialogs build
+                // their key lists. So the rows only need rebuilding when a card
+                // serial actually changed — otherwise reload's own apply_filter
+                // already produced exactly the rows this would produce again,
+                // and for anyone whose key is merely in gpg-agent rather than on
+                // a card, that second pass rebuilt every row to no effect.
+                let mut rows_changed = false;
                 {
                     let mut guard = lock(&state);
                     for summary in guard.all.iter_mut() {
                         if let Some(key) = agent_keys.get(&summary.fingerprint) {
                             summary.agent_backed = true;
-                            summary.card_serial = key.card_serial.clone();
+                            if summary.card_serial != key.card_serial {
+                                summary.card_serial = key.card_serial.clone();
+                                rows_changed = true;
+                            }
                         }
                     }
                 }
-                // Read the selection now rather than before the agent was
-                // asked: the user may have moved since. apply_filter clears
-                // the selection, so it has to be put back.
-                let selected = ui
-                    .get_has_selection()
-                    .then(|| ui.get_detail().fingerprint.to_string());
-                apply_filter(&ui, &state);
-                if let Some(fingerprint) = selected {
-                    reselect(&ui, &state, &fingerprint);
+                if rows_changed {
+                    // Read the selection now rather than before the agent was
+                    // asked: the user may have moved since. apply_filter clears
+                    // the selection, so it has to be put back.
+                    let selected = ui
+                        .get_has_selection()
+                        .then(|| ui.get_detail().fingerprint.to_string());
+                    apply_filter(&ui, &state);
+                    if let Some(fingerprint) = selected {
+                        reselect(&ui, &state, &fingerprint);
+                    }
                 }
             }
 
