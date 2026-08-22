@@ -61,6 +61,10 @@ export component Btn inherits Rectangle {
     /// Fills its container and left-aligns, for buttons used as navigation
     /// rather than as a compact action.
     in property <bool> wide: false;
+    /// Drop the label and show the glyph alone, for a row too narrow to spell
+    /// every action out. `text` is still what assistive technology announces,
+    /// so a compact button is unlabelled only on screen.
+    in property <bool> compact: false;
     /// What assistive technology should call this. Needed only where `text` is
     /// empty — an icon-only button announces as nothing otherwise, and several
     /// of those are destructive.
@@ -86,7 +90,12 @@ export component Btn inherits Rectangle {
 
     height: 32px;
     horizontal-stretch: 0;
-    min-width: root.text == "" ? 32px : 0px;
+    // Never narrower than what is inside it. This was `0px` for a labelled
+    // button, which let a cramped layout shrink the rectangle to nothing while
+    // the Text kept its natural width — so the label spilled out of its own
+    // button and across its neighbours instead of the row simply running out
+    // of space. An icon-only button has no text to measure, hence the floor.
+    min-width: root.text == "" || root.compact ? 32px : content.preferred-width;
     border-radius: Theme.r-sm;
     opacity: root.enabled ? 1.0 : 0.4;
 
@@ -110,9 +119,11 @@ export component Btn inherits Rectangle {
     // with their neighbours, and shifting one of them breaks the column.
     property <length> lead-trim: root.wide || root.glyph.width <= 0 ? 0px : 1px;
 
-    HorizontalLayout {
-        padding-left: root.text == "" ? 0px : Theme.s3 - root.lead-trim;
-        padding-right: root.text == "" ? 0px : Theme.s3;
+    property <bool> bare: root.text == "" || root.compact;
+
+    content := HorizontalLayout {
+        padding-left: root.bare ? 0px : Theme.s3 - root.lead-trim;
+        padding-right: root.bare ? 0px : Theme.s3;
         spacing: 6px;
         alignment: root.wide ? start : center;
 
@@ -122,7 +133,7 @@ export component Btn inherits Rectangle {
             y: (parent.height - self.height) / 2;
         }
 
-        if root.text != "": Text {
+        if !root.bare: Text {
             text: root.text;
             color: root.ink;
             font-size: Theme.t-md;

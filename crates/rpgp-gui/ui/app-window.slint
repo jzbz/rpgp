@@ -207,6 +207,25 @@ component CertListRow inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "rPGP";
+    // Whether the toolbar shows its secondary actions as glyphs alone.
+    //
+    // Assigned from `changed width` rather than bound to it. A binding of the
+    // form `compact: width < N` is a loop, and Slint says so: `compact` decides
+    // the buttons' min-width, min-width decides the row's layout info, and the
+    // layout info decides the width the binding just read. Slint's own warning
+    // calls that deprecated and liable to panic at runtime. Assigning breaks the
+    // circuit — the value is a fact about the window, not a function of what the
+    // toolbar did with it.
+    //
+    // Spelled out, the row needs about 806px once the search field has given up
+    // its 160px, and the sidebar takes 209px before that. The threshold sits
+    // above the sum rather than on it: the button widths behind it are text
+    // measurements that move with the font, and erring high costs a few labels
+    // early where erring low restores the overlap this exists to prevent.
+    property <bool> toolbar-compact: false;
+    init => { root.toolbar-compact = root.width < 1070px; }
+    changed width => { root.toolbar-compact = root.width < 1070px; }
+
     preferred-width: 1180px;
     preferred-height: 760px;
     min-width: 860px;
@@ -487,7 +506,15 @@ export component AppWindow inherits Window {
             spacing: 0px;
 
             // Toolbar
-            Rectangle {
+            //
+            // Everything in this row used to be rigid — a 300px field, a 150px
+            // select and five buttons that spelled themselves out — which came
+            // to about 966px against the 971px the row gets at the default
+            // window size. Five pixels of slack meant the first drag of the
+            // window edge broke it. The field now gives way first, and the
+            // three secondary actions drop to their glyphs before anything is
+            // forced to overlap.
+            toolbar := Rectangle {
                 height: 58px;
                 background: Theme.bg;
 
@@ -506,7 +533,13 @@ export component AppWindow inherits Window {
                     Field {
                         placeholder: "Search name, e-mail or fingerprint";
                         glyph: Icons.search;
-                        width: 300px;
+                        // Prefers 300px and never exceeds it, but a cramped row
+                        // takes it down to 140px before touching the buttons —
+                        // a search box is the one thing here that still works
+                        // when it is half its ideal size.
+                        min-width: 140px;
+                        max-width: 300px;
+                        horizontal-stretch: 1;
                         enabled: !root.busy;
                         y: (parent.height - self.height) / 2;
                         edited(text) => { root.filter-changed(text); }
@@ -525,6 +558,7 @@ export component AppWindow inherits Window {
 
                     Btn {
                         text: "Import";
+                        compact: root.toolbar-compact;
                         glyph: Icons.arrow-in;
                         enabled: !root.busy;
                         y: (parent.height - self.height) / 2;
@@ -532,6 +566,7 @@ export component AppWindow inherits Window {
                     }
                     Btn {
                         text: "Look up";
+                        compact: root.toolbar-compact;
                         glyph: Icons.search;
                         enabled: !root.busy;
                         y: (parent.height - self.height) / 2;
@@ -539,6 +574,7 @@ export component AppWindow inherits Window {
                     }
                     Btn {
                         text: "Export";
+                        compact: root.toolbar-compact;
                         glyph: Icons.arrow-out;
                         enabled: root.has-selection && !root.busy;
                         y: (parent.height - self.height) / 2;
