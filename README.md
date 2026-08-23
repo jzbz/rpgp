@@ -212,9 +212,11 @@ PC/SC transaction, so a second process asking the reader directly gets
 Two things follow, both good. **rPGP never sees a PIN** — the agent runs the
 user's own `pinentry`. And there is no PC/SC dependency.
 
-Signing, certifying and decrypting all work on a card. For the agent to raise
-its prompt it has to be told where to put it, which is fiddly enough to have
-its own note above `set_pinentry_context` in `agent.rs`.
+Signing, certifying and decrypting all work on a card. Where the agent puts its
+prompt is the agent's business: `sequoia-gpg-agent` builds those options from
+`GPG_TTY`, `TERM` and `DISPLAY` when a crypto operation opens its connection.
+The connection that only lists keys deliberately sets none, for the reason in
+the note above `connect` in `agent.rs`.
 
 ## Keyservers
 
