@@ -173,15 +173,13 @@ jobs:
           NAME="rpgp-${TAG}-${{ matrix.arch }}.flatpak"
           flatpak build-bundle --arch=${{ matrix.arch }} \
             repo "$NAME" app.rpgp.rpgp master
-          sha256sum "$NAME" | tee "$NAME.sha256"
+          sha256sum "$NAME"
           ls -lh "$NAME"
 
       - uses: actions/upload-artifact@v4
         with:
           name: flatpak-${{ matrix.arch }}
-          path: |
-            *.flatpak
-            *.flatpak.sha256
+          path: '*.flatpak'
 
   release:
     name: Attach to the release
@@ -194,12 +192,33 @@ jobs:
         with:
           merge-multiple: true
 
+      # One SHA256SUMS for the whole release rather than a .sha256 beside each
+      # file. A hash served from the same release as the artifact it describes
+      # catches a truncated download and nothing else; it is only a real check
+      # once signed, and signing happens by hand here because the key never
+      # goes near CI. Signing one file every release is sustainable — signing
+      # one per artifact, with Windows and macOS still to come, would not be,
+      # and an unsigned .sha256 sitting beside a signed SHA256SUMS is a
+      # downgrade path rather than a convenience.
+      #
+      # Every collected file is hashed, so a new platform is covered by adding
+      # its build job and changing nothing here.
       - name: Upload
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          ls -lh *.flatpak *.flatpak.sha256
+
+          mapfile -t files < <(
+            find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -printf '%P\n' | sort
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no artifacts were collected, so there is nothing to publish"
+            exit 1
+          fi
+          ls -lh "${files[@]}"
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
 
           # A tag push creates no release on its own, so make one if it is not
           # already there. --verify-tag refuses to invent a tag that does not
@@ -213,5 +232,5 @@ jobs:
           fi
 
           gh release upload "$TAG" \
-            *.flatpak *.flatpak.sha256 \
+            "${files[@]}" SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --clobber
