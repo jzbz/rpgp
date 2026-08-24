@@ -236,6 +236,58 @@ jobs:
           name: windows-x86_64
           path: '*.exe'
 
+  # Unpublished, like the Windows job above and for the same reason: the
+  # workspace builds and its tests pass on macOS in CI, but nobody has run the
+  # app there, and a release build is not a debug build. This produces an
+  # artifact to inspect, not something to ship.
+  #
+  # macos-latest is Apple Silicon, so this is arm64 only. macOS is the one
+  # platform where a single file could serve both architectures — `lipo` makes
+  # universal binaries — but that is a second target and a second set of
+  # failures, and is worth adding only once this much is known to work.
+  macos:
+    name: macOS (arm64, unpublished)
+    timeout-minutes: 60
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install capnproto
+        timeout-minutes: 10
+        run: brew install capnp
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Build
+        run: cargo build --release --workspace --locked
+
+      - name: Stage the binary
+        run: |
+          set -euo pipefail
+          NAME="rpgp-${TAG}-macos-arm64"
+          cp target/release/rpgp "$NAME"
+          ls -lh "$NAME"
+          shasum -a 256 "$NAME"
+          echo "--- architecture ---"
+          lipo -archs "$NAME" || file "$NAME"
+          echo "--- linked libraries ---"
+          otool -L "$NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: 'rpgp-*-macos-arm64'
+
   release:
     name: Attach to the release
     needs: bundle
