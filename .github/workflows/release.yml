@@ -213,7 +213,14 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-release-
 
+      # Statically linked CRT, so the binary has no dependency outside Windows
+      # itself. Without it the only non-system import is VCRUNTIME140.dll — the
+      # Visual C++ Redistributable — which most machines happen to have and a
+      # clean install does not, and whose absence shows up as a missing-DLL box
+      # at launch rather than anything a user can act on.
       - name: Build
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release --workspace --locked
 
       - name: Stage the binary
