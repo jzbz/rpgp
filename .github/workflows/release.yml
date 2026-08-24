@@ -134,12 +134,21 @@ jobs:
         run: python3 packaging/cargo-sources.py > packaging/cargo-sources.json
 
       # The manifest in the tree names the released tag. Building the exact
-      # commit that triggered this run keeps the artifact honest even when the
-      # two disagree — a tag moved after the fact cannot change what shipped.
+      # commit that was checked out keeps the artifact honest even when the two
+      # disagree — a tag moved after the fact cannot change what shipped.
+      #
+      # `git rev-parse HEAD`, not GITHUB_SHA. On a manual run GITHUB_SHA is the
+      # tip of the ref the workflow was *dispatched on* — master — while the
+      # checkout above honours inputs.ref and sits on the tag. Rewriting the
+      # pin to master while `tag:` still named the release left the two
+      # contradicting each other, and flatpak-builder refused the source with
+      # "Git commit for branch (null) is <tag>, but expected <master>". HEAD is
+      # the commit being built by construction, on a tag push and a manual run
+      # alike.
       - name: Point the manifest at this commit
         run: |
           set -euo pipefail
-          python3 - "$GITHUB_SHA" <<'PY'
+          python3 - "$(git rev-parse HEAD)" <<'PY'
           import pathlib, re, sys
           sha = sys.argv[1]
           p = pathlib.Path("packaging/app.rpgp.rpgp.yml")
