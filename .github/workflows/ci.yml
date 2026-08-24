@@ -313,18 +313,20 @@ jobs:
         run: cargo test -p rpgp-core --locked
 
   windows-workspace:
-    name: Windows workspace (informational)
+    name: Windows workspace
     runs-on: windows-latest
     timeout-minutes: 45
     # Builds rather than checks, because `cargo check` never invokes the
-    # linker: it cannot tell us whether Slint, wgpu on DX12, rfd's Win32 file
-    # dialogs or arboard's clipboard actually resolve on this platform. The GUI
-    # has never been linked here, and whether it links at all is the question.
+    # linker: it cannot say whether Slint, wgpu on DX12, rfd's Win32 file
+    # dialogs or arboard's clipboard resolve on this platform. They do — the
+    # whole workspace linked here in 8m54s from a cold cache, which is what
+    # earned this job its `continue-on-error` removal.
     #
-    # Still non-blocking, deliberately — the first run exists to find out, not
-    # to redden master. Promote it to blocking once it is green; leaving it
-    # informational forever is how the answer stays unknown.
-    continue-on-error: true
+    # Blocking, so a regression is a failure rather than a green tick nobody
+    # reads. Note this proves the workspace *links*, not that the GUI runs:
+    # no runner has a display, so the wgpu adapter, the software-renderer
+    # fallback and the winit event loop are still unexercised. rpgp is not
+    # shipped for Windows on the strength of this.
     steps:
       - uses: actions/checkout@v4
 
