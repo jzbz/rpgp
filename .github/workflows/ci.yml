@@ -316,10 +316,14 @@ jobs:
     name: Windows workspace (informational)
     runs-on: windows-latest
     timeout-minutes: 45
-    # Still non-blocking and still only a check. rpgp is not supported on
-    # Windows and linking a GUI binary for a platform we do not ship is not
-    # worth the minutes. The file-permission half of the question moved to the
-    # blocking job above.
+    # Builds rather than checks, because `cargo check` never invokes the
+    # linker: it cannot tell us whether Slint, wgpu on DX12, rfd's Win32 file
+    # dialogs or arboard's clipboard actually resolve on this platform. The GUI
+    # has never been linked here, and whether it links at all is the question.
+    #
+    # Still non-blocking, deliberately — the first run exists to find out, not
+    # to redden master. Promote it to blocking once it is green; leaving it
+    # informational forever is how the answer stays unknown.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -336,8 +340,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-check-
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-build-
 
-      - name: Check
-        run: cargo check --workspace --locked
+      - name: Build
+        run: cargo build --workspace --locked
