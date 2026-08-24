@@ -74,6 +74,54 @@ inside the `XDG_DATA_HOME` you give it:
 XDG_DATA_HOME=/tmp/rpgp-demo cargo run -p rpgp-core --example seed-demo-store && XDG_DATA_HOME=/tmp/rpgp-demo cargo run -p rpgp-gui
 ```
 
+## Verifying a download
+
+A [release](https://github.com/jzbz/rpgp/releases) carries the Flatpak bundles,
+a `SHA256SUMS` listing them, and a `SHA256SUMS.asc` signing that list. Fetch the
+signing key once, from GitHub:
+
+```bash
+curl -sL https://github.com/jzbz.gpg | gpg --import
+```
+
+or from a keyserver, which is the better of the two — it does not come from the
+same host as the release:
+
+```bash
+gpg --locate-keys jz@jz.bz
+```
+
+Either way the fingerprint below is what to trust, not where you got it. Then
+check the signature before the files:
+
+```bash
+gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c --ignore-missing SHA256SUMS
+```
+
+`gpg --verify` has to report a *Good signature* from
+`252B 901C 8885 3CF9 F939  2559 2497 38C8 641C 3359`; any other key, or none, and
+the rest is meaningless. `--ignore-missing` checks whichever bundle you actually
+downloaded and stays quiet about the other architecture.
+
+A freshly imported key also draws *"WARNING: This key is not certified with a
+trusted signature"*. That is expected and is not a failed check: it says the key
+carries no web-of-trust path from anything you already trust, which a key you
+just fetched never does. The signature is still good. Compare the fingerprint
+gpg prints against the one above and move on, or sign the key locally
+(`gpg --lsign-key jz@jz.bz`) to silence it on later releases.
+
+The order is the whole point. `SHA256SUMS` sits in the same release as the files
+it describes, so by itself it catches a truncated download and nothing else —
+anyone able to replace a bundle could replace the list beside it just as easily.
+The signature is what turns it into a check, and it is made by hand: the key
+never goes near CI, so a compromised workflow can publish a bundle but cannot
+sign for one.
+
+None of which needs `gpg`, incidentally. Import the signing key into rPGP, open
+**Decrypt / Verify**, give it `SHA256SUMS.asc`, and it will ask for the file that
+goes with it. Circular for the download you have not verified yet, and perfectly
+sound for every release after that.
+
 ## Stack decisions
 
 ### GUI: Slint on winit, rendering through wgpu
