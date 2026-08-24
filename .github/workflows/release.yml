@@ -181,6 +181,54 @@ jobs:
           name: flatpak-${{ matrix.arch }}
           path: '*.flatpak'
 
+  # Not wired into `release` below, and deliberately: Windows is not a platform
+  # rpgp ships for yet. This exists to keep the release build honest — the
+  # workspace links on Windows in CI, but a debug link is not a release link,
+  # and LTO and codegen settings have their own ways of failing.
+  #
+  # Dispatching this workflow with a ref that does not start with `v` builds
+  # every job here and skips the publish step, which is how to exercise this
+  # without cutting a release.
+  windows:
+    name: Windows (x86_64, unpublished)
+    timeout-minutes: 60
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      # Chocolatey's CDN rate-limits, as ci.yml notes.
+      - name: Install capnproto
+        timeout-minutes: 10
+        run: choco install capnproto -y --no-progress
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Build
+        run: cargo build --release --workspace --locked
+
+      - name: Stage the binary
+        shell: pwsh
+        run: |
+          $name = "rpgp-$env:TAG-x86_64.exe"
+          Copy-Item target\release\rpgp.exe $name
+          Get-Item $name | Select-Object Name, Length
+          (Get-FileHash -Algorithm SHA256 $name).Hash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: '*.exe'
+
   release:
     name: Attach to the release
     needs: bundle
