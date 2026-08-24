@@ -241,12 +241,16 @@ jobs:
   # app there, and a release build is not a debug build. This produces an
   # artifact to inspect, not something to ship.
   #
-  # macos-latest is Apple Silicon, so this is arm64 only. macOS is the one
-  # platform where a single file could serve both architectures — `lipo` makes
-  # universal binaries — but that is a second target and a second set of
-  # failures, and is worth adding only once this much is known to work.
+  # Universal: macos-latest is Apple Silicon, and the Intel half is
+  # cross-compiled beside it and joined with lipo. macOS is the only platform
+  # here where one file serves both architectures — Flatpak and Windows each
+  # need one per arch.
+  #
+  # The bundle is unsigned, so Gatekeeper will refuse to open it on a machine
+  # that did not build it. Signing and notarisation need an Apple Developer
+  # account and are a separate decision; this proves the bundle assembles.
   macos:
-    name: macOS (arm64, unpublished)
+    name: macOS (universal, unpublished)
     timeout-minutes: 60
     runs-on: macos-latest
     steps:
@@ -268,25 +272,87 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-release-
 
-      - name: Build
-        run: cargo build --release --workspace --locked
+      - name: Add the Intel target
+        run: rustup target add x86_64-apple-darwin
 
-      - name: Stage the binary
+      # Both halves of the universal binary. -p rpgp-gui rather than
+      # --workspace: this builds the shipped binary, and whether the whole
+      # workspace compiles on macOS is already a blocking CI job.
+      - name: Build both architectures
         run: |
           set -euo pipefail
-          NAME="rpgp-${TAG}-macos-arm64"
-          cp target/release/rpgp "$NAME"
+          cargo build --release --locked -p rpgp-gui --target aarch64-apple-darwin
+          cargo build --release --locked -p rpgp-gui --target x86_64-apple-darwin
+
+      - name: Render the icon
+        run: brew install librsvg
+
+      - name: Assemble the app bundle
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          APP="rPGP.app"
+          rm -rf "$APP" rpgp.iconset
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+          # One binary serving Apple Silicon and Intel. macOS is the only
+          # platform here where that is possible; Flatpak and Windows each
+          # need a file per architecture.
+          lipo -create -output "$APP/Contents/MacOS/rpgp" \
+            target/aarch64-apple-darwin/release/rpgp \
+            target/x86_64-apple-darwin/release/rpgp
+
+          # From the same SVG the Linux packaging renders, so the icon cannot
+          # drift between platforms. iconutil wants every size present.
+          SVG=crates/rpgp-gui/desktop/app.rpgp.rpgp.svg
+          mkdir -p rpgp.iconset
+          for s in 16 32 128 256 512; do
+            rsvg-convert -w "$s" -h "$s" "$SVG" -o "rpgp.iconset/icon_${s}x${s}.png"
+            rsvg-convert -w "$((s * 2))" -h "$((s * 2))" "$SVG" \
+              -o "rpgp.iconset/icon_${s}x${s}@2x.png"
+          done
+          iconutil -c icns rpgp.iconset -o "$APP/Contents/Resources/rpgp.icns"
+
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>rPGP</string>
+            <key>CFBundleDisplayName</key><string>rPGP</string>
+            <key>CFBundleIdentifier</key><string>app.rpgp.rpgp</string>
+            <key>CFBundleExecutable</key><string>rpgp</string>
+            <key>CFBundleIconFile</key><string>rpgp</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          # The heredoc above is indented for YAML; strip that back out.
+          sed -i '' 's/^          //' "$APP/Contents/Info.plist"
+
+          plutil -lint "$APP/Contents/Info.plist"
+          echo "--- architectures ---"
+          lipo -archs "$APP/Contents/MacOS/rpgp"
+          echo "--- linked libraries ---"
+          otool -L "$APP/Contents/MacOS/rpgp"
+          echo "--- minimum macOS the binary demands ---"
+          otool -l "$APP/Contents/MacOS/rpgp" | grep -A3 LC_BUILD_VERSION | head -8
+
+          # ditto rather than zip: it preserves the bundle's metadata, and it
+          # is what notarisation expects to be handed later.
+          NAME="rpgp-${TAG}-macos-universal.zip"
+          ditto -c -k --keepParent "$APP" "$NAME"
           ls -lh "$NAME"
           shasum -a 256 "$NAME"
-          echo "--- architecture ---"
-          lipo -archs "$NAME" || file "$NAME"
-          echo "--- linked libraries ---"
-          otool -L "$NAME"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-arm64
-          path: 'rpgp-*-macos-arm64'
+          name: macos-universal
+          path: 'rpgp-*-macos-universal.zip'
 
   release:
     name: Attach to the release
