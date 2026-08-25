@@ -278,7 +278,16 @@ jobs:
       # Both halves of the universal binary. -p rpgp-gui rather than
       # --workspace: this builds the shipped binary, and whether the whole
       # workspace compiles on macOS is already a blocking CI job.
+      #
+      # Both pinned to 11.0. Left alone, rustc defaults the Intel slice to
+      # 10.12 and the Apple Silicon slice to 11.0, which puts a version in the
+      # binary that LSMinimumSystemVersion then contradicts — and 10.12 is a
+      # toolchain default rather than anything anyone has run the app on. Big
+      # Sur reaches Intel Macs back to 2013, so the floor costs little, and it
+      # can be lowered once someone has tested an older machine.
       - name: Build both architectures
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
         run: |
           set -euo pipefail
           cargo build --release --locked -p rpgp-gui --target aarch64-apple-darwin
@@ -339,8 +348,12 @@ jobs:
           lipo -archs "$APP/Contents/MacOS/rpgp"
           echo "--- linked libraries ---"
           otool -L "$APP/Contents/MacOS/rpgp"
-          echo "--- minimum macOS the binary demands ---"
-          otool -l "$APP/Contents/MacOS/rpgp" | grep -A3 LC_BUILD_VERSION | head -8
+          echo "--- minimum macOS each slice demands (both must read 11.0) ---"
+          for arch in arm64 x86_64; do
+            printf '%s: ' "$arch"
+            otool -l -arch "$arch" "$APP/Contents/MacOS/rpgp" \
+              | awk '/LC_BUILD_VERSION/,/sdk/' | awk '/minos/{print $2; exit}'
+          done
 
           # ditto rather than zip: it preserves the bundle's metadata, and it
           # is what notarisation expects to be handed later.
