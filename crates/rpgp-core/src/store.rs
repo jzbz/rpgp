@@ -110,7 +110,18 @@ impl Store {
                 .ok_or(Error::NoStoreDir)?
                 .join("pgp.cert.d"),
         };
-        let secrets_dir = dirs::data_dir()
+        // data_local_dir, not data_dir, and only the secrets differ: on Windows
+        // the two are Local and Roaming AppData respectively, and a roaming
+        // profile copies its contents to a domain file server at every logon.
+        // Secret key material and revocation certificates are exactly what
+        // should not be replicated onto a share the user does not control.
+        // Public certificates stay on data_dir, which is where other cert-d
+        // tooling looks and where nothing secret lives.
+        //
+        // On Linux and macOS the two functions return the same path, so this
+        // changes nothing there: $XDG_DATA_HOME and ~/Library/Application
+        // Support respectively.
+        let secrets_dir = dirs::data_local_dir()
             .ok_or(Error::NoStoreDir)?
             .join("rpgp")
             .join("secrets");
