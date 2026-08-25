@@ -374,8 +374,16 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
+      # Only the Flatpak bundles. Without the pattern this collects every
+      # artifact the run produced, and the windows and macos jobs — both named
+      # "unpublished" and neither ever run by a human — upload their own. Since
+      # this job needs only `bundle`, whether those had finished by the time it
+      # started decided whether they were hashed into SHA256SUMS and published,
+      # which made publication a race rather than a decision. Adding a job here
+      # is now a deliberate act: it has to be named.
       - uses: actions/download-artifact@v4
         with:
+          pattern: flatpak-*
           merge-multiple: true
 
       # One SHA256SUMS for the whole release rather than a .sha256 beside each
