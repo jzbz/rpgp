@@ -1977,6 +1977,17 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
                             ui.set_status(summary.into());
                         }
                         Err(message) => {
+                            // Clear the previous run's verdict and output, as
+                            // the Decrypt/Verify worker does on this branch.
+                            // Both persist for the life of the dialog and were
+                            // cleared only at open, so a failed run left the
+                            // last message's "good signature — Alice
+                            // (verified)" row and her plaintext on screen under
+                            // a red banner describing a different message.
+                            ui.set_np_signatures(ModelRc::new(VecModel::from(
+                                Vec::<SignatureRow>::new(),
+                            )));
+                            ui.set_np_output(SharedString::new());
                             ui.set_np_result(message.clone().into());
                             ui.set_np_tone(3);
                             ui.set_status(message.into());
@@ -2722,10 +2733,22 @@ fn survey_agent_and_secrets(ui: &AppWindow, state: &Shared, store: std::sync::Ar
                     let selected = ui
                         .get_has_selection()
                         .then(|| ui.get_detail().fingerprint.to_string());
+
+                    // And the status line with it. Every mutation sets its own
+                    // confirmation — "Imported 3 certificates" — and reload
+                    // then spawns this survey, which ends in apply_filter,
+                    // which overwrites the status with its generic count.
+                    // from_cert resets card_serial to None on every reload, so
+                    // for anyone whose agent reports a card this fired every
+                    // time: the confirmation was replaced before it could be
+                    // read.
+                    let status = ui.get_status();
+
                     apply_filter(&ui, &state);
                     if let Some(fingerprint) = selected {
                         reselect(&ui, &state, &fingerprint);
                     }
+                    ui.set_status(status);
                 }
             }
 

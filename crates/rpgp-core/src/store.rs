@@ -421,12 +421,27 @@ impl Store {
         let handle: sequoia_openpgp::KeyHandle = handle
             .parse()
             .map_err(|_| Error::invalid(format!("{handle} is not a fingerprint or key ID")))?;
+        // Prefer the certificate whose *own* fingerprint matches the handle.
+        //
+        // lookup_by_cert_or_subkey answers "which certificates carry this key
+        // anywhere", and the same key can be attached to more than one
+        // certificate, so taking the first of those could hand back a
+        // certificate whose own fingerprint is not the one asked for — and
+        // certify, revoke and the details pane all pass a fingerprint
+        // precisely when they mean one particular certificate.
+        //
+        // The subkey-tolerant search still has to happen, though: verification
+        // resolves a signature's issuer, which names the *subkey* that signed,
+        // and the certificate has to be found from it. So the search is kept
+        // and the choice is made afterwards, primary match first.
         let found = self.certs.lookup_by_cert_or_subkey(&handle)?;
-        let first = found
-            .into_iter()
-            .next()
+        let chosen = found
+            .iter()
+            .find(|c| sequoia_openpgp::KeyHandle::from(c.fingerprint()).aliases(&handle))
+            .cloned()
+            .or_else(|| found.into_iter().next())
             .ok_or_else(|| Error::NoSuchCert(handle.to_string()))?;
-        Ok(first.to_cert()?.clone())
+        Ok(chosen.to_cert()?.clone())
     }
 
     /// Insert or merge a public certificate.
