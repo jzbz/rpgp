@@ -59,7 +59,17 @@ fn set_expiry() {
             Some(PASSPHRASE),
         )
         .map_err(|e| format!("set_expiry: {e}"))?;
-        assert!(CertSummary::from_cert(&updated).expires.is_some());
+        // The expiry has to have *moved*, not merely be present: KeyGenRequest
+        // defaults to two years, so `is_some()` held before the call and would
+        // hold with set_expiry replaced by a function that returns the
+        // certificate untouched.
+        let before = CertSummary::from_cert(&cert).expires;
+        let after = CertSummary::from_cert(&updated).expires;
+        assert!(after.is_some(), "the key should still expire");
+        assert_ne!(
+            before, after,
+            "set_expiry must change the expiry, not just return a certificate"
+        );
         Ok(())
     });
 }
@@ -177,8 +187,9 @@ fn sign_detached_and_cleartext() {
         let result = ops::verify_detached(store, &detached, DATA)
             .map_err(|e| format!("verify_detached: {e}"))?;
         assert!(
-            !result.signatures.is_empty(),
-            "detached signature did not verify"
+            result.all_good(),
+            "detached signature did not verify: {:?}",
+            result.signatures
         );
 
         let mut cleartext = Vec::new();
@@ -188,8 +199,9 @@ fn sign_detached_and_cleartext() {
             ops::verify_inline(store, &cleartext).map_err(|e| format!("verify_inline: {e}"))?;
         assert_eq!(body, DATA);
         assert!(
-            !result.signatures.is_empty(),
-            "cleartext signature did not verify"
+            result.all_good(),
+            "cleartext signature did not verify: {:?}",
+            result.signatures
         );
         Ok(())
     });
@@ -220,8 +232,9 @@ fn encrypt_signed_then_decrypt() {
             .map_err(|e| format!("decrypt: {e}"))?;
         assert_eq!(recovered, PLAINTEXT);
         assert!(
-            !result.signatures.is_empty(),
-            "the signature did not verify"
+            result.all_good(),
+            "the signature did not verify: {:?}",
+            result.signatures
         );
         Ok(())
     });

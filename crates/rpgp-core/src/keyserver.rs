@@ -577,16 +577,38 @@ mod tests {
         assert!(err.contains("too large"), "streamed body not capped: {err}");
 
         // (3) A redirect that leaves HTTPS is refused rather than followed.
+        //
+        // The target has to be a server that would actually answer, and answer
+        // with something the caller would accept. Pointing at a dead port made
+        // this vacuous: every transport error is formatted through the same
+        // "lookup failed: {e}" line at get(), so deleting the redirect policy
+        // left reqwest to follow the redirect, fail to connect, and produce the
+        // very string the assertion accepted. Here, following it *succeeds* —
+        // so the policy is the only thing that can turn this into an error.
+        use sequoia_openpgp::serialize::SerializeInto;
+        let bait = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        let bait = bait.armored().export_to_vec().unwrap();
+        let mut answer = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/pgp-keys\r\nContent-Length: {}\r\n\r\n",
+            bait.len()
+        )
+        .into_bytes();
+        answer.extend_from_slice(&bait);
+        let target = serve_once(answer);
+
         let redirect =
-            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/evil\r\nContent-Length: 0\r\n\r\n"
-                .to_vec();
+            format!("HTTP/1.1 302 Found\r\nLocation: {target}/evil\r\nContent-Length: 0\r\n\r\n")
+                .into_bytes();
         unsafe { std::env::set_var("RPGP_KEYSERVER", serve_once(redirect)) };
-        let err = lookup_keyserver("alice@example.org")
-            .unwrap_err()
-            .to_string();
+        let outcome = lookup_keyserver("alice@example.org");
         assert!(
-            err.contains("lookup failed") || err.contains("redirect"),
-            "a non-HTTPS redirect should not be followed: {err}"
+            outcome.is_err(),
+            "a redirect off HTTPS was followed and returned {:?}",
+            outcome.map(|found| found.len())
         );
 
         unsafe { std::env::remove_var("RPGP_KEYSERVER") };
