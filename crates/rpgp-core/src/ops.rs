@@ -191,13 +191,27 @@ pub fn decrypt(
     store: &Store,
     ciphertext: &[u8],
     passwords: &[&str],
+    sink: impl Write,
+) -> Result<VerifyResult> {
+    decrypt_stream(store, ciphertext, passwords, sink)
+}
+
+/// [`decrypt`], reading the ciphertext as it goes instead of taking it whole.
+///
+/// Same packet stream either way — sequoia's parser consumes a reader
+/// regardless of where the bytes come from — so the plaintext and the
+/// verification result are what the buffered form produced.
+pub fn decrypt_stream<R: std::io::Read + Send + Sync>(
+    store: &Store,
+    source: R,
+    passwords: &[&str],
     mut sink: impl Write,
 ) -> Result<VerifyResult> {
     let policy = policy();
     let helper = Helper::new(store, passwords);
 
     let mut decryptor =
-        DecryptorBuilder::from_bytes(ciphertext)?.with_policy(&policy, None, helper)?;
+        DecryptorBuilder::from_reader(source)?.with_policy(&policy, None, helper)?;
     std::io::copy(&mut decryptor, &mut sink).map_err(|e| Error::io("decrypting message", e))?;
 
     let helper = decryptor.into_helper();
@@ -745,7 +759,13 @@ pub fn decrypt_file(
     passwords: &[&str],
     output: &Path,
 ) -> Result<VerifyResult> {
-    let ciphertext = read(input)?;
+    // The ciphertext is streamed too, not read whole. The output half of this
+    // function has always been streamed; the input half was still a read() of
+    // a file the user picked, so peak memory tracked its size on the one
+    // operation whose binding resource is memory.
+    let source =
+        fs::File::open(input).map_err(|e| Error::io(format!("reading {}", input.display()), e))?;
+    let source = std::io::BufReader::new(source);
 
     // Streamed to a sibling file and renamed on success, rather than buffered
     // in memory. The property being preserved is that a failed decryption
@@ -767,7 +787,7 @@ pub fn decrypt_file(
         let file = fs::File::create(&staging)
             .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
         let mut sink = BufWriter::new(file);
-        match decrypt(store, &ciphertext, passwords, &mut sink) {
+        match decrypt_stream(store, source, passwords, &mut sink) {
             Ok(result) => {
                 use std::io::Write;
                 sink.flush()
