@@ -156,6 +156,9 @@ pub fn revoke_certification(
     let target = store.lookup(target)?;
     let mut signer = certification_signer(&certifier, password)?;
 
+    // Hoisted for the verification filter below, and invariant across user IDs.
+    let certifier_key = certifier.primary_key().key();
+
     let mut signatures = Vec::new();
     for wanted in user_ids {
         let amalgamation = target
@@ -178,10 +181,26 @@ pub fn revoke_certification(
         // once, which meant a single future-dated certification from some third
         // party pushed our revocation into the future — where it does not apply
         // yet, and our certification stood despite having been withdrawn.
+        //
+        // "This certifier's" means one that verifies against our key, not one
+        // that merely names it. certifications() hands back packets exactly as
+        // they were parsed, and an issuer subpacket is an unauthenticated hint
+        // anyone can write — so filtering on the name alone let a planted
+        // packet dated in the far future set `when` to that instant, producing
+        // a revocation that is not yet valid and never takes effect, leaving
+        // the certification the user asked to withdraw still standing.
+        // certify.rs makes exactly this check on the mirror path; this is the
+        // other half of it.
         let mut when = SystemTime::now();
         for existing in amalgamation
             .certifications()
             .filter(|sig| crate::cert::issued_by(sig, &certifier))
+            .filter(|sig| {
+                (*sig)
+                    .clone()
+                    .verify_userid_binding(certifier_key, target.primary_key().key(), &userid)
+                    .is_ok()
+            })
         {
             if let Some(created) = existing.signature_creation_time() {
                 let after = created + Duration::from_secs(1);
@@ -578,6 +597,101 @@ mod tests {
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1300));
         assert_eq!(under(&b), crate::Authentication::Unknown);
+    }
+
+    /// A certification that merely *names* our key cannot date our withdrawal.
+    ///
+    /// `certifications()` hands back packets exactly as parsed, and an issuer
+    /// subpacket in the unhashed area is not covered by any signature — anyone
+    /// can write one. Filtering on the name alone let a planted packet dated in
+    /// the far future push `when` to that instant, so the revocation carried a
+    /// date it had not reached, never took effect, and the certification the
+    /// user asked to withdraw kept standing. certify.rs makes the same check on
+    /// the mirror path; this is the other half.
+    ///
+    /// Delete the `verify_userid_binding` filter in revoke_certification and
+    /// this fails: A's authentication stays Full because the withdrawal is
+    /// stamped five years out.
+    #[test]
+    fn a_planted_certification_cannot_date_the_withdrawal() {
+        use sequoia_openpgp::packet::signature::subpacket::{Subpacket, SubpacketValue};
+
+        let (_dir, store) = scratch();
+        let a = generate(&KeyGenRequest::new("A <a@example.org>"))
+            .unwrap()
+            .cert;
+        let b = generate(&KeyGenRequest::new("B <b@example.org>"))
+            .unwrap()
+            .cert;
+        let them = generate(&KeyGenRequest::new("Them <them@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&a).unwrap();
+        store.insert(&b).unwrap();
+        store.insert(&them).unwrap();
+
+        let user_id = "Them <them@example.org>".to_string();
+
+        // A genuinely certifies, so there is something to withdraw.
+        let mut request =
+            CertifyRequest::new(a.fingerprint().to_hex(), them.fingerprint().to_hex());
+        request.user_ids = vec![user_id.clone()];
+        certify(&store, &request).unwrap();
+
+        // The planted packet: B signs, five years out, and the signature is
+        // then relabelled to name A in its unhashed area. issued_by() accepts
+        // it because get_issuers() reads that area; verifying it against A does
+        // not, because A never signed it.
+        let userid = them
+            .userids()
+            .find(|ua| String::from_utf8_lossy(ua.userid().value()) == user_id.as_str())
+            .unwrap()
+            .userid()
+            .clone();
+        let future = SystemTime::now() + Duration::from_secs(5 * 365 * 24 * 60 * 60);
+        let mut signer = certification_signer(&b, None).unwrap();
+        let mut planted = SignatureBuilder::new(SignatureType::GenericCertification)
+            .set_signature_creation_time(future)
+            .unwrap()
+            .sign_userid_binding(&mut signer, them.primary_key().key(), &userid)
+            .unwrap();
+        planted
+            .unhashed_area_mut()
+            .add(Subpacket::new(SubpacketValue::Issuer(a.keyid()), false).unwrap())
+            .unwrap();
+        assert!(
+            crate::cert::issued_by(&planted, &a),
+            "the planted packet must look like A's, or the test proves nothing"
+        );
+        let them = them.insert_packets(vec![Packet::from(planted)]).unwrap().0;
+        store.insert(&them).unwrap();
+
+        let under = |root: &Cert| {
+            let certs = store.certs().unwrap();
+            wot::authenticate_all(&certs, &[root.fingerprint().to_hex()])
+                .get(&them.fingerprint().to_hex().to_uppercase())
+                .copied()
+                .unwrap_or_default()
+        };
+        assert_eq!(under(&a), crate::Authentication::Full, "A certified Them");
+
+        revoke_certification(
+            &store,
+            &a.fingerprint().to_hex(),
+            &them.fingerprint().to_hex(),
+            std::slice::from_ref(&user_id),
+            Reason::Superseded,
+            "",
+            None,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1300));
+
+        assert_eq!(
+            under(&a),
+            crate::Authentication::Unknown,
+            "the withdrawal must take effect now; a packet A did not sign cannot date it into the future"
+        );
     }
 
     #[test]

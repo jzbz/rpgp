@@ -270,21 +270,66 @@ pub fn certifications(store: &Store, cert: &Cert) -> Result<Vec<Certification>> 
                 };
 
                 let fingerprint = certifier.fingerprint().to_hex();
-                entry.certifier = primary_user_id(&certifier);
-                entry.by_me = store.has_secret(&fingerprint);
-                entry.certifier_fingerprint = Some(fingerprint);
-                let certifier_key = certifier.primary_key().key();
-                entry.verified = Some(if is_revocation {
-                    signature
-                        .clone()
-                        .verify_userid_revocation(certifier_key, primary, ua.userid())
-                        .is_ok()
+
+                // Verify before attributing, not after. get_issuers() reports
+                // the issuer subpackets from both the hashed and the unhashed
+                // area, and the unhashed half is not covered by the signature
+                // — the comment above certify() says exactly that. Naming the
+                // certifier, and worse setting by_me, from that hint meant a
+                // packet anyone could write earned a real identity in the list
+                // and a "(you)" badge with a withdraw affordance beside it.
+                //
+                // Every certification-capable key is tried, not just the
+                // primary: certify() signs with the first `for_certification()`
+                // key, which may well be a subkey, so a primary-only check
+                // would reject certifications this very program made.
+                let policy = policy();
+                let verified = certifier
+                    .with_policy(&policy, None)
+                    .ok()
+                    .into_iter()
+                    .flat_map(|valid| {
+                        valid
+                            .keys()
+                            .alive()
+                            .revoked(false)
+                            .supported()
+                            .for_certification()
+                            .map(|ka| ka.key().clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .chain(std::iter::once(
+                        certifier
+                            .primary_key()
+                            .key()
+                            .clone()
+                            .role_into_unspecified(),
+                    ))
+                    .any(|key| {
+                        if is_revocation {
+                            signature
+                                .clone()
+                                .verify_userid_revocation(&key, primary, ua.userid())
+                                .is_ok()
+                        } else {
+                            signature
+                                .clone()
+                                .verify_userid_binding(&key, primary, ua.userid())
+                                .is_ok()
+                        }
+                    });
+                entry.verified = Some(verified);
+                if verified {
+                    entry.certifier = primary_user_id(&certifier);
+                    entry.by_me = store.has_secret(&fingerprint);
+                    entry.certifier_fingerprint = Some(fingerprint);
                 } else {
-                    signature
-                        .clone()
-                        .verify_userid_binding(certifier_key, primary, ua.userid())
-                        .is_ok()
-                });
+                    // Names this certifier but does not verify against it.
+                    // Report the handle rather than the identity: by_me stays
+                    // false, so no withdraw affordance appears beside a
+                    // signature we cannot show the user made.
+                    entry.certifier = handle.to_string();
+                }
                 break;
             }
 
