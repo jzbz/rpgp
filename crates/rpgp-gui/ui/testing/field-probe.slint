@@ -27,6 +27,12 @@ export component ControlProbe inherits Window {
     in-out property <int> clicks: 0;
     in-out property <int> toggles: 0;
     in-out property <int> copies: 0;
+    // State the controls actually carry, so a test can move it and check the
+    // accessibility tree followed. Without these the probe never changed state
+    // and the tree's checked/value assertions were satisfied by the defaults —
+    // they would have held against a hardcoded binding just as well.
+    in-out property <bool> encrypt: false;
+    in-out property <int> standard: 0;
 
     width: 500px;
     height: 400px;
@@ -35,8 +41,20 @@ export component ControlProbe inherits Window {
         Btn { text: "Save"; clicked => { root.clicks += 1; } }
         // Icon-only and destructive: the case that used to announce nothing.
         Btn { label: "Revoke user ID alice"; clicked => { root.clicks += 1; } }
-        Check { text: "Encrypt"; toggled => { root.toggles += 1; } }
-        Select { label: "Standard"; model: ["Modern", "Compatible"]; }
+        Check {
+            text: "Encrypt";
+            checked: root.encrypt;
+            toggled => {
+                root.toggles += 1;
+                root.encrypt = !root.encrypt;
+            }
+        }
+        Select {
+            label: "Standard";
+            model: ["Modern", "Compatible"];
+            current: root.standard;
+            changed(index) => { root.standard = index; }
+        }
         FieldRow {
             label: "Fingerprint";
             value: "ABCD 1234";

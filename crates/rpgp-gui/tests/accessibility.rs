@@ -109,7 +109,11 @@ fn controls_are_announced_and_operable() {
         "a non-copyable row should expose no copy button"
     );
 
-    // State a screen reader cannot infer from the drawing.
+    // State a screen reader cannot infer from the drawing — and, more to the
+    // point, state that *tracks*. Asserting the initial values alone proved
+    // nothing: they are the defaults of an untouched probe, so a hardcoded
+    // `accessible-checked: false` would have satisfied them just as well. Each
+    // is therefore moved and read back.
     assert_eq!(by_label("Encrypt").accessible_checked(), Some(false));
     assert_eq!(
         by_label("Standard")
@@ -119,10 +123,25 @@ fn controls_are_announced_and_operable() {
         "Modern"
     );
 
+    probe.set_standard(1);
+    assert_eq!(
+        by_label("Standard")
+            .accessible_value()
+            .unwrap_or_default()
+            .as_str(),
+        "Compatible",
+        "the published value must follow the control, not be a constant"
+    );
+
     // And each one can actually be operated through the accessibility layer.
     by_label("Save").invoke_accessible_default_action();
     by_label("Encrypt").invoke_accessible_default_action();
     by_label("Copy Fingerprint").invoke_accessible_default_action();
+    assert_eq!(
+        by_label("Encrypt").accessible_checked(),
+        Some(true),
+        "toggling through the accessibility layer must move the published state"
+    );
     assert_eq!(
         (probe.get_clicks(), probe.get_toggles(), probe.get_copies()),
         (1, 1, 1),

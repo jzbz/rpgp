@@ -83,6 +83,7 @@ export component KeygenDialog inherits DialogShell {
                     font-size: Theme.t-sm;
                 }
                 key-type := Select {
+                    label: "Key type";
                     model: ["Curve 25519 (recommended)", "RSA 3072", "RSA 4096"];
                     enabled: !root.busy;
                 }
@@ -97,6 +98,7 @@ export component KeygenDialog inherits DialogShell {
                     font-size: Theme.t-sm;
                 }
                 expiry := Select {
+                    label: "Expires";
                     model: ["in 2 years", "in 1 year", "in 5 years", "never"];
                     enabled: !root.busy;
                 }
@@ -111,6 +113,7 @@ export component KeygenDialog inherits DialogShell {
                 font-size: Theme.t-sm;
             }
             standard := Select {
+                label: "Standard";
                 model: ["Modern (RFC 9580)", "Compatible (RFC 4880)"];
                 enabled: !root.busy;
             }
@@ -361,6 +364,7 @@ export component SignEncryptDialog inherits DialogShell {
                     font-size: Theme.t-sm;
                 }
                 Select {
+                    label: "Sign as";
                     model: root.signers;
                     enabled: !root.busy;
                     current: root.signer-index;
@@ -661,6 +665,7 @@ export component CertifyDialog inherits DialogShell {
                     font-size: Theme.t-sm;
                 }
                 Select {
+                    label: "Certify with";
                     model: root.certifiers;
                     enabled: !root.busy;
                     current: root.certifier-index;
@@ -677,6 +682,7 @@ export component CertifyDialog inherits DialogShell {
                     font-size: Theme.t-sm;
                 }
                 Select {
+                    label: "Confidence";
                     model: ["Full", "Partial"];
                     enabled: !root.busy;
                     current: root.confidence;
@@ -786,6 +792,7 @@ export component RevokeDialog inherits DialogShell {
             // used to be "No reason given", which reads as neutral and is not:
             // OpenPGP treats it as a hard revocation, the same as a compromise.
             Select {
+                label: "Reason for revocation";
                 model: [
                     "No longer used",
                     "Replaced by a newer key",
@@ -1077,6 +1084,7 @@ export component NotepadDialog inherits DialogShell {
         HorizontalLayout {
             spacing: Theme.s2;
             if root.signers.length > 0: Select {
+                label: "Sign as";
                 model: root.signers;
                 enabled: !root.busy;
                 current: root.signer-index;
@@ -1513,6 +1521,7 @@ export component LifecycleDialog inherits DialogShell {
         spacing: Theme.s3;
 
         if root.mode == 0: Select {
+            label: "Expires";
             model: ["in 2 years", "in 1 year", "in 5 years", "never"];
             enabled: !root.busy;
             current: root.expiry;
@@ -1536,6 +1545,7 @@ export component LifecycleDialog inherits DialogShell {
         // exposed decides whether its past signatures still count. Same
         // model as RevokeDialog, mirroring Reason::ALL.
         if root.mode == 4: Select {
+            label: "Reason for revocation";
             model: [
                 "No longer used",
                 "Replaced by a newer key",
