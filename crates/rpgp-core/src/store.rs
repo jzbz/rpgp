@@ -446,6 +446,42 @@ impl Store {
             return Err(Error::invalid("certificate carries no secret key material"));
         }
         let path = self.secret_path(&cert.fingerprint().to_hex());
+
+        // Merged with what is already there, never written over it. This used
+        // to serialise whatever it was handed straight onto the path: a file
+        // holding a key's only copy of its secret material was replaced
+        // wholesale by a certificate that might carry less of it, or none, and
+        // there was no merge, no comparison and no backup. Importing a public
+        // certificate the user already held a secret for destroyed the secret.
+        //
+        // merge_public_and_secret prefers the incoming secret where there is
+        // one, so the legitimate writers — keygen, certify, revoke, lifecycle,
+        // all of which hand back an updated copy of the same key — still win,
+        // and secret material can only ever be added.
+        //
+        // A file that will not parse is moved aside rather than overwritten:
+        // it cannot be merged, and destroying it is the failure this whole
+        // function now exists to prevent.
+        let cert = match Cert::from_file(&path) {
+            Ok(existing) => existing.merge_public_and_secret(cert.clone())?,
+            Err(_) if path.exists() => {
+                let mut aside = path.clone();
+                aside.as_mut_os_string().push(".unreadable");
+                for n in 1..1000 {
+                    if !aside.exists() {
+                        break;
+                    }
+                    aside = path.clone();
+                    aside.as_mut_os_string().push(format!(".unreadable.{n}"));
+                }
+                fs::rename(&path, &aside).map_err(|e| {
+                    Error::io(format!("moving unreadable {} aside", path.display()), e)
+                })?;
+                cert.clone()
+            }
+            Err(_) => cert.clone(),
+        };
+
         // Written beside the target and renamed into place, so a crash while
         // serialising leaves a stray .tmp rather than a truncated .pgp. The
         // rename keeps the private mode/ACL the file was created with, and the
@@ -459,7 +495,7 @@ impl Store {
         }
         fs::rename(&staging, &path)
             .map_err(|e| Error::io(format!("writing {}", path.display()), e))?;
-        self.insert(cert)
+        self.insert(&cert)
     }
 
     /// Every transferable secret key on disk.
@@ -1163,6 +1199,60 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
         (dir, store)
+    }
+
+    /// Importing a key with less secret material than we hold must not take
+    /// what we already have.
+    ///
+    /// `gpg --export-secret-subkeys` produces exactly this shape: a TSK whose
+    /// primary carries secret material and whose subkeys do not. insert_secret
+    /// used to serialise whatever it was handed straight over the file, so
+    /// importing one of those discarded every subkey secret the store held —
+    /// silently, with no merge, no comparison and no backup.
+    ///
+    /// Replace the merge with the old unconditional write and this fails: the
+    /// subkey comes back public.
+    #[test]
+    fn importing_a_partial_secret_key_does_not_discard_what_we_hold() {
+        let (_dir, store) = scratch();
+        let full = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        let secret_subkeys = |cert: &Cert| cert.keys().subkeys().secret().count();
+        assert!(
+            secret_subkeys(&full) > 0,
+            "the generated key must have secret subkeys, or this proves nothing"
+        );
+        store.insert_secret(&full).unwrap();
+
+        // The same key with its subkey secrets stripped: still a TSK, because
+        // the primary keeps its own. This is what `gpg --export-secret-subkeys`
+        // inverts, and what as_tsk().set_filter() exists to express.
+        let primary = full.primary_key().key().fingerprint();
+        let mut bytes = Vec::new();
+        full.as_tsk()
+            .set_filter(move |k| k.fingerprint() == primary)
+            .serialize(&mut bytes)
+            .unwrap();
+        let partial = Cert::from_bytes(&bytes).unwrap();
+        assert!(partial.is_tsk(), "the primary still carries its secret");
+        assert_eq!(secret_subkeys(&partial), 0, "subkey secrets are gone");
+
+        store.insert_secret(&partial).unwrap();
+
+        let on_disk = store
+            .secret_certs()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.fingerprint() == full.fingerprint())
+            .expect("the key is still in the store");
+        assert_eq!(
+            secret_subkeys(&on_disk),
+            secret_subkeys(&full),
+            "importing a partial key must not discard secret subkeys we already held"
+        );
     }
 
     /// An imported secret key must not become a trust root.
