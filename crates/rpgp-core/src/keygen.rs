@@ -99,7 +99,7 @@ impl Standard {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct KeyGenRequest {
     /// Full user IDs, e.g. `Alice <alice@example.org>`.
     pub user_ids: Vec<String>,
@@ -110,6 +110,31 @@ pub struct KeyGenRequest {
     /// years rather than "never".
     pub validity: Option<Duration>,
     pub password: Option<Zeroizing<String>>,
+}
+
+/// Written out rather than derived, so the passphrase cannot be printed.
+///
+/// `Zeroizing` is `#[repr(transparent)]` and its `Debug` delegates straight to
+/// the inner `String`, so a derived one rendered the passphrase verbatim into
+/// whatever formatted it. Nothing does today; the point is that a `dbg!` or an
+/// error that captured the request would, and the type carrying a secret should
+/// not depend on nobody ever doing that.
+impl std::fmt::Debug for KeyGenRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyGenRequest")
+            .field("user_ids", &self.user_ids)
+            .field("key_type", &self.key_type)
+            .field("standard", &self.standard)
+            .field("validity", &self.validity)
+            .field(
+                "password",
+                match self.password {
+                    Some(_) => &"<redacted>",
+                    None => &"None",
+                },
+            )
+            .finish()
+    }
 }
 
 impl KeyGenRequest {

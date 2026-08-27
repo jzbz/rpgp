@@ -156,6 +156,22 @@ impl Store {
             }
         }
 
+        // The two bookkeeping files beside the secrets directory. Neither holds
+        // key material, but trust-roots is the list of keys this user has
+        // decided to trust — anyone able to write it can make a stranger's
+        // certificate authenticate as fully trusted — and both were created
+        // with the default mode in a parent directory this function does not
+        // restrict, so they landed world-readable and group-writable on a
+        // typical umask.
+        for path in [
+            secrets_dir.with_file_name("trust-roots"),
+            secrets_dir.with_file_name("imported-secrets"),
+        ] {
+            if path.is_file() {
+                restrict(&path, 0o600)?;
+            }
+        }
+
         Ok(Store {
             certs: CertStore::open(cert_dir)?,
             cert_dir: cert_dir.to_path_buf(),
