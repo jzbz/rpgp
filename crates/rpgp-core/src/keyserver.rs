@@ -101,6 +101,19 @@ fn redirects_inward(url: &reqwest::Url) -> bool {
     else {
         return false;
     };
+    inward(addr)
+}
+
+/// Whether an address points somewhere the caller's own network can reach.
+///
+/// Split out so the IPv4-mapped case can recurse: `::ffff:127.0.0.1` is a
+/// perfectly ordinary way to write a loopback address in a URL, and every IPv6
+/// test below says no to it — `is_loopback` is true only of `::1`, and both
+/// segment masks read the first segment, which is zero in a mapped address. It
+/// therefore sailed through the guard and named 127.0.0.1 anyway.
+fn inward(addr: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+
     match addr {
         IpAddr::V4(v4) => {
             v4.is_private()
@@ -111,12 +124,24 @@ fn redirects_inward(url: &reqwest::Url) -> bool {
                 || v4.is_unspecified()
         }
         IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                // Unique-local (fc00::/7) and link-local (fe80::/10). The std
-                // predicates for these are still unstable, so test directly.
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
+            // These first, and before any IPv4 unwrapping: to_ipv4() reads ::1
+            // as the IPv4-compatible 0.0.0.1, which is neither loopback nor
+            // private, so unwrapping first would wave the plain IPv6 loopback
+            // through.
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            // An IPv4-mapped or IPv4-compatible address *is* that IPv4
+            // address; ask the question that applies to it. ::ffff:127.0.0.1
+            // is an ordinary way to write loopback in a URL and satisfies none
+            // of the tests below — is_loopback holds only for ::1, and both
+            // segment masks read the first segment, which is zero here.
+            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+                return inward(IpAddr::V4(v4));
+            }
+            // Unique-local (fc00::/7) and link-local (fe80::/10). The std
+            // predicates for these are still unstable, so test directly.
+            (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
     }
 }
@@ -726,6 +751,15 @@ mod tests {
             "https://[::1]/",
             "https://[fe80::1]/",
             "https://[fc00::1]/",
+            // IPv4-mapped and IPv4-compatible forms of the same private
+            // addresses. Every IPv6 predicate says no to these — is_loopback
+            // holds only for ::1, and the segment masks read the first
+            // segment, which is zero here — so they walked straight through
+            // the guard and named 127.0.0.1 anyway.
+            "https://[::ffff:127.0.0.1]/",
+            "https://[::ffff:169.254.169.254]/latest/meta-data/",
+            "https://[::ffff:10.0.0.5]/",
+            "https://[::ffff:192.168.1.1]/",
         ];
         for url in inward {
             let parsed = reqwest::Url::parse(url).unwrap();

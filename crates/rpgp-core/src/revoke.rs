@@ -152,7 +152,14 @@ pub fn revoke_certification(
         return Err(Error::invalid("select at least one user ID"));
     }
 
-    let certifier = store.secret_cert(certifier)?;
+    // The certifier may be a card key, which has no local secret half; the
+    // public certificate is enough for the agent to find it by keygrip. certify()
+    // has always accepted one, and the GUI offers card keys as certifiers, so
+    // refusing them here meant a certification the app let you make could not be
+    // withdrawn from the app.
+    let certifier = store
+        .secret_cert(certifier)
+        .or_else(|_| store.lookup(certifier))?;
     let target = store.lookup(target)?;
     let mut signer = certification_signer(&certifier, password)?;
 
@@ -345,7 +352,7 @@ fn primary_signer(cert: &Cert, password: Option<&str>) -> Result<sequoia_openpgp
 fn certification_signer(
     cert: &Cert,
     password: Option<&str>,
-) -> Result<sequoia_openpgp::crypto::KeyPair> {
+) -> Result<Box<dyn sequoia_openpgp::crypto::Signer + Send + Sync>> {
     let policy = policy();
     let valid = cert
         .with_policy(&policy, None)
@@ -357,9 +364,17 @@ fn certification_signer(
         .revoked(false)
         .supported()
         .for_certification()
-        .next()
-        .ok_or_else(|| Error::NoSecretKey(cert.fingerprint().to_hex()))?;
-    crate::secret::keypair(ka.key().clone(), password)
+        .next();
+
+    // No local secret half means a card key: hand the agent the certificate and
+    // let it find the key by keygrip, exactly as certify() does.
+    match ka {
+        Some(ka) => Ok(Box::new(crate::secret::keypair(
+            ka.key().clone(),
+            password,
+        )?)),
+        None => Ok(Box::new(crate::agent::certifier_for(cert)?)),
+    }
 }
 
 #[cfg(test)]
