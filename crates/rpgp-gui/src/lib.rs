@@ -436,10 +436,17 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            // A worker holds the state lock for the whole of its operation,
-            // and that can be a card PIN prompt lasting a minute. Locking here
-            // would block the UI thread and freeze the window, so these
-            // read-only callbacks bow out while one is running.
+            // A mutation is in flight and is about to replace `all`, so
+            // acting on what is there now would act on state that is already
+            // stale — and the reselect that follows would fight this callback
+            // for the selection. These read-only callbacks therefore bow out
+            // until it lands.
+            //
+            // Not, as this used to say, because a worker holds the state lock
+            // across a card PIN prompt: run_sign_encrypt and run_certify both
+            // take the lock in a scoped block and drop it before any crypto,
+            // so the prompt happens with the lock free. Import is the one
+            // worker that holds it throughout, and import never prompts.
             if ui.get_busy() {
                 return;
             }
@@ -454,10 +461,17 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            // A worker holds the state lock for the whole of its operation,
-            // and that can be a card PIN prompt lasting a minute. Locking here
-            // would block the UI thread and freeze the window, so these
-            // read-only callbacks bow out while one is running.
+            // A mutation is in flight and is about to replace `all`, so
+            // acting on what is there now would act on state that is already
+            // stale — and the reselect that follows would fight this callback
+            // for the selection. These read-only callbacks therefore bow out
+            // until it lands.
+            //
+            // Not, as this used to say, because a worker holds the state lock
+            // across a card PIN prompt: run_sign_encrypt and run_certify both
+            // take the lock in a scoped block and drop it before any crypto,
+            // so the prompt happens with the lock free. Import is the one
+            // worker that holds it throughout, and import never prompts.
             if ui.get_busy() {
                 return;
             }
@@ -472,10 +486,17 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            // A worker holds the state lock for the whole of its operation,
-            // and that can be a card PIN prompt lasting a minute. Locking here
-            // would block the UI thread and freeze the window, so these
-            // read-only callbacks bow out while one is running.
+            // A mutation is in flight and is about to replace `all`, so
+            // acting on what is there now would act on state that is already
+            // stale — and the reselect that follows would fight this callback
+            // for the selection. These read-only callbacks therefore bow out
+            // until it lands.
+            //
+            // Not, as this used to say, because a worker holds the state lock
+            // across a card PIN prompt: run_sign_encrypt and run_certify both
+            // take the lock in a scoped block and drop it before any crypto,
+            // so the prompt happens with the lock free. Import is the one
+            // worker that holds it throughout, and import never prompts.
             if ui.get_busy() {
                 return;
             }
@@ -490,10 +511,17 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            // A worker holds the state lock for the whole of its operation,
-            // and that can be a card PIN prompt lasting a minute. Locking here
-            // would block the UI thread and freeze the window, so these
-            // read-only callbacks bow out while one is running.
+            // A mutation is in flight and is about to replace `all`, so
+            // acting on what is there now would act on state that is already
+            // stale — and the reselect that follows would fight this callback
+            // for the selection. These read-only callbacks therefore bow out
+            // until it lands.
+            //
+            // Not, as this used to say, because a worker holds the state lock
+            // across a card PIN prompt: run_sign_encrypt and run_certify both
+            // take the lock in a scoped block and drop it before any crypto,
+            // so the prompt happens with the lock free. Import is the one
+            // worker that holds it throughout, and import never prompts.
             if ui.get_busy() {
                 return;
             }
@@ -2779,7 +2807,6 @@ impl State {
     }
 }
 
-/// Rebuild `shown` and the list model from the current scope and search text.
 /// Which certificates the list shows, in the order it shows them.
 ///
 /// The pure half of [`apply_filter`], split out so it can be measured: this is
@@ -2809,6 +2836,12 @@ pub fn visible_rows(all: &[CertSummary], filter: &str, scope: Scope, sort: Sort)
         .collect()
 }
 
+/// Rebuild `shown` and the list model from the current scope and search text.
+///
+/// The impure half: [`visible`] decides *which* certificates and in what
+/// order, this turns that answer into rows and hands them to the window. The
+/// summary above used to sit on `visible`, left there when the pure half was
+/// split out for the keystroke bench.
 fn apply_filter(ui: &AppWindow, state: &Shared) {
     let mut guard = lock(state);
 

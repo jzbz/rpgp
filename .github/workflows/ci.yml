@@ -269,9 +269,13 @@ jobs:
           restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-test-
 
       # No display is set up, and none is needed: the GUI tests drive Slint
-      # through its testing backend with no event loop. The five ignored tests
-      # want the developer's own GnuPG keyring or the network, so they stay
-      # ignored here.
+      # through its testing backend with no event loop.
+      #
+      # Six tests stay ignored, for four different reasons: one hits the
+      # network, one wants a local stand-in for the VKS API, two are
+      # interactive because the agent prompts for a PIN, one reads the
+      # developer's own GnuPG keyring, and the last is not a test at all — it
+      # is the helper process the hardening tests re-exec.
       - name: Test
         run: cargo test --workspace --locked
 

@@ -12,10 +12,13 @@
 //! lockfile offline. `harness = false` in Cargo.toml makes this a plain
 //! binary, so `cargo bench` runs it and no test harness is involved.
 //!
-//! Only the rpgp-core half of a reload is measured: the GUI's row building and
-//! sorting live in a binary crate with no library target, so a bench cannot
-//! reach them. What is here — parsing the store, summarising each certificate,
-//! and rebuilding the trust graph — is the part that scales with the keyring.
+//! Only the rpgp-core half of a reload is measured: parsing the store,
+//! summarising each certificate, and rebuilding the trust graph — the part
+//! that scales with the keyring. The GUI's row building and sorting are
+//! measured separately by rpgp-gui's keystroke bench, which reaches them
+//! through the `rpgp_gui` library target added for exactly that purpose. This
+//! used to say a bench could not reach them at all, which stopped being true
+//! when that target was added.
 //!
 //!     cargo bench -p rpgp-core
 //!     RPGP_BENCH_SIZES=50,200,1000 cargo bench -p rpgp-core
