@@ -302,10 +302,20 @@ fn apply(store: &Store, cert: Cert, signature: Signature) -> Result<Cert> {
 
     // Guard against silently storing a signature that changed nothing — a
     // revocation from the wrong key, or one the policy rejects.
-    if !matches!(
-        revoked.revocation_status(&policy(), None),
-        RevocationStatus::Revoked(_)
-    ) {
+    //
+    // The test is whether *this* signature was accepted, not whether the
+    // certificate ends up revoked. Sequoia computes revocation_status from the
+    // revocations it has already verified, so on a certificate that was
+    // revoked before this call the status is Revoked whatever we just inserted
+    // — the guard passed on its own history and wrote an arbitrary signature
+    // packet into the secret key file. Asking whether the returned set
+    // contains this signature keeps the verification sequoia already did, and
+    // covers a designated revoker's signature as readily as a self-revocation.
+    let accepted = match revoked.revocation_status(&policy(), None) {
+        RevocationStatus::Revoked(verified) => verified.iter().any(|s| **s == signature),
+        _ => false,
+    };
+    if !accepted {
         return Err(Error::invalid(format!(
             "that signature does not revoke {fingerprint}"
         )));
@@ -389,6 +399,54 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
         (dir, store)
+    }
+
+    /// An already-revoked certificate must not accept an arbitrary signature.
+    ///
+    /// The guard used to read the certificate's revocation status, which
+    /// sequoia computes from the revocations it has already verified. On a
+    /// certificate revoked earlier that is Revoked no matter what was just
+    /// inserted, so the check passed on the certificate's own history and any
+    /// signature packet was written into the secret key file.
+    ///
+    /// Restore the status-only guard and this fails: apply returns Ok.
+    #[test]
+    fn an_already_revoked_certificate_still_refuses_a_foreign_signature() {
+        let (_dir, store) = scratch();
+        let mine = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        let other = generate(&KeyGenRequest::new("Other <other@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&mine).unwrap();
+        store.insert_secret(&other).unwrap();
+
+        let mut request = RevokeRequest::new(mine.fingerprint().to_hex());
+        request.reason = Reason::Superseded;
+        let revoked = revoke_cert(&store, &request).unwrap();
+        assert!(
+            revocation_reason(&revoked).is_some(),
+            "it is revoked already"
+        );
+
+        // A signature that has nothing to do with revoking this certificate:
+        // Other's certification of its own user ID.
+        let foreign = other
+            .userids()
+            .next()
+            .unwrap()
+            .self_signatures()
+            .next()
+            .unwrap()
+            .clone();
+
+        let outcome = apply(&store, revoked, foreign);
+        assert!(
+            outcome.is_err(),
+            "a signature that does not revoke this certificate must be refused, \
+             even when the certificate is already revoked"
+        );
     }
 
     #[test]
