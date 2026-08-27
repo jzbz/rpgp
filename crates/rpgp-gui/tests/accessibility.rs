@@ -148,3 +148,124 @@ fn controls_are_announced_and_operable() {
         "default actions must reach the callbacks"
     );
 }
+
+/// The recipient and user-ID lists draw a tick box by hand instead of using
+/// `Check`. None of that drawing reaches assistive technology, so each row has
+/// to declare the checkbox contract itself — otherwise choosing who can read a
+/// file is a screen reader's blind spot: unlabelled geometry, with no way to
+/// tell a chosen recipient from an unchosen one or to change the answer.
+///
+/// Driven through the shipped dialogs rather than a copy of their rows, so
+/// this fails if the real ones lose the contract again.
+#[test]
+fn a_selection_row_says_what_it_is_and_whether_it_is_chosen() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+
+    let recipient = |label: &str, mail: &str, selected: bool| RecipientRow {
+        fingerprint: label.into(),
+        label: label.into(),
+        sublabel: mail.into(),
+        initials: label[..1].into(),
+        tint_index: 0,
+        selected,
+    };
+
+    let probe = SelectionProbe::new().unwrap();
+    probe.set_recipients(slint::ModelRc::new(slint::VecModel::from(vec![
+        recipient("Alice", "alice@example.org", false),
+        recipient("Bob", "bob@example.org", true),
+    ])));
+    probe.show().unwrap();
+
+    // The address is part of the name, not decoration: it is the only thing
+    // separating two keys held for the same person.
+    let row = |name: &str| {
+        ElementHandle::find_by_accessible_label(&probe, name)
+            .next()
+            .unwrap_or_else(|| panic!("no recipient row is called {name:?}"))
+    };
+    let alice = || row("Alice, alice@example.org");
+    let bob = || row("Bob, bob@example.org");
+
+    assert_eq!(alice().accessible_role(), Some(AccessibleRole::Checkbox));
+    assert_eq!(bob().accessible_role(), Some(AccessibleRole::Checkbox));
+
+    // Distinct values from the same binding: a hardcoded constant passes one of
+    // these two and fails the other, whichever it is set to.
+    assert_eq!(alice().accessible_checked(), Some(false));
+    assert_eq!(bob().accessible_checked(), Some(true));
+
+    alice().invoke_accessible_default_action();
+    assert_eq!(
+        probe.get_toggled_recipient(),
+        0,
+        "a row must be operable through the accessibility layer, not the mouse alone"
+    );
+}
+
+/// The same contract on the certify dialog's list, where the stakes are a
+/// signature over someone else's identity.
+#[test]
+fn a_user_id_row_says_what_it_is_and_whether_it_is_chosen() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+
+    let probe = CertifyProbe::new().unwrap();
+    probe.set_user_ids(slint::ModelRc::new(slint::VecModel::from(vec![
+        UserIdRow {
+            text: "Alice <alice@example.org>".into(),
+            selected: false,
+        },
+        UserIdRow {
+            text: "Alice <alice@work.example>".into(),
+            selected: true,
+        },
+    ])));
+    probe.show().unwrap();
+
+    let row = |name: &str| {
+        ElementHandle::find_by_accessible_label(&probe, name)
+            .next()
+            .unwrap_or_else(|| panic!("no user-ID row is called {name:?}"))
+    };
+    let home = || row("Alice <alice@example.org>");
+    let work = || row("Alice <alice@work.example>");
+
+    assert_eq!(home().accessible_role(), Some(AccessibleRole::Checkbox));
+    assert_eq!(home().accessible_checked(), Some(false));
+    assert_eq!(work().accessible_checked(), Some(true));
+
+    home().invoke_accessible_default_action();
+    assert_eq!(probe.get_toggled_user_id(), 0);
+}
+
+/// And the notepad's copy of the recipient row, which is a third instance of
+/// the same hand-drawn tick box rather than a shared component.
+#[test]
+fn the_notepad_recipient_row_carries_the_same_contract() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+
+    let probe = NotepadProbe::new().unwrap();
+    probe.set_recipients(slint::ModelRc::new(slint::VecModel::from(vec![
+        RecipientRow {
+            fingerprint: "AAAA".into(),
+            label: "Alice".into(),
+            sublabel: "alice@example.org".into(),
+            initials: "A".into(),
+            tint_index: 0,
+            selected: true,
+        },
+    ])));
+    probe.show().unwrap();
+
+    let row = ElementHandle::find_by_accessible_label(&probe, "Alice, alice@example.org")
+        .next()
+        .expect("the notepad's recipient row announces nothing");
+    assert_eq!(row.accessible_role(), Some(AccessibleRole::Checkbox));
+    assert_eq!(row.accessible_checked(), Some(true));
+
+    row.invoke_accessible_default_action();
+    assert_eq!(probe.get_toggled_recipient(), 0);
+}

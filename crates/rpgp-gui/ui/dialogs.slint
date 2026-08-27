@@ -294,6 +294,15 @@ export component SignEncryptDialog inherits DialogShell {
                             height: 42px;
                             background: pick.has-hover ? Theme.hover : transparent;
 
+                            // The row draws a tick box but is not one: without these a screen
+                            // reader sees an unlabelled rectangle and cannot tell a chosen
+                            // recipient from an unchosen one. Check declares the same set.
+                            accessible-role: checkbox;
+                            accessible-label: entry.label + ", " + entry.sublabel;
+                            accessible-checkable: true;
+                            accessible-checked: entry.selected;
+                            accessible-action-default => { root.toggle-recipient(index); }
+
                             HorizontalLayout {
                                 padding-left: Theme.s3;
                                 padding-right: Theme.s3;
@@ -612,6 +621,15 @@ export component CertifyDialog inherits DialogShell {
                     for entry[index] in root.user-ids: Rectangle {
                         height: 34px;
                         background: pick.has-hover ? Theme.hover : transparent;
+
+                        // The row draws a tick box but is not one: without these a screen
+                        // reader sees an unlabelled rectangle and cannot tell a chosen
+                        // recipient from an unchosen one. Check declares the same set.
+                        accessible-role: checkbox;
+                        accessible-label: entry.text;
+                        accessible-checkable: true;
+                        accessible-checked: entry.selected;
+                        accessible-action-default => { root.toggle-user-id(index); }
 
                         HorizontalLayout {
                             padding-left: Theme.s3;
@@ -1032,6 +1050,15 @@ export component NotepadDialog inherits DialogShell {
                         for entry[index] in root.recipients: Rectangle {
                             height: 34px;
                             background: pick.has-hover ? Theme.hover : transparent;
+
+                            // The row draws a tick box but is not one: without these a screen
+                            // reader sees an unlabelled rectangle and cannot tell a chosen
+                            // recipient from an unchosen one. Check declares the same set.
+                            accessible-role: checkbox;
+                            accessible-label: entry.label + ", " + entry.sublabel;
+                            accessible-checkable: true;
+                            accessible-checked: entry.selected;
+                            accessible-action-default => { root.toggle-recipient(index); }
                             HorizontalLayout {
                                 padding-left: Theme.s2;
                                 padding-right: Theme.s2;

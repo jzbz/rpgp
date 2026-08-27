@@ -2,6 +2,8 @@
 // accessibility tree publishes can be inspected from a Rust test. Not part of
 // the application.
 import { Field, Btn, Check, Select, FieldRow } from "../widgets.slint";
+import { SignEncryptDialog, CertifyDialog, NotepadDialog } from "../dialogs.slint";
+import { RecipientRow, UserIdRow } from "../types.slint";
 
 export component FieldProbe inherits Window {
     in-out property <string> secret-text <=> pass-field.text;
@@ -63,5 +65,56 @@ export component ControlProbe inherits Window {
             copy => { root.copies += 1; }
         }
         FieldRow { label: "Algorithm"; value: "Ed25519"; }
+    }
+}
+
+// The two selection lists, driven through the real dialogs rather than through
+// a copy of their markup here: a probe that reproduced the rows would go on
+// passing after the shipped rows lost their accessibility again.
+export component SelectionProbe inherits Window {
+    in-out property <[RecipientRow]> recipients;
+    in-out property <int> toggled-recipient: -1;
+
+    width: 620px;
+    height: 720px;
+
+    SignEncryptDialog {
+        width: 100%;
+        height: 100%;
+        input-path: "/tmp/message.txt";
+        recipients: root.recipients;
+        toggle-recipient(index) => { root.toggled-recipient = index; }
+    }
+}
+
+export component CertifyProbe inherits Window {
+    in-out property <[UserIdRow]> user-ids;
+    in-out property <int> toggled-user-id: -1;
+
+    width: 620px;
+    height: 720px;
+
+    CertifyDialog {
+        width: 100%;
+        height: 100%;
+        target-name: "Alice";
+        user-ids: root.user-ids;
+        toggle-user-id(index) => { root.toggled-user-id = index; }
+    }
+}
+
+// The notepad carries a third copy of the recipient row, behind its own filter.
+export component NotepadProbe inherits Window {
+    in-out property <[RecipientRow]> recipients;
+    in-out property <int> toggled-recipient: -1;
+
+    width: 620px;
+    height: 720px;
+
+    NotepadDialog {
+        width: 100%;
+        height: 100%;
+        recipients: root.recipients;
+        toggle-recipient(index) => { root.toggled-recipient = index; }
     }
 }
