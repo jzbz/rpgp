@@ -57,62 +57,75 @@ impl Authentication {
 /// A failure to build the network is reported as "nothing is authenticated"
 /// rather than as an error: an unusable trust graph should grey out the
 /// trust column, not stop the list from being shown.
-pub fn authenticate_all<C>(certs: &[C], roots: &[String]) -> HashMap<String, Authentication>
+pub fn authenticate_all<C>(
+    certs: &[C],
+    roots: &[String],
+) -> HashMap<(String, String), Authentication>
 where
     C: std::ops::Deref<Target = Cert>,
 {
-    // The all-Unknown map is only what the two early returns below hand back.
-    // Building it up front meant the success path inserted every key twice —
-    // once as Unknown and once with the real verdict — allocating the key
-    // string both times, for every certificate on every reload.
-    let unknown = || -> HashMap<String, Authentication> {
-        certs
-            .iter()
-            .map(|cert| {
-                (
-                    cert.fingerprint().to_hex().to_uppercase(),
-                    Authentication::Unknown,
-                )
-            })
-            .collect()
-    };
-
+    // Empty rather than an all-Unknown map: `for_user_id` answers Unknown for
+    // anything absent, so the two are indistinguishable to every caller, and
+    // building one entry per binding up front only to overwrite it allocated
+    // the key twice per certificate on every reload.
     let roots: Vec<Fingerprint> = roots.iter().filter_map(|r| r.parse().ok()).collect();
     if roots.is_empty() {
-        return unknown();
+        return HashMap::new();
     }
 
     let policy = crate::policy();
     let Ok(network) =
         Network::from_cert_refs(certs.iter().map(|c| &**c), &policy, None, roots.as_slice())
     else {
-        return unknown();
+        return HashMap::new();
     };
 
-    let mut result: HashMap<String, Authentication> = HashMap::with_capacity(certs.len());
+    // Keyed by binding — (certificate, user ID) — not by certificate.
+    //
+    // sequoia-wot authenticates a binding: the question it answers is whether
+    // *this name* on *this key* is vouched for, and answering it for each user
+    // ID and keeping the maximum threw away which name earned the verdict. A
+    // certificate carrying a certified work address and an uncertified
+    // pseudonym then reported one verdict for both, and every display site
+    // re-attached it to whichever name it happened to be printing — so the
+    // pseudonym wore the work address's badge.
+    let mut result: HashMap<(String, String), Authentication> = HashMap::new();
     for cert in certs {
         let fingerprint = cert.fingerprint();
-        let mut best = Authentication::Unknown;
-
+        let key = fingerprint.to_hex().to_uppercase();
         for ua in cert.userids() {
             let paths = network.authenticate(
                 ua.userid().clone(),
                 fingerprint.clone(),
                 sequoia_wot::FULLY_TRUSTED,
             );
-            let found = Authentication::from_amount(paths.amount());
-            if found > best {
-                best = found;
-            }
-            if best == Authentication::Full {
-                break;
-            }
+            result.insert(
+                (
+                    key.clone(),
+                    String::from_utf8_lossy(ua.userid().value()).into_owned(),
+                ),
+                Authentication::from_amount(paths.amount()),
+            );
         }
-
-        result.insert(fingerprint.to_hex().to_uppercase(), best);
     }
 
     result
+}
+
+/// The verdict for one identity, which is the only question this answers.
+///
+/// Absent means Unknown: a certificate with no path to a root, a user ID that
+/// was not on the certificate when the graph was built, or an empty map from
+/// the early returns above.
+pub fn for_user_id(
+    authenticated: &HashMap<(String, String), Authentication>,
+    fingerprint: &str,
+    user_id: &str,
+) -> Authentication {
+    authenticated
+        .get(&(fingerprint.to_uppercase(), user_id.to_string()))
+        .copied()
+        .unwrap_or_default()
 }
 
 // Ordering so `if found > best` above means "more authenticated".
@@ -148,13 +161,65 @@ mod tests {
         (dir, store)
     }
 
-    fn authentication_of(store: &Store, fingerprint: &str) -> Authentication {
+    fn authentication_of(store: &Store, fingerprint: &str, user_id: &str) -> Authentication {
         let certs = store.certs().unwrap();
         let roots: Vec<String> = store.effective_roots().unwrap().into_iter().collect();
-        authenticate_all(&certs, &roots)
-            .get(&fingerprint.to_uppercase())
-            .copied()
-            .unwrap_or_default()
+        for_user_id(&authenticate_all(&certs, &roots), fingerprint, user_id)
+    }
+
+    /// A verdict belongs to one identity, not to the whole certificate.
+    ///
+    /// sequoia-wot authenticates a binding — this name on this key. Folding
+    /// every user ID into a maximum and storing it under the fingerprint alone
+    /// meant one certified identity lent its badge to every other name on the
+    /// same key, including one nobody has vouched for. Someone certifies a
+    /// colleague's work address, and the pseudonym beside it inherits the tick.
+    ///
+    /// Restore the fold — take the maximum over `cert.userids()` and key the map
+    /// by fingerprint — and this fails: the uncertified identity reads Full.
+    #[test]
+    fn a_verdict_belongs_to_one_identity_not_to_the_certificate() {
+        let (_dir, store) = scratch();
+        let me = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        let them = generate(&KeyGenRequest::new("Work <work@example.org>"))
+            .unwrap()
+            .cert;
+
+        // The second identity is added in a store of its own: add_user_id needs
+        // the secret to sign the binding, and a secret key in the store under
+        // review would make Them a trust root and authenticate it trivially.
+        let (_their_dir, their_store) = scratch();
+        their_store.insert_secret(&them).unwrap();
+        let them = crate::lifecycle::add_user_id(
+            &their_store,
+            &them.fingerprint().to_hex(),
+            "Pseudonym <alias@example.org>",
+            None,
+        )
+        .unwrap();
+
+        store.insert_secret(&me).unwrap();
+        store.insert(&them).unwrap();
+
+        // Only the work address is vouched for.
+        let mut request =
+            CertifyRequest::new(me.fingerprint().to_hex(), them.fingerprint().to_hex());
+        request.user_ids = vec!["Work <work@example.org>".to_string()];
+        certify(&store, &request).unwrap();
+
+        let fpr = them.fingerprint().to_hex();
+        assert_eq!(
+            authentication_of(&store, &fpr, "Work <work@example.org>"),
+            Authentication::Full,
+            "the certified identity is authenticated"
+        );
+        assert_eq!(
+            authentication_of(&store, &fpr, "Pseudonym <alias@example.org>"),
+            Authentication::Unknown,
+            "an identity nobody certified must not inherit the other's verdict"
+        );
     }
 
     #[test]
@@ -171,13 +236,13 @@ mod tests {
 
         let stranger_fpr = stranger.fingerprint().to_hex();
         assert_eq!(
-            authentication_of(&store, &stranger_fpr),
+            authentication_of(&store, &stranger_fpr, "Stranger <them@example.org>"),
             Authentication::Unknown
         );
 
         // My own key is a root, so it authenticates itself.
         assert_eq!(
-            authentication_of(&store, &me.fingerprint().to_hex()),
+            authentication_of(&store, &me.fingerprint().to_hex(), "Me <me@example.org>"),
             Authentication::Full
         );
 
@@ -186,7 +251,7 @@ mod tests {
         certify(&store, &request).unwrap();
 
         assert_eq!(
-            authentication_of(&store, &stranger_fpr),
+            authentication_of(&store, &stranger_fpr, "Stranger <them@example.org>"),
             Authentication::Full
         );
     }
@@ -212,7 +277,11 @@ mod tests {
         certify(&store, &request).unwrap();
 
         assert_eq!(
-            authentication_of(&store, &acquaintance.fingerprint().to_hex()),
+            authentication_of(
+                &store,
+                &acquaintance.fingerprint().to_hex(),
+                "Pat <pat@example.org>"
+            ),
             Authentication::Marginal
         );
     }
@@ -252,7 +321,11 @@ mod tests {
         certify(&store, &delegate).unwrap();
 
         assert_eq!(
-            authentication_of(&store, &friend_of_friend.fingerprint().to_hex()),
+            authentication_of(
+                &store,
+                &friend_of_friend.fingerprint().to_hex(),
+                "Distant <far@example.org>"
+            ),
             Authentication::Full
         );
     }
@@ -284,7 +357,11 @@ mod tests {
         assert_eq!(store.trust_roots().unwrap().len(), 1);
 
         assert_eq!(
-            authentication_of(&store, &vouched.fingerprint().to_hex()),
+            authentication_of(
+                &store,
+                &vouched.fingerprint().to_hex(),
+                "Vouched <v@example.org>"
+            ),
             Authentication::Full
         );
 

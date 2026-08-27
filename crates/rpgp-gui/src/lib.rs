@@ -2548,7 +2548,9 @@ fn reload(ui: &AppWindow, state: &Shared) {
         let key = summary.fingerprint.to_uppercase();
         summary.has_secret = secrets.contains(&key);
         summary.is_trust_root = explicit_roots.contains(&key);
-        summary.authentication = authenticated.get(&key).copied().unwrap_or_default();
+        // The verdict for the identity actually shown on the row, not the
+        // best over every identity on the certificate.
+        summary.authentication = wot::for_user_id(&authenticated, &key, &summary.primary_user_id);
     }
 
     // Ordering belongs to apply_filter, so changing the sort does not

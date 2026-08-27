@@ -483,10 +483,11 @@ mod tests {
         let authenticated = |store: &Store| {
             let certs = store.certs().unwrap();
             let roots: Vec<String> = store.effective_roots().unwrap().into_iter().collect();
-            wot::authenticate_all(&certs, &roots)
-                .get(&them.fingerprint().to_hex().to_uppercase())
-                .copied()
-                .unwrap_or_default()
+            wot::for_user_id(
+                &wot::authenticate_all(&certs, &roots),
+                &them.fingerprint().to_hex(),
+                "Them <them@example.org>",
+            )
         };
         assert_eq!(authenticated(&store), crate::Authentication::Full);
 
@@ -551,10 +552,11 @@ mod tests {
         // be read separately.
         let under = |root: &Cert| {
             let certs = store.certs().unwrap();
-            wot::authenticate_all(&certs, &[root.fingerprint().to_hex()])
-                .get(&them.fingerprint().to_hex().to_uppercase())
-                .copied()
-                .unwrap_or_default()
+            wot::for_user_id(
+                &wot::authenticate_all(&certs, &[root.fingerprint().to_hex()]),
+                &them.fingerprint().to_hex(),
+                &user_id,
+            )
         };
         assert_eq!(under(&a), crate::Authentication::Full);
         assert_eq!(under(&b), crate::Authentication::Full);
@@ -589,7 +591,7 @@ mod tests {
             &store,
             &b.fingerprint().to_hex(),
             &them.fingerprint().to_hex(),
-            &[user_id],
+            std::slice::from_ref(&user_id),
             Reason::Superseded,
             "",
             None,
@@ -668,10 +670,11 @@ mod tests {
 
         let under = |root: &Cert| {
             let certs = store.certs().unwrap();
-            wot::authenticate_all(&certs, &[root.fingerprint().to_hex()])
-                .get(&them.fingerprint().to_hex().to_uppercase())
-                .copied()
-                .unwrap_or_default()
+            wot::for_user_id(
+                &wot::authenticate_all(&certs, &[root.fingerprint().to_hex()]),
+                &them.fingerprint().to_hex(),
+                &user_id,
+            )
         };
         assert_eq!(under(&a), crate::Authentication::Full, "A certified Them");
 
@@ -709,10 +712,11 @@ mod tests {
         let authenticated = |store: &Store| {
             let certs = store.certs().unwrap();
             let roots: Vec<String> = store.effective_roots().unwrap().into_iter().collect();
-            wot::authenticate_all(&certs, &roots)
-                .get(&them.fingerprint().to_hex().to_uppercase())
-                .copied()
-                .unwrap_or_default()
+            wot::for_user_id(
+                &wot::authenticate_all(&certs, &roots),
+                &them.fingerprint().to_hex(),
+                "Them <them@example.org>",
+            )
         };
         let mut request =
             CertifyRequest::new(me.fingerprint().to_hex(), them.fingerprint().to_hex());
