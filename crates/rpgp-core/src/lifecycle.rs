@@ -127,26 +127,17 @@ pub fn add_user_id(
         &userid,
     )?;
 
-    let packets: Vec<Packet> = vec![Packet::from(userid), Packet::from(binding)];
-    let updated = cert.clone().insert_packets(packets)?.0;
-    store.insert(&updated)?;
-    if store.has_secret(fingerprint) {
-        store.insert_secret(
-            &cert
-                .insert_packets(
-                    updated
-                        .userids()
-                        .find(|ua| String::from_utf8_lossy(ua.userid().value()) == user_id)
-                        .map(|ua| {
-                            let mut out: Vec<Packet> = vec![Packet::from(ua.userid().clone())];
-                            out.extend(ua.self_signatures().cloned().map(Packet::from));
-                            out
-                        })
-                        .unwrap_or_default(),
-                )?
-                .0,
-        )?;
-    }
+    // secret_cert is where `cert` came from, so the certificate always has a
+    // secret half here — the has_secret test that used to guard the write
+    // could not be false. What followed it rebuilt the new user ID and its
+    // binding out of `updated` and inserted them into `cert` a second time,
+    // reconstructing a certificate that had already been built one line
+    // above. insert_secret writes the public half itself, so one call does
+    // what three did.
+    let updated = cert
+        .insert_packets(vec![Packet::from(userid), Packet::from(binding)])?
+        .0;
+    store.insert_secret(&updated)?;
     Ok(updated)
 }
 
@@ -224,11 +215,14 @@ fn store_both(store: &Store, cert: Cert, signatures: Vec<Signature>) -> Result<C
     let updated = cert.insert_packets(signatures)?.0;
 
     // The secret certificate is the one that carries key material, so it is
-    // the copy that must not fall behind; cert-d gets the public half.
+    // the copy that must not fall behind; cert-d gets the public half — which
+    // insert_secret writes for us, so calling insert as well only serialised
+    // the same certificate into the same place twice.
     if store.has_secret(&fingerprint) {
         store.insert_secret(&updated)?;
+    } else {
+        store.insert(&updated)?;
     }
-    store.insert(&updated)?;
     Ok(updated)
 }
 

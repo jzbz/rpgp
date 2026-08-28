@@ -182,6 +182,13 @@ where
     let Ok(held) = keys() else {
         return found;
     };
+    // An agent that answers but holds nothing — a fresh GnuPG install, or a
+    // machine whose secrets live only here — makes every match below fail, so
+    // the policy walk and the keygrip of every signing key would rebuild the
+    // empty map we already have.
+    if held.is_empty() {
+        return found;
+    }
     let policy = crate::policy();
 
     for cert in certs {

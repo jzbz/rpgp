@@ -121,6 +121,26 @@ fn main() {
             certs.len()
         );
 
+        // The cold pass: a fresh handle with an empty cache, which is what
+        // startup and every delete-then-reopen actually pay. Separate from
+        // store.certs() below, which measures the warm cache the rest of the
+        // session sees.
+        //
+        // Added to settle a review claim that Store::open should call cert-d's
+        // prefetch_all to parallelise this. Measured at n=1000 and n=3000 over
+        // 25 samples, it is consistently a shade slower, not faster: cert-d
+        // already reads the files in parallel, and the canonicalisation left
+        // over is ~1.5 us per certificate. Do not add it back without a
+        // measurement that says otherwise on this line.
+        report(
+            "cold open + certs()",
+            n,
+            time(samples, || {
+                let fresh =
+                    Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+                fresh.certs().unwrap()
+            }),
+        );
         report("store.certs()", n, time(samples, || store.certs().unwrap()));
         report(
             "CertSummary::from_cert xN",

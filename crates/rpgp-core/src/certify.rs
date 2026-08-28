@@ -6,10 +6,13 @@
 //! really do belong to this key". It is the raw material the web of trust in
 //! [`crate::wot`] reasons over.
 
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use sequoia_openpgp::Cert;
+use sequoia_openpgp::packet::Key;
 use sequoia_openpgp::packet::Signature;
+use sequoia_openpgp::packet::key::{PublicParts, UnspecifiedRole};
 use sequoia_openpgp::packet::signature::SignatureBuilder;
 use sequoia_openpgp::types::{RevocationStatus, SignatureType};
 
@@ -242,9 +245,35 @@ fn primary_user_id(cert: &Cert) -> String {
 }
 
 /// Every third-party certification on `cert`, verified where possible.
+/// One resolved certifier, kept for the length of a `certifications()` call.
+///
+/// Derived values only, never the `Cert`: a certificate endorsed by hundreds
+/// of people in the store would otherwise pin hundreds of parsed certificates
+/// for the duration.
+struct Certifier {
+    /// Every key that could have made the certification. Kept whole rather
+    /// than reduced to the primary, because `certify` signs with the first
+    /// `for_certification()` key — often a subkey — so a primary-only check
+    /// marks this program's own certifications unverified.
+    keys: Vec<Key<PublicParts, UnspecifiedRole>>,
+    name: String,
+    fingerprint: String,
+    by_me: bool,
+}
+
 pub fn certifications(store: &Store, cert: &Cert) -> Result<Vec<Certification>> {
     let mut out = Vec::new();
     let primary = cert.primary_key().key();
+
+    // Both hoisted out of the per-signature loop below. The secrets directory
+    // was stat'd once per signature to answer by_me, and the certifier was
+    // re-read from the store, re-parsed and re-validated against the policy
+    // once per signature — so a certificate carrying twenty endorsements from
+    // one person did all of that twenty times over. `unwrap_or_default`, not
+    // `?`: an unreadable secrets directory reads as "no secrets" here exactly
+    // as `has_secret` treated it, rather than failing the whole listing.
+    let secrets = store.secret_fingerprints().unwrap_or_default();
+    let mut certifiers: HashMap<String, Option<Certifier>> = HashMap::new();
 
     for ua in cert.userids() {
         let user_id = String::from_utf8_lossy(ua.userid().value()).into_owned();
@@ -277,12 +306,7 @@ pub fn certifications(store: &Store, cert: &Cert) -> Result<Vec<Certification>> 
             // unresolvable issuer is normal — it just means we have not met
             // that person — so it is reported rather than dropped.
             for handle in signature.get_issuers() {
-                let Ok(certifier) = store.lookup(&handle.to_string()) else {
-                    entry.certifier = handle.to_string();
-                    continue;
-                };
-
-                let fingerprint = certifier.fingerprint().to_hex();
+                let handle = handle.to_string();
 
                 // Verify before attributing, not after. get_issuers() reports
                 // the issuer subpackets from both the hashed and the unhashed
@@ -292,56 +316,75 @@ pub fn certifications(store: &Store, cert: &Cert) -> Result<Vec<Certification>> 
                 // packet anyone could write earned a real identity in the list
                 // and a "(you)" badge with a withdraw affordance beside it.
                 //
-                // Every certification-capable key is tried, not just the
+                // Every certification-capable key is kept, not just the
                 // primary: certify() signs with the first `for_certification()`
                 // key, which may well be a subkey, so a primary-only check
                 // would reject certifications this very program made.
-                let policy = policy();
-                let verified = certifier
-                    .with_policy(&policy, None)
-                    .ok()
-                    .into_iter()
-                    .flat_map(|valid| {
-                        valid
-                            .keys()
-                            .alive()
-                            .revoked(false)
-                            .supported()
-                            .for_certification()
-                            .map(|ka| ka.key().clone())
-                            .collect::<Vec<_>>()
+                let resolved = certifiers.entry(handle.clone()).or_insert_with(|| {
+                    let certifier = store.lookup(&handle).ok()?;
+                    let policy = policy();
+                    let keys = certifier
+                        .with_policy(&policy, None)
+                        .ok()
+                        .into_iter()
+                        .flat_map(|valid| {
+                            valid
+                                .keys()
+                                .alive()
+                                .revoked(false)
+                                .supported()
+                                .for_certification()
+                                .map(|ka| ka.key().clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .chain(std::iter::once(
+                            certifier
+                                .primary_key()
+                                .key()
+                                .clone()
+                                .role_into_unspecified(),
+                        ))
+                        .collect();
+                    let fingerprint = certifier.fingerprint().to_hex();
+                    Some(Certifier {
+                        keys,
+                        name: primary_user_id(&certifier),
+                        by_me: secrets.contains(&fingerprint),
+                        fingerprint,
                     })
-                    .chain(std::iter::once(
-                        certifier
-                            .primary_key()
-                            .key()
+                });
+
+                // An unresolvable issuer is normal — it just means we have not
+                // met that person — so it is reported rather than dropped.
+                let Some(resolved) = resolved else {
+                    entry.certifier = handle;
+                    continue;
+                };
+
+                let verified = resolved.keys.iter().any(|key| {
+                    if is_revocation {
+                        signature
                             .clone()
-                            .role_into_unspecified(),
-                    ))
-                    .any(|key| {
-                        if is_revocation {
-                            signature
-                                .clone()
-                                .verify_userid_revocation(&key, primary, ua.userid())
-                                .is_ok()
-                        } else {
-                            signature
-                                .clone()
-                                .verify_userid_binding(&key, primary, ua.userid())
-                                .is_ok()
-                        }
-                    });
+                            .verify_userid_revocation(key, primary, ua.userid())
+                            .is_ok()
+                    } else {
+                        signature
+                            .clone()
+                            .verify_userid_binding(key, primary, ua.userid())
+                            .is_ok()
+                    }
+                });
                 entry.verified = Some(verified);
                 if verified {
-                    entry.certifier = primary_user_id(&certifier);
-                    entry.by_me = store.has_secret(&fingerprint);
-                    entry.certifier_fingerprint = Some(fingerprint);
+                    entry.certifier = resolved.name.clone();
+                    entry.by_me = resolved.by_me;
+                    entry.certifier_fingerprint = Some(resolved.fingerprint.clone());
                 } else {
                     // Names this certifier but does not verify against it.
                     // Report the handle rather than the identity: by_me stays
                     // false, so no withdraw affordance appears beside a
                     // signature we cannot show the user made.
-                    entry.certifier = handle.to_string();
+                    entry.certifier = handle;
                 }
                 break;
             }

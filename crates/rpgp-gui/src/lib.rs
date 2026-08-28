@@ -577,13 +577,20 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
                 let (ui_weak, state) = (ui_weak.clone(), state.clone());
                 std::thread::spawn(move || {
                     let _busy = BusyGuard(ui_weak.clone());
+                    // Cloned out under a brief lock, exactly as the comment on
+                    // State::store describes. Importing a GnuPG pubring parses
+                    // and writes thousands of certificates, and holding the
+                    // mutex across all of it blocked every other worker for
+                    // the duration. Nothing below touches the State the lock
+                    // protects — `all` is rebuilt by the reload in the
+                    // completion closure.
+                    let store = lock(&state).store.clone();
                     let outcome = {
-                        let guard = lock(&state);
                         // A revocation certificate is a bare signature, not a
                         // certificate, so CertParser rejects it. Same button,
                         // because a user handed a .rev file expects Import to
                         // take it.
-                        match guard.store.import_file(&path) {
+                        match store.import_file(&path) {
                             Ok(certs) => {
                                 // Secret keys are called out rather than folded
                                 // into the count: one arriving is the difference
@@ -604,7 +611,7 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
                                 })
                             }
                             Err(import_error) => {
-                                match revoke::apply_revocation_file(&guard.store, &path) {
+                                match revoke::apply_revocation_file(&store, &path) {
                                     Ok(cert) => Ok(format!(
                                         "Revoked {}",
                                         rpgp_core::CertSummary::from_cert(&cert).primary_user_id
