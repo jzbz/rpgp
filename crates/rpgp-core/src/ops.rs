@@ -39,6 +39,13 @@ pub struct VerifyResult {
     pub signatures: Vec<SignatureReport>,
     /// Fingerprint of the certificate whose subkey decrypted the message.
     pub decrypted_with: Option<String>,
+    /// Whether the message actually carried an encryption layer. Sequoia's
+    /// Decryptor walks a signed-only or bare-literal message straight to its
+    /// Literal packet without ever calling DecryptionHelper::decrypt, so
+    /// nothing else here separates "we opened it" from "it was never shut" —
+    /// and reporting the second as the first tells the reader a message that
+    /// crossed the network in clear arrived confidentially.
+    pub encrypted: bool,
 }
 
 impl VerifyResult {
@@ -217,6 +224,7 @@ pub fn decrypt_stream<R: std::io::Read + Send + Sync>(
     let helper = decryptor.into_helper();
     Ok(VerifyResult {
         signatures: helper.signatures,
+        encrypted: helper.encrypted,
         decrypted_with: helper.decrypted_with,
     })
 }
@@ -285,6 +293,9 @@ pub fn verify_inline(store: &Store, signed: &[u8]) -> Result<(Vec<u8>, VerifyRes
         VerifyResult {
             signatures: helper.signatures,
             decrypted_with: None,
+            // A detached or inline verification is not a decryption, and its
+            // callers do not claim otherwise.
+            encrypted: false,
         },
     ))
 }
@@ -302,6 +313,7 @@ pub fn verify_detached(store: &Store, signature: &[u8], data: &[u8]) -> Result<V
     Ok(VerifyResult {
         signatures: helper.signatures,
         decrypted_with: None,
+        encrypted: false,
     })
 }
 
@@ -349,6 +361,9 @@ struct Helper<'a> {
     passwords: Vec<Zeroizing<String>>,
     signatures: Vec<SignatureReport>,
     decrypted_with: Option<String>,
+    /// Set from the message structure, not from whether decrypt() ran: a
+    /// message encrypted only to a password we do not hold still had a layer.
+    encrypted: bool,
 }
 
 impl<'a> Helper<'a> {
@@ -362,6 +377,7 @@ impl<'a> Helper<'a> {
                 .collect(),
             signatures: Vec::new(),
             decrypted_with: None,
+            encrypted: false,
         }
     }
 }
@@ -379,8 +395,15 @@ impl VerificationHelper for Helper<'_> {
 
     fn check(&mut self, structure: MessageStructure) -> anyhow::Result<()> {
         for layer in structure {
-            let MessageLayer::SignatureGroup { results } = layer else {
-                continue;
+            let results = match layer {
+                // Recorded rather than skipped: this is the only place the
+                // presence of an encryption layer is observable.
+                MessageLayer::Encryption { .. } => {
+                    self.encrypted = true;
+                    continue;
+                }
+                MessageLayer::Compression { .. } => continue,
+                MessageLayer::SignatureGroup { results } => results,
             };
             for result in results {
                 self.signatures.push(match result {
@@ -416,6 +439,25 @@ impl DecryptionHelper for Helper<'_> {
     ) -> anyhow::Result<Option<Cert>> {
         let policy = policy();
 
+        // A real message carries one session-key packet per recipient plus one
+        // per password — single digits. Every loop below is O(packets × keys)
+        // with a key derivation inside: the local path runs our S2K once per
+        // protected key, and the symmetric path runs the *sender's* S2K once
+        // per (packet × password), which a v6 Argon2 SKESK can make arbitrarily
+        // expensive. Nothing in sequoia bounds the count, so a padded message
+        // is a decrypt-side amplifier: 128 wildcard packets in a 14 KB file
+        // pinned a core for ~9s, and the message still decrypted, so nothing
+        // looked wrong. 256 is a chosen ceiling, not a constant of nature: it
+        // is far above any real recipient list and keeps the residual worst
+        // case in seconds.
+        const MAX_ESK: usize = 256;
+        let esks = pkesks.len() + skesks.len();
+        if esks > MAX_ESK {
+            return Err(anyhow::anyhow!(
+                "this message carries {esks} session-key packets, more than rpgp will try"
+            ));
+        }
+
         // A PKESK names the *subkey* it was encrypted to, and a wildcard
         // recipient names nothing at all, so there is no lookup by primary
         // fingerprint to be done here: walk the secret keys we hold and match
@@ -425,47 +467,63 @@ impl DecryptionHelper for Helper<'_> {
         // opens this message" sent the user looking at the wrong thing.
         let secrets = self.store.secret_certs()?;
 
-        for pkesk in pkesks {
-            for cert in &secrets {
-                let Ok(valid) = cert.with_policy(&policy, None) else {
+        // Keys outside, packets inside. The other way round re-derived every
+        // protected key's passphrase once per packet, so the cost was
+        // (packets × keys) key derivations rather than (keys) — which is what
+        // made padding worth doing. The same set of keys is unlocked either
+        // way, just once each.
+        for cert in &secrets {
+            let Ok(valid) = cert.with_policy(&policy, None) else {
+                continue;
+            };
+
+            // Encryption keys only: a wildcard PKESK names no recipient,
+            // so without this filter every signing and certification key
+            // gets unlocked and tried as well.
+            //
+            // Deliberately *not* filtered by alive/revoked. Old mail must
+            // stay readable after a subkey expires or is retired —
+            // revoking a key withdraws it for future use, it does not
+            // burn the archive.
+            let usable = valid
+                .keys()
+                .secret()
+                .for_transport_encryption()
+                .chain(valid.keys().secret().for_storage_encryption());
+
+            for ka in usable {
+                // The per-packet recipient test, hoisted: skip a key that no
+                // packet in this message could be addressed to *before*
+                // paying for its passphrase.
+                if !pkesks.iter().any(|pkesk| {
+                    pkesk
+                        .recipient()
+                        .is_none_or(|handle| handle.aliases(ka.key().key_handle()))
+                }) {
+                    continue;
+                }
+
+                // try_unlock, not unlock: this walks every key the message
+                // might be addressed to, so one that will not open is a
+                // reason to try the next rather than to fail the decrypt.
+                // `None` first, which is what opens a key with no
+                // passphrase, then each secret the caller offered.
+                let Some(key) = std::iter::once(None)
+                    .chain(self.passwords.iter().map(|p| Some(p.as_str())))
+                    .find_map(|p| crate::secret::try_unlock(ka.key().clone(), p))
+                else {
+                    continue;
+                };
+                let Ok(mut pair) = key.into_keypair() else {
                     continue;
                 };
 
-                // Encryption keys only: a wildcard PKESK names no recipient,
-                // so without this filter every signing and certification key
-                // gets unlocked and tried as well.
-                //
-                // Deliberately *not* filtered by alive/revoked. Old mail must
-                // stay readable after a subkey expires or is retired —
-                // revoking a key withdraws it for future use, it does not
-                // burn the archive.
-                let usable = valid
-                    .keys()
-                    .secret()
-                    .for_transport_encryption()
-                    .chain(valid.keys().secret().for_storage_encryption());
-
-                for ka in usable {
+                for pkesk in pkesks {
                     if let Some(handle) = pkesk.recipient()
                         && !handle.aliases(ka.key().key_handle())
                     {
                         continue;
                     }
-
-                    // try_unlock, not unlock: this walks every key the message
-                    // might be addressed to, so one that will not open is a
-                    // reason to try the next rather than to fail the decrypt.
-                    // `None` first, which is what opens a key with no
-                    // passphrase, then each secret the caller offered.
-                    let Some(key) = std::iter::once(None)
-                        .chain(self.passwords.iter().map(|p| Some(p.as_str())))
-                        .find_map(|p| crate::secret::try_unlock(ka.key().clone(), p))
-                    else {
-                        continue;
-                    };
-                    let Ok(mut pair) = key.into_keypair() else {
-                        continue;
-                    };
                     if pkesk
                         .decrypt(&mut pair, sym_algo)
                         .is_some_and(|(algo, session_key)| decrypt(algo, &session_key))
@@ -642,9 +700,13 @@ pub fn encrypted_name(input: &Path) -> PathBuf {
 /// `notes.txt` you wrote yourself overwrites your notes. Deriving a free name
 /// is quieter than a prompt and loses nothing, since the result is reported.
 ///
-/// Racy in the strict sense — the name can be taken between the check and the
-/// write — but the alternative is clobbering by design rather than by
-/// collision, and the caller is a person picking a file.
+/// Best-effort, and deliberately so: it picks a pleasant name, it does not
+/// enforce the rule. The name can be taken between the check and the write,
+/// and after 999 collisions the series is exhausted and the original path
+/// comes back — which is why the three places that actually destroy data
+/// (`File::create_new` for the staging file, and the `output.exists()` guards
+/// before the renames and the detached-signature write) refuse rather than
+/// trust the name they were handed.
 fn free_name(path: PathBuf) -> PathBuf {
     if !path.exists() {
         return path;
@@ -720,7 +782,7 @@ pub fn encrypt_file(
         fs::File::open(input).map_err(|e| Error::io(format!("reading {}", input.display()), e))?;
     let staging = free_name(append_extension(output, "part"));
     {
-        let file = fs::File::create(&staging)
+        let file = fs::File::create_new(&staging)
             .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
         let mut sink = BufWriter::new(file);
         match encrypt_stream(recipients, passwords, signer, &mut source, &mut sink) {
@@ -732,6 +794,13 @@ pub fn encrypt_file(
                 return Err(e);
             }
         }
+    }
+    if output.exists() {
+        let _ = fs::remove_file(&staging);
+        return Err(Error::invalid(format!(
+            "{} already exists",
+            output.display()
+        )));
     }
     fs::rename(&staging, output)
         .map_err(|e| Error::io(format!("writing {}", output.display()), e))?;
@@ -750,6 +819,12 @@ pub fn sign_detached_file(
         fs::File::open(input).map_err(|e| Error::io(format!("reading {}", input.display()), e))?;
     let mut signature = Vec::new();
     sign_detached_stream(signer, password, &mut source, &mut signature)?;
+    if output.exists() {
+        return Err(Error::invalid(format!(
+            "{} already exists",
+            output.display()
+        )));
+    }
     write(output, &signature)
 }
 
@@ -784,12 +859,11 @@ pub fn decrypt_file(
     // had simply been left out of it.
     let staging = free_name(append_extension(output, "part"));
     let result = {
-        let file = fs::File::create(&staging)
+        let file = fs::File::create_new(&staging)
             .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
         let mut sink = BufWriter::new(file);
         match decrypt_stream(store, source, passwords, &mut sink) {
             Ok(result) => {
-                use std::io::Write;
                 sink.flush()
                     .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
                 result
@@ -800,6 +874,13 @@ pub fn decrypt_file(
             }
         }
     };
+    if output.exists() {
+        let _ = fs::remove_file(&staging);
+        return Err(Error::invalid(format!(
+            "{} already exists",
+            output.display()
+        )));
+    }
     fs::rename(&staging, output)
         .map_err(|e| Error::io(format!("writing {}", output.display()), e))?;
     Ok(result)
@@ -826,6 +907,7 @@ pub fn verify_detached_files(
     Ok(VerifyResult {
         signatures: helper.signatures,
         decrypted_with: None,
+        encrypted: false,
     })
 }
 
@@ -846,6 +928,121 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
         (dir, store)
+    }
+
+    /// Session-key packets are cheap to add and expensive to try. Each one is
+    /// tested against every key we hold, and each protected key costs a key
+    /// derivation, so a sender who pads a message with wildcard packets makes
+    /// the recipient burn CPU proportional to (packets × keys) — behind a
+    /// modal that says "Working..." and cannot be cancelled. A real message
+    /// carries one per recipient.
+    #[test]
+    fn a_message_padded_with_session_key_packets_is_refused() {
+        use sequoia_openpgp::{Packet, PacketPile, serialize::Serialize};
+
+        let (_dir, store) = scratch_store();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+
+        let mut ciphertext = Vec::new();
+        encrypt(&[alice], &[], None, b"hello", &mut ciphertext).unwrap();
+
+        // The honest message opens.
+        let mut out = Vec::new();
+        assert!(decrypt_to_memory(&store, &ciphertext, &[], &mut out).is_ok());
+
+        // Now pad it. Duplicating the one real PKESK is enough: every copy
+        // has to be tried, and the count is all the guard looks at.
+        let pile = PacketPile::from_bytes(&ciphertext).unwrap();
+        let mut packets: Vec<Packet> = pile.into_children().collect();
+        let pkesk = packets
+            .iter()
+            .find(|p| matches!(p, Packet::PKESK(_)))
+            .unwrap()
+            .clone();
+        for _ in 0..300 {
+            packets.insert(0, pkesk.clone());
+        }
+        let mut padded = Vec::new();
+        for packet in &packets {
+            packet.serialize(&mut padded).unwrap();
+        }
+
+        let mut out = Vec::new();
+        let refused = decrypt_to_memory(&store, &padded, &[], &mut out);
+        let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("session-key packets"),
+            "a padded message must be refused up front, got: {message:?}"
+        );
+    }
+
+    /// A signed-but-unencrypted message opens through exactly the same code
+    /// path as an encrypted one — sequoia's Decryptor walks straight to the
+    /// Literal packet and never calls DecryptionHelper::decrypt — so without
+    /// an explicit flag the app told the reader that a message which crossed
+    /// the network in clear had been "Decrypted to <path>", in the same tone
+    /// a properly encrypted one gets. The signature verdict was honest; the
+    /// confidentiality claim was not.
+    #[test]
+    fn a_signed_but_unencrypted_message_is_not_reported_as_encrypted() {
+        use sequoia_openpgp::serialize::stream::{LiteralWriter, Message, Signer};
+
+        let (_dir, store) = scratch_store();
+        let mallory = generate(&KeyGenRequest::new("Mallory <mallory@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert(&mallory).unwrap();
+
+        // Signed, encrypted to nobody: OnePassSig / Literal / Signature.
+        let keypair = mallory
+            .keys()
+            .secret()
+            .with_policy(&policy(), None)
+            .for_signing()
+            .next()
+            .unwrap()
+            .key()
+            .clone()
+            .into_keypair()
+            .unwrap();
+        let mut cleartext = Vec::new();
+        {
+            let message = Message::new(&mut cleartext);
+            let signer = Signer::new(message, keypair).unwrap().build().unwrap();
+            let mut literal = LiteralWriter::new(signer).build().unwrap();
+            literal
+                .write_all(b"this crossed the network in clear")
+                .unwrap();
+            literal.finalize().unwrap();
+        }
+
+        let mut plaintext = Vec::new();
+        let result = decrypt_to_memory(&store, &cleartext, &[], &mut plaintext).unwrap();
+
+        assert_eq!(plaintext, b"this crossed the network in clear");
+        assert!(
+            result.all_good(),
+            "the signature itself is genuine: {:?}",
+            result.signatures
+        );
+        assert!(
+            !result.encrypted,
+            "a message with no encryption layer must not be reported as decrypted"
+        );
+
+        // And a real one still reads as encrypted, or the flag is a constant.
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+        let mut ciphertext = Vec::new();
+        encrypt(&[alice], &[], None, b"secret", &mut ciphertext).unwrap();
+        let mut out = Vec::new();
+        let opened = decrypt_to_memory(&store, &ciphertext, &[], &mut out).unwrap();
+        assert!(opened.encrypted, "a real encryption layer must be seen");
     }
 
     #[test]

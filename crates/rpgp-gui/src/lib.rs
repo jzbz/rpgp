@@ -1162,7 +1162,18 @@ fn run_decrypt_verify(
     let result = ops::decrypt_file(&store, &input, &candidates, &output)
         .map_err(|e| format!("Decryption failed: {e}"))?;
 
-    let written = format!("Decrypted to {}", output.display());
+    // A message with no encryption layer opens just as cleanly, so saying
+    // "Decrypted to" would tell the reader that something which crossed the
+    // network in clear arrived confidentially. Say what actually happened,
+    // and hold the tone below green whatever the signature turned out to be.
+    let written = if result.encrypted {
+        format!("Decrypted to {}", output.display())
+    } else {
+        format!(
+            "This message was not encrypted. Written to {}",
+            output.display()
+        )
+    };
     let summary = if result.signatures.is_empty() {
         (format!("{written}. The message was not signed."), 2)
     } else {
@@ -1170,7 +1181,10 @@ fn run_decrypt_verify(
         // plaintext went. Composed rather than restated so the two cannot
         // drift apart on what counts as verified.
         let (verdict, tone) = signature_verdict(&lock(state).all, &result);
-        (format!("{written}. {verdict}"), tone)
+        (
+            format!("{written}. {verdict}"),
+            if result.encrypted { tone } else { tone.max(2) },
+        )
     };
     Ok((summary.0, summary.1, result))
 }
@@ -2168,11 +2182,22 @@ fn run_notepad(
             let result = ops::decrypt_to_memory(&store, text.as_bytes(), &candidates, &mut output)
                 .map_err(|e| format!("Decryption failed: {e}"))?;
 
+            // As on the file path: an unencrypted message opens just as
+            // cleanly, and calling that "Decrypted" claims a confidentiality
+            // it never had.
+            let opened = if result.encrypted {
+                "Decrypted."
+            } else {
+                "This message was not encrypted."
+            };
             let (summary, tone) = if result.signatures.is_empty() {
-                ("Decrypted. The message was not signed.".to_string(), 2)
+                (format!("{opened} The message was not signed."), 2)
             } else {
                 let (verdict, tone) = signature_verdict(&lock(state).all, &result);
-                (format!("Decrypted. {verdict}"), tone)
+                (
+                    format!("{opened} {verdict}"),
+                    if result.encrypted { tone } else { tone.max(2) },
+                )
             };
             Ok((string_of(output), summary, tone, result.signatures))
         }
@@ -3090,6 +3115,7 @@ mod tests {
         let result = ops::VerifyResult {
             signatures: vec![report(&fingerprint, true)],
             decrypted_with: None,
+            encrypted: true,
         };
 
         // Authenticated: the reassuring tone is earned.
@@ -3114,6 +3140,7 @@ mod tests {
         let bad = ops::VerifyResult {
             signatures: vec![report(&fingerprint, false)],
             decrypted_with: None,
+            encrypted: true,
         };
         let store = [known(&fingerprint, Authentication::Full)];
         assert_eq!(signature_verdict(&store, &bad).1, 3);
