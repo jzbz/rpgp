@@ -136,7 +136,8 @@ fn encrypt_stream(
     Ok(())
 }
 
-/// The most plaintext [`decrypt_to_memory`] will hand back.
+/// The most plaintext [`decrypt_to_memory`] or [`verify_inline`] will hand
+/// back.
 ///
 /// Generous for anything a person pastes into a text box, and far below what a
 /// compressed layer can expand to.
@@ -285,7 +286,17 @@ pub fn verify_inline(store: &Store, signed: &[u8]) -> Result<(Vec<u8>, VerifyRes
 
     let mut verifier = VerifierBuilder::from_bytes(signed)?.with_policy(&policy, None, helper)?;
     let mut text = Vec::new();
-    std::io::copy(&mut verifier, &mut text).map_err(|e| Error::io("verifying message", e))?;
+    // Bounded like decrypt_to_memory. The notepad routes some armored input
+    // here rather than through the decrypt path, and an inline-signed message
+    // carries a compressed layer that expands to whatever the sender chose —
+    // so without this the ceiling the notepad's own comment claimed applied to
+    // only one of the two branches it can take.
+    let mut sink = Bounded {
+        inner: &mut text,
+        written: 0,
+        limit: MAX_IN_MEMORY_PLAINTEXT,
+    };
+    std::io::copy(&mut verifier, &mut sink).map_err(|e| Error::io("verifying message", e))?;
 
     let helper = verifier.into_helper();
     Ok((
@@ -928,6 +939,57 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
         (dir, store)
+    }
+
+    /// The notepad routes cleartext-signed input to verify_inline rather than
+    /// to the decrypt path, and only the decrypt path had a ceiling — so the
+    /// comment claiming the notepad's output was bounded covered one of the
+    /// two branches it can take. An inline-signed message carries a compressed
+    /// layer, which expands to whatever the sender chose.
+    #[test]
+    fn an_inline_signed_bomb_is_refused_rather_than_held_in_memory() {
+        let (_dir, store) = scratch_store();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+
+        // Signed inline, with a body larger than the window. Zeroes compress
+        // to almost nothing, which is the whole point of the shape.
+        let huge = vec![0u8; MAX_IN_MEMORY_PLAINTEXT + 1];
+        let mut signed = Vec::new();
+        {
+            use sequoia_openpgp::serialize::stream::{Compressor, LiteralWriter, Message, Signer};
+            let keypair = alice
+                .keys()
+                .secret()
+                .with_policy(&policy(), None)
+                .for_signing()
+                .next()
+                .unwrap()
+                .key()
+                .clone()
+                .into_keypair()
+                .unwrap();
+            let message = Message::new(&mut signed);
+            let signer = Signer::new(message, keypair).unwrap().build().unwrap();
+            let compressor = Compressor::new(signer).build().unwrap();
+            let mut literal = LiteralWriter::new(compressor).build().unwrap();
+            literal.write_all(&huge).unwrap();
+            literal.finalize().unwrap();
+        }
+        assert!(
+            signed.len() < 1024 * 1024,
+            "the point is a small message with a large expansion, got {} bytes",
+            signed.len()
+        );
+
+        let refused = verify_inline(&store, &signed);
+        let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("more than this window can hold"),
+            "an oversized inline-signed message must be refused, got: {message:?}"
+        );
     }
 
     /// Session-key packets are cheap to add and expensive to try. Each one is

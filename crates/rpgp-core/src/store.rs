@@ -282,8 +282,7 @@ impl Store {
 
         let mut text = roots.into_iter().collect::<Vec<_>>().join("\n");
         text.push('\n');
-        fs::write(&self.roots_path, text)
-            .map_err(|e| Error::io(format!("writing {}", self.roots_path.display()), e))
+        write_private_atomic(&self.roots_path, &text)
     }
 
     /// The roots the web of trust is actually evaluated against: the explicit
@@ -347,12 +346,7 @@ impl Store {
         }
         let mut text = imported.into_iter().collect::<Vec<_>>().join("\n");
         text.push('\n');
-        fs::write(&self.imported_secrets_path, text).map_err(|e| {
-            Error::io(
-                format!("writing {}", self.imported_secrets_path.display()),
-                e,
-            )
-        })
+        write_private_atomic(&self.imported_secrets_path, &text)
     }
 
     /// Store a secret key that arrived from outside, rather than one generated
@@ -780,6 +774,30 @@ fn create_private(path: &Path) -> Result<fs::File> {
     options
         .open(path)
         .map_err(|e| Error::io(format!("writing {}", path.display()), e))
+}
+
+/// Replace a bookkeeping file atomically and privately.
+///
+/// The same stage-and-rename `insert_secret` uses, for the same reason: a
+/// crash or a full disk between the truncate and the writeback leaves the
+/// previous list intact rather than a zero-length one. That matters more here
+/// than the size of the file suggests — a truncated imported-secrets list does
+/// not fail closed. Every stranger keypair it used to name silently becomes a
+/// trust root again, all at once, which is the door the list exists to shut.
+///
+/// The staging file is created private, so the result is 0o600 from the moment
+/// it exists rather than 0o666 & ~umask until the next `Store::open` repairs
+/// it — a whole session, in an app the user leaves running.
+fn write_private_atomic(path: &Path, text: &str) -> Result<()> {
+    let staging = path.with_extension("tmp");
+    {
+        let mut file = create_private(&staging)?;
+        file.write_all(text.as_bytes())
+            .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
+        file.sync_all()
+            .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
+    }
+    fs::rename(&staging, path).map_err(|e| Error::io(format!("writing {}", path.display()), e))
 }
 
 /// Restrict a path to the current user.
@@ -1519,6 +1537,54 @@ mod tests {
             mode(&reopened.revocation_path(&fingerprint)),
             0o600,
             "revocation certificate after reopen",
+        );
+    }
+
+    /// The two bookkeeping lists are small enough to look harmless, but a
+    /// truncated imported-secrets list does not fail closed: every stranger
+    /// keypair it named silently becomes a trust root again, all at once, and
+    /// certifications those keys issued start rendering as verified. A bare
+    /// `fs::write` truncates first and can then fail — a full disk is enough —
+    /// so the list is staged and renamed like the secret keys are.
+    ///
+    /// They also used to be created 0o666 & ~umask and only repaired by the
+    /// next `Store::open`, which in an app the user leaves running is the rest
+    /// of the session.
+    #[test]
+    fn the_bookkeeping_lists_are_written_privately_and_all_at_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, store) = scratch();
+        let request = crate::keygen::KeyGenRequest::new("Alice <alice@example.org>");
+        let generated = crate::keygen::generate(&request).unwrap();
+        let fingerprint = generated.cert.fingerprint().to_hex();
+        store.insert(&generated.cert).unwrap();
+        store.set_trust_root(&fingerprint, true).unwrap();
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&store.roots_path), 0o600, "trust-roots as created");
+
+        // Nothing is left behind for the next open to trip over.
+        assert!(
+            !store.roots_path.with_extension("tmp").exists(),
+            "the staging file must be renamed away, not left in the store"
+        );
+
+        // The rename is what makes it all-or-nothing: replacing the directory
+        // entry cannot leave a half-written list, whatever happens mid-write.
+        assert!(
+            store
+                .trust_roots()
+                .unwrap()
+                .contains(&fingerprint.to_uppercase())
+        );
+        let reopened = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        assert!(
+            reopened
+                .trust_roots()
+                .unwrap()
+                .contains(&fingerprint.to_uppercase()),
+            "the list must survive a reopen"
         );
     }
 

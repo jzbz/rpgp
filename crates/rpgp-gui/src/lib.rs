@@ -2159,6 +2159,10 @@ fn run_notepad(
                 );
             }
 
+            // Both arms below are bounded: the notepad's output is a text
+            // box, and either a compressed encryption layer or an inline
+            // signed one expands to whatever the sender chose.
+            //
             // Cleartext-signed text carries its own content, so it is verified
             // rather than decrypted.
             if text.contains("-----BEGIN PGP SIGNED MESSAGE-----") {
@@ -2177,8 +2181,6 @@ fn run_notepad(
             if !secret.is_empty() {
                 candidates.push(secret);
             }
-            // Bounded: the notepad's output is a text box, and a compressed
-            // layer expands to whatever the sender chose.
             let result = ops::decrypt_to_memory(&store, text.as_bytes(), &candidates, &mut output)
                 .map_err(|e| format!("Decryption failed: {e}"))?;
 
