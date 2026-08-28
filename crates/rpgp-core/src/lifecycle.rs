@@ -62,13 +62,28 @@ pub fn set_expiry(
     // original date — the user believes they extended it and a month later
     // nobody can encrypt to them.
     //
-    // A signing-capable subkey has to countersign its own new binding (the
-    // primary key binding signature, or "back-sig"), so it needs its own
-    // signer. Encryption-only subkeys cannot sign and must be passed none.
+    // A subkey that can certify, sign or authenticate has to countersign its
+    // own new binding (the primary key binding signature, or "back-sig"), so
+    // it needs its own signer; anything else must be passed none. That is
+    // sequoia's condition verbatim, and it refuses either mismatch. Testing
+    // for_signing() alone missed authentication subkeys, so every GnuPG
+    // [S][E][A] key — which is what `gpg --export-secret-keys` produces —
+    // failed the whole change with "requires subkey signer", naming a
+    // capability the subkey does not have. Keys generated here have only
+    // [S] and [E], so nothing in the tree exercised it.
+    //
     // Revoked subkeys are left alone: a new expiry on a revoked key is noise.
-    for ka in valid.keys().subkeys().secret().revoked(false) {
-        let mut subkey_signer = if ka.for_signing() {
-            Some(crate::secret::keypair(ka.key().clone(), password)?)
+    // Subkeys with no local secret are not filtered out up front, because an
+    // encryption subkey does not need one — only the primary signs its
+    // binding — and skipping it left it to lapse on the original date while
+    // the pane showed the new one. Only the back-sig branch needs it.
+    for ka in valid.keys().subkeys().revoked(false) {
+        let needs_backsig = ka.for_signing() || ka.for_certification() || ka.for_authentication();
+        let mut subkey_signer = if needs_backsig {
+            let Ok(secret) = ka.key().clone().parts_into_secret() else {
+                continue;
+            };
+            Some(crate::secret::keypair(secret, password)?)
         } else {
             None
         };
@@ -279,6 +294,128 @@ mod tests {
             CertSummary::from_cert(&store.secret_cert(&fingerprint).unwrap())
                 .expires
                 .is_none()
+        );
+    }
+
+    /// A GnuPG key is [S][E][A], and the authentication subkey is the one this
+    /// loop used to get wrong. It cannot sign messages, so `for_signing()` is
+    /// false and it was handed no signer — but it *can* authenticate, and
+    /// sequoia demands a back-signature from anything that can, so it refused
+    /// the whole operation. The user saw "requires subkey signer" naming a
+    /// capability their subkey does not have, and could never change that
+    /// key's expiry at all. Nothing in the tree caught it because keygen here
+    /// only ever makes [S][E].
+    #[test]
+    fn an_imported_gnupg_key_with_an_auth_subkey_can_still_be_extended() {
+        use sequoia_openpgp::cert::CertBuilder;
+        use sequoia_openpgp::policy::StandardPolicy;
+        let policy = StandardPolicy::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let (cert, _) = CertBuilder::new()
+            .add_userid("Alice <alice@example.org>")
+            .add_signing_subkey()
+            .add_transport_encryption_subkey()
+            .add_authentication_subkey()
+            .set_validity_period(Duration::from_secs(1))
+            .generate()
+            .unwrap();
+        store.insert_secret(&cert).unwrap();
+        let fingerprint = cert.fingerprint().to_hex();
+        std::thread::sleep(Duration::from_millis(1500));
+
+        assert_eq!(
+            cert.with_policy(&policy, None)
+                .unwrap()
+                .keys()
+                .subkeys()
+                .count(),
+            3,
+            "the shape under test is [S][E][A]"
+        );
+
+        let extended = set_expiry(
+            &store,
+            &fingerprint,
+            Some(Duration::from_secs(31_536_000)),
+            None,
+        )
+        .expect("an authentication subkey must not abort the whole change");
+
+        let valid = extended.with_policy(&policy, None).unwrap();
+        assert!(
+            valid.keys().subkeys().all(|ka| ka.alive().is_ok()),
+            "every subkey must be re-dated, including the one that needed a back-signature"
+        );
+    }
+
+    /// An encryption subkey does not countersign its own binding — only the
+    /// primary signs it — so one whose secret is not held locally can still be
+    /// re-dated. Filtering the loop by `.secret()` skipped it silently: the
+    /// pane showed the new date, read off the primary, while the subkey lapsed
+    /// on the old one and nobody could encrypt to the user a month later.
+    #[test]
+    fn an_encryption_subkey_without_a_local_secret_is_still_re_dated() {
+        use sequoia_openpgp::policy::StandardPolicy;
+        use sequoia_openpgp::{Packet, cert::CertBuilder};
+        let policy = StandardPolicy::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let (cert, _) = CertBuilder::new()
+            .add_userid("Alice <alice@example.org>")
+            .add_signing_subkey()
+            .add_transport_encryption_subkey()
+            .set_validity_period(Duration::from_secs(1))
+            .generate()
+            .unwrap();
+
+        // Strip the encryption subkey's secret, the way a key that has been
+        // split across devices arrives.
+        let encryption = cert
+            .with_policy(&policy, None)
+            .unwrap()
+            .keys()
+            .subkeys()
+            .for_transport_encryption()
+            .next()
+            .unwrap()
+            .key()
+            .fingerprint();
+        let stripped: Vec<Packet> = cert
+            .as_tsk()
+            .into_packets()
+            .map(|p| match p {
+                Packet::SecretSubkey(k) if k.fingerprint() == encryption => {
+                    Packet::PublicSubkey(k.take_secret().0)
+                }
+                other => other,
+            })
+            .collect();
+        let cert = Cert::try_from(stripped).unwrap();
+        store.insert_secret(&cert).unwrap();
+        let fingerprint = cert.fingerprint().to_hex();
+        std::thread::sleep(Duration::from_millis(1500));
+
+        let extended = set_expiry(
+            &store,
+            &fingerprint,
+            Some(Duration::from_secs(31_536_000)),
+            None,
+        )
+        .unwrap();
+
+        let valid = extended.with_policy(&policy, None).unwrap();
+        assert_eq!(
+            valid
+                .keys()
+                .subkeys()
+                .alive()
+                .for_transport_encryption()
+                .count(),
+            1,
+            "the encryption subkey lapsed while the pane showed the new date"
         );
     }
 
