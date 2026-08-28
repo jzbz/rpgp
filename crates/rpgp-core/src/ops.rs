@@ -273,7 +273,27 @@ pub fn sign_cleartext(
     let keypair = signing_keypair(signer, password)?;
     let message = Message::new(sink);
     let mut message = Signer::new(message, keypair)?.cleartext().build()?;
-    message.write_all(data)?;
+
+    // A trailing bare CR is completed to CRLF before it reaches the cleartext
+    // writer, which otherwise emits a block it cannot verify itself: the final
+    // line runs straight into the signature marker with no line ending between
+    // them, and reading it back gives "Bad signature: Message has been
+    // manipulated" over text nobody touched.
+    //
+    // Deliberately only the trailing byte. A bare CR in the middle round-trips
+    // today, and rewriting those would change where the reader sees line breaks
+    // in someone else's message. The last line ending is not part of the signed
+    // text (RFC 9580 §7.1), so completing it changes nothing that is signed.
+    //
+    // The input is easy to produce and hard to see: everything copied out of a
+    // Windows application is CRLF, and deleting the trailing blank line leaves
+    // exactly this.
+    if data.last() == Some(&b'\r') {
+        message.write_all(data)?;
+        message.write_all(b"\n")?;
+    } else {
+        message.write_all(data)?;
+    }
     message.finalize()?;
     Ok(())
 }
@@ -1038,6 +1058,40 @@ mod tests {
         assert!(
             message.contains("session-key packets"),
             "a padded message must be refused up front, got: {message:?}"
+        );
+    }
+
+    /// Text that ends without a trailing newline — a bare CR, or nothing at all
+    /// — must still round-trip. Pasting from a Windows application yields CRLF,
+    /// and deleting the trailing blank line then leaves a bare CR at the end;
+    /// the app signed that without complaint and then called its own output
+    /// "Message has been manipulated" when asked to verify it back.
+    #[test]
+    fn cleartext_signing_round_trips_whatever_the_text_ends_with() {
+        let (_dir, store) = scratch_store();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+
+        let mut failures = Vec::new();
+        for (name, body) in [
+            ("trailing CRLF", "Line one.\r\nLine two.\r\n"),
+            ("trailing bare CR", "Line one.\r\nLine two.\r"),
+            ("no trailing newline", "Line one.\r\nLine two."),
+            ("trailing LF", "Line one.\nLine two.\n"),
+            ("bare CR in the middle", "Line one.\rLine two.\n"),
+        ] {
+            let mut signed = Vec::new();
+            sign_cleartext(&alice, None, body.as_bytes(), &mut signed).unwrap();
+            let (_text, result) = verify_inline(&store, &signed).unwrap();
+            if !result.all_good() {
+                failures.push(name);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "signed our own text and then rejected it: {failures:?}"
         );
     }
 
