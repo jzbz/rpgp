@@ -358,13 +358,10 @@ fn restart_with_software_renderer() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ui = AppWindow::new()?;
 
-    let store = match Store::open_default() {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("rpgp: cannot open the certificate store: {e}");
-            return Err(e.into());
-        }
-    };
+    // Returned rather than reported here: run_app funnels every startup failure
+    // through report_fatal, which also puts it in front of a user who launched
+    // this from a desktop and has no terminal to read.
+    let store = Store::open_default()?;
 
     let state: Shared = Arc::new(Mutex::new(State {
         store: Arc::new(store),
@@ -2999,6 +2996,35 @@ fn tint_index(fingerprint: &str) -> i32 {
 }
 
 /// The binary's entry point, here so `main.rs` stays a wrapper.
+/// Report a failure that happened before there was a window to put it in.
+///
+/// Every startup error funnels through here, and until now every one of them
+/// was invisible in exactly the situation where it matters. A GUI launch has no
+/// terminal attached: on Windows a `windows_subsystem = "windows"` process has
+/// no console at all, and std maps a write to that invalid handle to `Ok(())`
+/// rather than an error, so `eprintln!` succeeds and discards. A macOS .app
+/// opened from Finder and a Flatpak launched from a menu both send stderr
+/// somewhere the user will not look either. The window does not exist yet —
+/// `AppWindow::new` only constructs, nothing is shown until `run()` — so a
+/// failure to open the certificate store ended as a process that started and
+/// vanished, with no window, no message and nothing in a log the user reads.
+///
+/// The terminal test is the condition itself rather than a platform check: if
+/// stderr is a terminal the message is already in front of whoever ran it, and
+/// a modal dialog would be in the way — and would hang a headless run that has
+/// no one to dismiss it.
+fn report_fatal(message: &str) {
+    eprintln!("rpgp: {message}");
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        return;
+    }
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("rPGP could not start")
+        .set_description(message)
+        .show();
+}
+
 pub fn run_app() -> ExitCode {
     // First, before the renderer brings up wgpu and long before any key
     // material exists: everything after this point is inside a process that
@@ -3021,7 +3047,7 @@ pub fn run_app() -> ExitCode {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
         Ok(Ok(())) => ExitCode::SUCCESS,
         Ok(Err(e)) => {
-            eprintln!("rpgp: {e}");
+            report_fatal(&e.to_string());
             ExitCode::FAILURE
         }
         Err(payload) => {
