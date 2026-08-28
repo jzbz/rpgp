@@ -1552,8 +1552,6 @@ mod tests {
     /// of the session.
     #[test]
     fn the_bookkeeping_lists_are_written_privately_and_all_at_once() {
-        use std::os::unix::fs::PermissionsExt;
-
         let (dir, store) = scratch();
         let request = crate::keygen::KeyGenRequest::new("Alice <alice@example.org>");
         let generated = crate::keygen::generate(&request).unwrap();
@@ -1561,8 +1559,18 @@ mod tests {
         store.insert(&generated.cert).unwrap();
         store.set_trust_root(&fingerprint, true).unwrap();
 
-        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&store.roots_path), 0o600, "trust-roots as created");
+        // Windows carries the same property through an ACL rather than a mode;
+        // the acl tests below cover that side.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&store.roots_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "trust-roots as created");
+        }
 
         // Nothing is left behind for the next open to trip over.
         assert!(
