@@ -14,7 +14,9 @@ use sequoia_openpgp::packet::Signature;
 use sequoia_openpgp::packet::signature::SignatureBuilder;
 use sequoia_openpgp::parse::Parse;
 use sequoia_openpgp::serialize::Serialize;
-use sequoia_openpgp::types::{ReasonForRevocation, RevocationStatus, SignatureType};
+use sequoia_openpgp::types::{
+    ReasonForRevocation, RevocationStatus, RevocationType, SignatureType,
+};
 use sequoia_openpgp::{Cert, Packet, PacketPile};
 
 use crate::error::{Error, Result};
@@ -339,12 +341,29 @@ pub fn revocation_reason(cert: &Cert) -> Option<(Reason, String)> {
         return None;
     };
 
-    let signature = signatures.first()?;
-    let (code, message) = signature.reason_for_revocation()?;
-    Some((
-        Reason::from_openpgp(code),
-        String::from_utf8_lossy(message).into_owned(),
-    ))
+    // Newest first, and a hard revocation stays in the set whatever follows
+    // it, because nothing undoes one. Reporting the newest would let a
+    // KeyRetired — which anyone holding the stolen secret can issue — hide a
+    // KeyCompromised behind "No longer used", so prefer the newest hard
+    // revocation and fall back to the newest of any kind. A revocation
+    // carrying no reason subpacket is hard (RFC 9580 §5.2.3.31), which is
+    // also why the reason-less case reports Unspecified rather than blanking
+    // the banner: returning None here left the certificate looking unrevoked.
+    let signature = signatures
+        .iter()
+        .find(|s| {
+            s.reason_for_revocation()
+                .is_none_or(|(code, _)| code.revocation_type() == RevocationType::Hard)
+        })
+        .or_else(|| signatures.first())?;
+
+    Some(match signature.reason_for_revocation() {
+        Some((code, message)) => (
+            Reason::from_openpgp(code),
+            String::from_utf8_lossy(message).into_owned(),
+        ),
+        None => (Reason::Unspecified, String::new()),
+    })
 }
 
 fn primary_signer(cert: &Cert, password: Option<&str>) -> Result<sequoia_openpgp::crypto::KeyPair> {
@@ -481,6 +500,41 @@ mod tests {
             CertSummary::from_cert(&store.secret_cert(&fingerprint).unwrap()).validity,
             Validity::Revoked
         );
+    }
+
+    /// The banner has to show the worst thing that has happened to a key, not
+    /// the most recent. Anyone holding a stolen secret can issue a further
+    /// revocation with a gentler reason; if the newest wins, "the secret is in
+    /// someone else's hands" is replaced by "no longer used" by the very person
+    /// who stole it, and the reader downgrades their response accordingly.
+    #[test]
+    fn a_later_retirement_cannot_soften_a_compromise() {
+        let (_dir, store) = scratch();
+        let mine = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&mine).unwrap();
+        let fingerprint = mine.fingerprint().to_hex();
+
+        let mut compromise = RevokeRequest::new(&fingerprint);
+        compromise.reason = Reason::Compromised;
+        compromise.message = "laptop stolen".to_string();
+        revoke_cert(&store, &compromise).unwrap();
+
+        let mut retire = RevokeRequest::new(&fingerprint);
+        retire.reason = Reason::Retired;
+        retire.message = "just retiring this".to_string();
+        let revoked = revoke_cert(&store, &retire).unwrap();
+
+        // Both are on the certificate; the question is which one is reported.
+        let (reason, message) = revocation_reason(&revoked).unwrap();
+        assert_eq!(
+            reason,
+            Reason::Compromised,
+            "a soft revocation issued later must not mask the hard one; got {message:?}"
+        );
+        assert!(reason.is_hard());
+        assert_eq!(message, "laptop stolen");
     }
 
     /// "No reason given" is a hard revocation in OpenPGP, and it used to be

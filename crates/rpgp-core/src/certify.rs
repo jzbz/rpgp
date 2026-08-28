@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 use sequoia_openpgp::Cert;
 use sequoia_openpgp::packet::Signature;
 use sequoia_openpgp::packet::signature::SignatureBuilder;
-use sequoia_openpgp::types::SignatureType;
+use sequoia_openpgp::types::{RevocationStatus, SignatureType};
 
 use crate::error::{Error, Result};
 use crate::policy;
@@ -139,6 +139,19 @@ pub fn certify(store: &Store, request: &CertifyRequest) -> Result<Cert> {
             .find(|ua| String::from_utf8_lossy(ua.userid().value()) == wanted.as_str())
             .ok_or_else(|| Error::invalid(format!("{wanted} is not a user ID on this key")))?;
         let userid = amalgamation.userid().clone();
+
+        // A user ID its owner has retracted is not ours to vouch for. Signing
+        // one publishes an attestation binding a name the holder has disowned
+        // — usually an address that has since been reassigned to someone else,
+        // which is precisely the claim a certification must not make.
+        if matches!(
+            amalgamation.revocation_status(&policy, None),
+            RevocationStatus::Revoked(_)
+        ) {
+            return Err(Error::invalid(format!(
+                "{wanted} has been revoked by its owner"
+            )));
+        }
 
         // The mirror of revoke_certification's rule. A revocation supersedes
         // a certification made strictly earlier, so a certification has to be
@@ -390,6 +403,53 @@ mod tests {
         assert!(found[0].exportable);
         assert_eq!(found[0].amount, FULL);
         assert_eq!(found[0].depth, 0);
+    }
+
+    /// Certifying is a public claim that a name belongs to someone. Once the
+    /// holder revokes a user ID they are saying it no longer does — an old
+    /// address, typically, which the provider may since have handed to a
+    /// stranger. Vouching for it then puts our signature behind a claim its
+    /// own subject has withdrawn.
+    #[test]
+    fn refuses_to_vouch_for_a_user_id_its_owner_has_revoked() {
+        let (_dir, store) = scratch();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        let bob = generate(&KeyGenRequest::new("Bob <bob@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+        store.insert_secret(&bob).unwrap();
+        let bob_fp = bob.fingerprint().to_hex();
+        crate::lifecycle::add_user_id(&store, &bob_fp, "Bob <bob@oldjob.example>", None).unwrap();
+
+        // Bob leaves the job and disowns the address.
+        crate::lifecycle::revoke_user_id(
+            &store,
+            &bob_fp,
+            "Bob <bob@oldjob.example>",
+            "left that job",
+            None,
+        )
+        .unwrap();
+
+        let mut request = CertifyRequest::new(alice.fingerprint().to_hex(), &bob_fp);
+        request.user_ids = vec!["Bob <bob@oldjob.example>".to_string()];
+        let refused = certify(&store, &request);
+        assert!(
+            refused.is_err(),
+            "certified an address its owner had revoked"
+        );
+
+        // And the live one is still certifiable, or the guard is just a wall.
+        let mut request = CertifyRequest::new(alice.fingerprint().to_hex(), &bob_fp);
+        request.user_ids = vec!["Bob <bob@example.org>".to_string()];
+        certify(&store, &request).unwrap();
+        let bob = store.lookup(&bob_fp).unwrap();
+        let found = certifications(&store, &bob).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].user_id, "Bob <bob@example.org>");
     }
 
     #[test]

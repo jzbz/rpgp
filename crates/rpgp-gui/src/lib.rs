@@ -1213,11 +1213,25 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
 
             // Every user ID starts ticked: certifying a person usually means
             // certifying the identity you just checked, and they normally have
-            // one. Unticking is cheaper than hunting for the right box.
+            // one. Unticking is cheaper than hunting for the right box. The
+            // exception is one the holder has revoked — a name they have
+            // disowned, which core refuses to sign anyway, so offering it
+            // pre-ticked only sets up an error at the end of the dialog.
+            let revoked: std::collections::HashSet<String> = guard
+                .store
+                .lookup(&target.fingerprint)
+                .map(|cert| {
+                    rpgp_core::cert::user_ids(&cert)
+                        .into_iter()
+                        .filter(|uid| uid.revoked)
+                        .map(|uid| uid.text)
+                        .collect()
+                })
+                .unwrap_or_default();
             let user_ids: Vec<(String, bool)> = target
                 .user_ids
                 .iter()
-                .map(|uid| (uid.clone(), true))
+                .map(|uid| (uid.clone(), !revoked.contains(uid)))
                 .collect();
 
             let certifiers: Vec<(String, String)> = guard
