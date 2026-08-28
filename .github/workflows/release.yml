@@ -28,8 +28,11 @@ on:
         description: "Tag or commit to build"
         required: true
 
+# Read by default; only the job that publishes gets write. The three build
+# jobs compile the build scripts of 800-odd crates, which run as ordinary code
+# on the runner beside the credential the checkout persists to disk.
 permissions:
-  contents: write
+  contents: read
 
 env:
   RUNTIME_VERSION: "25.08"
@@ -373,6 +376,8 @@ jobs:
     if: startsWith(inputs.ref || github.ref_name, 'v')
     timeout-minutes: 15
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       # Only the Flatpak bundles. Without the pattern this collects every
       # artifact the run produced, and the windows and macos jobs — both named

@@ -3,6 +3,7 @@
 // the application.
 import { Field, Btn, Check, Select, FieldRow } from "../widgets.slint";
 import { SignEncryptDialog, CertifyDialog, NotepadDialog } from "../dialogs.slint";
+import { KeygenDialog, DecryptVerifyDialog, RevokeDialog, LifecycleDialog } from "../dialogs.slint";
 import { RecipientRow, UserIdRow } from "../types.slint";
 
 export component FieldProbe inherits Window {
@@ -117,4 +118,33 @@ export component NotepadProbe inherits Window {
         recipients: root.recipients;
         toggle-recipient(index) => { root.toggled-recipient = index; }
     }
+}
+
+// The four passphrase-bearing dialogs the probes above do not reach. The other
+// five passphrase fields live in SignEncryptDialog, CertifyDialog and
+// NotepadDialog, which the selection probes already instantiate.
+export component KeygenProbe inherits Window {
+    width: 620px;
+    height: 720px;
+    KeygenDialog { width: 100%; height: 100%; }
+}
+
+export component DecryptProbe inherits Window {
+    width: 620px;
+    height: 720px;
+    // The passphrase field is conditional on a file having been chosen.
+    DecryptVerifyDialog { width: 100%; height: 100%; input-path: "/tmp/message.txt"; }
+}
+
+export component RevokeProbe inherits Window {
+    width: 620px;
+    height: 720px;
+    RevokeDialog { width: 100%; height: 100%; target-name: "Alice"; }
+}
+
+export component LifecycleProbe inherits Window {
+    width: 620px;
+    height: 720px;
+    // Every mode but publish carries the passphrase field.
+    LifecycleDialog { width: 100%; height: 100%; mode: 0; target: "Alice"; }
 }

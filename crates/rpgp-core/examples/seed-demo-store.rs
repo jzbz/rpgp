@@ -17,7 +17,13 @@ use rpgp_core::certify::{CertifyRequest, PARTIAL, certify};
 use rpgp_core::keygen::{KeyGenRequest, KeyType, generate};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Store::open_default()?;
+    let root = std::path::PathBuf::from(std::env::args_os().nth(1).ok_or(
+        "usage: seed-demo-store <directory>   (e.g. /tmp/rpgp-demo; \
+         this never writes to the default store)",
+    )?);
+    // The same layout Store::open_default builds.
+    let secrets_dir = root.join("rpgp").join("secrets");
+    let store = Store::open(root.join("pgp.cert.d"), &secrets_dir)?;
 
     let ada = make(
         &store,
@@ -98,12 +104,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         |_| {},
     )?;
 
-    let secrets = dirs::data_dir()
-        .ok_or("no data directory")?
-        .join("rpgp")
-        .join("secrets")
-        .join(format!("{barbara}.pgp"));
-    std::fs::remove_file(&secrets)?;
+    // From the directory this actually wrote to. Rebuilding it from
+    // dirs::data_dir() named a different place on two of the three platforms:
+    // the store uses data_local_dir(), which on Windows is Local rather than
+    // Roaming, so this deleted nothing and Barbara kept her secret key.
+    std::fs::remove_file(secrets_dir.join(format!("{barbara}.pgp")))?;
     println!("dropped Barbara's secret key so she reads as a third party");
 
     Ok(())

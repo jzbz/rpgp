@@ -137,10 +137,23 @@ pub fn certify(store: &Store, request: &CertifyRequest) -> Result<Cert> {
 
     let mut signatures: Vec<Signature> = Vec::new();
     for wanted in &request.user_ids {
-        let amalgamation = target
+        // A user ID is bytes; this string is those bytes rendered lossily, and
+        // that is not injective — every invalid byte becomes U+FFFD. Two user
+        // IDs differing only there display identically, so `find` would sign
+        // whichever came first and report the other's text. Refuse instead:
+        // nothing in the dialog could have told the user which one they picked.
+        let mut candidates = target
             .userids()
-            .find(|ua| String::from_utf8_lossy(ua.userid().value()) == wanted.as_str())
+            .filter(|ua| String::from_utf8_lossy(ua.userid().value()) == wanted.as_str());
+        let amalgamation = candidates
+            .next()
             .ok_or_else(|| Error::invalid(format!("{wanted} is not a user ID on this key")))?;
+        if candidates.next().is_some() {
+            return Err(Error::invalid(format!(
+                "{wanted} matches more than one user ID on this key; they differ in \
+                 bytes that do not display, so there is no way to say which you meant"
+            )));
+        }
         let userid = amalgamation.userid().clone();
 
         // A user ID its owner has retracted is not ours to vouch for. Signing
@@ -493,6 +506,71 @@ mod tests {
         let found = certifications(&store, &bob).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].user_id, "Bob <bob@example.org>");
+    }
+
+    /// A user ID is bytes, and everything above the storage layer handles it
+    /// as `from_utf8_lossy` text — which maps every invalid byte to the same
+    /// replacement character. Two user IDs differing only in those bytes are
+    /// one string by the time they reach the dialog, so the user picks a row
+    /// that names both and `find` would sign whichever came first while the
+    /// list reported the other. There is no answer to give here, only a
+    /// choice between guessing and saying so.
+    #[test]
+    fn two_user_ids_that_display_alike_are_refused_rather_than_guessed() {
+        use sequoia_openpgp::packet::UserID;
+
+        let (_dir, store) = scratch();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        let bob = generate(&KeyGenRequest::new("Bob <bob@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+        store.insert_secret(&bob).unwrap();
+        let bob_fp = bob.fingerprint().to_hex();
+
+        // Two user IDs, different bytes, identical rendering: 0xFE and 0xFF
+        // are both invalid UTF-8 and both display as U+FFFD.
+        let mut signer = bob
+            .primary_key()
+            .key()
+            .clone()
+            .parts_into_secret()
+            .unwrap()
+            .into_keypair()
+            .unwrap();
+        let mut packets: Vec<sequoia_openpgp::Packet> = Vec::new();
+        for byte in [0xFEu8, 0xFF] {
+            let raw = [b"Bob <bob@", &[byte][..], b".example>"].concat();
+            let userid = UserID::from(raw);
+            let binding = SignatureBuilder::new(SignatureType::PositiveCertification)
+                .sign_userid_binding(&mut signer, bob.primary_key().key(), &userid)
+                .unwrap();
+            packets.push(sequoia_openpgp::Packet::from(userid));
+            packets.push(sequoia_openpgp::Packet::from(binding));
+        }
+        let bob = bob.insert_packets(packets).unwrap().0;
+        store.insert_secret(&bob).unwrap();
+
+        let displayed = String::from_utf8_lossy(
+            &[b"Bob <bob@".to_vec(), vec![0xFE], b".example>".to_vec()].concat(),
+        )
+        .into_owned();
+
+        let mut request = CertifyRequest::new(alice.fingerprint().to_hex(), &bob_fp);
+        request.user_ids = vec![displayed.clone()];
+        let refused = certify(&store, &request);
+        let message = refused.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("more than one user ID"),
+            "an ambiguous identity must be refused, not guessed at; got {message:?}"
+        );
+
+        // An unambiguous one still signs, or this is just a wall.
+        let mut request = CertifyRequest::new(alice.fingerprint().to_hex(), &bob_fp);
+        request.user_ids = vec!["Bob <bob@example.org>".to_string()];
+        certify(&store, &request).unwrap();
     }
 
     #[test]

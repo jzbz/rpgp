@@ -269,3 +269,80 @@ fn the_notepad_recipient_row_carries_the_same_contract() {
     row.invoke_accessible_default_action();
     assert_eq!(probe.get_toggled_recipient(), 0);
 }
+
+/// The suppression has two halves: the binding inside `Field`, which the two
+/// tests at the top cover, and the `secret: true` at each call site, which they
+/// do not — they exercise the probe's own copy of a passphrase field, so every
+/// dialog in the app could have lost its flag with all three still passing.
+///
+/// This drives the shipped dialogs. It types into every text input each one
+/// has, through the same accessibility action a screen reader would use, and
+/// asks what the bus was told: a field the dialog itself labels as taking a
+/// passphrase must answer nothing, and every other field must still answer.
+#[test]
+fn every_passphrase_field_in_the_real_dialogs_suppresses_its_value() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{ElementHandle, ElementRoot};
+
+    fn check(dialog: &str, probe: &impl ElementRoot) -> usize {
+        let mut suppressed = 0;
+        for field in ElementHandle::find_by_element_type_name(probe, "TextInput") {
+            let label = field.accessible_label().unwrap_or_default().to_string();
+            // Slint gives every TextInput an accessible-action-set-value that
+            // assigns `text`, so this is the field being typed into.
+            field.set_accessible_value(PASSPHRASE);
+            let published = field.accessible_value().unwrap_or_default();
+            let lower = label.to_lowercase();
+            if lower.contains("passphrase") || lower.contains("password") {
+                assert!(
+                    !published.contains(PASSPHRASE),
+                    "{dialog}: {label:?} takes a passphrase and publishes it: {published:?}"
+                );
+                suppressed += 1;
+            } else {
+                assert!(
+                    published.contains(PASSPHRASE),
+                    "{dialog}: {label:?} is not a passphrase field but announces nothing"
+                );
+            }
+        }
+        suppressed
+    }
+
+    let mut reached = 0;
+    let probe = KeygenProbe::new().unwrap();
+    probe.show().unwrap();
+    reached += check("KeygenDialog", &probe);
+    let probe = DecryptProbe::new().unwrap();
+    probe.show().unwrap();
+    reached += check("DecryptVerifyDialog", &probe);
+    let probe = RevokeProbe::new().unwrap();
+    probe.show().unwrap();
+    reached += check("RevokeDialog", &probe);
+    let probe = LifecycleProbe::new().unwrap();
+    probe.show().unwrap();
+    reached += check("LifecycleDialog", &probe);
+    let probe = SelectionProbe::new().unwrap();
+    probe.show().unwrap();
+    reached += check("SignEncryptDialog", &probe);
+    let probe = CertifyProbe::new().unwrap();
+    probe.show().unwrap();
+    reached += check("CertifyDialog", &probe);
+    let probe = NotepadProbe::new().unwrap();
+    probe.show().unwrap();
+    reached += check("NotepadDialog", &probe);
+
+    // A passphrase field in a dialog no probe instantiates, or one behind a
+    // condition no probe satisfies, would be silently uncovered — so hold the
+    // count against the source rather than against a number written here.
+    let declared =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dialogs.slint"))
+            .expect("reading ui/dialogs.slint")
+            .matches("secret: true")
+            .count();
+    assert_eq!(
+        reached, declared,
+        "ui/dialogs.slint marks {declared} fields secret but only {reached} were reached \
+         through a probe — add a probe for the dialog holding the new one"
+    );
+}

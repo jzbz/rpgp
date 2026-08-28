@@ -328,15 +328,6 @@ pub struct Published {
     pub token: Option<String>,
 }
 
-/// Upload a certificate to the keyserver.
-///
-/// This cannot be undone. A keyserver has no delete: once a certificate is
-/// uploaded it is public, permanently, and so is every user ID on it. Callers
-/// must make that clear before getting here.
-///
-/// Only the public half is ever sent — the secret key material is stripped
-/// first, so a caller that hands over a certificate carrying secrets does not
-/// publish them by accident.
 /// The exact bytes [`publish`] uploads.
 ///
 /// Split out so the guarantees in publish's doc comment can be asserted on the
@@ -355,6 +346,15 @@ fn upload_body(cert: &Cert) -> Result<String> {
         .map_err(|_| Error::invalid("the certificate did not armor as text"))
 }
 
+/// Upload a certificate to the keyserver.
+///
+/// This cannot be undone. A keyserver has no delete: once a certificate is
+/// uploaded it is public, permanently, and so is every user ID on it. Callers
+/// must make that clear before getting here.
+///
+/// Only the public half is ever sent — the secret key material is stripped
+/// first, so a caller that hands over a certificate carrying secrets does not
+/// publish them by accident.
 pub fn publish(cert: &Cert) -> Result<Published> {
     let armored = upload_body(cert)?;
 
