@@ -207,6 +207,13 @@ component CertListRow inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "rPGP";
+    // The window icon is a separate thing from the executable's icon resource,
+    // and Windows does not fall back from one to the other: the .ico embedded by
+    // build.rs is what Explorer draws for the file, while the title bar, the
+    // taskbar button and Alt-Tab all read the icon set on the window itself.
+    // Without this the app had a correct icon on disk and a blank placeholder
+    // everywhere the user actually looks at it.
+    icon: @image-url("../desktop/app.rpgp.rpgp-256.png");
     // Whether the toolbar shows its secondary actions as glyphs alone.
     //
     // Assigned from `changed width` rather than bound to it. A binding of the
