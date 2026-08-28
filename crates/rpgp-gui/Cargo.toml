@@ -68,3 +68,11 @@ harness = false
 
 [build-dependencies]
 slint-build = "1.17"
+
+# Windows only, and a build dependency, so it never enters the shipped binary
+# or any other platform's graph. Without it the .exe has no resource section at
+# all: no icon (the taskbar and title bar show a generic placeholder), no
+# version info (Explorer's Details tab is blank), and no manifest (the process
+# is DPI-unaware and Windows bitmap-scales it on any HiDPI display).
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
