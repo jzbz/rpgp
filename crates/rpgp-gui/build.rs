@@ -56,7 +56,10 @@ fn windows_resources() {
     // lists the process as, so it is the name a user looks for, not "rpgp.exe".
     resource.set("FileDescription", "rPGP — OpenPGP certificate manager");
     resource.set("ProductName", "rPGP");
-    resource.set("LegalCopyright", "GPL-3.0-or-later");
+    resource.set(
+        "LegalCopyright",
+        "Copyright © 2026 Jonathan Zeppettini. MIT licensed.",
+    );
     resource
         .compile()
         .expect("embedding the Windows icon, manifest and version info");
