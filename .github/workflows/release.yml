@@ -193,7 +193,7 @@ jobs:
   # every job here and skips the publish step, which is how to exercise this
   # without cutting a release.
   windows:
-    name: Windows (x86_64, unpublished)
+    name: Windows (x86_64)
     timeout-minutes: 60
     runs-on: windows-latest
     steps:
@@ -239,21 +239,23 @@ jobs:
           name: windows-x86_64
           path: '*.exe'
 
-  # Unpublished, like the Windows job above and for the same reason: the
-  # workspace builds and its tests pass on macOS in CI, but nobody has run the
-  # app there, and a release build is not a debug build. This produces an
-  # artifact to inspect, not something to ship.
+  # Not published from here, and unlike the Windows job that is not a matter
+  # of confidence. What this builds has been run: the bundle launches on macOS,
+  # falls back to the software renderer where there is no GPU and says so, and
+  # creates its store with the right permissions. What it cannot do is reach a
+  # user. Gatekeeper refuses an unsigned .app outright — tested on macOS 26,
+  # the dialog reads "Apple could not verify rPGP is free of malware", offers
+  # Move to Trash as the default button, and no longer offers Open Anyway at
+  # all — so this artifact is an input to packaging/macos-sign.sh, which signs
+  # and notarises it on the machine holding the Developer ID key. That key is
+  # not here for the same reason no signing key is.
   #
   # Universal: macos-latest is Apple Silicon, and the Intel half is
   # cross-compiled beside it and joined with lipo. macOS is the only platform
   # here where one file serves both architectures — Flatpak and Windows each
   # need one per arch.
-  #
-  # The bundle is unsigned, so Gatekeeper will refuse to open it on a machine
-  # that did not build it. Signing and notarisation need an Apple Developer
-  # account and are a separate decision; this proves the bundle assembles.
   macos:
-    name: macOS (universal, unpublished)
+    name: macOS (universal, signed by hand)
     timeout-minutes: 60
     runs-on: macos-latest
     steps:
@@ -372,26 +374,39 @@ jobs:
 
   release:
     name: Attach to the release
-    needs: bundle
+    needs: [bundle, windows]
     if: startsWith(inputs.ref || github.ref_name, 'v')
     timeout-minutes: 15
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      # Named patterns rather than everything the run produced. Which jobs
-      # publish is a decision, not a function of which finished first: this
-      # job needs only `bundle`, so collecting `*` made publication a race.
-      # Adding a platform here is a deliberate act.
+      # Named patterns rather than everything the run produced, and `needs`
+      # lists exactly the jobs those patterns come from. Which jobs publish is
+      # a decision, not a function of which finished first: collecting `*`
+      # while waiting on a subset made publication a race. Adding a platform
+      # means naming it twice, in `needs` and here, and that is the point.
       #
-      # macOS is deliberately absent. That bundle cannot ship as CI builds
-      # it — Gatekeeper refuses an unsigned .app outright, offering "Move to
-      # Trash" and nothing else — so it detours through the machine holding
-      # the Developer ID key and is uploaded to this draft by hand. See
-      # packaging/macos-sign.sh.
+      # Windows ships unsigned. SmartScreen will warn on first run — an
+      # unsigned .exe with no download history is what it exists to flag — but
+      # it warns and then lets the user through, so the artifact is usable.
+      # Signing it needs a certificate from a commercial CA or a Trusted
+      # Signing subscription; a Microsoft developer account is for Store
+      # submission and does not sign a direct download.
+      #
+      # macOS is deliberately absent, because there the same shortcut does not
+      # exist: Gatekeeper refuses an unsigned .app outright, offering "Move to
+      # Trash" and nothing else. That bundle detours through the machine
+      # holding the Developer ID key and is uploaded to this draft by hand.
+      # See packaging/macos-sign.sh.
       - uses: actions/download-artifact@v4
         with:
           pattern: flatpak-*
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
           merge-multiple: true
 
       # No SHA256SUMS here. It covers every artifact in the release, and one
