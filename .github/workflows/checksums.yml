@@ -1,0 +1,107 @@
+name: Release checksums
+
+# One SHA256SUMS over every artifact in a release, written after they are all
+# there. It is separate from release.yml because they cannot all be there when
+# release.yml runs: the macOS bundle detours through the machine holding the
+# Developer ID key to be signed and notarised, and only then is it uploaded. A
+# checksum file written before that names fewer files than the release ships,
+# which is worse than none — it looks complete.
+#
+# A hash served from the same release as the artifact it describes catches a
+# truncated download and nothing else. It becomes a real check only once signed,
+# and that signature is made by hand, so this workflow deliberately stops at the
+# unsigned file: it does not publish the release and it cannot sign anything.
+#
+#   1. tag        -> release.yml builds and attaches what CI can, as a draft
+#   2. by hand    -> sign and notarise the macOS bundle, upload it to the draft
+#   3. this       -> hash everything attached, upload SHA256SUMS
+#   4. by hand    -> gpg --detach-sign --armor SHA256SUMS, upload the .asc
+#   5. by hand    -> publish the draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag whose release assets to hash (e.g. v0.1.2)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  checksums:
+    name: Hash every attached artifact
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    permissions:
+      # The one job that writes to the release, as in release.yml.
+      contents: write
+    steps:
+      - name: Collect, hash and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || {
+            echo "::error::no release for tag $TAG"
+            exit 1
+          }
+
+          # A signature over the previous SHA256SUMS does not describe the new
+          # one, and leaving it in place would leave a release carrying a
+          # signature that fails against the file beside it — which reads as
+          # tampering rather than as staleness. Refuse, and make the operator
+          # decide.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+               --json assets --jq '.assets[].name' | grep -qx 'SHA256SUMS.asc'; then
+            echo "::error::$TAG already has SHA256SUMS.asc. Re-hashing would"
+            echo "::error::invalidate it. Delete the signature first if the"
+            echo "::error::asset list has genuinely changed:"
+            echo "::error::  gh release delete-asset $TAG SHA256SUMS.asc"
+            exit 1
+          fi
+
+          mkdir -p dist && cd dist
+          # Everything except the checksum file itself; hashing SHA256SUMS into
+          # SHA256SUMS is both impossible and a sign the pattern is wrong.
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*' --clobber
+          rm -f SHA256SUMS SHA256SUMS.asc
+
+          shopt -s nullglob
+          files=(*)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::$TAG has no assets to hash"
+            exit 1
+          fi
+
+          # Bare filenames, not paths, so `sha256sum -c SHA256SUMS` works in
+          # whatever directory someone downloaded them to.
+          ls -lh
+          sha256sum "${files[@]}" > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+          gh release upload "$TAG" SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+          {
+            echo "## SHA256SUMS written for $TAG"
+            echo
+            echo "Covering ${#files[@]} artifact(s):"
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+            echo
+            echo "Not finished. Still by hand, on the machine with the key:"
+            echo
+            echo '```bash'
+            echo "gh release download $TAG --repo $GITHUB_REPOSITORY --pattern SHA256SUMS --clobber"
+            echo "gpg --detach-sign --armor SHA256SUMS"
+            echo "gh release upload $TAG SHA256SUMS.asc --repo $GITHUB_REPOSITORY --clobber"
+            echo "gh release edit $TAG --repo $GITHUB_REPOSITORY --draft=false"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

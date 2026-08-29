@@ -379,29 +379,33 @@ jobs:
     permissions:
       contents: write
     steps:
-      # Only the Flatpak bundles. Without the pattern this collects every
-      # artifact the run produced, and the windows and macos jobs — both named
-      # "unpublished" and neither ever run by a human — upload their own. Since
-      # this job needs only `bundle`, whether those had finished by the time it
-      # started decided whether they were hashed into SHA256SUMS and published,
-      # which made publication a race rather than a decision. Adding a job here
-      # is now a deliberate act: it has to be named.
+      # Named patterns rather than everything the run produced. Which jobs
+      # publish is a decision, not a function of which finished first: this
+      # job needs only `bundle`, so collecting `*` made publication a race.
+      # Adding a platform here is a deliberate act.
+      #
+      # macOS is deliberately absent. That bundle cannot ship as CI builds
+      # it — Gatekeeper refuses an unsigned .app outright, offering "Move to
+      # Trash" and nothing else — so it detours through the machine holding
+      # the Developer ID key and is uploaded to this draft by hand. See
+      # packaging/macos-sign.sh.
       - uses: actions/download-artifact@v4
         with:
           pattern: flatpak-*
           merge-multiple: true
 
-      # One SHA256SUMS for the whole release rather than a .sha256 beside each
-      # file. A hash served from the same release as the artifact it describes
-      # catches a truncated download and nothing else; it is only a real check
-      # once signed, and signing happens by hand here because the key never
-      # goes near CI. Signing one file every release is sustainable — signing
-      # one per artifact, with Windows and macOS still to come, would not be,
-      # and an unsigned .sha256 sitting beside a signed SHA256SUMS is a
-      # downgrade path rather than a convenience.
+      # No SHA256SUMS here. It covers every artifact in the release, and one
+      # of them — the signed macOS bundle — does not exist yet at this point,
+      # so anything written now would be missing a file by the time the
+      # release is complete. checksums.yml writes it once everything is
+      # attached, which is also the only moment at which signing it by hand
+      # means anything.
       #
-      # Every collected file is hashed, so a new platform is covered by adding
-      # its build job and changing nothing here.
+      # Which is why the release is created as a draft. A draft is invisible
+      # to anyone but this repository's maintainers, so there is no window in
+      # which a half-assembled release — no checksums, no macOS build, no
+      # signature over either — is something a stranger can download.
+      # Publishing is the last step and a person does it.
       - name: Upload
         env:
           GH_TOKEN: ${{ github.token }}
@@ -416,8 +420,6 @@ jobs:
             exit 1
           fi
           ls -lh "${files[@]}"
-          sha256sum "${files[@]}" > SHA256SUMS
-          cat SHA256SUMS
 
           # A tag push creates no release on its own, so make one if it is not
           # already there. --verify-tag refuses to invent a tag that does not
@@ -425,11 +427,11 @@ jobs:
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --verify-tag \
+              --verify-tag --draft \
               --title "rPGP $TAG" \
               --generate-notes
           fi
 
           gh release upload "$TAG" \
-            "${files[@]}" SHA256SUMS \
+            "${files[@]}" \
             --repo "$GITHUB_REPOSITORY" --clobber
