@@ -109,6 +109,46 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.1.2" date="2026-08-28">
+      <description>
+        <p>A Windows build, and fixes from a second review of the whole tree
+        plus the first end-to-end testing on each platform.</p>
+        <ul>
+          <li>rPGP now runs on Windows</li>
+          <li>Signing text that ended without a proper line ending produced a
+          signature rPGP itself then called invalid. Text copied from a Windows
+          application and trimmed of its last blank line did exactly that</li>
+          <li>A certificate revoked twice showed the most recent reason rather
+          than the most serious, so a later "no longer used" could hide "the
+          secret key may be compromised" — which anyone holding the stolen key
+          could arrange</li>
+          <li>Certifying an identity its owner had revoked is now refused. A
+          revoked address is one the holder has disowned, and often one the
+          provider has since given to somebody else</li>
+          <li>The expiry of a key imported from GnuPG could not be changed at
+          all. Keys with an authentication subkey, which is what GnuPG makes,
+          failed the whole operation</li>
+          <li>A message that was signed but never encrypted was reported as
+          decrypted, telling the reader that something which crossed the network
+          in clear had arrived confidentially</li>
+          <li>Importing a file that held part of a key you already had could
+          discard the material you held. The two are now merged</li>
+          <li>A certification is attributed only after it verifies, so a packet
+          naming your key without being signed by it can no longer appear in the
+          list as yours</li>
+          <li>Verified badges belong to an identity rather than to the whole
+          certificate, so an unauthenticated name on a key can no longer inherit
+          another identity's verdict</li>
+          <li>A screen reader can now see which recipients are selected, and
+          every dropdown says what it is for</li>
+          <li>Toolbar buttons no longer overlap when the window is narrow</li>
+          <li>A failure to open the certificate store now says so, instead of
+          the app starting and vanishing without a word</li>
+          <li>An oversized or padded message is refused rather than allowed to
+          exhaust memory or CPU</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.1" date="2026-08-21">
       <description>
         <p>Fixes found by a security and optimization review of the whole tree.</p>
