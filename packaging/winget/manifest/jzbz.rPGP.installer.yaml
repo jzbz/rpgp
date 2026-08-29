@@ -1,0 +1,17 @@
+PackageIdentifier: jzbz.rPGP
+PackageVersion: 0.1.2
+InstallerType: portable
+# The alias put on PATH. Without this winget falls back to the asset's own
+# filename, so the command would be "rpgp-v0.1.2-x86_64" and would change with
+# every release.
+Commands:
+- rpgp
+ReleaseDate: 2026-08-28
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/jzbz/rpgp/releases/download/v0.1.2/rpgp-v0.1.2-x86_64.exe
+  # Filled from the published asset. Komac computes it; if this is edited by
+  # hand it must match the release byte for byte or validation rejects it.
+  InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+ManifestType: installer
+ManifestVersion: 1.12.0

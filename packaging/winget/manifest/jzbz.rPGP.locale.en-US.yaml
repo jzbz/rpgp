@@ -1,0 +1,27 @@
+PackageIdentifier: jzbz.rPGP
+PackageVersion: 0.1.2
+PackageLocale: en-US
+Publisher: Jonathan Zeppettini
+PublisherUrl: https://github.com/jzbz
+PublisherSupportUrl: https://github.com/jzbz/rpgp/issues
+PackageName: rPGP
+PackageUrl: https://github.com/jzbz/rpgp
+License: MIT
+LicenseUrl: https://github.com/jzbz/rpgp/blob/master/LICENSE
+Copyright: Copyright (c) 2026 Jonathan Zeppettini
+ShortDescription: Manage OpenPGP certificates and keys
+Description: |-
+  A window that lists your certificates and lets you generate, import, export,
+  sign, encrypt, decrypt and verify without touching a command line. Rust
+  throughout, Sequoia for OpenPGP, and no gpg subprocess.
+Moniker: rpgp
+Tags:
+- openpgp
+- pgp
+- gpg
+- encryption
+- cryptography
+- security
+ReleaseNotesUrl: https://github.com/jzbz/rpgp/releases/tag/v0.1.2
+ManifestType: defaultLocale
+ManifestVersion: 1.12.0
