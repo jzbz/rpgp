@@ -387,12 +387,27 @@ jobs:
       # while waiting on a subset made publication a race. Adding a platform
       # means naming it twice, in `needs` and here, and that is the point.
       #
-      # Windows ships unsigned. SmartScreen will warn on first run — an
-      # unsigned .exe with no download history is what it exists to flag — but
-      # it warns and then lets the user through, so the artifact is usable.
-      # Signing it needs a certificate from a commercial CA or a Trusted
-      # Signing subscription; a Microsoft developer account is for Store
-      # submission and does not sign a direct download.
+      # Windows ships unsigned, and that is a decision rather than a gap.
+      # SmartScreen warns on first run — an unsigned exe with no download
+      # history is what it exists to flag — but it warns and then lets the user
+      # through, so the artifact is usable.
+      #
+      # Signing would not change that. Microsoft's own comparison marks every
+      # non-Store option as "flagged as unrecognized until reputation
+      # accumulates": an OV certificate, an EV certificate and an Azure Artifact
+      # Signing subscription all leave the same warning in place, and EV's
+      # instant-reputation bypass was removed in 2024. What a certificate buys
+      # immediately is the publisher's name in the dialog instead of "Unknown
+      # publisher" — real, but not the problem. Reputation accrues per file
+      # hash, so a project at this size would wait months either way, and
+      # Microsoft has reset established publisher reputation as recently as 2026
+      # by migrating intermediate CAs.
+      #
+      # winget is the answer instead, and it is free: `winget install` carries
+      # no Mark-of-the-Web and raises no SmartScreen prompt at all, so for users
+      # who install that way the warning never happens. See packaging/winget/.
+      # A Microsoft developer account is for Store submission and signs nothing
+      # that is downloaded directly.
       #
       # macOS is deliberately absent, because there the same shortcut does not
       # exist: Gatekeeper refuses an unsigned .app outright, offering "Move to
