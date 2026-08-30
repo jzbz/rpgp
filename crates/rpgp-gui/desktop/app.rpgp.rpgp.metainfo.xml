@@ -109,7 +109,7 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
-    <release version="0.1.2" date="2026-08-28">
+    <release version="0.1.2" date="2026-08-30">
       <description>
         <p>A Windows build, and fixes from a second review of the whole tree
         plus the first end-to-end testing on each platform.</p>
