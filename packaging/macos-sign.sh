@@ -23,6 +23,19 @@ PROFILE="${RPGP_NOTARY_PROFILE:-rpgp-notary}"
 die() { printf '\nerror: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n== %s\n' "$*"; }
 
+# Run a command, indent what it says, and KEEP ITS EXIT STATUS.
+#
+# `cmd | sed` reports sed's status, not cmd's, so `set -e` never sees a failure
+# and an `|| die` after it is unreachable. That is not hypothetical: the first
+# real run of this script had codesign fail with errSecInternalComponent, print
+# "code object is not signed at all", and carry on to spend four minutes
+# notarising an unsigned bundle before Apple rejected it.
+run() {
+    _out=$("$@" 2>&1); _rc=$?
+    [ -n "$_out" ] && printf '%s\n' "$_out" | sed 's/^/  /'
+    return $_rc
+}
+
 if [ "${1:-}" = "--setup" ]; then
     cat <<'SETUP'
 One-time setup on the signing Mac
@@ -167,11 +180,25 @@ xattr -cr "$APP"
 # disable-library-validation are all cargo-cult here, and the middle one would
 # be a poor thing to put on a program that holds secret keys.
 step "Signing"
-codesign --sign "$IDENTITY" \
-         --force --timestamp --options runtime \
-         --verbose "$APP" 2>&1 | sed 's/^/  /'
+run codesign --sign "$IDENTITY" \
+             --force --timestamp --options runtime \
+             --verbose "$APP" \
+    || die "codesign failed.
 
-codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | sed 's/^/  /' \
+  errSecInternalComponent here almost always means codesign could not use the
+  private key without asking, and could not ask: over SSH there is no way to
+  show the keychain's 'allow access' prompt. Two ways round it —
+
+    1. Run this from Terminal ON the Mac, once. macOS asks whether codesign may
+       use the key; choose 'Always Allow'. Afterwards SSH runs work too.
+
+    2. Or authorise it without the prompt, which needs your login password on
+       the command line:
+
+           security set-key-partition-list -S apple-tool:,apple:,codesign: \\
+             -s -k '<login password>' ~/Library/Keychains/login.keychain-db"
+
+run codesign --verify --deep --strict --verbose=2 "$APP" \
     || die "the signature did not verify immediately after signing"
 
 # ----------------------------------------------------------------- notarise
@@ -207,7 +234,7 @@ fi
 # reach Apple: without it Gatekeeper has to ask, and a machine behind a captive
 # portal or a firewall gets the same refusal as an unsigned build.
 step "Stapling the ticket into the bundle"
-xcrun stapler staple "$APP" 2>&1 | sed 's/^/  /'
+run xcrun stapler staple "$APP" || die "stapling failed"
 
 # The order matters and is the step most often missed: the zip that ships has
 # to be made AFTER stapling. Re-using the submission zip ships an unstapled app.
