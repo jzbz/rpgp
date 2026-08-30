@@ -1,9 +1,9 @@
 # Version manifest. Three files are required — singleton manifests are
 # prohibited in the community repository.
 #
-# In winget-pkgs these live at manifests/j/jzbz/rPGP/0.1.2/, with each folder
+# In winget-pkgs these live at manifests/r/rPGP/rPGP/0.1.2/, with each folder
 # matching the case of its identifier segment.
-PackageIdentifier: jzbz.rPGP
+PackageIdentifier: rPGP.rPGP
 PackageVersion: 0.1.2
 DefaultLocale: en-US
 ManifestType: version

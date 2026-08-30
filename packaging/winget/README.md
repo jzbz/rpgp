@@ -27,7 +27,7 @@ over SHA256SUMS, not before.
 
 Once v0.1.2 is published, from any machine (Komac is Rust and runs on Linux):
 
-    komac new jzbz.rPGP \
+    komac new rPGP.rPGP \
       --urls https://github.com/jzbz/rpgp/releases/download/v0.1.2/rpgp-v0.1.2-x86_64.exe \
       --submit
 
@@ -43,7 +43,7 @@ Two options, and they differ in where a credential lives.
 
 By hand, per release, from the machine that already holds the signing keys:
 
-    komac update jzbz.rPGP --version 0.1.3 \
+    komac update rPGP.rPGP --version 0.1.3 \
       --urls https://github.com/jzbz/rpgp/releases/download/v0.1.3/rpgp-v0.1.3-x86_64.exe \
       --submit
 

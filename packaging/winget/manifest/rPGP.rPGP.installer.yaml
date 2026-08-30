@@ -1,4 +1,4 @@
-PackageIdentifier: jzbz.rPGP
+PackageIdentifier: rPGP.rPGP
 PackageVersion: 0.1.2
 InstallerType: portable
 # The alias put on PATH. Without this winget falls back to the asset's own
