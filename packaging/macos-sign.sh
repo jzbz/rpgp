@@ -104,6 +104,21 @@ xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1 \
   Run '$0 --setup' for how to create it, or set RPGP_NOTARY_PROFILE."
 echo "  notary:    profile '$PROFILE' authenticates"
 
+# The login keychain unlocks with the password at console login and stays locked
+# in an SSH session, so this is the normal state when signing remotely. Checked
+# here rather than left to codesign, which fails partway through with an error
+# about the identity rather than about the lock.
+if ! security show-keychain-info 2>&1 | grep -qi "no-timeout\|timeout"; then
+    die "the login keychain is locked, so codesign cannot reach the private key.
+  Unlock it and run this again:
+
+      security unlock-keychain
+
+  This is the usual state over SSH: the keychain unlocks with your password
+  when you log in at the console, not when you connect remotely."
+fi
+echo "  keychain:  unlocked"
+
 # ------------------------------------------------------------------- unpack
 WORK=$(mktemp -d) || die "could not create a working directory"
 trap 'rm -rf "$WORK"' EXIT
