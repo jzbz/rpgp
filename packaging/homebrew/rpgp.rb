@@ -22,7 +22,7 @@ cask "rpgp" do
       verified: "github.com/jzbz/rpgp/"
   name "rPGP"
   desc "Manage OpenPGP certificates and keys"
-  homepage "https://github.com/jzbz/rpgp"
+  homepage "https://rpgp.app/"
 
   livecheck do
     url :url
