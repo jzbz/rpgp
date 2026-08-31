@@ -25,7 +25,14 @@ fn main() {
             SignatureRow {
                 good: false,
                 signer: "unknown".into(),
-                detail: "Subkey of FD13B6835E248FAF4BD1838D6DF634AA7608AF04 not bound: primary key"
+                detail: std::env::var("RPGP_DETAIL")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| {
+                        "Subkey of FD13B6835E248FAF4BD1838D6DF634AA7608AF04 not bound: primary key"
+                            .into()
+                    })
+                    .as_str()
                     .into(),
                 authentication: "".into(),
                 authenticated: false,

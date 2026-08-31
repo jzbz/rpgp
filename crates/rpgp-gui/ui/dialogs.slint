@@ -494,78 +494,91 @@ export component DecryptVerifyDialog inherits DialogShell {
                 padding: Theme.s3;
                 spacing: Theme.s2;
 
-                HorizontalLayout {
-                    spacing: Theme.s2;
+                // The icon sits in a reserved gutter rather than in a row
+                // beside the text, and that is what makes the box the right
+                // height. A wrapping text can only report the height it needs
+                // once its width is settled; as a stretchy child of a
+                // horizontal layout its width is settled *after* the row has
+                // fixed its height, so the row counted one line and every
+                // wrapped line after the first was drawn outside the coloured
+                // box. Given a known width it reports honestly and the box
+                // grows to fit. 24px is the icon's 16px plus s2 — the same
+                // gutter the signature rows below already indent by, which is
+                // why they line up.
+                Rectangle {
                     Icon {
                         glyph: root.result-tone == 1 ? Icons.check : Icons.cross;
                         tint: root.result-tone == 1 ? Theme.ok
                             : root.result-tone == 2 ? Theme.warn
                             : Theme.danger;
-                        y: (parent.height - self.height) / 2;
+                        x: 0;
+                        y: 2px;
                     }
-                    Text {
-                        text: root.result;
-                        color: root.result-tone == 1 ? Theme.ok
-                            : root.result-tone == 2 ? Theme.warn
-                            : Theme.danger;
-                        font-size: Theme.t-md;
-                        font-weight: Theme.w-medium;
-                        wrap: word-wrap;
-                        horizontal-stretch: 1;
+                    VerticalLayout {
+                        padding-left: 24px;
+                        Text {
+                            // Same reason as the detail text below: bind the
+                            // width or the reported height is always one line.
+                            width: parent.width - 24px;
+                            text: root.result;
+                            color: root.result-tone == 1 ? Theme.ok
+                                : root.result-tone == 2 ? Theme.warn
+                                : Theme.danger;
+                            font-size: Theme.t-md;
+                            font-weight: Theme.w-medium;
+                            wrap: word-wrap;
+                        }
                     }
                 }
 
-                for signature in root.signatures: HorizontalLayout {
-                    spacing: Theme.s2;
+                // Pills above the text for the same reason: inline, the text
+                // is stretchy and its height goes uncounted, and a sibling's
+                // width cannot be referenced to fix that without a binding
+                // loop. Stacked, the text is a direct child of a layout whose
+                // width is already known.
+                for signature in root.signatures: VerticalLayout {
                     padding-left: 24px;
-                    Pill {
-                        text: signature.good ? "good" : "bad";
-                        tone: signature.good ? Tone.ok : Tone.danger;
-                        y: (parent.height - self.height) / 2;
-                    }
-                    // Two different questions, two pills: the first says the
-                    // signature checks out against a key, this one says
-                    // whether that key is known to belong to the name beside
-                    // it. Only the second is reassuring on its own.
-                    if signature.good: Pill {
-                        text: signature.authentication;
-                        tone: signature.authenticated ? Tone.accent : Tone.warn;
-                        y: (parent.height - self.height) / 2;
-                    }
-                    // A third question again: not whether the signature checks
-                    // out, nor whether the name is vouched for, but how much a
-                    // check that passed is worth. SHA-1 collisions are
-                    // practical, so this one says the key was involved rather
-                    // than that its holder signed this.
-                    if signature.sha1: Pill {
-                        text: "SHA-1";
-                        tone: Tone.warn;
-                        y: (parent.height - self.height) / 2;
-                    }
-                    // The nesting is load-bearing, not tidiness. As a direct
-                    // stretchy child of this row the text was allotted one
-                    // line's height, wrapped to two, and had the overflow
-                    // clipped by the banner — worse the longer the failure,
-                    // which is backwards for the message that most needs
-                    // reading. Its width is only settled after the pills
-                    // beside it are measured, and by then the row's height
-                    // has been decided; a layout of its own is what lets the
-                    // wrapped height propagate back out. `alignment: center`
-                    // keeps a one-line signer level with the pills, which is
-                    // what `vertical-alignment` on the text used to do — and
-                    // that centred a two-line text inside a one-line box, so
-                    // it spilled past both edges rather than just the bottom.
-                    VerticalLayout {
-                        horizontal-stretch: 1;
-                        alignment: center;
-                        Text {
-                            text: signature.good
-                                ? signature.signer
-                                : (signature.detail == "" ? signature.signer : signature.detail);
-                            color: Theme.text;
-                            font-size: Theme.t-sm;
-                            wrap: word-wrap;
+                    spacing: Theme.s1;
+
+                    HorizontalLayout {
+                        spacing: Theme.s2;
+                        alignment: start;
+                        Pill {
+                            text: signature.good ? "good" : "bad";
+                            tone: signature.good ? Tone.ok : Tone.danger;
                         }
+                        // Two different questions, two pills: the first says
+                        // the signature checks out against a key, this one
+                        // says whether that key is known to belong to the name
+                        // beside it. Only the second is reassuring on its own.
+                        if signature.good: Pill {
+                            text: signature.authentication;
+                            tone: signature.authenticated ? Tone.accent : Tone.warn;
+                        }
+                        // A third question again: not whether the signature
+                        // checks out, nor whether the name is vouched for, but
+                        // how much a check that passed is worth. SHA-1
+                        // collisions are practical, so this one says the key
+                        // was involved rather than that its holder signed this.
+                        if signature.sha1: Pill {
+                            text: "SHA-1";
+                            tone: Tone.warn;
+                        }
+                    }
+
+                    Text {
+                        // Explicit, even though the layout would give it the
+                        // same width anyway: Slint computes a wrapping text's
+                        // preferred height at its *natural* width unless the
+                        // width is already bound, so without this the height
+                        // it reports is one line no matter how many it draws.
+                        width: parent.width - 24px;
+                        text: signature.good
+                            ? signature.signer
+                            : (signature.detail == "" ? signature.signer : signature.detail);
+                        color: Theme.text;
+                        font-size: Theme.t-sm;
+                        wrap: word-wrap;
                     }
                 }
             }
@@ -1165,6 +1178,11 @@ export component NotepadDialog inherits DialogShell {
                 padding: Theme.s3;
                 spacing: Theme.s1;
                 Text {
+                    // Bound, not inherited. Slint sizes a wrapping text's preferred
+                    // height at its natural width unless the width is already
+                    // bound, so an unbound one reports a single line however many
+                    // it draws, and the extra lines land outside the box.
+                    width: parent.width;
                     text: root.result;
                     color: root.result-tone == 1 ? Theme.ok
                         : root.result-tone == 2 ? Theme.warn : Theme.danger;
@@ -1173,6 +1191,7 @@ export component NotepadDialog inherits DialogShell {
                     wrap: word-wrap;
                 }
                 for signature in root.signatures: Text {
+                    width: parent.width;
                     // The notepad's banner is text rather than pills, so the
                     // SHA-1 caveat rides in the parenthesis beside the
                     // authentication verdict rather than as a badge of its own.
