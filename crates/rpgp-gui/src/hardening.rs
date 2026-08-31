@@ -55,7 +55,9 @@ pub fn harden() {
     // core file and someone attaching gdb to a running rpgp. There is no
     // portable equivalent: macOS has PT_DENY_ATTACH, which is bypassable and
     // breaks crash reporting, so the macOS answer is the hardened runtime at
-    // signing time instead.
+    // signing time instead — applied by `packaging/macos-sign.sh`, which signs
+    // with --options runtime and no entitlements file, so the bundle carries no
+    // get-task-allow. A locally built macOS binary is unsigned and has neither.
     #[cfg(target_os = "linux")]
     {
         use rustix::process::{DumpableBehavior, set_dumpable_behavior};

@@ -323,12 +323,14 @@ differs by platform, and the gap is wide enough to spell out:
 also revokes `ptrace`, including from another process of the same user, so `gdb`
 will not attach and a crash leaves nothing in `coredumpctl`.
 
-**macOS.** Only `RLIMIT_CORE` is set, and that has not been tested on macOS.
-There is no equivalent of the non-dumpable flag, so a debugger run by the same
-user can still attach to a running rPGP and read key material out of it. The
-supported answer is codesigning the release with the hardened runtime and
-without the `get-task-allow` entitlement — not done yet. Until it is, assume the
-macOS build offers none of this paragraph.
+**macOS.** `RLIMIT_CORE` is set, though that half has not been tested — the
+hardening tests are Linux-only. There is no equivalent of the non-dumpable flag,
+so debugger attach is denied at signing time rather than by the process itself:
+the released bundle is codesigned with the hardened runtime and no entitlements
+file, so it carries no `get-task-allow` and `task_for_pid` fails for a debugger
+run by the same user. `packaging/macos-sign.sh` is what applies it. A macOS
+binary you built yourself is unsigned and gets none of that — assume a debugger
+can attach to that one.
 
 Keeping passphrases off the accessibility bus is not platform-specific and
 applies to both. The bus publishes the contents of an ordinary text field

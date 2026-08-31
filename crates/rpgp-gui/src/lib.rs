@@ -2651,14 +2651,24 @@ fn reload(ui: &AppWindow, state: &Shared) {
         }
     };
 
+    // The bookkeeping reads below each fall back to an empty answer, and every
+    // one of those fallbacks errs in the safe direction: no trust roots means
+    // nothing authenticates, no SHA-1 entries means the strict policy, no secret
+    // fingerprints means no key claims to hold one. So a failure here cannot
+    // turn into a badge that overstates what is known — but it can make one
+    // quietly disappear, and an unexplained missing badge is exactly how "my key
+    // is gone" becomes a mystery. That is the reasoning behind the damaged-file
+    // survey further down, and it applies here too: fall back, then say so.
+    let mut degraded: Vec<&str> = Vec::new();
+
     // Summarised under the store's policy rather than the standard one, so a
     // certificate the user opted into SHA-1 shows the user IDs and subkeys it
     // actually has. Strict for everything else, and strict for all of it when
     // nothing is opted in — which is the ordinary case and costs nothing.
-    let sha1_policy = guard
-        .store
-        .sha1_policy()
-        .unwrap_or_else(|_| Sha1Policy::strict());
+    let sha1_policy = guard.store.sha1_policy().unwrap_or_else(|_| {
+        degraded.push("SHA-1 acceptance");
+        Sha1Policy::strict()
+    });
     guard.all = certs
         .iter()
         .map(|c| CertSummary::from_cert_with(c, &sha1_policy))
@@ -2670,18 +2680,30 @@ fn reload(ui: &AppWindow, state: &Shared) {
     let roots: Vec<String> = guard
         .store
         .effective_roots()
-        .unwrap_or_default()
+        .unwrap_or_else(|_| {
+            degraded.push("trust roots");
+            Default::default()
+        })
         .into_iter()
         .collect();
-    let explicit_roots = guard.store.trust_roots().unwrap_or_default();
-    let sha1_accepted = guard.store.sha1_accepted().unwrap_or_default();
+    let explicit_roots = guard.store.trust_roots().unwrap_or_else(|_| {
+        degraded.push("trust roots");
+        Default::default()
+    });
+    let sha1_accepted = guard.store.sha1_accepted().unwrap_or_else(|_| {
+        degraded.push("SHA-1 acceptance");
+        Default::default()
+    });
     let authenticated = wot::authenticate_all(&certs, &roots);
 
     // The secret half lives outside cert-d, so ask the store which ones it has
     // — once, as a set. Asking per certificate meant a stat syscall and four
     // string allocations each, to re-derive what the directory listing above
     // already produced.
-    let secrets = guard.store.secret_fingerprints().unwrap_or_default();
+    let secrets = guard.store.secret_fingerprints().unwrap_or_else(|_| {
+        degraded.push("secret keys");
+        Default::default()
+    });
     let State { all, .. } = &mut *guard;
     for summary in all.iter_mut() {
         let key = summary.fingerprint.to_uppercase();
@@ -2699,6 +2721,23 @@ fn reload(ui: &AppWindow, state: &Shared) {
     let store = guard.store.clone();
     drop(guard);
     apply_filter(ui, state);
+
+    // After apply_filter, never before: that sets the status line itself, so a
+    // message written earlier would be overwritten by the ordinary count and the
+    // reader would never see it. Two reads name the same file, so dedupe rather
+    // than tell them about trust roots twice.
+    if !degraded.is_empty() {
+        degraded.sort_unstable();
+        degraded.dedup();
+        ui.set_status(
+            format!(
+                "Loaded, but could not read: {}. Badges for those may be missing.",
+                degraded.join(", ")
+            )
+            .into(),
+        );
+    }
+
     survey_agent_and_secrets(ui, state, store);
 }
 
