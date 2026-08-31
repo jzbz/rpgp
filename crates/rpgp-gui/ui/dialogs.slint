@@ -531,18 +531,23 @@ export component DecryptVerifyDialog inherits DialogShell {
                     }
                 }
 
-                // Pills above the text for the same reason: inline, the text
-                // is stretchy and its height goes uncounted, and a sibling's
-                // width cannot be referenced to fix that without a binding
-                // loop. Stacked, the text is a direct child of a layout whose
-                // width is already known.
-                for signature in root.signatures: VerticalLayout {
-                    padding-left: 24px;
-                    spacing: Theme.s1;
-
-                    HorizontalLayout {
+                // The pills sit in a plain rectangle rather than in a row
+                // shared with the text, and that is what keeps them inline.
+                // A wrapping text only reports an honest height once its width
+                // is bound, and inside a horizontal layout the only way to
+                // express that width is in terms of the pills beside it —
+                // which is a binding loop, because there their width comes from
+                // the very layout pass being computed. Positioned outside a
+                // layout the pills' width is their own preferred width, settled
+                // before anything asks about heights, so the text can be
+                // measured against it.
+                for signature in root.signatures: Rectangle {
+                    pills := HorizontalLayout {
+                        x: 24px;
+                        y: 0;
+                        width: self.preferred-width;
+                        height: self.preferred-height;
                         spacing: Theme.s2;
-                        alignment: start;
                         Pill {
                             text: signature.good ? "good" : "bad";
                             tone: signature.good ? Tone.ok : Tone.danger;
@@ -566,19 +571,17 @@ export component DecryptVerifyDialog inherits DialogShell {
                         }
                     }
 
-                    Text {
-                        // Explicit, even though the layout would give it the
-                        // same width anyway: Slint computes a wrapping text's
-                        // preferred height at its *natural* width unless the
-                        // width is already bound, so without this the height
-                        // it reports is one line no matter how many it draws.
-                        width: parent.width - 24px;
-                        text: signature.good
-                            ? signature.signer
-                            : (signature.detail == "" ? signature.signer : signature.detail);
-                        color: Theme.text;
-                        font-size: Theme.t-sm;
-                        wrap: word-wrap;
+                    VerticalLayout {
+                        padding-left: 24px + pills.width + Theme.s2;
+                        Text {
+                            width: parent.width - 24px - pills.width - Theme.s2;
+                            text: signature.good
+                                ? signature.signer
+                                : (signature.detail == "" ? signature.signer : signature.detail);
+                            color: Theme.text;
+                            font-size: Theme.t-sm;
+                            wrap: word-wrap;
+                        }
                     }
                 }
             }
