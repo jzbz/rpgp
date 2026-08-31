@@ -3,6 +3,7 @@
 use std::time::SystemTime;
 
 use sequoia_openpgp::Cert;
+use sequoia_openpgp::policy::Policy;
 use sequoia_openpgp::types::RevocationStatus;
 
 use crate::policy;
@@ -53,6 +54,15 @@ pub struct CertSummary {
     pub authentication: crate::Authentication,
     /// Whether the user has designated this certificate a trust root.
     pub is_trust_root: bool,
+    /// The certificate is unusable, and SHA-1 self-signatures are the reason —
+    /// so offering the opt-in in [`crate::sha1`] would actually help. False for
+    /// a certificate that is broken some other way, where the opt-in would
+    /// change nothing and offering it would only mislead.
+    pub sha1_blocked: bool,
+    /// The user has opted this certificate into SHA-1 verification. Filled in
+    /// by the caller from [`crate::Store::sha1_accepted`], like
+    /// [`CertSummary::is_trust_root`] beside it.
+    pub sha1_accepted: bool,
     /// Why the certificate was revoked, when it has been.
     pub revocation: Option<String>,
     /// Serial of the smartcard whose key can sign for this certificate, when
@@ -63,8 +73,19 @@ pub struct CertSummary {
 }
 
 impl CertSummary {
+    /// Summarise under the standard policy.
     pub fn from_cert(cert: &Cert) -> Self {
-        let policy = policy();
+        Self::from_cert_with(cert, &policy())
+    }
+
+    /// Summarise under a caller-supplied policy.
+    ///
+    /// Exists so the key list can show an opted-in SHA-1 certificate as what it
+    /// is — a certificate with user IDs and subkeys — rather than as `unusable`
+    /// while its signatures verify perfectly well two panes over. Pass
+    /// [`crate::Store::sha1_policy`] to get that; pass nothing and you get the
+    /// standard policy, which is what every trust-bearing caller does.
+    pub fn from_cert_with(cert: &Cert, policy: &dyn Policy) -> Self {
         let now = SystemTime::now();
 
         let fingerprint = cert.fingerprint().to_hex();
@@ -77,12 +98,19 @@ impl CertSummary {
         // A certificate that fails to validate still gets a row in the list —
         // Kleopatra shows unusable certificates rather than hiding them — so
         // fall back to the unpoliced parts instead of returning an error.
-        let valid = cert.with_policy(&policy, now).ok();
+        let valid = cert.with_policy(policy, now).ok();
 
         let revoked = matches!(
-            cert.revocation_status(&policy, now),
+            cert.revocation_status(policy, now),
             RevocationStatus::Revoked(_)
         );
+
+        // Only asked when the certificate has already failed, which keeps it
+        // off the hot path: a store full of ordinary certificates pays nothing
+        // for this, and a certificate that is unusable anyway is worth one more
+        // check to find out whether the user can do something about it.
+        let sha1_blocked =
+            valid.is_none() && cert.with_policy(&crate::sha1::permissive(), now).is_ok();
 
         let user_ids: Vec<String> = match valid.as_ref() {
             Some(vc) => vc
@@ -148,6 +176,8 @@ impl CertSummary {
             has_secret,
             authentication: crate::Authentication::Unknown,
             is_trust_root: false,
+            sha1_blocked,
+            sha1_accepted: false,
             revocation: revoked.then(|| describe_revocation(cert)).flatten(),
             card_serial: None,
             agent_backed: false,
@@ -241,9 +271,12 @@ impl SubkeySummary {
 /// Every subkey of `cert`, primary key excluded — it is already the headline
 /// of the details pane.
 pub fn subkeys(cert: &Cert) -> Vec<SubkeySummary> {
-    let policy = policy();
+    subkeys_with(cert, &policy())
+}
+
+pub fn subkeys_with(cert: &Cert, policy: &dyn Policy) -> Vec<SubkeySummary> {
     let now = SystemTime::now();
-    let Ok(valid) = cert.with_policy(&policy, now) else {
+    let Ok(valid) = cert.with_policy(policy, now) else {
         return Vec::new();
     };
 
@@ -284,10 +317,13 @@ pub struct UserIdDetail {
 }
 
 pub fn user_ids(cert: &Cert) -> Vec<UserIdDetail> {
-    let policy = policy();
+    user_ids_with(cert, &policy())
+}
+
+pub fn user_ids_with(cert: &Cert, policy: &dyn Policy) -> Vec<UserIdDetail> {
     let now = SystemTime::now();
     let primary = cert
-        .with_policy(&policy, now)
+        .with_policy(policy, now)
         .ok()
         .and_then(|vc| vc.primary_userid().ok())
         .map(|ua| ua.userid().clone());
@@ -297,7 +333,7 @@ pub fn user_ids(cert: &Cert) -> Vec<UserIdDetail> {
             text: String::from_utf8_lossy(ua.userid().value()).into_owned(),
             is_primary: primary.as_ref() == Some(ua.userid()),
             revoked: matches!(
-                ua.revocation_status(&policy, now),
+                ua.revocation_status(policy, now),
                 RevocationStatus::Revoked(_)
             ),
             self_signed: ua

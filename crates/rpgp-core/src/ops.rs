@@ -32,6 +32,15 @@ pub struct SignatureReport {
     pub fingerprint: Option<String>,
     /// Human-readable reason, filled in for bad and unverifiable signatures.
     pub detail: String,
+    /// SHA-1 was load-bearing in accepting this signature: either the message
+    /// was hashed with it, or the signer's certificate only validated because
+    /// the user opted it into [`crate::sha1`].
+    ///
+    /// A good signature carrying this is weaker than a good signature without
+    /// it, and by a margin worth telling the reader about: SHA-1 collisions are
+    /// practical, so what it establishes is that the signer's key was involved,
+    /// not that the signer approved this particular document.
+    pub sha1: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -215,7 +224,11 @@ pub fn decrypt_stream<R: std::io::Read + Send + Sync>(
     passwords: &[&str],
     mut sink: impl Write,
 ) -> Result<VerifyResult> {
-    let policy = policy();
+    // The signature half of a decryption is still verification, so an opted-in
+    // sender is honoured here too. Our own decryption key is unaffected: the
+    // relaxation is keyed on the issuer of each signature, and nothing in the
+    // store opts our key in unless the user did so deliberately.
+    let policy = store.sha1_policy()?;
     let helper = Helper::new(store, passwords);
 
     let mut decryptor =
@@ -301,7 +314,7 @@ pub fn sign_cleartext(
 /// Verify a message that carries its own text: cleartext-signed, or signed and
 /// wrapped. Returns the text alongside the verdict.
 pub fn verify_inline(store: &Store, signed: &[u8]) -> Result<(Vec<u8>, VerifyResult)> {
-    let policy = policy();
+    let policy = store.sha1_policy()?;
     let helper = Helper::new(store, &[]);
 
     let mut verifier = VerifierBuilder::from_bytes(signed)?.with_policy(&policy, None, helper)?;
@@ -333,7 +346,7 @@ pub fn verify_inline(store: &Store, signed: &[u8]) -> Result<(Vec<u8>, VerifyRes
 
 /// Verify a detached signature over `data`.
 pub fn verify_detached(store: &Store, signature: &[u8], data: &[u8]) -> Result<VerifyResult> {
-    let policy = policy();
+    let policy = store.sha1_policy()?;
     let helper = Helper::new(store, &[]);
 
     let mut verifier =
@@ -439,12 +452,21 @@ impl VerificationHelper for Helper<'_> {
             for result in results {
                 self.signatures.push(match result {
                     Ok(good) => {
-                        let summary = crate::CertSummary::from_cert(good.ka.cert());
+                        let cert = good.ka.cert();
+                        // Deliberately the standard policy, not the one this
+                        // verification ran under: the question is what the
+                        // certificate looks like to everyone else, and
+                        // summarising it under its own opt-in would report the
+                        // certificate as ordinary in the one place the reader
+                        // most needs to hear that it is not.
+                        let summary = crate::CertSummary::from_cert(cert);
                         SignatureReport {
                             good: true,
                             signer: summary.primary_user_id.clone(),
                             fingerprint: Some(summary.fingerprint),
                             detail: String::new(),
+                            sha1: crate::sha1::hashed_with_sha1(good.sig)
+                                || crate::sha1::blocked(cert),
                         }
                     }
                     Err(err) => SignatureReport {
@@ -452,6 +474,7 @@ impl VerificationHelper for Helper<'_> {
                         signer: "unknown".to_string(),
                         fingerprint: None,
                         detail: format!("{err}"),
+                        sha1: false,
                     },
                 });
             }
@@ -928,7 +951,7 @@ pub fn verify_detached_files(
     // caller-supplied, while the signature beside it is a few hundred bytes.
     // verify_file reaches the same verdict as verify_bytes; this writes
     // nothing, so there is no output to keep intact.
-    let policy = policy();
+    let policy = store.sha1_policy()?;
     let helper = Helper::new(store, &[]);
     let mut verifier =
         DetachedVerifierBuilder::from_bytes(&signature)?.with_policy(&policy, None, helper)?;

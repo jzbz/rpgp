@@ -24,6 +24,14 @@ export struct CertRow {
     // internally sound.
     authentication: string,
     is-trust-root: bool,
+    // The certificate is unusable *because* its self-signatures are hashed
+    // with SHA-1, so the opt-in below would actually make it verifiable.
+    // False for a certificate that is unusable some other way, where offering
+    // the opt-in would weaken the policy for no gain.
+    sha1-blocked: bool,
+    // The user has opted this certificate into SHA-1 verification. Widens what
+    // verifies and nothing else — never what is trusted.
+    sha1-accepted: bool,
     // Why the certificate was revoked; empty when it has not been.
     revocation: string,
     // Smartcard serial when gpg-agent signs for this key from a card.
@@ -69,6 +77,10 @@ export struct SignatureRow {
     /// True only for a fully authenticated signer, so the reassuring styling
     /// is reserved for the case that has earned it.
     authenticated: bool,
+    /// SHA-1 was load-bearing in accepting this signature. A good signature
+    /// carrying this establishes that the signer's key was involved, not that
+    /// the signer approved this document — SHA-1 collisions are practical.
+    sha1: bool,
 }
 
 // A subkey row in the certificate details dialog.

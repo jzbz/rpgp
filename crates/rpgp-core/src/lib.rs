@@ -14,11 +14,13 @@ pub mod lifecycle;
 pub mod ops;
 pub mod revoke;
 pub mod secret;
+pub mod sha1;
 pub mod store;
 pub mod wot;
 
 pub use cert::{CertSummary, Validity};
 pub use error::{Error, Result};
+pub use sha1::Sha1Policy;
 pub use store::Store;
 pub use wot::Authentication;
 

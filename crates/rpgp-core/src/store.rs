@@ -72,6 +72,10 @@ pub struct Store {
     /// Fingerprints of secret keys that arrived from outside, one per line.
     /// These are *not* implicit trust roots — see [`Store::effective_roots`].
     imported_secrets_path: PathBuf,
+    /// Fingerprints the user has allowed SHA-1 for, one per line. Kept apart
+    /// from every other list here because it grants nothing: see
+    /// [`Store::sha1_policy`] and the [`crate::sha1`] module.
+    sha1_path: PathBuf,
 }
 
 /// A certificate in the store, borrowed rather than copied.
@@ -178,6 +182,7 @@ impl Store {
             secrets_dir: secrets_dir.to_path_buf(),
             roots_path: secrets_dir.with_file_name("trust-roots"),
             imported_secrets_path: secrets_dir.with_file_name("imported-secrets"),
+            sha1_path: secrets_dir.with_file_name("sha1-accepted"),
             revocations_dir: secrets_dir.with_file_name("revocations"),
         })
     }
@@ -283,6 +288,61 @@ impl Store {
         let mut text = roots.into_iter().collect::<Vec<_>>().join("\n");
         text.push('\n');
         write_private_atomic(&self.roots_path, &text)
+    }
+
+    /// Fingerprints the user has allowed SHA-1 signatures from.
+    ///
+    /// Read [`crate::sha1`] before using this for anything: the list widens
+    /// what *verifies*, and must never widen what is *trusted*. It is not a
+    /// weaker cousin of [`Store::trust_roots`] and the two are never combined.
+    pub fn sha1_accepted(&self) -> Result<BTreeSet<String>> {
+        match fs::read_to_string(&self.sha1_path) {
+            Ok(text) => Ok(text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_uppercase)
+                .collect()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+            Err(e) => Err(Error::io(
+                format!("reading {}", self.sha1_path.display()),
+                e,
+            )),
+        }
+    }
+
+    pub fn set_sha1_accepted(&self, fingerprint: &str, accepted: bool) -> Result<()> {
+        let mut list = self.sha1_accepted()?;
+        let key = hex_only(fingerprint).to_uppercase();
+        if accepted {
+            list.insert(key);
+        } else {
+            list.remove(&key);
+        }
+
+        let mut text = list.into_iter().collect::<Vec<_>>().join("\n");
+        text.push('\n');
+        write_private_atomic(&self.sha1_path, &text)
+    }
+
+    /// The policy the verification paths run under.
+    ///
+    /// Strict for every certificate except those the user opted in by
+    /// fingerprint, and strict for all of them when nothing is opted in — which
+    /// is the default and stays the default until someone acts.
+    ///
+    /// An opted-in fingerprint that no longer resolves to a certificate is
+    /// skipped rather than treated as an error: the user may have deleted the
+    /// key and left the line behind, and a stale entry should cost them a
+    /// silently strict verification, not a failed one.
+    pub fn sha1_policy(&self) -> Result<crate::Sha1Policy> {
+        let mut policy = crate::Sha1Policy::strict();
+        for fingerprint in self.sha1_accepted()? {
+            if let Ok(cert) = self.lookup(&fingerprint) {
+                policy.accept(&cert);
+            }
+        }
+        Ok(policy)
     }
 
     /// The roots the web of trust is actually evaluated against: the explicit

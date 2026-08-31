@@ -307,6 +307,7 @@ export component AppWindow inherits Window {
     callback certify-toggle-user-id(int);
     callback certify-run(int, bool, bool, int, string);
     callback toggle-trust-root();
+    callback toggle-sha1-accepted();
 
     // --- Revocation -------------------------------------------------------
     in-out property <bool> delete-open: false;
@@ -748,6 +749,15 @@ export component AppWindow inherits Window {
                                     : root.detail.validity == "expired" ? Tone.warn
                                     : Tone.danger;
                             }
+                            // An opted-in certificate summarises as "valid",
+                            // because under its own policy it is. Saying only
+                            // that would hide the asterisk the user themselves
+                            // attached to it, so the pill rides alongside.
+                            if root.detail.sha1-accepted: Pill {
+                                text: "SHA-1";
+                                tone: Tone.warn;
+                                glyph: Icons.shield;
+                            }
                             if root.detail.card-serial != "": Pill {
                                 text: "smartcard " + root.detail.card-serial;
                                 tone: Tone.accent;
@@ -781,6 +791,57 @@ export component AppWindow inherits Window {
                                     font-size: Theme.t-sm;
                                     wrap: word-wrap;
                                     horizontal-stretch: 1;
+                                }
+                            }
+                        }
+
+                        // Shown only when the opt-in is the actual question:
+                        // either SHA-1 is what makes this certificate unusable,
+                        // or the user has already accepted it. A certificate
+                        // that is unusable for some other reason gets nothing
+                        // here, because the checkbox would not help it.
+                        if root.detail.sha1-blocked || root.detail.sha1-accepted: Rectangle {
+                            background: Theme.warn-soft;
+                            border-radius: Theme.r-md;
+                            // As above the revocation notice: without this the
+                            // box keeps one line's height and the wrapped
+                            // explanation is drawn outside it.
+                            height: sha1-banner.preferred-height;
+
+                            sha1-banner := VerticalLayout {
+                                padding: Theme.s3;
+                                spacing: Theme.s2;
+
+                                HorizontalLayout {
+                                    spacing: Theme.s2;
+                                    Icon {
+                                        glyph: Icons.shield;
+                                        tint: Theme.warn;
+                                        y: 1px;
+                                    }
+                                    Text {
+                                        text: root.detail.sha1-accepted
+                                            ? "You accept SHA-1 from this certificate. Its signatures can be checked, but a good result shows only that this key was involved — not that its holder approved what you are reading."
+                                            : "This certificate signs itself with SHA-1, which is old enough to be forgeable, so none of it can be checked. Keys certified before about 2010 are often like this. You can accept SHA-1 from this one certificate to read its signatures.";
+                                        color: Theme.warn;
+                                        font-size: Theme.t-sm;
+                                        wrap: word-wrap;
+                                        horizontal-stretch: 1;
+                                    }
+                                }
+
+                                Check {
+                                    text: "Accept SHA-1 from this certificate";
+                                    checked: root.detail.sha1-accepted;
+                                    enabled: !root.busy;
+                                    toggled => { root.toggle-sha1-accepted(); }
+                                }
+
+                                Text {
+                                    text: "Applies to checking signatures and nothing else. This certificate can still never be verified through the web of trust, act as a trust root, or vouch for anyone else — and rPGP will not encrypt to it.";
+                                    color: Theme.text-faint;
+                                    font-size: Theme.t-sm;
+                                    wrap: word-wrap;
                                 }
                             }
                         }

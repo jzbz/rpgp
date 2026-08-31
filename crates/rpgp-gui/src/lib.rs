@@ -20,7 +20,7 @@ use rpgp_core::keygen::{self, KeyGenRequest, KeyType};
 use rpgp_core::lifecycle;
 use rpgp_core::ops::{self, InputKind, VerifyResult};
 use rpgp_core::revoke::{self, Reason, RevokeRequest};
-use rpgp_core::{CertSummary, Store, wot};
+use rpgp_core::{CertSummary, Sha1Policy, Store, wot};
 use slint::{ModelRc, SharedString, VecModel};
 use zeroize::Zeroizing;
 
@@ -1364,6 +1364,49 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
             }
         }
     });
+
+    ui.on_toggle_sha1_accepted({
+        let (ui_weak, state) = (ui.as_weak(), state.clone());
+        move || {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let fingerprint = ui.get_detail().fingerprint.to_string();
+            if fingerprint.is_empty() {
+                return;
+            }
+
+            let outcome = {
+                let guard = lock(&state);
+                let was_accepted = guard
+                    .all
+                    .iter()
+                    .find(|c| c.fingerprint == fingerprint)
+                    .is_some_and(|c| c.sha1_accepted);
+                guard.store.set_sha1_accepted(&fingerprint, !was_accepted)
+            };
+
+            match outcome {
+                Ok(()) => {
+                    // A full reload for the same reason the trust-root toggle
+                    // takes one: the certificate is re-summarised under a
+                    // different policy, so its user IDs, subkeys and
+                    // capabilities all change with it.
+                    reload(&ui, &state);
+                    reselect(&ui, &state, &fingerprint);
+                    ui.set_status(
+                        if ui.get_detail().sha1_accepted {
+                            "SHA-1 accepted for this certificate. Signatures from it can now be checked; it still cannot be trusted or encrypted to."
+                        } else {
+                            "SHA-1 no longer accepted for this certificate."
+                        }
+                        .into(),
+                    );
+                }
+                Err(e) => ui.set_status(format!("Could not change SHA-1 acceptance: {e}").into()),
+            }
+        }
+    });
 }
 
 /// The blocking half of Certify, run on a worker thread.
@@ -2608,7 +2651,18 @@ fn reload(ui: &AppWindow, state: &Shared) {
         }
     };
 
-    guard.all = certs.iter().map(|c| CertSummary::from_cert(c)).collect();
+    // Summarised under the store's policy rather than the standard one, so a
+    // certificate the user opted into SHA-1 shows the user IDs and subkeys it
+    // actually has. Strict for everything else, and strict for all of it when
+    // nothing is opted in — which is the ordinary case and costs nothing.
+    let sha1_policy = guard
+        .store
+        .sha1_policy()
+        .unwrap_or_else(|_| Sha1Policy::strict());
+    guard.all = certs
+        .iter()
+        .map(|c| CertSummary::from_cert_with(c, &sha1_policy))
+        .collect();
 
     // Authentication is a property of the whole graph, so it is computed once
     // for the store rather than per certificate. Trust roots are the explicit
@@ -2620,6 +2674,7 @@ fn reload(ui: &AppWindow, state: &Shared) {
         .into_iter()
         .collect();
     let explicit_roots = guard.store.trust_roots().unwrap_or_default();
+    let sha1_accepted = guard.store.sha1_accepted().unwrap_or_default();
     let authenticated = wot::authenticate_all(&certs, &roots);
 
     // The secret half lives outside cert-d, so ask the store which ones it has
@@ -2632,6 +2687,7 @@ fn reload(ui: &AppWindow, state: &Shared) {
         let key = summary.fingerprint.to_uppercase();
         summary.has_secret = secrets.contains(&key);
         summary.is_trust_root = explicit_roots.contains(&key);
+        summary.sha1_accepted = sha1_accepted.contains(&key);
         // The verdict for the identity actually shown on the row, not the
         // best over every identity on the certificate.
         summary.authentication = wot::for_user_id(&authenticated, &key, &summary.primary_user_id);
@@ -2678,6 +2734,7 @@ fn signature_rows(known: &[CertSummary], signatures: &[ops::SignatureReport]) ->
                 detail: s.detail.clone().into(),
                 authentication: authentication.as_str().into(),
                 authenticated: authentication == rpgp_core::Authentication::Full,
+                sha1: s.sha1,
             }
         })
         .collect()
@@ -2698,6 +2755,16 @@ fn signature_verdict(known: &[CertSummary], result: &ops::VerifyResult) -> (Stri
         return ("Signature is NOT valid".to_string(), 3);
     }
     let rows = signature_rows(known, &result.signatures);
+    // Ahead of the authentication check, and it has to be: a SHA-1 signer can
+    // never authenticate anyway, so without this the reader is told only that
+    // the identity is unverified — the smaller of the two problems, and the one
+    // that hides the larger. Never tone 1, whatever else is true of it.
+    if rows.iter().any(|r| r.sha1) {
+        return (
+            "Valid only because you accepted SHA-1 — this shows the key was involved, not that its holder signed this".to_string(),
+            2,
+        );
+    }
     if rows.iter().all(|r| r.authenticated) {
         ("Signature verified".to_string(), 1)
     } else {
@@ -2944,6 +3011,8 @@ pub fn to_row(summary: &CertSummary) -> CertRow {
         has_secret: summary.has_secret,
         authentication: summary.authentication.as_str().into(),
         is_trust_root: summary.is_trust_root,
+        sha1_blocked: summary.sha1_blocked,
+        sha1_accepted: summary.sha1_accepted,
         revocation: summary.revocation.clone().unwrap_or_default().into(),
         card_serial: summary.card_serial.clone().unwrap_or_default().into(),
     }
@@ -3072,6 +3141,7 @@ mod tests {
             signer: "Alice <alice@example.org>".to_string(),
             fingerprint: Some(fingerprint.to_string()),
             detail: String::new(),
+            sha1: false,
         }
     }
 
@@ -3179,6 +3249,40 @@ mod tests {
         };
         let store = [known(&fingerprint, Authentication::Full)];
         assert_eq!(signature_verdict(&store, &bad).1, 3);
+    }
+
+    /// SHA-1 outranks authentication in the banner, because it is the worse
+    /// news. An opted-in certificate cannot authenticate — so a reader who
+    /// only saw "identity is not verified" would be told the lesser of the two
+    /// problems and left to infer the greater one.
+    #[test]
+    fn a_sha1_signature_never_reads_as_verified() {
+        let fingerprint = "EF".repeat(20);
+        let mut sha1_report = report(&fingerprint, true);
+        sha1_report.sha1 = true;
+        let result = ops::VerifyResult {
+            signatures: vec![sha1_report],
+            decrypted_with: None,
+            encrypted: true,
+        };
+
+        // Even with the signer fully authenticated — which cannot happen for a
+        // real SHA-1 certificate, and is asserted here so that the banner does
+        // not quietly depend on that being enforced elsewhere.
+        let store = [known(&fingerprint, Authentication::Full)];
+        let (text, tone) = signature_verdict(&store, &result);
+        assert_eq!(tone, 2, "{text}");
+        assert!(text.contains("SHA-1"), "{text}");
+
+        // And a bad SHA-1 signature is still reported as bad, not as weak.
+        let mut bad = report(&fingerprint, false);
+        bad.sha1 = true;
+        let result = ops::VerifyResult {
+            signatures: vec![bad],
+            decrypted_with: None,
+            encrypted: true,
+        };
+        assert_eq!(signature_verdict(&store, &result).1, 3);
     }
 
     /// The rows carry the same distinction the banner does.

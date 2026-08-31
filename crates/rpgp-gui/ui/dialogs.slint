@@ -532,6 +532,16 @@ export component DecryptVerifyDialog inherits DialogShell {
                         tone: signature.authenticated ? Tone.accent : Tone.warn;
                         y: (parent.height - self.height) / 2;
                     }
+                    // A third question again: not whether the signature checks
+                    // out, nor whether the name is vouched for, but how much a
+                    // check that passed is worth. SHA-1 collisions are
+                    // practical, so this one says the key was involved rather
+                    // than that its holder signed this.
+                    if signature.sha1: Pill {
+                        text: "SHA-1";
+                        tone: Tone.warn;
+                        y: (parent.height - self.height) / 2;
+                    }
                     Text {
                         text: signature.good
                             ? signature.signer
@@ -1148,9 +1158,13 @@ export component NotepadDialog inherits DialogShell {
                     wrap: word-wrap;
                 }
                 for signature in root.signatures: Text {
+                    // The notepad's banner is text rather than pills, so the
+                    // SHA-1 caveat rides in the parenthesis beside the
+                    // authentication verdict rather than as a badge of its own.
                     text: (signature.good ? "good signature — " : "BAD — ")
                         + (signature.good
-                            ? signature.signer + " (" + signature.authentication + ")"
+                            ? signature.signer + " (" + signature.authentication
+                                + (signature.sha1 ? ", SHA-1" : "") + ")"
                             : signature.detail);
                     color: Theme.text;
                     font-size: Theme.t-sm;
