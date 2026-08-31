@@ -542,15 +542,30 @@ export component DecryptVerifyDialog inherits DialogShell {
                         tone: Tone.warn;
                         y: (parent.height - self.height) / 2;
                     }
-                    Text {
-                        text: signature.good
-                            ? signature.signer
-                            : (signature.detail == "" ? signature.signer : signature.detail);
-                        color: Theme.text;
-                        font-size: Theme.t-sm;
-                        vertical-alignment: center;
-                        wrap: word-wrap;
+                    // The nesting is load-bearing, not tidiness. As a direct
+                    // stretchy child of this row the text was allotted one
+                    // line's height, wrapped to two, and had the overflow
+                    // clipped by the banner — worse the longer the failure,
+                    // which is backwards for the message that most needs
+                    // reading. Its width is only settled after the pills
+                    // beside it are measured, and by then the row's height
+                    // has been decided; a layout of its own is what lets the
+                    // wrapped height propagate back out. `alignment: center`
+                    // keeps a one-line signer level with the pills, which is
+                    // what `vertical-alignment` on the text used to do — and
+                    // that centred a two-line text inside a one-line box, so
+                    // it spilled past both edges rather than just the bottom.
+                    VerticalLayout {
                         horizontal-stretch: 1;
+                        alignment: center;
+                        Text {
+                            text: signature.good
+                                ? signature.signer
+                                : (signature.detail == "" ? signature.signer : signature.detail);
+                            color: Theme.text;
+                            font-size: Theme.t-sm;
+                            wrap: word-wrap;
+                        }
                     }
                 }
             }
