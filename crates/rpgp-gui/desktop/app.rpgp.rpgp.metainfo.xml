@@ -109,6 +109,42 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.1.3" date="2026-08-31">
+      <description>
+        <p>A way to read signatures from certificates too old for the standard
+        policy, and fixes to what the verification banner manages to say.</p>
+        <ul>
+          <li>Keys certified before about 2010 sign themselves with SHA-1, so
+          rPGP found no valid identity and no valid subkey on them and showed
+          the whole certificate as unusable — accurate, and no help to someone
+          trying to check a signature a project still publishes. Such a
+          certificate now offers to accept SHA-1 from that one certificate</li>
+          <li>Accepting it widens what can be checked and nothing else. The
+          certificate still cannot be authenticated through the web of trust,
+          act as a trust root, vouch for another key, or be encrypted to, and
+          every other certificate is judged exactly as strictly as before in
+          the same operation</li>
+          <li>What comes back is not a guarantee, and says so. SHA-1 collisions
+          are practical, so a signature that checks out shows the signer's key
+          was involved rather than that its holder approved the document. The
+          result leads with that, ahead of the identity verdict, and the
+          signature is marked SHA-1 wherever it is listed</li>
+          <li>The offer appears only where it would help — where SHA-1 is the
+          reason the certificate is unusable, not on one that is broken some
+          other way</li>
+          <li>The reason a verification failed could be cut off in the decrypt
+          and verify banner, sliced along the top and bottom of a box built for
+          a single line. The longer the failure, the less of it survived, which
+          is backwards for the message that most needs reading</li>
+          <li>That banner counted every wrapped line as one, so a verdict
+          running to three lines was drawn outside its coloured box entirely.
+          It is now sized to the text it actually draws</li>
+          <li>A certificate list that loads while part of the store cannot be
+          read now names the part that failed, rather than leaving a badge
+          missing with no explanation</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.2" date="2026-08-30">
       <description>
         <p>A Windows build, and fixes from a second review of the whole tree

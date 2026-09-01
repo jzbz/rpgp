@@ -228,7 +228,7 @@ pub fn decrypt_stream<R: std::io::Read + Send + Sync>(
     // sender is honoured here too. Our own decryption key is unaffected: the
     // relaxation is keyed on the issuer of each signature, and nothing in the
     // store opts our key in unless the user did so deliberately.
-    let policy = store.sha1_policy()?;
+    let policy = sha1_policy_or_strict(store);
     let helper = Helper::new(store, passwords);
 
     let mut decryptor =
@@ -311,10 +311,28 @@ pub fn sign_cleartext(
     Ok(())
 }
 
+/// The verification policy, degrading to strict rather than failing.
+///
+/// Reading the opt-in list can fail for reasons that have nothing to do with the
+/// message in hand — the file is there but unreadable, or holds bytes that are
+/// not UTF-8. Propagating that would make an unreadable `sha1-accepted` break
+/// every verify and decrypt in the app, including the overwhelming majority that
+/// never involve SHA-1 at all; before the opt-in existed those calls could not
+/// fail this way. Strict is the same answer an empty list gives, so the cost of
+/// the fallback is that an opted-in certificate stops being opted in, which
+/// fails closed. The GUI names the unreadable file in its status line when it
+/// reloads, so the condition is reported once where it can be explained rather
+/// than at every operation.
+fn sha1_policy_or_strict(store: &Store) -> crate::Sha1Policy {
+    store
+        .sha1_policy()
+        .unwrap_or_else(|_| crate::Sha1Policy::strict())
+}
+
 /// Verify a message that carries its own text: cleartext-signed, or signed and
 /// wrapped. Returns the text alongside the verdict.
 pub fn verify_inline(store: &Store, signed: &[u8]) -> Result<(Vec<u8>, VerifyResult)> {
-    let policy = store.sha1_policy()?;
+    let policy = sha1_policy_or_strict(store);
     let helper = Helper::new(store, &[]);
 
     let mut verifier = VerifierBuilder::from_bytes(signed)?.with_policy(&policy, None, helper)?;
@@ -346,7 +364,7 @@ pub fn verify_inline(store: &Store, signed: &[u8]) -> Result<(Vec<u8>, VerifyRes
 
 /// Verify a detached signature over `data`.
 pub fn verify_detached(store: &Store, signature: &[u8], data: &[u8]) -> Result<VerifyResult> {
-    let policy = store.sha1_policy()?;
+    let policy = sha1_policy_or_strict(store);
     let helper = Helper::new(store, &[]);
 
     let mut verifier =
@@ -951,7 +969,7 @@ pub fn verify_detached_files(
     // caller-supplied, while the signature beside it is a few hundred bytes.
     // verify_file reaches the same verdict as verify_bytes; this writes
     // nothing, so there is no output to keep intact.
-    let policy = store.sha1_policy()?;
+    let policy = sha1_policy_or_strict(store);
     let helper = Helper::new(store, &[]);
     let mut verifier =
         DetachedVerifierBuilder::from_bytes(&signature)?.with_policy(&policy, None, helper)?;

@@ -5834,7 +5834,7 @@ dependencies = [
 
 [[package]]
 name = "rpgp-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5858,7 +5858,7 @@ dependencies = [
 
 [[package]]
 name = "rpgp-gui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "arboard",
  "i-slint-backend-testing",

@@ -15,7 +15,7 @@
 # zip is what makes this work — an unsigned one would install and then refuse
 # to open, which is worse than not offering it.
 cask "rpgp" do
-  version "0.1.2"
+  version "0.1.3"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
 
   url "https://github.com/jzbz/rpgp/releases/download/v#{version}/rpgp-v#{version}-macos-universal.zip",

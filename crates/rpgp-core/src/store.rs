@@ -171,6 +171,7 @@ impl Store {
         for path in [
             secrets_dir.with_file_name("trust-roots"),
             secrets_dir.with_file_name("imported-secrets"),
+            secrets_dir.with_file_name("sha1-accepted"),
         ] {
             if path.is_file() {
                 restrict(&path, 0o600)?;

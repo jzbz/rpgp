@@ -315,3 +315,77 @@ mod sha1_message_hash {
         );
     }
 }
+
+/// An unreadable opt-in list must not break operations that have nothing to do
+/// with it.
+///
+/// The opt-in made the verification policy fallible where it had been infallible,
+/// and propagating that error would have meant a single unreadable bookkeeping
+/// file turning every verify and decrypt into a failure — including the ones that
+/// never touch SHA-1. Strict is what an empty list yields anyway, so degrading to
+/// it costs an opted-in certificate its opt-in and nothing else.
+#[test]
+fn an_unreadable_opt_in_list_degrades_to_strict_rather_than_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = dir.path().join("secrets");
+    let store = Store::open(dir.path().join("certs.d"), &secrets).unwrap();
+
+    let signer = Cert::from_bytes(include_bytes!("fixtures/sha1-signer.asc")).unwrap();
+    store.insert(&signer).unwrap();
+
+    // Bytes that are not UTF-8, so the read errors rather than returning empty.
+    let path = secrets.with_file_name("sha1-accepted");
+    std::fs::write(&path, b"\xff\xfe not utf-8 \xff").unwrap();
+    assert!(
+        store.sha1_accepted().is_err(),
+        "the fixture must actually make the read fail, or this proves nothing"
+    );
+
+    // A perfectly ordinary signature, unrelated to SHA-1, still verifies.
+    let mut signed = Vec::new();
+    let mine = rpgp_core::keygen::generate(&rpgp_core::keygen::KeyGenRequest::new(
+        "Me <me@example.com>",
+    ))
+    .unwrap()
+    .cert;
+    store.insert_secret(&mine).unwrap();
+    rpgp_core::ops::sign_detached(&mine, None, b"hello", &mut signed).unwrap();
+    let ok = rpgp_core::ops::verify_detached(&store, &signed, b"hello")
+        .expect("an unreadable opt-in list must not fail an unrelated verification");
+    assert!(ok.all_good(), "{ok:?}");
+
+    // And the SHA-1 signature is refused, because strict is the fallback.
+    let refused = rpgp_core::ops::verify_detached(
+        &store,
+        include_bytes!("fixtures/sha1-detached.asc"),
+        b"the quick brown fox",
+    );
+    assert!(
+        refused.as_ref().is_ok_and(|r| !r.all_good()),
+        "the fallback must fail closed and must still return a verdict: {refused:?}"
+    );
+}
+
+/// The opt-in list is repaired to 0600 on open, like the two bookkeeping files
+/// beside it. It records which certificates the user has weakened a rule for, so
+/// anyone able to write it can widen what verifies.
+#[cfg(unix)]
+#[test]
+fn the_opt_in_list_is_repaired_to_private_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = dir.path().join("secrets");
+    {
+        let store = Store::open(dir.path().join("certs.d"), &secrets).unwrap();
+        store.set_sha1_accepted(&"AB".repeat(20), true).unwrap();
+    }
+
+    // Whatever a careless earlier build might have left behind.
+    let path = secrets.with_file_name("sha1-accepted");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let _store = Store::open(dir.path().join("certs.d"), &secrets).unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "reopening the store should have repaired it");
+}

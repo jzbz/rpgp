@@ -184,10 +184,11 @@ jobs:
           name: flatpak-${{ matrix.arch }}
           path: '*.flatpak'
 
-  # Not wired into `release` below, and deliberately: Windows is not a platform
-  # rpgp ships for yet. This exists to keep the release build honest — the
-  # workspace links on Windows in CI, but a debug link is not a release link,
-  # and LTO and codegen settings have their own ways of failing.
+  # Wired into `release` below, which needs this job and uploads its .exe:
+  # Windows has shipped since v0.1.2 and the winget manifests point at the asset
+  # produced here. It also keeps the release build honest — the workspace links
+  # on Windows in CI, but a debug link is not a release link, and LTO and
+  # codegen settings have their own ways of failing.
   #
   # Dispatching this workflow with a ref that does not start with `v` builds
   # every job here and skips the publish step, which is how to exercise this
