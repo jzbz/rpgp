@@ -102,5 +102,5 @@ modules:
         tag: v0.1.3
         # Pinned alongside the tag so a tag that is later moved cannot change
         # what Flathub builds. Both have to be updated together on a release.
-        commit: d32c7d6c13317c449a5faedcf08c7693aaf8f5fa
+        commit: baa82bf012e388fd62106ec91ec177d635332e69
       - cargo-sources.json
