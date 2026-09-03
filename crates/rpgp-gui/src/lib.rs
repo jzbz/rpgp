@@ -141,6 +141,10 @@ struct State {
     /// certificate on every reload and every keystroke. Rebuilt by
     /// `apply_filter` whenever `all` changes, so an index is never stale.
     shown: Vec<usize>,
+    /// Which reload the contents of `all` came from. Bumped when one is asked
+    /// for and checked when its worker comes back, so two mutations in quick
+    /// succession cannot have the slower read put an older keyring back.
+    reload_generation: u64,
     filter: String,
     scope: Scope,
     sort: Sort,
@@ -367,6 +371,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         store: Arc::new(store),
         all: Vec::new(),
         shown: Vec::new(),
+        reload_generation: 0,
         filter: String::new(),
         scope: Scope::All,
         sort: Sort::MineFirst,
@@ -628,10 +633,14 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
                         };
                         ui.set_busy(false);
                         match outcome {
-                            Ok(message) => {
-                                reload(&ui, &state);
-                                ui.set_status(message.into());
-                            }
+                            Ok(message) => reload_after(
+                                &ui,
+                                &state,
+                                AfterReload {
+                                    status: Some(message),
+                                    ..Default::default()
+                                },
+                            ),
                             Err(e) => ui.set_status(format!("Import failed: {e}").into()),
                         }
                     });
@@ -730,8 +739,14 @@ fn wire_keygen(ui: &AppWindow, state: &Shared) {
                     }) {
                         Ok(fingerprint) => {
                             ui.set_keygen_open(false);
-                            reload(&ui, &state);
-                            ui.set_status(format!("Created {fingerprint}").into());
+                            reload_after(
+                                &ui,
+                                &state,
+                                AfterReload {
+                                    status: Some(format!("Created {fingerprint}")),
+                                    ..Default::default()
+                                },
+                            );
                         }
                         Err(e) => ui.set_status(format!("Key generation failed: {e}").into()),
                     }
@@ -1333,8 +1348,14 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
                     match outcome {
                         Ok(count) => {
                             ui.set_certify_open(false);
-                            reload(&ui, &state);
-                            ui.set_status(format!("Certified {count} user ID(s)").into());
+                            reload_after(
+                                &ui,
+                                &state,
+                                AfterReload {
+                                    status: Some(format!("Certified {count} user ID(s)")),
+                                    ..Default::default()
+                                },
+                            );
                         }
                         Err(message) => ui.set_status(message.into()),
                     }
@@ -1368,8 +1389,14 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
                 Ok(()) => {
                     // Trust roots change what the whole graph authenticates,
                     // so this is a full recompute, not a row update.
-                    reload(&ui, &state);
-                    reselect(&ui, &state, &fingerprint);
+                    reload_after(
+                        &ui,
+                        &state,
+                        AfterReload {
+                            select: Some(fingerprint),
+                            ..Default::default()
+                        },
+                    );
                 }
                 Err(e) => ui.set_status(format!("Could not change trust root: {e}").into()),
             }
@@ -1387,14 +1414,17 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
                 return;
             }
 
-            let outcome = {
+            let (accepted, outcome) = {
                 let guard = lock(&state);
                 let was_accepted = guard
                     .all
                     .iter()
                     .find(|c| c.fingerprint == fingerprint)
                     .is_some_and(|c| c.sha1_accepted);
-                guard.store.set_sha1_accepted(&fingerprint, !was_accepted)
+                (
+                    !was_accepted,
+                    guard.store.set_sha1_accepted(&fingerprint, !was_accepted),
+                )
             };
 
             match outcome {
@@ -1403,15 +1433,25 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
                     // takes one: the certificate is re-summarised under a
                     // different policy, so its user IDs, subkeys and
                     // capabilities all change with it.
-                    reload(&ui, &state);
-                    reselect(&ui, &state, &fingerprint);
-                    ui.set_status(
-                        if ui.get_detail().sha1_accepted {
-                            "SHA-1 accepted for this certificate. Signatures from it can now be checked; it still cannot be trusted or encrypted to."
-                        } else {
-                            "SHA-1 no longer accepted for this certificate."
-                        }
-                        .into(),
+                    //
+                    // The message comes from what was just written rather than
+                    // from reading the row back. It used to read `detail` after
+                    // reselect, which only worked while the reload was
+                    // synchronous; the store is the authority either way.
+                    reload_after(
+                        &ui,
+                        &state,
+                        AfterReload {
+                            select: Some(fingerprint),
+                            status: Some(
+                                if accepted {
+                                    "SHA-1 accepted for this certificate. Signatures from it can now be checked; it still cannot be trusted or encrypted to."
+                                } else {
+                                    "SHA-1 no longer accepted for this certificate."
+                                }
+                                .to_string(),
+                            ),
+                        },
                     );
                 }
                 Err(e) => ui.set_status(format!("Could not change SHA-1 acceptance: {e}").into()),
@@ -1703,13 +1743,19 @@ fn wire_lookup(ui: &AppWindow, state: &Shared) {
 
             match outcome {
                 Ok(who) => {
-                    reload(&ui, &state);
-                    // Imported, not trusted: a fetched certificate is
-                    // unauthenticated until somebody certifies it.
+                    // The lookup dialog's own line is not touched by
+                    // apply_filter, so it is set here; the main status line is.
                     ui.set_lookup_status(
                         format!("Imported {who}. It is unverified until you certify it.").into(),
                     );
-                    ui.set_status(format!("Imported {who} from the network").into());
+                    reload_after(
+                        &ui,
+                        &state,
+                        AfterReload {
+                            status: Some(format!("Imported {who} from the network")),
+                            ..Default::default()
+                        },
+                    );
                 }
                 Err(e) => ui.set_lookup_status(format!("Import failed: {e}").into()),
             }
@@ -1804,9 +1850,14 @@ fn wire_lifecycle(ui: &AppWindow, state: &Shared) {
                     match outcome {
                         Ok((message, fingerprint)) => {
                             ui.set_lifecycle_open(false);
-                            reload(&ui, &state);
-                            reselect(&ui, &state, &fingerprint);
-                            ui.set_status(message.into());
+                            reload_after(
+                                &ui,
+                                &state,
+                                AfterReload {
+                                    select: Some(fingerprint),
+                                    status: Some(message),
+                                },
+                            );
                         }
                         Err(message) => ui.set_status(message.into()),
                     }
@@ -2387,8 +2438,14 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
                     match outcome {
                         Ok(message) => {
                             ui.set_delete_open(false);
-                            reload(&ui, &state);
-                            ui.set_status(message.into());
+                            reload_after(
+                                &ui,
+                                &state,
+                                AfterReload {
+                                    status: Some(message),
+                                    ..Default::default()
+                                },
+                            );
                         }
                         Err(message) => ui.set_status(message.into()),
                     }
@@ -2472,9 +2529,14 @@ fn wire_revoke(ui: &AppWindow, state: &Shared) {
                     match outcome {
                         Ok((fingerprint, message)) => {
                             ui.set_revoke_open(false);
-                            reload(&ui, &state);
-                            reselect(&ui, &state, &fingerprint);
-                            ui.set_status(message.into());
+                            reload_after(
+                                &ui,
+                                &state,
+                                AfterReload {
+                                    select: Some(fingerprint),
+                                    status: Some(message),
+                                },
+                            );
                         }
                         Err(message) => ui.set_status(message.into()),
                     }
@@ -2643,11 +2705,44 @@ fn run_revoke(
 
 // ------------------------------------------------------------------- plumbing
 
+/// What a caller wants done once a reload's worker comes back.
+///
+/// Both fields exist because [`apply_filter`] runs at the end of a reload and
+/// writes over two things a caller used to set for itself. When the reload was
+/// synchronous, `reload(); reselect(); set_status()` ran in that order and the
+/// caller's writes landed last. Off the event loop it comes back a turn later,
+/// so what used to be the caller's next statement has to travel with the
+/// request instead.
+#[derive(Default)]
+struct AfterReload {
+    /// The row to put the selection back on. `None` keeps whichever row the
+    /// user is on, which is not the same as clearing it: a reload no longer
+    /// blocks them, so they are free to move while one is in flight.
+    select: Option<String>,
+    /// The confirmation the mutation wants shown — "Imported 3 certificates".
+    /// Set by the caller after `apply_filter` has had its say, exactly as it
+    /// was before.
+    status: Option<String>,
+}
+
+/// Everything a reload reads, with nothing in it that touches the window.
+struct Loaded {
+    all: Vec<CertSummary>,
+    /// Bookkeeping files that would not read. Named rather than counted, so
+    /// the status line can say which badge may be missing.
+    degraded: Vec<&'static str>,
+}
+
 /// Re-read the store from disk and rebuild the list.
 ///
 /// Everything here is local — cert-d, the trust graph, the secret-key
-/// directory — and runs on the event loop because the list has to exist before
-/// the call returns: several call sites follow it immediately with `reselect`.
+/// directory — and all of it now happens on a worker, because it does not fit
+/// in a frame. Measured by `benches/reload.rs`, the read is 18ms at a thousand
+/// certificates and 118ms at five thousand, against a 16ms budget; the web of
+/// trust alone is 62ms of that second figure. It ran on the event loop because
+/// the list had to exist before the call returned, several callers following it
+/// straight away with `reselect` — [`AfterReload`] carries that intent across
+/// the gap instead.
 ///
 /// It reads the secrets directory but does not open the keys in it: which
 /// certificates have a secret half is answered from the filenames, via
@@ -2655,15 +2750,101 @@ fn run_revoke(
 /// damaged-file survey that does re-parse every secret key, are handed to
 /// [`survey_agent_and_secrets`] instead.
 fn reload(ui: &AppWindow, state: &Shared) {
-    let mut guard = lock(state);
+    reload_after(ui, state, AfterReload::default());
+}
 
-    let certs = match guard.store.certs() {
-        Ok(certs) => certs,
-        Err(e) => {
-            ui.set_status(format!("Cannot read the certificate store: {e}").into());
-            return;
-        }
+/// [`reload`], with something to do when it lands.
+fn reload_after(ui: &AppWindow, state: &Shared, after: AfterReload) {
+    let (store, generation, first) = {
+        let mut guard = lock(state);
+        guard.reload_generation += 1;
+        (
+            guard.store.clone(),
+            guard.reload_generation,
+            guard.all.is_empty(),
+        )
     };
+
+    // Only when there is nothing on screen yet, which in practice means
+    // startup. A refresh of a list already showing keeps showing them, and
+    // replacing the count with this for one frame would just be a flicker.
+    if first {
+        ui.set_status("Reading the certificate store…".into());
+    }
+
+    let (ui_weak, state) = (ui.as_weak(), state.clone());
+    std::thread::spawn(move || {
+        let loaded = read_store(&store);
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            // A read that a newer one has already overtaken says nothing at
+            // all — not even its error, which would otherwise sit on the status
+            // line describing a store the newer read is about to succeed at.
+            // Without this the list could also go backwards: delete then
+            // import, and if the delete's read finishes second it puts the
+            // deleted certificate back on screen until something forces
+            // another reload.
+            if lock(&state).reload_generation != generation {
+                return;
+            }
+
+            let loaded = match loaded {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    ui.set_status(format!("Cannot read the certificate store: {e}").into());
+                    return;
+                }
+            };
+            lock(&state).all = loaded.all;
+
+            // Read before apply_filter, which clears it.
+            let select = after.select.or_else(|| {
+                ui.get_has_selection()
+                    .then(|| ui.get_detail().fingerprint.to_string())
+            });
+
+            apply_filter(&ui, &state);
+            if let Some(fingerprint) = &select {
+                reselect(&ui, &state, fingerprint);
+            }
+
+            // After apply_filter, never before: that sets the status line
+            // itself, so a message written earlier would be overwritten by the
+            // ordinary count and the reader would never see it. The caller's
+            // own confirmation wins over the degraded notice, which is the
+            // order these two arrived in when the caller set its status on the
+            // line after `reload`.
+            if let Some(status) = after.status {
+                ui.set_status(status.into());
+            } else if !loaded.degraded.is_empty() {
+                // Two reads name the same file, so dedupe rather than tell
+                // them about trust roots twice.
+                let mut degraded = loaded.degraded;
+                degraded.sort_unstable();
+                degraded.dedup();
+                ui.set_status(
+                    format!(
+                        "Loaded, but could not read: {}. Badges for those may be missing.",
+                        degraded.join(", ")
+                    )
+                    .into(),
+                );
+            }
+
+            survey_agent_and_secrets(&ui, &state, store);
+        });
+    });
+}
+
+/// The blocking half of a reload: every read of the store, and no window.
+///
+/// Split out for the same reason [`visible`] was — it is what the cost is, and
+/// it was unreachable from a worker thread while it lived inside a function
+/// that takes an `AppWindow`.
+fn read_store(store: &Store) -> std::result::Result<Loaded, String> {
+    let certs = store.certs().map_err(|e| e.to_string())?;
 
     // The bookkeeping reads below each fall back to an empty answer, and every
     // one of those fallbacks errs in the safe direction: no trust roots means
@@ -2672,18 +2853,18 @@ fn reload(ui: &AppWindow, state: &Shared) {
     // turn into a badge that overstates what is known — but it can make one
     // quietly disappear, and an unexplained missing badge is exactly how "my key
     // is gone" becomes a mystery. That is the reasoning behind the damaged-file
-    // survey further down, and it applies here too: fall back, then say so.
-    let mut degraded: Vec<&str> = Vec::new();
+    // survey elsewhere, and it applies here too: fall back, then say so.
+    let mut degraded: Vec<&'static str> = Vec::new();
 
     // Summarised under the store's policy rather than the standard one, so a
     // certificate the user opted into SHA-1 shows the user IDs and subkeys it
     // actually has. Strict for everything else, and strict for all of it when
     // nothing is opted in — which is the ordinary case and costs nothing.
-    let sha1_policy = guard.store.sha1_policy().unwrap_or_else(|_| {
+    let sha1_policy = store.sha1_policy().unwrap_or_else(|_| {
         degraded.push("SHA-1 acceptance");
         Sha1Policy::strict()
     });
-    guard.all = certs
+    let mut all: Vec<CertSummary> = certs
         .iter()
         .map(|c| CertSummary::from_cert_with(c, &sha1_policy))
         .collect();
@@ -2691,8 +2872,7 @@ fn reload(ui: &AppWindow, state: &Shared) {
     // Authentication is a property of the whole graph, so it is computed once
     // for the store rather than per certificate. Trust roots are the explicit
     // list plus every key whose secret half is here.
-    let roots: Vec<String> = guard
-        .store
+    let roots: Vec<String> = store
         .effective_roots()
         .unwrap_or_else(|_| {
             degraded.push("trust roots");
@@ -2700,11 +2880,11 @@ fn reload(ui: &AppWindow, state: &Shared) {
         })
         .into_iter()
         .collect();
-    let explicit_roots = guard.store.trust_roots().unwrap_or_else(|_| {
+    let explicit_roots = store.trust_roots().unwrap_or_else(|_| {
         degraded.push("trust roots");
         Default::default()
     });
-    let sha1_accepted = guard.store.sha1_accepted().unwrap_or_else(|_| {
+    let sha1_accepted = store.sha1_accepted().unwrap_or_else(|_| {
         degraded.push("SHA-1 acceptance");
         Default::default()
     });
@@ -2714,11 +2894,10 @@ fn reload(ui: &AppWindow, state: &Shared) {
     // — once, as a set. Asking per certificate meant a stat syscall and four
     // string allocations each, to re-derive what the directory listing above
     // already produced.
-    let secrets = guard.store.secret_fingerprints().unwrap_or_else(|_| {
+    let secrets = store.secret_fingerprints().unwrap_or_else(|_| {
         degraded.push("secret keys");
         Default::default()
     });
-    let State { all, .. } = &mut *guard;
     for summary in all.iter_mut() {
         let key = summary.fingerprint.to_uppercase();
         summary.has_secret = secrets.contains(&key);
@@ -2731,28 +2910,7 @@ fn reload(ui: &AppWindow, state: &Shared) {
 
     // Ordering belongs to apply_filter, so changing the sort does not
     // require re-reading the store.
-
-    let store = guard.store.clone();
-    drop(guard);
-    apply_filter(ui, state);
-
-    // After apply_filter, never before: that sets the status line itself, so a
-    // message written earlier would be overwritten by the ordinary count and the
-    // reader would never see it. Two reads name the same file, so dedupe rather
-    // than tell them about trust roots twice.
-    if !degraded.is_empty() {
-        degraded.sort_unstable();
-        degraded.dedup();
-        ui.set_status(
-            format!(
-                "Loaded, but could not read: {}. Badges for those may be missing.",
-                degraded.join(", ")
-            )
-            .into(),
-        );
-    }
-
-    survey_agent_and_secrets(ui, state, store);
+    Ok(Loaded { all, degraded })
 }
 
 /// Turn signature reports into rows, resolving each signer's authentication.
@@ -3208,6 +3366,59 @@ mod tests {
         summary.fingerprint = fingerprint.to_string();
         summary.authentication = authentication;
         summary
+    }
+
+    /// The reads that moved off the event loop, exercised where they now live.
+    ///
+    /// `read_store` is the whole of what a reload does before it touches the
+    /// window, and the stitching at the end of it is the part that would fail
+    /// quietly: `has_secret`, `is_trust_root` and `sha1_accepted` each come
+    /// from a different file, are matched to a row by uppercased fingerprint,
+    /// and a mismatch produces a row with somebody else's badges rather than an
+    /// error. Nothing else asserts on that join.
+    #[test]
+    fn read_store_puts_every_badge_on_the_right_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+
+        let generate = |user_id: &str| {
+            rpgp_core::keygen::generate(&rpgp_core::keygen::KeyGenRequest::new(user_id))
+                .unwrap()
+                .cert
+        };
+        let mine = generate("Me <me@example.org>");
+        let other = generate("Other <other@example.org>");
+        store.insert_secret(&mine).unwrap();
+        store.insert(&other).unwrap();
+
+        let (mine, other) = (mine.fingerprint().to_hex(), other.fingerprint().to_hex());
+        store.set_trust_root(&mine, true).unwrap();
+        store.set_sha1_accepted(&other, true).unwrap();
+
+        let loaded = read_store(&store).expect("a healthy store reads");
+        assert!(
+            loaded.degraded.is_empty(),
+            "nothing was damaged, so nothing should be reported: {:?}",
+            loaded.degraded
+        );
+        assert_eq!(loaded.all.len(), 2);
+
+        let row = |fingerprint: &str| {
+            loaded
+                .all
+                .iter()
+                .find(|c| c.fingerprint == fingerprint)
+                .unwrap_or_else(|| panic!("{fingerprint} is missing from the list"))
+        };
+        let (mine, other) = (row(&mine), row(&other));
+
+        assert!(mine.has_secret, "the secret half is in the store");
+        assert!(mine.is_trust_root, "it was just made one");
+        assert!(!mine.sha1_accepted, "the other certificate was opted in");
+
+        assert!(!other.has_secret);
+        assert!(!other.is_trust_root);
+        assert!(other.sha1_accepted);
     }
 
     /// The list is a view of positions into `all`, so ordering it must still

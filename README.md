@@ -203,8 +203,11 @@ identities that key had certified. The key still works for decrypting and
 signing — it simply does not vouch for anyone until you say so. Restoring your
 own backup is the same story: tick Trust root once, and it stays.
 
-The graph is rebuilt on every store reload rather than cached, which is fine
-for the sizes tested and will need revisiting for a keyring of thousands.
+The graph is rebuilt on every store reload rather than cached. At five thousand
+certificates that rebuild is about 62ms of a 118ms read — a caching layer would
+have to be invalidated by every certification, revocation and trust-root change,
+and taking the read off the event loop was the cheaper answer to the same
+complaint. A keyring well past that size will still want the cache.
 
 ## Encrypting with a password
 

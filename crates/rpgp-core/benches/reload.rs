@@ -1,9 +1,14 @@
 //! What a store reload costs, and how it scales.
 //!
 //! Reload is the dominant workload: it runs at startup and after every
-//! mutation — import, certify, revoke, keygen, delete — and it runs on the
-//! Slint event loop, so its cost is latency the user feels rather than
-//! throughput that can be amortised.
+//! mutation — import, certify, revoke, keygen, delete — so its cost is latency
+//! the user feels rather than throughput that can be amortised.
+//!
+//! It used to run on the Slint event loop, and these numbers are why it no
+//! longer does: 18ms at a thousand certificates and 118ms at five thousand,
+//! against a 16ms frame. Off the loop the cost is a list that fills a moment
+//! later rather than a window that stops repainting, but it is the same cost —
+//! this still measures the thing worth making smaller.
 //!
 //! Deliberately not criterion. The questions here are "does this scale" and
 //! "did that change help", both answered by wall-clock at two-times

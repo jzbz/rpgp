@@ -61,6 +61,9 @@ rustix = { version = "1", features = ["process"] }
 # ElementHandle::accessible_value, to assert on what the accessibility tree
 # actually publishes rather than trusting that input-type is enough.
 i-slint-backend-testing = "1.17"
+# A real store on disk for the reload tests: read_store takes a Store, and the
+# badges it stitches come from four separate files in one.
+tempfile = "3"
 
 [[bench]]
 name = "keystroke"
