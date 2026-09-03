@@ -71,9 +71,17 @@ impl VerifyResult {
 /// only has a shared secret.
 ///
 /// A password-only message is what `gpg -c` produces.
+///
+/// `Zeroizing`, to match the decrypt side: [`Helper`] has held its candidate
+/// passwords that way since it was written, and [`crate::keygen::KeyGenRequest`]
+/// its passphrase. This half took a plain `String` and so left the caller's
+/// copy — the only copy, since nothing here duplicates it — in freed memory
+/// after the message was written. Defence in depth rather than a fix for a
+/// reachable bug: reading it needs the address space, which `harden` already
+/// closes to `ptrace` and core dumps.
 pub fn encrypt(
     recipients: &[Cert],
-    passwords: &[String],
+    passwords: &[Zeroizing<String>],
     signer: Option<(&Cert, Option<&str>)>,
     plaintext: &[u8],
     sink: impl Write + Send + Sync,
@@ -88,12 +96,12 @@ pub fn encrypt(
 /// buffered form produced.
 fn encrypt_stream(
     recipients: &[Cert],
-    passwords: &[String],
+    passwords: &[Zeroizing<String>],
     signer: Option<(&Cert, Option<&str>)>,
     source: &mut dyn Read,
     sink: impl Write + Send + Sync,
 ) -> Result<()> {
-    let passwords: Vec<&String> = passwords.iter().filter(|p| !p.is_empty()).collect();
+    let passwords: Vec<&Zeroizing<String>> = passwords.iter().filter(|p| !p.is_empty()).collect();
     if recipients.is_empty() && passwords.is_empty() {
         return Err(Error::invalid(
             "choose at least one recipient, or set a password",
@@ -831,7 +839,7 @@ fn append_extension(path: &Path, extension: &str) -> PathBuf {
 
 pub fn encrypt_file(
     recipients: &[Cert],
-    passwords: &[String],
+    passwords: &[Zeroizing<String>],
     signer: Option<(&Cert, Option<&str>)>,
     input: &Path,
     output: &Path,
@@ -1696,7 +1704,7 @@ mod tests {
         let mut ciphertext = Vec::new();
         encrypt(
             &[],
-            &["hunter2".to_string()],
+            &[Zeroizing::new("hunter2".to_string())],
             None,
             b"no keys involved",
             &mut ciphertext,
@@ -1728,7 +1736,7 @@ mod tests {
         let mut ciphertext = Vec::new();
         encrypt(
             std::slice::from_ref(&alice),
-            &["message password".to_string()],
+            &[Zeroizing::new("message password".to_string())],
             None,
             b"either secret opens this",
             &mut ciphertext,
@@ -1765,7 +1773,7 @@ mod tests {
         let mut ciphertext = Vec::new();
         encrypt(
             std::slice::from_ref(&alice),
-            &["shared secret".to_string()],
+            &[Zeroizing::new("shared secret".to_string())],
             None,
             b"either way in",
             &mut ciphertext,
@@ -1787,7 +1795,16 @@ mod tests {
     #[test]
     fn refuses_a_message_addressed_to_nobody() {
         assert!(encrypt(&[], &[], None, b"x", Vec::new()).is_err());
-        assert!(encrypt(&[], &[String::new()], None, b"x", Vec::new()).is_err());
+        assert!(
+            encrypt(
+                &[],
+                &[Zeroizing::new(String::new())],
+                None,
+                b"x",
+                Vec::new()
+            )
+            .is_err()
+        );
     }
 
     #[test]

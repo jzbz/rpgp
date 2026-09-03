@@ -250,6 +250,29 @@ pub fn armor(signature: &Signature) -> Result<Vec<u8>> {
 /// This is the emergency path: it needs no secret key and no passphrase,
 /// because the signature was made when the revocation certificate was created.
 pub fn apply_revocation_file(store: &Store, path: &Path) -> Result<Cert> {
+    // Read whole, so the size has to be settled before reading rather than
+    // after: `PacketPile` holds every packet in the file at once, and this path
+    // takes a file somebody else made. The network fetch has had a cap for the
+    // same reason since it was written; a file simply arrives by a different
+    // road.
+    //
+    // The number is generous by three orders of magnitude, which is what makes
+    // it safe to apply here. A revocation certificate is one signature — GnuPG
+    // writes about seven hundred bytes — and even a certificate carrying a
+    // designated revoker adds only a handful more. Nor is this the door a large
+    // keyring comes through: `import_file` streams and handles those, and this
+    // function is only reached when it has already failed to find a single
+    // certificate in the file.
+    const MAX_REVOCATION: u64 = 1024 * 1024;
+    if let Ok(metadata) = std::fs::metadata(path)
+        && metadata.len() > MAX_REVOCATION
+    {
+        return Err(Error::invalid(format!(
+            "{} is too large to be a revocation certificate",
+            path.display()
+        )));
+    }
+
     let pile = PacketPile::from_file(path)
         .map_err(|_| Error::invalid(format!("{} is not an OpenPGP file", path.display())))?;
 
@@ -588,6 +611,40 @@ mod tests {
         let path = store.revocation_path(&fingerprint);
         let revoked = apply_revocation_file(&store, &path).unwrap();
         assert_eq!(CertSummary::from_cert(&revoked).validity, Validity::Revoked);
+    }
+
+    /// A real revocation certificate is under a kilobyte, so the cap is only
+    /// ever reached by something that is not one. Padding the genuine file is
+    /// the point: the same bytes that worked above are refused once there are
+    /// too many of them, which is the cap talking and not the parser.
+    #[test]
+    fn an_oversized_revocation_file_is_refused_before_it_is_parsed() {
+        let (_dir, store) = scratch();
+        let generated = generate(&KeyGenRequest::new("Me <me@example.org>")).unwrap();
+        store.insert_secret(&generated.cert).unwrap();
+
+        let fingerprint = generated.cert.fingerprint().to_hex();
+        let armored = armor(&generated.revocation).unwrap();
+        store.save_revocation(&fingerprint, &armored).unwrap();
+        let path = store.revocation_path(&fingerprint);
+
+        // Armor ignores trailing text, so the padding cannot be what breaks it.
+        let mut padded = std::fs::read(&path).unwrap();
+        padded.extend(std::iter::repeat_n(b'\n', 1024 * 1024 + 1));
+        std::fs::write(&path, &padded).unwrap();
+
+        let err = apply_revocation_file(&store, &path)
+            .expect_err("an oversized file was read whole")
+            .to_string();
+        assert!(
+            err.contains("too large to be a revocation certificate"),
+            "refused for the wrong reason: {err}"
+        );
+        assert_eq!(
+            CertSummary::from_cert(&store.lookup(&fingerprint).unwrap()).validity,
+            Validity::Valid,
+            "the refusal must leave the certificate alone"
+        );
     }
 
     #[test]

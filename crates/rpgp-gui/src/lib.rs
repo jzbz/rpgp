@@ -835,7 +835,15 @@ fn wire_sign_encrypt(ui: &AppWindow, state: &Shared) {
             );
 
             let (ui_weak, state) = (ui_weak.clone(), state.clone());
-            let (password, secret) = (password.to_string(), secret.to_string());
+            // These two copies live on the worker for the whole operation,
+            // which on a card can be a minute of waiting at a PIN prompt. The
+            // Slint string they are copied from cannot be wiped — that is the
+            // toolkit's memory — but ours can be, and this is where a passphrase
+            // and a message password sit longest.
+            let (password, secret) = (
+                Zeroizing::new(password.to_string()),
+                Zeroizing::new(secret.to_string()),
+            );
             std::thread::spawn(move || {
                 let _busy = BusyGuard(ui_weak.clone());
                 let outcome =
@@ -913,10 +921,13 @@ fn run_sign_encrypt(
                     .map_err(|e| format!("Recipient {label} unavailable: {e}"))?,
             );
         }
-        let passwords: Vec<String> = if secret.is_empty() {
+        // Zeroizing, as `ops::encrypt_file` now asks for: this vector holds the
+        // only copy of the message password that outlives the call, so it is
+        // the one worth wiping.
+        let passwords: Vec<Zeroizing<String>> = if secret.is_empty() {
             Vec::new()
         } else {
-            vec![secret.to_string()]
+            vec![Zeroizing::new(secret.to_string())]
         };
         if certs.is_empty() && passwords.is_empty() {
             return Err("Select a recipient, or set a password".to_string());
@@ -2060,8 +2071,11 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
             ui.set_status("Working…".into());
 
             let (ui_weak, state) = (ui_weak.clone(), state.clone());
-            let (text, password, secret) =
-                (text.to_string(), password.to_string(), secret.to_string());
+            let (text, password, secret) = (
+                text.to_string(),
+                Zeroizing::new(password.to_string()),
+                Zeroizing::new(secret.to_string()),
+            );
             std::thread::spawn(move || {
                 let _busy = BusyGuard(ui_weak.clone());
                 let outcome = run_notepad(&state, action, &text, signer_index, &password, &secret);
@@ -2176,10 +2190,10 @@ fn run_notepad(
         1 | 2 => {
             let certs = recipients()?;
             let signing = if action == 2 { Some(signer()?) } else { None };
-            let passwords: Vec<String> = if secret.is_empty() {
+            let passwords: Vec<Zeroizing<String>> = if secret.is_empty() {
                 Vec::new()
             } else {
-                vec![secret.to_string()]
+                vec![Zeroizing::new(secret.to_string())]
             };
             ops::encrypt(
                 &certs,

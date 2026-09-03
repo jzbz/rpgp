@@ -230,31 +230,17 @@ pub fn certify(store: &Store, request: &CertifyRequest) -> Result<Cert> {
     Ok(certified)
 }
 
-/// The primary user ID, chosen exactly as [`crate::cert::CertSummary::from_cert`]
-/// chooses it: the policy-valid primary user ID, else the first user ID present,
-/// else a placeholder. Duplicated from that function deliberately and kept in step
-/// with it by hand — building a whole summary per signature to read one field
-/// also walks every key for capabilities, computes revocation status and
-/// allocates a String per user ID, all of which is then dropped.
+/// The primary user ID under the standard policy, for naming a certifier.
+///
+/// The rule itself lives in [`crate::cert::primary_user_id`], called with the
+/// `ValidCert` resolved here: this file used to carry a copy of it, kept in
+/// step by hand, and the reason it gave for the copy — that reading one field
+/// off a whole `CertSummary` costs a walk of every key — is answered by
+/// sharing the rule rather than the summary.
 fn primary_user_id(cert: &Cert) -> String {
     let policy = policy();
-    let now = SystemTime::now();
-    let valid = cert.with_policy(&policy, now).ok();
-    valid
-        .as_ref()
-        .and_then(|vc| vc.primary_userid().ok())
-        .map(|ua| String::from_utf8_lossy(ua.userid().value()).into_owned())
-        .or_else(|| match valid.as_ref() {
-            Some(vc) => vc
-                .userids()
-                .next()
-                .map(|ua| String::from_utf8_lossy(ua.userid().value()).into_owned()),
-            None => cert
-                .userids()
-                .next()
-                .map(|ua| String::from_utf8_lossy(ua.userid().value()).into_owned()),
-        })
-        .unwrap_or_else(|| "(no user ID)".to_string())
+    let valid = cert.with_policy(&policy, SystemTime::now()).ok();
+    crate::cert::primary_user_id(cert, valid.as_ref())
 }
 
 /// Every third-party certification on `cert`, verified where possible.

@@ -10,6 +10,8 @@
 //! WKD is tried before a keyserver. A certificate served from the domain of
 //! the address itself carries more weight than one anybody could upload.
 
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sequoia_openpgp::Cert;
@@ -60,12 +62,13 @@ fn client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(TIMEOUT)
         .user_agent(concat!("rpgp/", env!("CARGO_PKG_VERSION")))
+        .dns_resolver(Arc::new(Guarded::new()))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 5 {
                 attempt.error("too many redirects")
             } else if attempt.url().scheme() != "https" {
                 attempt.error("redirected off HTTPS")
-            } else if redirects_inward(attempt.url()) {
+            } else if inward_literal(attempt.url()) {
                 attempt.error("redirected to a private address")
             } else {
                 attempt.follow()
@@ -74,8 +77,74 @@ fn client() -> Result<reqwest::Client> {
         .build()
         .map_err(|e| Error::invalid(format!("cannot build an HTTP client: {e}")))
 }
-/// Whether a redirect target names an address inside the machine or its
-/// network, which a keyserver never legitimately does.
+
+/// A resolver that refuses a name resolving inside the machine or its network.
+///
+/// [`inward_literal`] can only see an address written as an address, and the
+/// hosts this client is pointed at are not chosen here: a WKD URL is built from
+/// the domain half of whatever address someone handed the user, and a redirect
+/// names whatever the server likes. `evil.example` with an A record of
+/// 127.0.0.1 satisfied every test and probed the local network anyway — the
+/// case the note on `inward_literal` said it did not close, closed here.
+///
+/// Resolving rather than testing a URL also closes the gap between the check
+/// and the connection: reqwest connects to exactly the addresses handed back,
+/// so a second DNS answer cannot arrive in between.
+///
+/// The configured keyserver is exempt, and only it. `RPGP_KEYSERVER` exists for
+/// an organisation's internal server, which is precisely a name that resolves
+/// to a private address; refusing that would break the documented reason the
+/// variable exists. A WKD domain and a redirect target are somebody else's
+/// choice, so neither is exempt — including a redirect away from the keyserver,
+/// which matches how a redirect to a private *literal* has always been treated.
+struct Guarded {
+    /// The configured keyserver's host, lowercased, read once when the client
+    /// is built so a resolution cannot straddle a change to the variable.
+    exempt: Option<String>,
+}
+
+impl Guarded {
+    fn new() -> Self {
+        Self {
+            exempt: reqwest::Url::parse(&keyserver())
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_lowercase)),
+        }
+    }
+}
+
+impl reqwest::dns::Resolve for Guarded {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_lowercase();
+        let exempt = self.exempt.as_deref() == Some(host.as_str());
+        Box::pin(async move {
+            let lookup = host.clone();
+            // The system resolver, off the runtime thread, which is what the
+            // default resolver does too. Port 0 because reqwest substitutes the
+            // one the URL asked for.
+            let addrs: Vec<SocketAddr> =
+                tokio::task::spawn_blocking(move || (lookup.as_str(), 0u16).to_socket_addrs())
+                    .await??
+                    .collect();
+
+            // One inward answer refuses the name outright rather than being
+            // filtered out of the list: a server free to answer with a public
+            // address and a private one would otherwise still have the private
+            // one tried.
+            if !exempt && let Some(bad) = addrs.iter().find(|addr| inward(addr.ip())) {
+                return Err(format!(
+                    "{host} resolves to {}, which is inside this network",
+                    bad.ip()
+                )
+                .into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Whether a URL names an address inside the machine or its network, which a
+/// keyserver or a WKD host never legitimately does.
 ///
 /// Scheme and hop count alone left the client willing to follow a hostile
 /// server's `Location` to a loopback or RFC1918 address, turning a key lookup
@@ -83,12 +152,10 @@ fn client() -> Result<reqwest::Client> {
 /// parsed as a certificate and discarded, but the difference between a refused
 /// connection and a timeout is still an answer.
 ///
-/// Only IP literals are rejected. A DNS name that resolves inward still passes,
-/// because refusing that needs a resolver-level hook rather than a URL test;
-/// this closes the direct case and does not pretend to close the other one.
-fn redirects_inward(url: &reqwest::Url) -> bool {
-    use std::net::IpAddr;
-
+/// Only IP literals, and deliberately so: a literal never reaches a resolver at
+/// all, because hyper connects to one straight away. The name half of the same
+/// question belongs to [`Guarded`], which is where it is now answered.
+fn inward_literal(url: &reqwest::Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
@@ -111,9 +178,7 @@ fn redirects_inward(url: &reqwest::Url) -> bool {
 /// test below says no to it — `is_loopback` is true only of `::1`, and both
 /// segment masks read the first segment, which is zero in a mapped address. It
 /// therefore sailed through the guard and named 127.0.0.1 anyway.
-fn inward(addr: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-
+fn inward(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => {
             v4.is_private()
@@ -196,12 +261,25 @@ pub fn lookup_wkd(address: &str) -> Result<Vec<Found>> {
     // The advanced method is tried first, as the specification requires: a
     // domain that delegates to openpgpkey.<domain> should win over the direct
     // URL, which may be served by unrelated web hosting.
-    let urls = [
-        format!(
-            "https://openpgpkey.{domain}/.well-known/openpgpkey/{domain}/hu/{hash}?l={encoded}"
-        ),
-        format!("https://{domain}/.well-known/openpgpkey/hu/{hash}?l={encoded}"),
-    ];
+    let advanced = format!(
+        "https://openpgpkey.{domain}/.well-known/openpgpkey/{domain}/hu/{hash}?l={encoded}"
+    );
+    let direct = format!("https://{domain}/.well-known/openpgpkey/hu/{hash}?l={encoded}");
+
+    // The domain half of an address is not required to be a name: `alice@[::1]`
+    // and `alice@127.0.0.1:8080` are both accepted by the split above, and a
+    // literal never reaches [`Guarded`] because hyper connects to one without
+    // asking a resolver. So the URL test has to be applied here, where an
+    // address someone else supplied first becomes a URL. Only the direct form
+    // can be a literal — the advanced one carries an `openpgpkey.` prefix,
+    // which makes it a name whatever the domain was.
+    if reqwest::Url::parse(&direct).is_ok_and(|url| inward_literal(&url)) {
+        return Err(Error::invalid(format!(
+            "{address} names an address inside this network, not a domain to look up"
+        )));
+    }
+
+    let urls = [advanced, direct];
 
     for url in urls {
         if let Ok(bytes) = get(&url)
@@ -785,7 +863,7 @@ mod tests {
         ];
         for url in inward {
             let parsed = reqwest::Url::parse(url).unwrap();
-            assert!(redirects_inward(&parsed), "should have been refused: {url}");
+            assert!(inward_literal(&parsed), "should have been refused: {url}");
         }
 
         let outward = [
@@ -796,9 +874,114 @@ mod tests {
         ];
         for url in outward {
             let parsed = reqwest::Url::parse(url).unwrap();
+            assert!(!inward_literal(&parsed), "should have been allowed: {url}");
+        }
+    }
+
+    /// The name half of the same guard, which the URL test above cannot reach:
+    /// a domain that *resolves* inward rather than being written as an address.
+    ///
+    /// `localhost` is the one name every machine resolves to loopback, so it
+    /// stands in for the attacker's `evil.example` with an A record of
+    /// 127.0.0.1 without needing a resolver of our own. The exempt case is the
+    /// other half of the rule: `RPGP_KEYSERVER` exists for an internal server,
+    /// which is exactly a name resolving to a private address.
+    #[test]
+    fn refuses_a_name_that_resolves_inward_unless_it_is_the_keyserver() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let guarded = Guarded { exempt: None };
+        let outcome = runtime.block_on(async {
+            guarded
+                .resolve(reqwest::dns::Name::from_str("localhost").unwrap())
+                .await
+                .map(|addrs| addrs.collect::<Vec<_>>())
+        });
+        let err = outcome
+            .expect_err("a name resolving to loopback was allowed")
+            .to_string();
+        assert!(
+            err.contains("inside this network"),
+            "refused for the wrong reason: {err}"
+        );
+
+        let exempt = Guarded {
+            exempt: Some("localhost".to_string()),
+        };
+        let addrs = runtime
+            .block_on(async {
+                exempt
+                    .resolve(reqwest::dns::Name::from_str("localhost").unwrap())
+                    .await
+                    .map(|addrs| addrs.collect::<Vec<_>>())
+            })
+            .expect("the configured keyserver's own host must still resolve");
+        assert!(
+            addrs.iter().any(|addr| addr.ip().is_loopback()),
+            "the exempt host resolved to nothing inward: {addrs:?}"
+        );
+    }
+
+    /// The resolver is wired into the client, not merely correct in isolation.
+    ///
+    /// Every other test here points at an IP literal, which hyper connects to
+    /// without asking a resolver at all — so deleting the `dns_resolver` line
+    /// would leave all of them green. This one fetches a name: the server is
+    /// real and answers, so success is what happens if the guard is not
+    /// installed, and only the guard can turn it into an error.
+    #[test]
+    fn the_client_actually_asks_the_guarded_resolver() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // Not the keyserver, so `localhost` is not the exempt host.
+        unsafe { std::env::remove_var("RPGP_KEYSERVER") };
+
+        let body = b"nothing that parses as a certificate";
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        )
+        .into_bytes();
+        let origin = serve_once(reply);
+        let port = origin.rsplit_once(':').expect("origin carries a port").1;
+
+        let err = get(&format!("http://localhost:{port}/"))
+            .expect_err("a name resolving to loopback was fetched")
+            .to_string();
+        assert!(
+            err.contains("lookup failed"),
+            "refused for the wrong reason: {err}"
+        );
+    }
+
+    /// The domain half of an address is not required to be a name, and a
+    /// literal never reaches the resolver — hyper connects to one directly —
+    /// so `lookup_wkd` has to refuse it before building a URL. The port comes
+    /// along for free, which is what turns this from "reach loopback:443" into
+    /// a port scan.
+    #[test]
+    fn refuses_a_wkd_domain_written_as_an_address() {
+        for address in [
+            "alice@127.0.0.1",
+            "alice@127.0.0.1:8080",
+            "alice@[::1]",
+            "alice@10.0.0.5",
+            "alice@169.254.169.254",
+            "alice@[::ffff:127.0.0.1]",
+        ] {
+            let err = lookup_wkd(address)
+                .err()
+                .unwrap_or_else(|| panic!("{address} was looked up rather than refused"))
+                .to_string();
             assert!(
-                !redirects_inward(&parsed),
-                "should have been allowed: {url}"
+                err.contains("inside this network"),
+                "{address} refused for the wrong reason: {err}"
             );
         }
     }

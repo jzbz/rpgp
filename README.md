@@ -273,6 +273,20 @@ to `keys.openpgp.org`. `RPGP_KEYSERVER` overrides the server, for an internal
 one or for testing against a local stand-in rather than uploading to public
 infrastructure.
 
+A lookup is the least trusted fetch the app makes: a WKD URL is built from the
+domain half of whatever address was typed, and a redirect names whatever the
+server chooses. So neither is allowed to reach this machine or its network. An
+address written as an address is refused before a URL is built, and a *name* is
+resolved by a guard that hands reqwest only the addresses it approved — which
+also means no second DNS answer can arrive between the check and the connection.
+Without this, `alice@127.0.0.1:8080` was a port probe and `evil.example` with an
+A record of 127.0.0.1 was the same probe wearing a name.
+
+The server named by `RPGP_KEYSERVER` is the one exception, because an internal
+keyserver is precisely a name that resolves to a private address and that is
+what the variable is for. Nothing else is exempt, including a redirect away from
+that server.
+
 Publishing cannot be undone — a keyserver has no delete — so the dialog says so
 and uses the same danger styling as revocation. Only the public half is ever
 sent, and no local certification goes with it: `publish` serialises the

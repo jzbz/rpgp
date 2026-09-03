@@ -8,6 +8,37 @@ use sequoia_openpgp::types::RevocationStatus;
 
 use crate::policy;
 
+/// The name to show for a certificate: its policy-valid primary user ID, else
+/// the first user ID present, else a placeholder.
+///
+/// Shared with [`crate::certify`], which needs the same answer per signature.
+/// It used to carry its own copy of this rule, kept in step by hand, because
+/// the alternative on offer was building a whole [`CertSummary`] to read one
+/// field — which also walks every key for capabilities, computes revocation
+/// status and allocates a String per user ID, all of it then dropped. Taking
+/// the already-resolved `ValidCert` costs none of that, so the duplication had
+/// nothing left to buy.
+///
+/// `valid` is the certificate under whichever policy the caller cares about,
+/// or `None` when it satisfies none: a certificate too weak to validate still
+/// has a name, and refusing to show one is how a user loses track of the key
+/// they are trying to fix.
+pub(crate) fn primary_user_id(
+    cert: &Cert,
+    valid: Option<&sequoia_openpgp::cert::ValidCert<'_>>,
+) -> String {
+    let text =
+        |ua: &sequoia_openpgp::packet::UserID| String::from_utf8_lossy(ua.value()).into_owned();
+    valid
+        .and_then(|vc| vc.primary_userid().ok())
+        .map(|ua| text(ua.userid()))
+        .or_else(|| match valid {
+            Some(vc) => vc.userids().next().map(|ua| text(ua.userid())),
+            None => cert.userids().next().map(|ua| text(ua.userid())),
+        })
+        .unwrap_or_else(|| "(no user ID)".to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Validity {
     /// Binding signatures check out under the standard policy and the
@@ -123,12 +154,7 @@ impl CertSummary {
                 .collect(),
         };
 
-        let primary_user_id = valid
-            .as_ref()
-            .and_then(|vc| vc.primary_userid().ok())
-            .map(|ua| String::from_utf8_lossy(ua.userid().value()).into_owned())
-            .or_else(|| user_ids.first().cloned())
-            .unwrap_or_else(|| "(no user ID)".to_string());
+        let primary_user_id = primary_user_id(cert, valid.as_ref());
 
         let expires = valid
             .as_ref()
