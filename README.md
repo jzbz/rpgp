@@ -2,9 +2,10 @@
 
 [![CI](https://github.com/jzbz/rpgp/actions/workflows/ci.yml/badge.svg)](https://github.com/jzbz/rpgp/actions/workflows/ci.yml)
 
-An OpenPGP certificate manager for Linux and macOS, in the spirit of KDE's
-Kleopatra: a window that lists your certificates and lets you generate, import,
-export, sign, encrypt, decrypt and verify without touching a command line.
+An OpenPGP certificate manager for Linux, macOS and Windows, in the spirit of
+KDE's Kleopatra: a window that lists your certificates and lets you generate,
+import, export, sign, encrypt, decrypt and verify without touching a command
+line.
 
 Rust throughout, Slint for the GUI, Sequoia for the OpenPGP implementation. No
 webview, no Qt, no C++, no `gpg` subprocess.
@@ -73,6 +74,25 @@ inside the `XDG_DATA_HOME` you give it:
 ```bash
 XDG_DATA_HOME=/tmp/rpgp-demo cargo run -p rpgp-core --example seed-demo-store && XDG_DATA_HOME=/tmp/rpgp-demo cargo run -p rpgp-gui
 ```
+
+## Installing
+
+A [release](https://github.com/jzbz/rpgp/releases) carries a Flatpak bundle for
+`x86_64` and `aarch64`, a universal `.app` for macOS, and one self-contained
+`.exe` for Windows. The macOS bundle is signed with a Developer ID and notarised
+by Apple, so it opens on first launch rather than having to be talked past
+Gatekeeper; the Windows executable is not signed, so SmartScreen warns on first
+run and then lets you through.
+
+```bash
+brew install --cask jzbz/tap/rpgp                  # macOS, from the tap
+flatpak install ./rpgp-*.flatpak                   # Linux, from the bundle
+winget install rPGP.rPGP                           # Windows
+```
+
+The cask lives in `github.com/jzbz/homebrew-tap`, a tap of this project's own;
+`packaging/homebrew/README.md` says why that rather than homebrew-cask. Whatever
+the route, the signed `SHA256SUMS` on the release is worth checking first.
 
 ## Verifying a download
 

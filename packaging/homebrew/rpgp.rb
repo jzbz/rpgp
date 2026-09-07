@@ -1,10 +1,12 @@
 # Homebrew cask for rPGP.
 #
-# This file belongs in a tap repository — github.com/jzbz/homebrew-rpgp, at
-# Casks/rpgp.rb — not here. It is kept in-tree so it versions with the thing it
-# describes, and so the release process has one place to update.
+# This file exists twice and update-cask.sh keeps the two in step: the template
+# at packaging/homebrew/rpgp.rb in the app repo, which versions with the thing
+# it describes, and the published cask at github.com/jzbz/homebrew-tap in
+# Casks/rpgp.rb, which is that template with the release's version and hash
+# filled in.
 #
-#   brew install --cask jzbz/rpgp/rpgp
+#   brew install --cask jzbz/tap/rpgp
 #
 # A tap rather than homebrew-cask because homebrew-cask applies a notability
 # bar, and at 3x for a self-submission that is 225 stars, 90 forks or 90

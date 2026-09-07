@@ -23,25 +23,30 @@ a notarised, stapled zip. The 2026-09-01 deadline that disables unsigned casks
 applies only to the main repository, not to a tap — but Gatekeeper applies
 everywhere.
 
-## Setting the tap up, once
+## The tap
 
-Create a public repository named `homebrew-rpgp` under your account, containing
-a `Casks/` directory. That is the whole of it: no registration, no review, no
-Homebrew involvement.
+`github.com/jzbz/homebrew-tap` — one tap for everything published this way,
+rather than one per app. A tap is a public repository named `homebrew-<name>`
+with a `Casks/` directory, and that is the whole of it: no registration, no
+review, no Homebrew involvement. Nothing about it is per-project, so Azzurro's
+cask sits beside this one and a third app would need no new repository at all.
 
-    brew tap jzbz/rpgp
+    brew tap jzbz/tap
     brew install --cask rpgp
 
 or in one step, without tapping first:
 
-    brew install --cask jzbz/rpgp/rpgp
+    brew install --cask jzbz/tap/rpgp
 
 ## Per release
 
 After the release is published and the notarised zip is attached:
 
-    ./packaging/homebrew/update-cask.sh v0.1.2 > ~/homebrew-rpgp/Casks/rpgp.rb
-    cd ~/homebrew-rpgp && git commit -a -S -m "rpgp 0.1.2" && git push
+    ./packaging/homebrew/update-cask.sh v0.1.2 > ~/zx/dev/homebrew-tap/Casks/rpgp.rb
+    cd ~/zx/dev/homebrew-tap && git commit -S -m "rpgp 0.1.2" Casks/rpgp.rb && git push
+
+Name the file rather than reaching for `git commit -a`: the tap is shared now,
+and a bump for one app has no business carrying another app's in-flight change.
 
 The script downloads the published asset, hashes it, and — where the release
 carries a SHA256SUMS — refuses to emit a cask whose hash disagrees with it. That
@@ -55,6 +60,7 @@ so a tap is a hand-written commit each release — two lines, but they are yours
 ## Moving to homebrew-cask later
 
 When the project clears the notability bar, the cask can be submitted upstream
-and the tap kept as a redirect or archived. Users who tapped will keep working
-either way; `brew` prefers the official cask once both exist, and the fully
-qualified `jzbz/rpgp/rpgp` continues to resolve.
+and this one file deleted from the tap — the tap itself stays, because it holds
+other apps. Users who tapped will keep working either way; `brew` prefers the
+official cask once both exist, and the fully qualified `jzbz/tap/rpgp` goes on
+resolving until the file is removed.
