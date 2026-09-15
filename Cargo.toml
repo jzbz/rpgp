@@ -56,7 +56,11 @@ futures = "0.3"
 # dependencies everywhere else.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset", "json"] }
 serde_json = "1"
-sha1 = "0.10"
+# Only for the WKD hash in keyserver.rs, which needs nothing beyond `Digest`.
+# Default features are off because `oid` would pull in const-oid 0.10 beside
+# the 0.9 the crypto backend already compiles, for an identifier nothing here
+# asks for.
+sha1 = { version = "0.11", default-features = false }
 z-base-32 = "0.1"
 
 anyhow = "1"
