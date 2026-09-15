@@ -56,7 +56,7 @@ jobs:
           - { os: ubuntu-24.04-arm, arch: aarch64 }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
 
@@ -179,7 +179,7 @@ jobs:
           sha256sum "$NAME"
           ls -lh "$NAME"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: flatpak-${{ matrix.arch }}
           path: '*.flatpak'
@@ -198,7 +198,7 @@ jobs:
     timeout-minutes: 60
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
 
@@ -207,7 +207,7 @@ jobs:
         timeout-minutes: 10
         run: choco install capnproto -y --no-progress
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -235,7 +235,7 @@ jobs:
           Get-Item $name | Select-Object Name, Length
           (Get-FileHash -Algorithm SHA256 $name).Hash
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-x86_64
           path: '*.exe'
@@ -260,7 +260,7 @@ jobs:
     timeout-minutes: 60
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
 
@@ -268,7 +268,7 @@ jobs:
         timeout-minutes: 10
         run: brew install capnp
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -368,7 +368,7 @@ jobs:
           ls -lh "$NAME"
           shasum -a 256 "$NAME"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-universal
           path: 'rpgp-*-macos-universal.zip'
@@ -415,12 +415,12 @@ jobs:
       # Trash" and nothing else. That bundle detours through the machine
       # holding the Developer ID key and is uploaded to this draft by hand.
       # See packaging/macos-sign.sh.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: flatpak-*
           merge-multiple: true
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: windows-*
           merge-multiple: true

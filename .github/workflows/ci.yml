@@ -27,7 +27,7 @@ jobs:
     # These ceilings sit well above a cold-cache build and should never fire.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # capnproto is not optional: sequoia-ipc's build script runs the capnp
       # compiler unconditionally. fontconfig is what Slint draws text with on
@@ -124,7 +124,7 @@ jobs:
           echo "::error::apt failed twice; the Ubuntu mirrors are not answering"
           exit 1
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -160,7 +160,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Same shape, and the same reasoning, as the lint job's copy above. It
       # is duplicated rather than factored into a local composite action
@@ -255,7 +255,7 @@ jobs:
         timeout-minutes: 10
         run: brew install capnp
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -292,14 +292,14 @@ jobs:
     # workspace selects crypto-rust), so it does not depend on the much larger
     # bet that the GUI stack builds on Windows.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Chocolatey's CDN rate-limits, and this call is as unbounded as apt was.
       - name: Install capnproto
         timeout-minutes: 10
         run: choco install capnproto -y --no-progress
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -332,14 +332,14 @@ jobs:
     # fallback and the winit event loop are still unexercised. rpgp is not
     # shipped for Windows on the strength of this.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Chocolatey's CDN rate-limits, and this call is as unbounded as apt was.
       - name: Install capnproto
         timeout-minutes: 10
         run: choco install capnproto -y --no-progress
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
