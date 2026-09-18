@@ -3780,4 +3780,57 @@ mod tests {
             "a refused signature must leave no file behind"
         );
     }
+
+    /// The pickers are built from the summary's capability flags, so a key the
+    /// core will refuse must not be in them.
+    ///
+    /// Both lists come from `build_signing_targets`, which filters on
+    /// `can_encrypt` for recipients and on `can_sign` for signers and does not
+    /// look at `validity` at all. A revoked certificate kept whichever
+    /// capabilities sat on its subkeys, so a key the user had just retired was
+    /// still offered as a signer and as a recipient, with the red `revoked`
+    /// pill against its row in the list behind the dialog.
+    #[test]
+    fn the_pickers_offer_only_the_keys_the_operations_will_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let generate = |user_id: &str| {
+            rpgp_core::keygen::generate(&rpgp_core::keygen::KeyGenRequest::new(user_id))
+                .unwrap()
+                .cert
+        };
+        let live = generate("Live <live@example.org>");
+        let retired = generate("Retired <retired@example.org>");
+        store.insert_secret(&live).unwrap();
+        store.insert_secret(&retired).unwrap();
+        let (live, retired) = (live.fingerprint().to_hex(), retired.fingerprint().to_hex());
+        revoke::revoke_cert(&store, &RevokeRequest::new(&retired)).unwrap();
+
+        let loaded = read_store(&store).expect("a healthy store reads");
+        let state = state_for(store);
+        let mut guard = lock(&state);
+        guard.all = loaded.all;
+        build_signing_targets(&mut guard, None);
+
+        let offered_to = |fingerprint: &str| {
+            guard
+                .se_recipients
+                .iter()
+                .any(|r| r.fingerprint == fingerprint)
+        };
+        let signs_with = |fingerprint: &str| guard.se_signers.iter().any(|(f, _)| f == fingerprint);
+
+        assert!(
+            offered_to(&live) && signs_with(&live),
+            "a live key with a secret half belongs in both lists, or this test proves nothing"
+        );
+        assert!(
+            !offered_to(&retired),
+            "a revoked key must not be offered as a recipient: encrypt refuses it"
+        );
+        assert!(
+            !signs_with(&retired),
+            "nor as a signer: signing refuses it too"
+        );
+    }
 }

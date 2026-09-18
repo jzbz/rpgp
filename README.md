@@ -284,6 +284,14 @@ filter does not catch, a certification *subkey*, held locally or on a card.
 after a soft revocation, where every certification the key made still stands
 and withdrawing them is the only remedy there is.
 
+The list says the same thing rather than something of its own. The capability
+letters on a row — `C`, `S`, `E` — are what this app will *do* with the
+certificate, not an inventory of the flags on its keys, so a revoked
+certificate shows none of them and the recipient, signer and certifier pickers
+never offer it. The same rule is why a certificate you accept SHA-1 from shows
+none either: that acceptance is for checking signatures, and every operation
+judges the certificate strictly.
+
 A **revocation certificate** is now written at key generation, to
 `$XDG_DATA_HOME/rpgp/revocations/<fingerprint>.rev`, and can be exported from
 the details pane. It is the way back if the secret key or its passphrase is

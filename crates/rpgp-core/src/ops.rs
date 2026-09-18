@@ -4,8 +4,12 @@ use std::fs;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use sequoia_openpgp::cert::ValidCert;
+use sequoia_openpgp::cert::amalgamation::key::{
+    ValidErasedKeyAmalgamation, ValidKeyAmalgamationIter,
+};
 use sequoia_openpgp::crypto::{Password, SessionKey};
-use sequoia_openpgp::packet::{PKESK, SKESK};
+use sequoia_openpgp::packet::{PKESK, SKESK, key};
 use sequoia_openpgp::parse::Parse;
 use sequoia_openpgp::parse::stream::{
     DecryptionHelper, DecryptorBuilder, DetachedVerifierBuilder, MessageLayer, MessageStructure,
@@ -123,15 +127,7 @@ fn encrypt_stream(
             .with_policy(&policy, None)
             .map_err(|_| Error::NoEncryptionKey(cert.fingerprint().to_hex()))?;
         let before = recipient_keys.len();
-        for ka in valid
-            .keys()
-            .alive()
-            .revoked(false)
-            .supported()
-            .for_transport_encryption()
-        {
-            recipient_keys.push(Recipient::from(ka));
-        }
+        recipient_keys.extend(encryption_keys(&valid).into_iter().map(Recipient::from));
         if recipient_keys.len() == before {
             return Err(Error::NoEncryptionKey(cert.fingerprint().to_hex()));
         }
@@ -156,6 +152,74 @@ fn encrypt_stream(
     std::io::copy(source, &mut message)?;
     message.finalize()?;
     Ok(())
+}
+
+/// The encryption keys `valid` offers under one of the two encryption flags.
+///
+/// OpenPGP has two — one for messages in flight, one for data at rest — and
+/// nearly every implementation sets both on a single subkey, so the distinction
+/// is invisible on almost every certificate one meets. It is not always: `sq key
+/// generate --can-encrypt=storage` makes a certificate with the storage flag
+/// alone, and this app's own [`crate::keygen`] gives each key a separate
+/// storage subkey beside its transport one.
+///
+/// Split out so that the two filters, and everything in front of them, are
+/// written once. [`has_encryption_key`] answers the recipient picker from the
+/// same two calls, which is what stops the picker offering a certificate that
+/// [`encrypt`] then refuses.
+fn encryption_candidates<'a>(
+    valid: &ValidCert<'a>,
+    storage: bool,
+) -> ValidKeyAmalgamationIter<'a, key::PublicParts, key::UnspecifiedRole> {
+    let keys = valid.keys().alive().revoked(false).supported();
+    if storage {
+        keys.for_storage_encryption()
+    } else {
+        keys.for_transport_encryption()
+    }
+}
+
+/// Every key a message to this certificate is encrypted to.
+///
+/// Storage keys are a fallback rather than a second helping: they are taken
+/// only when the certificate offers no transport key at all. Both at once is
+/// the shorter spelling — sequoia unions repeated flag filters on one iterator
+/// — but every certificate this app generates carries a separate storage
+/// subkey, so it would add a second PKESK to every message sent to one of its
+/// own keys. That changes the output for the ordinary certificate in order to
+/// serve the unusual one. As a fallback it changes nothing for any certificate
+/// that can already be encrypted to, and the certificates that could not now
+/// can.
+///
+/// A storage subkey is a proper encryption key either way. Both decrypt paths
+/// below chain the two flags together and [`crate::cert::subkeys_with`] marks
+/// either one `E`, so refusing them here was rPGP disagreeing with itself
+/// rather than enforcing anything. Sequoia's own documentation puts the
+/// distinction in perspective: most implementations set both flags on a single
+/// subkey, and offer no way to ask for one kind of protection when encrypting.
+fn encryption_keys<'a>(
+    valid: &ValidCert<'a>,
+) -> Vec<ValidErasedKeyAmalgamation<'a, key::PublicParts>> {
+    let transport: Vec<_> = encryption_candidates(valid, false).collect();
+    if transport.is_empty() {
+        encryption_candidates(valid, true).collect()
+    } else {
+        transport
+    }
+}
+
+/// Whether [`encrypt`] has anything to encrypt to here.
+///
+/// What [`crate::CertSummary::can_encrypt`] reports, and through it which
+/// certificates the Sign / Encrypt dialog and the notepad offer as recipients.
+/// It asks the same two filters rather than describing them a second time,
+/// because a second description is what drifted: the picker offered every
+/// certificate with either encryption flag while `encrypt` took only transport
+/// keys, so a storage-only certificate was listed, ticked, and then refused
+/// with "no usable encryption key".
+pub(crate) fn has_encryption_key(valid: &ValidCert<'_>) -> bool {
+    encryption_candidates(valid, false).next().is_some()
+        || encryption_candidates(valid, true).next().is_some()
 }
 
 /// The most plaintext [`decrypt_to_memory`] or [`verify_inline`] will hand
@@ -1025,6 +1089,70 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
         (dir, store)
+    }
+
+    /// OpenPGP's two encryption flags mean "in flight" and "at rest", and this
+    /// app used to answer the same question differently depending on who asked.
+    ///
+    /// [`crate::CertSummary::can_encrypt`], the details pane and both decrypt
+    /// paths all count either flag; encrypting took transport keys alone. A
+    /// certificate whose only encryption subkey carries the storage flag — `sq
+    /// key generate --can-encrypt=storage` makes one — was therefore listed in
+    /// the recipient picker, shown with an `E`, and refused with "no usable
+    /// encryption key" the moment it was used.
+    #[test]
+    fn encrypts_to_a_certificate_whose_only_encryption_key_is_for_storage() {
+        use sequoia_openpgp::cert::CertBuilder;
+        use sequoia_openpgp::types::KeyFlags;
+
+        let (_dir, store) = scratch_store();
+        let (cert, _) = CertBuilder::new()
+            .add_userid("Dana <dana@example.org>")
+            .add_subkey(KeyFlags::empty().set_storage_encryption(), None, None)
+            .generate()
+            .unwrap();
+        store.insert_secret(&cert).unwrap();
+        assert!(
+            crate::CertSummary::from_cert(&cert).can_encrypt,
+            "the recipient picker is built from this, and it offers the key"
+        );
+
+        let mut ciphertext = Vec::new();
+        encrypt(
+            std::slice::from_ref(&cert),
+            &[],
+            None,
+            b"the quarterly figures",
+            &mut ciphertext,
+        )
+        .expect("a storage-encryption key is an encryption key");
+
+        // And what came out is really readable, rather than merely produced.
+        let mut plaintext = Vec::new();
+        decrypt(&store, &ciphertext, &[], &mut plaintext).unwrap();
+        assert_eq!(plaintext, b"the quarterly figures");
+
+        // Storage keys are a fallback, not an addition: a key generated here
+        // carries a storage subkey beside its transport one, and taking both
+        // would put a second PKESK on every message it is ever sent.
+        let ordinary = generate(&KeyGenRequest::new("Erin <erin@example.org>"))
+            .unwrap()
+            .cert;
+        let mut ciphertext = Vec::new();
+        encrypt(
+            std::slice::from_ref(&ordinary),
+            &[],
+            None,
+            b"the quarterly figures",
+            &mut ciphertext,
+        )
+        .unwrap();
+        let pkesks = sequoia_openpgp::PacketPile::from_bytes(&ciphertext)
+            .unwrap()
+            .descendants()
+            .filter(|p| matches!(p, sequoia_openpgp::Packet::PKESK(_)))
+            .count();
+        assert_eq!(pkesks, 1, "one recipient, one PKESK");
     }
 
     /// The notepad routes cleartext-signed input to verify_inline rather than

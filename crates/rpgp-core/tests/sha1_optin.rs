@@ -110,10 +110,11 @@ fn opting_in_makes_the_certificate_usable_for_verification() {
     assert!(!policy.is_strict());
     let summary = CertSummary::from_cert_with(&cert, &policy);
     assert_eq!(summary.validity, Validity::Valid);
-    assert!(summary.can_sign, "the signing subkey should bind now");
     assert!(
-        !cert::subkeys_with(&cert, &policy).is_empty(),
-        "subkeys should bind now"
+        cert::subkeys_with(&cert, &policy)
+            .iter()
+            .any(|k| k.can_sign),
+        "the signing subkey should bind now"
     );
     assert!(
         cert::user_ids_with(&cert, &policy)
@@ -129,6 +130,117 @@ fn opting_in_makes_the_certificate_usable_for_verification() {
         CertSummary::from_cert_with(&cert, &store.sha1_policy().unwrap()).validity,
         Validity::Unusable
     );
+}
+
+/// "For verification" is the whole of it, and the key list has to say so.
+///
+/// The row reads `valid` once the user opts in, because under their policy it
+/// is. Its capabilities are a different question — what this app will *do* with
+/// the certificate — and the answer is nothing: every operation builds
+/// [`rpgp_core::policy`] itself and never consults the opt-in list, so
+/// encrypting to this certificate fails with "no usable encryption key" and
+/// signing with it, were the secret half here, would fail for the same reason.
+/// The capabilities were read off the opted-in policy, so the row showed `CSE`
+/// and the Sign / Encrypt dialog listed a recipient it would then refuse.
+#[test]
+fn an_opted_in_certificate_is_offered_for_nothing_new() {
+    let (_dir, store) = scratch();
+    let cert = sha1_cert();
+    let fingerprint = cert.fingerprint().to_hex();
+    store.insert(&cert).unwrap();
+    store.set_sha1_accepted(&fingerprint, true).unwrap();
+
+    let policy = store.sha1_policy().unwrap();
+    let summary = CertSummary::from_cert_with(&cert, &policy);
+    assert_eq!(
+        summary.validity,
+        Validity::Valid,
+        "the premise: opted in, the certificate itself reads as sound"
+    );
+    assert_eq!(
+        summary.capabilities(),
+        "-",
+        "and there is still nothing the app will use it for"
+    );
+    assert!(
+        !summary.can_encrypt,
+        "the recipient list is built from this"
+    );
+    assert!(!summary.can_sign, "and the signer list from this");
+    assert!(!summary.can_certify, "and the certifier list from this");
+
+    // Which is the answer encrypting gives, and the reason the flags have to
+    // agree with it rather than with the pill beside them.
+    let refused = rpgp_core::ops::encrypt(
+        std::slice::from_ref(&cert),
+        &[],
+        None,
+        b"for the release team",
+        Vec::new(),
+    )
+    .map(|_| ())
+    .expect_err("an opted-in SHA-1 certificate cannot be encrypted to");
+    assert!(
+        refused.to_string().contains("no usable encryption key"),
+        "for the reason the banner gives: {refused}"
+    );
+
+    // The other certificate in the store is judged strictly and is unaffected,
+    // as everywhere else in this file.
+    let modern = modern_cert(&store, "Someone Else <else@example.com>");
+    assert_eq!(
+        CertSummary::from_cert_with(&modern, &store.sha1_policy().unwrap()).capabilities(),
+        "CSE"
+    );
+}
+
+/// The capability flags are answered under the standard policy, and where
+/// nothing is opted in they are read off the certificate the caller already
+/// resolved rather than resolved a second time.
+///
+/// That shortcut is what keeps an ordinary reload at one policy pass per row,
+/// and it rests on an equivalence between two types rather than on one
+/// expression: a `Sha1Policy` with an empty opt-in list delegates every question
+/// to the standard policy, so the certificate already in hand is the strictly
+/// judged one. Nothing in the code says so, and a field added to `Sha1Policy`
+/// later could make the two disagree while the list stayed empty. Opting a
+/// *different* certificate in makes `is_strict` false and sends these two down
+/// the branch that resolves again, so the branch that assumes the equivalence
+/// and the branch that does not can be compared on the same certificates.
+#[test]
+fn a_certificate_nobody_opted_in_reads_the_same_whichever_branch_answers_it() {
+    let (_dir, store) = scratch();
+    let decoy = modern_cert(&store, "Decoy <decoy@example.com>");
+    store
+        .set_sha1_accepted(&decoy.fingerprint().to_hex(), true)
+        .unwrap();
+    let policy = store.sha1_policy().unwrap();
+    assert!(
+        !policy.is_strict(),
+        "the premise: under this policy the flags are resolved a second time"
+    );
+
+    // One certificate of each kind the shortcut has to get right: one the
+    // standard policy accepts, and one it refuses for the very reason the
+    // opt-in exists to excuse — had it been asked about this certificate.
+    let modern = modern_cert(&store, "Someone Else <else@example.com>");
+    let old = sha1_cert();
+    for (cert, expected) in [(&modern, "CSE"), (&old, "-")] {
+        let shortcut = CertSummary::from_cert(cert);
+        let resolved_again = CertSummary::from_cert_with(cert, &policy);
+        assert_eq!(
+            shortcut.capabilities(),
+            resolved_again.capabilities(),
+            "a certificate nobody opted in reads the same either way"
+        );
+        assert_eq!(
+            shortcut.capabilities(),
+            expected,
+            "and the comparison above is not between two empty answers"
+        );
+        assert_eq!(shortcut.validity, resolved_again.validity);
+        assert_eq!(shortcut.user_ids, resolved_again.user_ids);
+    }
 }
 
 /// The property that makes this an opt-in for one certificate rather than a

@@ -9,7 +9,9 @@ use sequoia_openpgp::types::RevocationStatus;
 use crate::policy;
 
 /// The name to show for a certificate: its policy-valid primary user ID, else
-/// the first user ID present, else a placeholder.
+/// the first name it has signed for itself, else — for a certificate that
+/// validates under no policy at all — the first name it merely carries, else a
+/// placeholder.
 ///
 /// Shared with [`crate::certify`], which needs the same answer per signature.
 /// It used to carry its own copy of this rule, kept in step by hand, because
@@ -19,10 +21,24 @@ use crate::policy;
 /// the already-resolved `ValidCert` costs none of that, so the duplication had
 /// nothing left to buy.
 ///
-/// `valid` is the certificate under whichever policy the caller cares about,
-/// or `None` when it satisfies none: a certificate too weak to validate still
-/// has a name, and refusing to show one is how a user loses track of the key
-/// they are trying to fix.
+/// `valid` is the certificate under whichever policy the caller cares about, or
+/// `None` when it satisfies none. A certificate too weak to validate still has
+/// a name, and refusing to show one is how a user loses track of the key they
+/// are trying to fix — but that reason applies just as well to a certificate
+/// that *does* validate and whose user IDs do not, which is a shape sequoia
+/// produces readily: the primary key falls back to its direct-key signature for
+/// its own binding, so a certificate whose every user-ID binding the policy
+/// rejects still validates, with no user ID in it. Such a row read "(no user
+/// ID)" and could not be found by searching for the name printed on it.
+///
+/// The middle step is the reason this is three steps rather than two. Sequoia
+/// keeps a user ID that carries no self-signature at all, so `cert.userids()`
+/// includes any name a stranger appended to a certificate in flight; falling
+/// straight back to it would put that name on the row, beside the `valid` pill,
+/// as the certificate's own. [`self_signed_user_ids`] is the cryptographic
+/// question instead of the claimed one, and only where even that finds nothing
+/// — for a certificate that validates under no policy, whose row therefore
+/// reads `unusable`, or `revoked` where it is both — is an unsigned name shown.
 pub(crate) fn primary_user_id(
     cert: &Cert,
     valid: Option<&sequoia_openpgp::cert::ValidCert<'_>>,
@@ -32,11 +48,38 @@ pub(crate) fn primary_user_id(
     valid
         .and_then(|vc| vc.primary_userid().ok())
         .map(|ua| text(ua.userid()))
-        .or_else(|| match valid {
-            Some(vc) => vc.userids().next().map(|ua| text(ua.userid())),
-            None => cert.userids().next().map(|ua| text(ua.userid())),
+        .or_else(|| self_signed_user_ids(cert).next())
+        .or_else(|| {
+            valid
+                .is_none()
+                .then(|| cert.userids().next().map(|ua| text(ua.userid())))
+                .flatten()
         })
         .unwrap_or_else(|| "(no user ID)".to_string())
+}
+
+/// The names a certificate has signed for itself, whatever the policy makes of
+/// those signatures.
+///
+/// Sequoia hands out no self-signature it has not verified: `self_signatures`
+/// is an `iter_verified`, which checks each one and drops those that fail. So
+/// this is the cryptographic question — a user ID anyone at all can append has
+/// nothing here. What it deliberately does not ask is whether the *policy*
+/// accepts the signature, which is the whole case it exists for: a SHA-1
+/// self-signature is a real signature the standard policy will not act on, and
+/// the certificate is still that person's.
+///
+/// The verification is on demand rather than done once when the certificate is
+/// canonicalised — sequoia moved it because doing it eagerly was expensive — so
+/// it is real work here: one signature check per user ID, against a key already
+/// parsed, for every row that gets this far. That is every `unusable` row on
+/// every reload, where the old fallback took `cert.userids().next()` and
+/// verified nothing. What it buys is the difference between a name the key
+/// signed for itself and a name somebody else wrote on it.
+fn self_signed_user_ids(cert: &Cert) -> impl Iterator<Item = String> + '_ {
+    cert.userids()
+        .filter(|ua| ua.self_signatures().next().is_some())
+        .map(|ua| String::from_utf8_lossy(ua.userid().value()).into_owned())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,14 +109,31 @@ impl Validity {
 pub struct CertSummary {
     pub fingerprint: String,
     pub key_id: String,
-    /// Primary user ID, or a placeholder when the certificate has none that is
-    /// valid under the policy.
+    /// Primary user ID: the policy-valid one, else a name the certificate has
+    /// signed for itself, else — for a certificate that validates under no
+    /// policy — one it merely carries, else a placeholder. The rule lives in
+    /// `cert::primary_user_id`, which answers it for [`crate::certify`] too;
+    /// plain text rather than a link because that function is crate-private.
     pub primary_user_id: String,
+    /// The identities the row is searched by, from the same three steps.
     pub user_ids: Vec<String>,
     pub algorithm: String,
     pub created: SystemTime,
     pub expires: Option<SystemTime>,
     pub validity: Validity,
+    /// What this app will use the certificate for, each answered under the
+    /// policy the corresponding operation builds for itself and by the same key
+    /// filters it selects with — so that what a picker offers and what the
+    /// operation behind it accepts cannot come apart. A certificate its owner
+    /// has revoked answers no to all three, as one that has expired or that
+    /// does not validate already did.
+    ///
+    /// They are not a description of the certificate's contents. The details
+    /// pane has that, per key, in [`subkeys_with`], where a revoked
+    /// certificate's subkeys are still listed with the flags they carry. That
+    /// pane answers under the standard policy, though, and so lists nothing for
+    /// a certificate the user accepts SHA-1 from — for which the `-` on the row
+    /// is now the only thing the app says about its key flags.
     pub can_certify: bool,
     pub can_sign: bool,
     pub can_encrypt: bool,
@@ -106,17 +166,35 @@ pub struct CertSummary {
 impl CertSummary {
     /// Summarise under the standard policy.
     pub fn from_cert(cert: &Cert) -> Self {
-        Self::from_cert_with(cert, &policy())
+        Self::from_cert_with(cert, &crate::Sha1Policy::strict())
     }
 
-    /// Summarise under a caller-supplied policy.
+    /// Summarise under the caller's SHA-1 opt-in.
     ///
     /// Exists so the key list can show an opted-in SHA-1 certificate as what it
     /// is — a certificate with user IDs and subkeys — rather than as `unusable`
     /// while its signatures verify perfectly well two panes over. Pass
-    /// [`crate::Store::sha1_policy`] to get that; pass nothing and you get the
-    /// standard policy, which is what every trust-bearing caller does.
-    pub fn from_cert_with(cert: &Cert, policy: &dyn Policy) -> Self {
+    /// [`crate::Store::sha1_policy`] to get that; pass
+    /// [`crate::Sha1Policy::strict`], as [`CertSummary::from_cert`] does, and
+    /// every certificate is judged strictly, which is what every trust-bearing
+    /// caller wants.
+    ///
+    /// The opt-in reaches what this function reports the certificate to *be*:
+    /// its validity and its user IDs. It does not reach the three
+    /// capability flags, which say what this app will do with the certificate
+    /// and are therefore answered under the policy the operations themselves
+    /// construct. Accepting SHA-1 buys the ability to check a signature and
+    /// nothing else, so an opted-in certificate reports no capability at all:
+    /// [`crate::ops::encrypt`] and [`crate::ops`]'s signing paths would refuse
+    /// it, and a picker that offered it would be offering a refusal.
+    ///
+    /// Taking the concrete type rather than `&dyn Policy` is what lets the
+    /// strict answer be reused rather than recomputed. A [`crate::Sha1Policy`]
+    /// with nothing opted in *is* the standard policy — it delegates every
+    /// question — so when it says so, the certificate under it is already the
+    /// certificate under the standard policy, and the extra pass is skipped for
+    /// every store where nobody has opted anything in.
+    pub fn from_cert_with(cert: &Cert, policy: &crate::Sha1Policy) -> Self {
         let now = SystemTime::now();
 
         let fingerprint = cert.fingerprint().to_hex();
@@ -143,11 +221,25 @@ impl CertSummary {
         let sha1_blocked =
             valid.is_none() && cert.with_policy(&crate::sha1::permissive(), now).is_ok();
 
+        // What the row is searched by, resolved exactly as the name above it
+        // is: the policy-valid identities, else the ones the certificate has
+        // signed for itself, else — for a certificate that validates under no
+        // policy, whose row therefore reads `unusable`, or `revoked` where it
+        // is both — whatever it carries. A row
+        // that shows a name and cannot be found by typing it is the bug this
+        // shares with `primary_user_id`.
         let user_ids: Vec<String> = match valid.as_ref() {
-            Some(vc) => vc
-                .userids()
-                .map(|ua| String::from_utf8_lossy(ua.userid().value()).into_owned())
-                .collect(),
+            Some(vc) => {
+                let bound: Vec<String> = vc
+                    .userids()
+                    .map(|ua| String::from_utf8_lossy(ua.userid().value()).into_owned())
+                    .collect();
+                if bound.is_empty() {
+                    self_signed_user_ids(cert).collect()
+                } else {
+                    bound
+                }
+            }
             None => cert
                 .userids()
                 .map(|ua| String::from_utf8_lossy(ua.userid().value()).into_owned())
@@ -160,20 +252,60 @@ impl CertSummary {
             .as_ref()
             .and_then(|vc| vc.primary_key().key_expiration_time());
 
-        // One traversal, three answers. Each `alive()` rebuilt the whole
-        // policy-filtered iterator, so asking three questions walked every
-        // subkey four times — once per question plus one for the storage-key
-        // chain — and from_cert runs once per certificate on every reload.
+        // The certificate the capabilities below are read off: the one the
+        // operations see, which is not always the one the caller does, since
+        // they build `crate::policy()` themselves and never consult the opt-in
+        // list.
+        //
+        // A revoked certificate is nothing to any of them, which the key
+        // filters cannot work out for themselves: `revoked(false)` asks the
+        // *certificate* only of the primary key, and asks a subkey about itself
+        // alone. So a revoked certificate kept exactly the capabilities that
+        // happened to sit on subkeys — "SE" for a key generated here, "E" for a
+        // GnuPG-shaped one — and the pickers went on offering it for signing
+        // and as a recipient with the `revoked` pill against its own row.
+        // Expiry never needed this, because `alive()` does fold the
+        // certificate's expiry into every subkey.
+        //
+        // The second pass costs nothing where it can decide nothing: not for a
+        // revoked certificate, and not for a caller whose policy has nothing
+        // opted in, because such a policy *is* the standard policy and `valid`
+        // is already the answer.
+        let strict_policy = (!revoked && !policy.is_strict()).then(crate::policy);
+        let strictly_valid = strict_policy
+            .as_ref()
+            .and_then(|strict| cert.with_policy(strict, now).ok());
+        let usable = match (revoked, policy.is_strict()) {
+            (true, _) => None,
+            (false, true) => valid.as_ref(),
+            (false, false) => strictly_valid.as_ref(),
+        };
+
+        // One traversal for two of the three. Each `alive()` rebuilds the whole
+        // policy-filtered iterator, so asking separately walked every subkey
+        // once per question, and this runs once per certificate on every
+        // reload. Encryption is asked of `ops` instead, at the price of a walk
+        // of its own: "carries an encryption flag" and "is a key `encrypt` will
+        // use" were two descriptions of one rule, and the second description is
+        // precisely what drifted — the picker offered storage-only certificates
+        // that encrypting then refused. `supported()` is here for the same
+        // reason: `signing_keypair`, `certify` and the encryption filters all
+        // select local key material with it, so a key whose algorithm this
+        // build cannot use is not a capability, whatever its flags say. Their
+        // agent fallbacks do not filter on it, because the agent does the
+        // arithmetic rather than this build; for an agent-backed key of an
+        // algorithm this build lacks, the flag is therefore the narrower of the
+        // two, which is the direction a picker can afford to be wrong in.
         let (mut can_certify, mut can_sign, mut can_encrypt) = (false, false, false);
-        if let Some(vc) = valid.as_ref() {
-            for ka in vc.keys().alive().revoked(false) {
+        if let Some(vc) = usable {
+            for ka in vc.keys().alive().revoked(false).supported() {
                 let Some(flags) = ka.key_flags() else {
                     continue;
                 };
                 can_certify |= flags.for_certification();
                 can_sign |= flags.for_signing();
-                can_encrypt |= flags.for_transport_encryption() || flags.for_storage_encryption();
             }
+            can_encrypt = crate::ops::has_encryption_key(vc);
         }
 
         let expired = expires.is_some_and(|t| t <= now);
@@ -402,4 +534,181 @@ pub fn issued_by(
         .get_issuers()
         .iter()
         .any(|issuer| cert.keys().any(|ka| issuer.aliases(ka.key().key_handle())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keygen::{KeyGenRequest, generate};
+    use crate::store::Store;
+    use sequoia_openpgp::Packet;
+    use sequoia_openpgp::cert::CertBuilder;
+    use sequoia_openpgp::packet::UserID;
+    use sequoia_openpgp::packet::signature::SignatureBuilder;
+    use sequoia_openpgp::types::{KeyFlags, SignatureType};
+    use std::time::Duration;
+
+    fn scratch() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        (dir, store)
+    }
+
+    /// Revoking a key withdraws it, and which capabilities survived that used
+    /// to depend on where they happened to sit.
+    ///
+    /// `revoked(false)` asks the *certificate* only of the primary key; of a
+    /// subkey it asks that subkey alone. A key generated here certifies with
+    /// its primary and signs and encrypts with subkeys, so revoking it left
+    /// "SE" on the row beside the `revoked` pill, and the Sign / Encrypt dialog
+    /// went on offering it as a signer and as a recipient. A GnuPG-shaped key,
+    /// which signs with its primary, kept "E" instead — the same certificate
+    /// state reading two different ways because of key layout.
+    #[test]
+    fn a_revoked_certificate_offers_no_capability() {
+        let (_dir, store) = scratch();
+        let cert = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        let fingerprint = cert.fingerprint().to_hex();
+        store.insert_secret(&cert).unwrap();
+        assert_eq!(
+            CertSummary::from_cert(&cert).capabilities(),
+            "CSE",
+            "the premise: live, it can do all three"
+        );
+
+        // The app's own default reason, Retired, which is soft — the case where
+        // the key looks healthiest to anyone who has not read the revocation.
+        crate::revoke::revoke_cert(&store, &crate::revoke::RevokeRequest::new(&fingerprint))
+            .unwrap();
+        let summary = CertSummary::from_cert(&store.lookup(&fingerprint).unwrap());
+        assert_eq!(summary.validity, Validity::Revoked);
+        assert_eq!(
+            summary.capabilities(),
+            "-",
+            "a withdrawn key is not offered for anything new"
+        );
+        assert!(!summary.can_sign && !summary.can_encrypt && !summary.can_certify);
+
+        // The other layout, so that the answer is the certificate's state and
+        // not the arrangement of its keys. Revoked with the signature
+        // `CertBuilder` hands back, which is Unspecified and therefore hard.
+        let (gnupg_shaped, revocation) = CertBuilder::new()
+            .add_userid("Bob <bob@example.org>")
+            .set_primary_key_flags(KeyFlags::empty().set_certification().set_signing())
+            .add_transport_encryption_subkey()
+            .generate()
+            .unwrap();
+        assert_eq!(
+            CertSummary::from_cert(&gnupg_shaped).capabilities(),
+            "CSE",
+            "the premise again, for the second layout"
+        );
+        let revoked = gnupg_shaped
+            .insert_packets(vec![Packet::from(revocation)])
+            .unwrap()
+            .0;
+        let summary = CertSummary::from_cert(&revoked);
+        assert_eq!(summary.validity, Validity::Revoked);
+        assert_eq!(summary.capabilities(), "-");
+    }
+
+    /// A certificate can validate while none of its user IDs does, and then the
+    /// row showed "(no user ID)" over a certificate whose name is right there.
+    ///
+    /// Sequoia's primary key falls back to the direct-key signature for its own
+    /// binding when no user ID binds, so the certificate as a whole is valid.
+    /// The name and the searchable identities were both taken from the
+    /// policy-valid user IDs alone, so the row could not be found by typing the
+    /// name printed on the key — and the details pane, which reads the
+    /// unpoliced user IDs, disagreed with the list about the same certificate.
+    ///
+    /// The binding here is expired rather than SHA-1 — the shape this build can
+    /// make, since its backend refuses to *create* a SHA-1 signature — but the
+    /// certificate is the same shape either way: a self-signature that verifies
+    /// and that the policy will not act on.
+    #[test]
+    fn a_valid_certificate_whose_user_ids_do_not_bind_is_still_named_and_searchable() {
+        let hour = Duration::from_secs(60 * 60);
+        // Dated in the past so the expired binding below is still made after
+        // the key it binds to.
+        let (cert, _) = CertBuilder::new()
+            .set_creation_time(SystemTime::now() - 30 * hour)
+            .add_signing_subkey()
+            .generate()
+            .unwrap();
+        let mut signer = cert
+            .primary_key()
+            .key()
+            .clone()
+            .parts_into_secret()
+            .unwrap()
+            .into_keypair()
+            .unwrap();
+
+        // One name the key has signed for itself, bound by a signature that has
+        // since run out; and one anybody could have appended on the way here,
+        // which carries no signature at all.
+        let mine = UserID::from("Old Maintainer <maint@example.org>");
+        let expired = SignatureBuilder::new(SignatureType::PositiveCertification)
+            .set_signature_creation_time(SystemTime::now() - 2 * hour)
+            .unwrap()
+            .set_signature_validity_period(hour)
+            .unwrap()
+            .sign_userid_binding(&mut signer, None, &mine)
+            .unwrap();
+        let theirs = UserID::from("Mallory <mallory@example.invalid>");
+        let cert = cert
+            .insert_packets(vec![
+                Packet::from(mine),
+                Packet::from(expired),
+                Packet::from(theirs),
+            ])
+            .unwrap()
+            .0;
+
+        let summary = CertSummary::from_cert(&cert);
+        assert_eq!(
+            summary.validity,
+            Validity::Valid,
+            "the premise: the certificate itself validates"
+        );
+        assert!(
+            cert.with_policy(&policy(), None)
+                .unwrap()
+                .userids()
+                .next()
+                .is_none(),
+            "and the premise's other half: no user ID binds under the policy"
+        );
+
+        assert_eq!(
+            summary.primary_user_id,
+            "Old Maintainer <maint@example.org>"
+        );
+        assert!(
+            summary.matches("maint") && summary.matches("example.org"),
+            "the row has to be findable by the name it shows: {:?}",
+            summary.user_ids
+        );
+        assert!(
+            !summary.matches("mallory"),
+            "and a name the key never signed is not the key's: {:?}",
+            summary.user_ids
+        );
+
+        // Strip every signature and the certificate validates under nothing.
+        // Then even an unsigned name earns its place: the row says `unusable`
+        // beside it, and a key nobody can identify is a key nobody can fix.
+        let stripped = Cert::from_packets(
+            cert.into_packets()
+                .filter(|p| !matches!(p, Packet::Signature(_))),
+        )
+        .unwrap();
+        let summary = CertSummary::from_cert(&stripped);
+        assert_eq!(summary.validity, Validity::Unusable);
+        assert_eq!(summary.user_ids.len(), 2);
+        assert_ne!(summary.primary_user_id, "(no user ID)");
+    }
 }
