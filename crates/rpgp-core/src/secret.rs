@@ -1,4 +1,5 @@
-//! The one place a secret key is unlocked.
+//! The one place a secret key is unlocked, and the one place that says whether
+//! a secret is real key material at all.
 //!
 //! Choosing *which* key to use is deliberately not here. Signing, certification
 //! and decryption each want a different key, and they disagree about what
@@ -18,9 +19,36 @@
 
 use sequoia_openpgp::crypto::{KeyPair, Password, Signer};
 use sequoia_openpgp::packet::Key;
-use sequoia_openpgp::packet::key::{KeyRole, SecretParts};
+use sequoia_openpgp::packet::key::{KeyRole, SecretKeyMaterial, SecretParts};
 
 use crate::error::{Error, Result};
+
+/// Whether `secret` is key material this process could ever use, as opposed to
+/// a placeholder standing where key material is not.
+///
+/// GnuPG writes a stub wherever an export carries no key material: `gnu-dummy`
+/// for the primary that `gpg --export-secret-subkeys` deliberately leaves out,
+/// and `divert-to-card` for a key that lives on a smartcard, whose secret half
+/// gpg could not export even if asked to. Both are secret-key packets with the
+/// private S2K type 101, so sequoia parses them as an encrypted secret and
+/// `has_secret` — and therefore `Cert::is_tsk` — is true of them. No passphrase
+/// opens either. Ask this instead of `has_secret` wherever the answer decides
+/// whether an operation can proceed, or which of two copies of a key to keep.
+///
+/// Encryption alone is not the question, which is why this is not
+/// `!is_encrypted`: an ordinary passphrase-protected key is real material that
+/// the user can open. The test is [`S2K::is_supported`], not a match on the
+/// variants, because `S2K` is `#[non_exhaustive]` and `is_supported` is false
+/// for exactly the two kinds that carry no derivation sequoia can run,
+/// `Private` and `Unknown`.
+///
+/// [`S2K::is_supported`]: sequoia_openpgp::crypto::S2K::is_supported
+pub fn is_usable(secret: &SecretKeyMaterial) -> bool {
+    match secret {
+        SecretKeyMaterial::Unencrypted(_) => true,
+        SecretKeyMaterial::Encrypted(encrypted) => encrypted.s2k().is_supported(),
+    }
+}
 
 /// Decrypt `key` if it is passphrase-protected, otherwise hand it back as-is.
 ///
@@ -97,6 +125,8 @@ pub fn signer<R: KeyRole>(
 mod tests {
     use super::*;
     use crate::keygen::{KeyGenRequest, generate};
+    use sequoia_openpgp::crypto::{S2K, mpi};
+    use sequoia_openpgp::packet::key::Encrypted;
 
     fn primary(
         request: &KeyGenRequest,
@@ -109,6 +139,46 @@ mod tests {
             .clone()
             .parts_into_secret()
             .unwrap()
+    }
+
+    /// Encryption is not what makes a secret unusable; being a placeholder is.
+    ///
+    /// Stated directly as well as through the store, because [`is_usable`]
+    /// decides what a caller may attempt, and the three answers belong in one
+    /// place: unprotected material is usable, passphrase-protected material is
+    /// usable once the passphrase is supplied, and a stub never is.
+    #[test]
+    fn a_protected_secret_is_usable_material_and_a_stub_is_not() {
+        let unprotected = primary(&KeyGenRequest::new("Alice <alice@example.org>"));
+        assert!(is_usable(unprotected.secret()));
+
+        let mut request = KeyGenRequest::new("Alice <alice@example.org>");
+        request.password = Some("correct horse".to_string().into());
+        let protected = primary(&request);
+        assert!(protected.secret().is_encrypted());
+        assert!(
+            is_usable(protected.secret()),
+            "a passphrase-protected secret is material the user can open"
+        );
+
+        // A `gnu-dummy` stub: the private S2K type 101, whose parameters are a
+        // hash-algorithm byte, `GNU`, and the mode, with no key material
+        // behind it. `tests/gnupg_stubs.rs` pins this shape against a real gpg
+        // export; what matters here is only that the S2K is the private kind.
+        let stub = SecretKeyMaterial::Encrypted(Encrypted::new(
+            S2K::Private {
+                tag: 101,
+                parameters: Some(vec![0, b'G', b'N', b'U', 1].into()),
+            },
+            0.into(),
+            Some(mpi::SecretKeyChecksum::Sum16),
+            Vec::new().into(),
+        ));
+        assert!(
+            stub.is_encrypted(),
+            "which is why `is_encrypted` cannot answer this question"
+        );
+        assert!(!is_usable(&stub));
     }
 
     #[test]

@@ -541,16 +541,16 @@ impl Store {
         // there was no merge, no comparison and no backup. Importing a public
         // certificate the user already held a secret for destroyed the secret.
         //
-        // merge_public_and_secret prefers the incoming secret where there is
-        // one, so the legitimate writers — keygen, certify, revoke, lifecycle,
-        // all of which hand back an updated copy of the same key — still win,
-        // and secret material can only ever be added.
+        // The merge settles each key on its own, because a merge that only
+        // ever adds material is not enough: a GnuPG stub is a secret-key
+        // packet carrying no key, and taking it because it is "more" throws
+        // away the real thing. See `merge_secret` for the rules it applies.
         //
         // A file that will not parse is moved aside rather than overwritten:
         // it cannot be merged, and destroying it is the failure this whole
         // function now exists to prevent.
         let cert = match Cert::from_file(&path) {
-            Ok(existing) => existing.merge_public_and_secret(cert.clone())?,
+            Ok(existing) => merge_secret(existing, cert)?,
             Err(_) if path.exists() => {
                 let mut aside = path.clone();
                 aside.as_mut_os_string().push(".unreadable");
@@ -780,6 +780,70 @@ impl Store {
         self.secrets_dir
             .join(format!("{}.pgp", hex_only(fingerprint).to_uppercase()))
     }
+}
+
+/// Merge an incoming transferable secret key into the copy already stored,
+/// deciding key by key which secret survives.
+///
+/// [`Cert::merge_public_and_secret`] alone prefers the incoming secret for
+/// every key the incoming copy has one for, and a GnuPG stub counts as having
+/// one — see [`crate::secret::is_usable`]. Importing the output of `gpg
+/// --export-secret-subkeys`, or an export of a key that has since moved to a
+/// smartcard, therefore replaced real key material with a placeholder that no
+/// passphrase opens.
+///
+/// Reversing the merge order instead would only move the loss: a stub imported
+/// first would then block the full backup that restores the key. So the
+/// incoming stubs that would displace something are taken out before the
+/// merge, which leaves three rules:
+///
+/// - an incoming secret that is usable wins, as it did before;
+/// - an incoming stub is dropped wherever the stored copy already holds a
+///   secret for that key, so what is held survives;
+/// - anything at all is kept where the stored copy holds no secret for that
+///   key, since a stub still records that the key exists elsewhere.
+///
+/// A usable incoming secret winning is what lets a full backup replace a stub.
+/// The writers that hand back an updated copy of a stored key — revoke and the
+/// lifecycle operations — are unaffected either way, because the secrets they
+/// hand back are the ones they read from this same file.
+///
+/// Two copies that are both usable are not distinguished: the incoming one
+/// wins, so re-importing a backup made under a different passphrase, or under
+/// none, still replaces the stored encryption.
+///
+/// Taking the stubs out means rebuilding the incoming certificate through
+/// [`Cert::from_packets`], so this can fail where the plain merge could not.
+/// The packets come from a certificate sequoia has already accepted and
+/// nothing but secrets is taken out of them, so there should be nothing left
+/// to reject; and an error here stops the write and leaves the stored file
+/// exactly as it was, which is the direction to fail in.
+fn merge_secret(existing: Cert, incoming: &Cert) -> Result<Cert> {
+    // Keyed by fingerprint rather than by role, so a key bound as both the
+    // primary and a subkey is one entry. `keys()` walks the primary and every
+    // subkey, including ones no policy accepts, which is what is wanted here:
+    // an expired subkey's secret is still the user's only copy of it.
+    let held: BTreeSet<_> = existing
+        .keys()
+        .secret()
+        .map(|key| key.key().fingerprint())
+        .collect();
+
+    // `set_filter` rejects a secret by writing the key out as a public packet,
+    // which is exactly the shape the merge below has nothing to prefer. Doing
+    // it here rather than repairing the merged certificate afterwards keeps
+    // the rule in one place and needs no second pass over the keys.
+    let stripped = Cert::from_packets(
+        incoming
+            .clone()
+            .into_tsk()
+            .set_filter(move |key| {
+                crate::secret::is_usable(key.secret()) || !held.contains(&key.fingerprint())
+            })
+            .into_packets(),
+    )?;
+
+    Ok(existing.merge_public_and_secret(stripped)?)
 }
 
 /// Keep only the hex digits of `fingerprint`.
@@ -1306,6 +1370,10 @@ mod windows_acl {
 mod tests {
     use super::*;
 
+    use sequoia_openpgp::crypto::{S2K, mpi};
+    use sequoia_openpgp::packet::key;
+    use sequoia_openpgp::{Fingerprint, Packet};
+
     fn scratch() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
@@ -1315,11 +1383,14 @@ mod tests {
     /// Importing a key with less secret material than we hold must not take
     /// what we already have.
     ///
-    /// `gpg --export-secret-subkeys` produces exactly this shape: a TSK whose
-    /// primary carries secret material and whose subkeys do not. insert_secret
-    /// used to serialise whatever it was handed straight over the file, so
-    /// importing one of those discarded every subkey secret the store held —
-    /// silently, with no merge, no comparison and no backup.
+    /// The shape here is a TSK whose primary carries secret material and whose
+    /// subkeys do not — the mirror image of `gpg --export-secret-subkeys`,
+    /// which keeps the subkey secrets and stubs the primary, except that these
+    /// subkeys are left plainly public where gpg would write a stub. The stub
+    /// shapes are what the tests below cover. insert_secret used to serialise
+    /// whatever it was handed straight over the file, so importing one of these
+    /// discarded every subkey secret the store held — silently, with no merge,
+    /// no comparison and no backup.
     ///
     /// Replace the merge with the old unconditional write and this fails: the
     /// subkey comes back public.
@@ -1339,8 +1410,8 @@ mod tests {
         store.insert_secret(&full).unwrap();
 
         // The same key with its subkey secrets stripped: still a TSK, because
-        // the primary keeps its own. This is what `gpg --export-secret-subkeys`
-        // inverts, and what as_tsk().set_filter() exists to express.
+        // the primary keeps its own. `gpg --export-secret-subkeys` writes the
+        // other way round, and as_tsk().set_filter() expresses either.
         let primary = full.primary_key().key().fingerprint();
         let mut bytes = Vec::new();
         full.as_tsk()
@@ -1364,6 +1435,277 @@ mod tests {
             secret_subkeys(&full),
             "importing a partial key must not discard secret subkeys we already held"
         );
+    }
+
+    /// The two shapes GnuPG writes in place of a secret it is not holding.
+    #[derive(Debug, Clone, Copy)]
+    enum Stub {
+        /// What `gpg --export-secret-subkeys` leaves for the primary.
+        GnuDummy,
+        /// What any export writes for a key that lives on a smartcard.
+        DivertToCard,
+    }
+
+    /// A GnuPG stub, as secret key material.
+    ///
+    /// Both shapes are the private S2K type 101 followed by a hash-algorithm
+    /// byte, `GNU`, and a mode: 1 for gnu-dummy, 2 for divert-to-card, the
+    /// card form carrying the length and bytes of the card's serial number
+    /// after it. Built here rather than exported, because exporting the card
+    /// form needs a card to export from. `tests/gnupg_stubs.rs` holds a real
+    /// gpg 2.4.9 export to pin the gnu-dummy half against; the card half is
+    /// this description of GnuPG's format and no more.
+    fn stub_secret(shape: Stub) -> key::SecretKeyMaterial {
+        let mut parameters = vec![0, b'G', b'N', b'U'];
+        match shape {
+            Stub::GnuDummy => parameters.push(1),
+            Stub::DivertToCard => {
+                parameters.push(2);
+                // An OpenPGP card application identifier with an invented
+                // serial number. Nothing here reads it, but a real card stub
+                // carries one, and it is what makes this stub longer than a
+                // gnu-dummy — the two are not the same number of bytes.
+                let serial = [
+                    0xd2, 0x76, 0x00, 0x01, 0x24, 0x01, 0x03, 0x04, 0x00, 0x05, 0x00, 0x00, 0x11,
+                    0x22, 0x33, 0x44,
+                ];
+                parameters.push(serial.len() as u8);
+                parameters.extend_from_slice(&serial);
+            }
+        }
+        key::SecretKeyMaterial::Encrypted(key::Encrypted::new(
+            S2K::Private {
+                tag: 101,
+                parameters: Some(parameters.into()),
+            },
+            // No cipher, no ciphertext: there is nothing here to decrypt. The
+            // 16-bit checksum is what GnuPG 2.1 and later record.
+            0.into(),
+            Some(mpi::SecretKeyChecksum::Sum16),
+            Vec::new().into(),
+        ))
+    }
+
+    /// A key to hang stubs on.
+    ///
+    /// RFC 4880, not the default: a GnuPG stub is a v4 shape. RFC 9580 forbids
+    /// the S2K usage byte a stub is written under, and gpg 2.4, which made the
+    /// fixtures in `tests/gnupg_stubs.rs`, writes no v6 keys at all, so
+    /// grafting a stub onto a v6 key would be testing a packet that cannot
+    /// occur. The merge never looks at the key version, and the tests either
+    /// side of these do use the default.
+    fn stub_host(password: Option<&str>) -> Cert {
+        let mut request = crate::keygen::KeyGenRequest::new("Stub <stub@example.org>");
+        request.standard = crate::keygen::Standard::Rfc4880;
+        request.password = password.map(|p| p.to_string().into());
+        crate::keygen::generate(&request).unwrap().cert
+    }
+
+    /// `cert` with the secret of every key `which` names replaced by `stub`.
+    fn with_stubs(
+        cert: &Cert,
+        stub: &key::SecretKeyMaterial,
+        which: impl Fn(&Fingerprint) -> bool,
+    ) -> Cert {
+        let packets = cert
+            .clone()
+            .into_tsk()
+            .into_packets()
+            .map(|packet| match packet {
+                Packet::PublicKey(key) if which(&key.fingerprint()) => {
+                    Packet::SecretKey(key.add_secret(stub.clone()).0)
+                }
+                Packet::SecretKey(key) if which(&key.fingerprint()) => {
+                    Packet::SecretKey(key.take_secret().0.add_secret(stub.clone()).0)
+                }
+                Packet::PublicSubkey(key) if which(&key.fingerprint()) => {
+                    Packet::SecretSubkey(key.add_secret(stub.clone()).0)
+                }
+                Packet::SecretSubkey(key) if which(&key.fingerprint()) => {
+                    Packet::SecretSubkey(key.take_secret().0.add_secret(stub.clone()).0)
+                }
+                other => other,
+            })
+            .collect::<Vec<_>>();
+        Cert::from_packets(packets.into_iter()).unwrap()
+    }
+
+    /// Every key's secret material, paired with the key's fingerprint.
+    ///
+    /// Read back from serialised bytes, so that both sides of a comparison
+    /// have been through the parser. A v4 packet carries no length for its
+    /// S2K, so the parser of a stub cannot tell where the S2K's parameters
+    /// end and puts all of it in the ciphertext instead: the same stub built
+    /// in memory and parsed from a packet serialises identically and compares
+    /// unequal.
+    fn secrets(cert: &Cert) -> Vec<(Fingerprint, Option<key::SecretKeyMaterial>)> {
+        let mut bytes = Vec::new();
+        cert.as_tsk().serialize(&mut bytes).unwrap();
+        Cert::from_bytes(&bytes)
+            .unwrap()
+            .keys()
+            .map(|key| {
+                (
+                    key.key().fingerprint(),
+                    key.key().optional_secret().cloned(),
+                )
+            })
+            .collect()
+    }
+
+    /// A GnuPG stub must not displace secret material the store already holds.
+    ///
+    /// Both stub shapes parse as an encrypted secret, so `has_secret` — and
+    /// therefore `Cert::is_tsk`, which is what routes a file to
+    /// `insert_imported_secret` — is true of a certificate carrying nothing
+    /// but stubs. A merge that prefers the incoming secret wherever there is
+    /// one takes them, and the primary that could certify, revoke and set an
+    /// expiry is gone.
+    ///
+    /// The passphrase-protected case is here because a stub and a protected
+    /// key are both encrypted: anything that decides on `is_encrypted` alone
+    /// gets one of the two wrong.
+    #[test]
+    fn a_stub_does_not_replace_a_usable_secret() {
+        for password in [None, Some("correct horse")] {
+            for shape in [Stub::GnuDummy, Stub::DivertToCard] {
+                let (_dir, store) = scratch();
+                let full = stub_host(password);
+                let fingerprint = full.fingerprint().to_hex();
+                store.insert_secret(&full).unwrap();
+                let held = store.secret_cert(&fingerprint).unwrap();
+
+                let stubbed = with_stubs(&full, &stub_secret(shape), |_| true);
+                assert!(
+                    stubbed.is_tsk(),
+                    "a stub reads as secret material, which is the whole problem"
+                );
+                store.insert_secret(&stubbed).unwrap();
+
+                assert_eq!(
+                    secrets(&store.secret_cert(&fingerprint).unwrap()),
+                    secrets(&held),
+                    "{shape:?} replaced usable secret material (protected: {})",
+                    password.is_some()
+                );
+            }
+        }
+    }
+
+    /// Every key is settled on its own, not by which copy the merge saw last.
+    ///
+    /// The store holds a gnu-dummy primary over real subkeys — what a
+    /// `gpg --export-secret-subkeys` file leaves behind when it is the first
+    /// thing imported — and then the real primary arrives with its subkeys
+    /// stubbed to a card. Neither copy is the better one as a whole, so
+    /// neither merge order can be right: only deciding per key ends with
+    /// every real secret.
+    #[test]
+    fn each_key_keeps_whichever_secret_is_usable() {
+        for password in [None, Some("correct horse")] {
+            let (_dir, store) = scratch();
+            let full = stub_host(password);
+            let fingerprint = full.fingerprint().to_hex();
+            let primary = full.fingerprint();
+
+            let stored = with_stubs(&full, &stub_secret(Stub::GnuDummy), |fp| *fp == primary);
+            store.insert_secret(&stored).unwrap();
+
+            let incoming = with_stubs(&full, &stub_secret(Stub::DivertToCard), |fp| *fp != primary);
+            store.insert_secret(&incoming).unwrap();
+
+            assert_eq!(
+                secrets(&store.secret_cert(&fingerprint).unwrap()),
+                secrets(&full),
+                "every key should have ended with its real secret (protected: {})",
+                password.is_some()
+            );
+        }
+    }
+
+    /// Where nothing usable is held, a stub is still worth keeping.
+    ///
+    /// It is the only record that the key exists somewhere else — on a card,
+    /// or on the machine the export came from — and dropping it would leave a
+    /// certificate that does not mention the subkey at all.
+    #[test]
+    fn a_stub_is_kept_where_no_secret_is_held() {
+        let (_dir, store) = scratch();
+        let full = stub_host(None);
+        let fingerprint = full.fingerprint().to_hex();
+        let primary = full.fingerprint();
+
+        // The primary's secret and nothing else, so the store holds no subkey
+        // secret for the stubs to be weighed against.
+        let mut bytes = Vec::new();
+        let only_primary = primary.clone();
+        full.as_tsk()
+            .set_filter(move |key| key.fingerprint() == only_primary)
+            .serialize(&mut bytes)
+            .unwrap();
+        store
+            .insert_secret(&Cert::from_bytes(&bytes).unwrap())
+            .unwrap();
+
+        let carded = with_stubs(&full, &stub_secret(Stub::DivertToCard), |fp| *fp != primary);
+        store.insert_secret(&carded).unwrap();
+
+        let after = store.secret_cert(&fingerprint).unwrap();
+        assert!(
+            after.keys().subkeys().count() > 0,
+            "the generated key must have subkeys, or this proves nothing"
+        );
+        for subkey in after.keys().subkeys() {
+            let secret = subkey
+                .key()
+                .optional_secret()
+                .expect("a stub records that the subkey exists elsewhere");
+            assert!(
+                !crate::secret::is_usable(secret),
+                "the stub should have been kept as it arrived"
+            );
+        }
+    }
+
+    /// A secret file that will not parse is moved aside, never written over.
+    ///
+    /// It is the one case where the merge cannot run, and the bytes it cannot
+    /// read may still be the only copy of a key: truncated by a failed sync,
+    /// or damaged on disk. Restoring from a backup is exactly when a user
+    /// re-imports over such a file, so the second half goes through
+    /// `import_file`, which is the path that reaches this from the GUI.
+    #[test]
+    fn an_unreadable_secret_file_is_moved_aside_rather_than_overwritten() {
+        let (dir, store) = scratch();
+        let key = stub_host(None);
+        let fingerprint = key.fingerprint().to_hex();
+        let path = store.secret_path(&fingerprint);
+
+        let mut aside = path.clone();
+        aside.as_mut_os_string().push(".unreadable");
+        let mut second = path.clone();
+        second.as_mut_os_string().push(".unreadable.1");
+
+        fs::write(&path, b"not a key at all").unwrap();
+        store.insert_secret(&key).unwrap();
+        assert_eq!(fs::read(&aside).unwrap(), b"not a key at all");
+        assert!(store.secret_cert(&fingerprint).unwrap().is_tsk());
+
+        // Again, over a second damaged file, through the import path.
+        let bundle = dir.path().join("backup.pgp");
+        let mut bytes = Vec::new();
+        key.as_tsk().serialize(&mut bytes).unwrap();
+        fs::write(&bundle, &bytes).unwrap();
+        fs::write(&path, b"nor is this").unwrap();
+        store.import_file(&bundle).unwrap();
+
+        assert_eq!(fs::read(&second).unwrap(), b"nor is this");
+        assert_eq!(
+            fs::read(&aside).unwrap(),
+            b"not a key at all",
+            "the first copy set aside must not be overwritten by the second"
+        );
+        assert!(store.secret_cert(&fingerprint).unwrap().is_tsk());
     }
 
     /// An imported secret key must not become a trust root.
