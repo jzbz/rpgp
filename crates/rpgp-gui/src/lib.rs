@@ -2409,6 +2409,11 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
             };
 
             ui.set_delete_target(detail.primary_user_id.clone());
+            // This write is not only what the dialog says. The delete is
+            // performed against it, so it is the record of what the user was
+            // warned about and agreed to, and it has to be written afresh for
+            // every target the dialog opens on rather than left holding an
+            // answer about a previous one.
             ui.set_delete_has_secret(has_secret);
             ui.set_delete_has_revocation(has_revocation);
             ui.set_delete_confirm_word(detail.key_id.clone());
@@ -2427,9 +2432,13 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
 
             let (ui_weak, state) = (ui_weak.clone(), state.clone());
             let fingerprint = ui.get_detail().fingerprint.to_string();
+            // Read here, on the event loop, because this is the value the
+            // dialog was built from: whether it warned about a secret key and
+            // asked for the key ID to be typed. Nothing else writes it.
+            let confirmed_secret = ui.get_delete_has_secret();
             std::thread::spawn(move || {
                 let _busy = BusyGuard(ui_weak.clone());
-                let outcome = run_delete(&state, &fingerprint);
+                let outcome = run_delete(&state, &fingerprint, confirmed_secret);
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(ui) = ui_weak.upgrade() else {
                         return;
@@ -2461,16 +2470,51 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
 /// scan that prunes it is rate-limited. Reopening is the only way to get a
 /// current view, and it is I/O, so it happens off the lock like every other
 /// worker here.
-fn run_delete(state: &Shared, fingerprint: &str) -> Result<String, String> {
+///
+/// `confirmed_secret` is what the dialog warned about when it opened, not what
+/// is on disk now. Asking the store again here would hand [`Store::delete`]
+/// the very answer its guard compares against, so the guard could never
+/// refuse — and a secret key that appeared after the dialog opened, which is
+/// exactly what the guard is for, would be destroyed without the warning or
+/// the typed key ID the user would have been asked for. Nothing stops a second
+/// rPGP window, or anything else writing to the same directories, from putting
+/// one there in the meantime.
+fn run_delete(state: &Shared, fingerprint: &str, confirmed_secret: bool) -> Result<String, String> {
     let store = {
         let guard = lock(state);
         guard.store.clone()
     };
 
-    let had_secret = store.has_secret(fingerprint);
-    store
-        .delete(fingerprint, had_secret)
-        .map_err(|e| format!("Could not delete the certificate: {e}"))?;
+    // Claiming at the end that a secret key went takes both halves: one there
+    // to take, and a delete that was allowed to take it. The two can disagree
+    // now that `secret_too` no longer comes from this read — an unwarned
+    // secret key that vanishes before the guard looks lets the delete through,
+    // and unlinking an absent file succeeds, but nothing secret was removed
+    // and the status must not say one was.
+    let had_secret = confirmed_secret && store.has_secret(fingerprint);
+
+    // The guard refuses because a secret key is there that the dialog did not
+    // warn about, and its wording — that deleting it needs to be confirmed —
+    // describes a confirmation the user was never offered. So say what is true
+    // of the store, and say it without guessing at how it came to be true:
+    // this fires both for a secret key written since the dialog opened and,
+    // until the delete target is captured with the dialog, for a target that
+    // moved under it. What to do comes first, because the status line elides
+    // and the tail is what goes; it names the buttons that are on screen,
+    // since a failed delete leaves the dialog open and dismissing it is what
+    // makes reopening re-read the store and put the warning back. The state is
+    // read here rather than before the call so that a failure past the guard,
+    // with the certificate already unlinked, is not reported as having deleted
+    // nothing.
+    store.delete(fingerprint, confirmed_secret).map_err(|e| {
+        if !confirmed_secret && store.has_secret(fingerprint) {
+            "Cancel, then open Delete again: nothing was deleted, because this \
+             certificate has a secret key the dialog did not warn about."
+                .to_string()
+        } else {
+            format!("Could not delete the certificate: {e}")
+        }
+    })?;
 
     let refreshed =
         Arc::new(store.reopen().map_err(|e| {
@@ -3562,5 +3606,87 @@ mod tests {
         let rows = signature_rows(&[], &[report(&fingerprint, true)]);
         assert_eq!(rows[0].authentication, "unverified");
         assert!(!rows[0].authenticated);
+    }
+
+    /// A `State` holding nothing but the store, which is all `run_delete`
+    /// touches: it takes the store out and puts the reopened one back.
+    fn state_for(store: Store) -> Shared {
+        Arc::new(Mutex::new(State {
+            store: Arc::new(store),
+            all: Vec::new(),
+            shown: Vec::new(),
+            reload_generation: 0,
+            filter: String::new(),
+            scope: Scope::All,
+            sort: Sort::MineFirst,
+            se_input: None,
+            se_recipients: Vec::new(),
+            se_filter: String::new(),
+            se_signers: Vec::new(),
+            dv_input: None,
+            dv_data: None,
+            dv_kind: InputKind::NotOpenPgp,
+            certify_target: None,
+            certify_user_ids: Vec::new(),
+            certify_certifiers: Vec::new(),
+            lookup_results: Vec::new(),
+            revoke_target: None,
+            revoke_certification: false,
+        }))
+    }
+
+    /// The dialog decides once, when it opens, whether this is a tidying
+    /// operation or the destruction of the only copy of a key — and it asks
+    /// for the key ID to be typed only in the second case. The delete has to
+    /// act on that same answer, so that a secret key written by something else
+    /// in between is refused by the store rather than removed on the strength
+    /// of a confirmation the user was never shown.
+    #[test]
+    fn deleting_follows_the_warning_the_dialog_showed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (certs, secrets) = (dir.path().join("certs.d"), dir.path().join("secrets"));
+        let cert = rpgp_core::keygen::generate(&rpgp_core::keygen::KeyGenRequest::new(
+            "Bob <bob@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        let fingerprint = cert.fingerprint().to_hex();
+
+        // The public half only, so the dialog opens with no warning and no
+        // field to type in.
+        let store = Store::open(&certs, &secrets).unwrap();
+        store.insert(&cert).unwrap();
+        let state = state_for(store);
+
+        // Another writer on the same directories — a second rPGP window, a
+        // sync tool — restores the secret half while the dialog is open.
+        let elsewhere = Store::open(&certs, &secrets).unwrap();
+        elsewhere.insert_secret(&cert).unwrap();
+        assert!(elsewhere.has_secret(&fingerprint));
+
+        let refused = run_delete(&state, &fingerprint, false)
+            .expect_err("a secret key the dialog never warned about must not be deleted");
+        assert!(
+            refused.contains("the dialog did not warn about"),
+            "the message should say what is wrong, not just that it failed: {refused}"
+        );
+        assert!(
+            elsewhere.has_secret(&fingerprint),
+            "the secret key is still on disk"
+        );
+        assert!(
+            elsewhere.reopen().unwrap().lookup(&fingerprint).is_ok(),
+            "and so is the certificate, since nothing was deleted"
+        );
+
+        // Reopened, the dialog now warns and asks for the key ID; confirmed,
+        // both halves go.
+        let message = run_delete(&state, &fingerprint, true).expect("a confirmed delete proceeds");
+        assert!(
+            message.contains("secret key deleted"),
+            "the status should report what went: {message}"
+        );
+        assert!(!elsewhere.has_secret(&fingerprint));
+        assert!(elsewhere.reopen().unwrap().lookup(&fingerprint).is_err());
     }
 }
