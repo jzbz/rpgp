@@ -8,10 +8,11 @@
 
 use std::time::{Duration, SystemTime};
 
+use sequoia_openpgp::cert::amalgamation::ValidAmalgamation;
 use sequoia_openpgp::cert::{SubkeyRevocationBuilder, UserIDRevocationBuilder};
 use sequoia_openpgp::packet::signature::SignatureBuilder;
 use sequoia_openpgp::packet::{Signature, UserID};
-use sequoia_openpgp::types::{ReasonForRevocation, SignatureType};
+use sequoia_openpgp::types::{ReasonForRevocation, RevocationStatus, SignatureType};
 use sequoia_openpgp::{Cert, Packet};
 
 use crate::error::{Error, Result};
@@ -125,8 +126,16 @@ pub fn set_expiry(
 
 /// Bind a new identity to a certificate.
 ///
+/// The new binding is copied from the primary user ID's, so the new name
+/// carries the key's flags, its expiry and its algorithm preferences rather
+/// than nothing at all, and the primary identity does not move — unless it has
+/// been retired, in which case the new name takes it over rather than the
+/// retirement being quietly undone.
+///
 /// A revoked certificate is refused, as in [`set_expiry`] and for the same
-/// reason.
+/// reason, and so is one the standard policy cannot evaluate: the key's own
+/// account of itself is what this copies, and a certificate that cannot be
+/// read has none to copy.
 pub fn add_user_id(
     store: &Store,
     fingerprint: &str,
@@ -140,13 +149,17 @@ pub fn add_user_id(
 
     let cert = store.secret_cert(fingerprint)?;
 
-    // The new binding signature is dated now, and the primary user ID's binding
-    // overrides a soft revocation exactly as a direct-key signature does. On a
-    // certificate whose existing bindings carry no primary-user-ID subpacket —
-    // which is how a fair number of imported keys look — the newest binding
-    // becomes the primary one, so the new name un-revokes the key. Keys
-    // generated here flag their first user ID and so happen to be safe, which
-    // is precisely the kind of accident not to leave a guarantee resting on.
+    // Where the binding over the primary user ID is re-issued below — which is
+    // every certificate whose bindings claim no primary identity, the shape
+    // most imported keys have — that signature is dated now, and the primary
+    // user ID's binding overrides a soft revocation exactly as a direct-key
+    // signature does. So naming a retired key would bring it back to life, and
+    // the status bar would then invite its owner to publish it. A certificate
+    // that already claims its primary identity takes no re-issue, so nothing
+    // this writes lands on the primary user ID and the revocation stands; keys
+    // generated here are that shape and so happen to be safe, which is
+    // precisely the kind of accident not to leave a guarantee resting on. Both
+    // shapes are refused.
     //
     // Both halves of the store are asked, and the guard sits ahead of
     // `unlock_primary`, for the reasons set out in [`set_expiry`].
@@ -159,13 +172,156 @@ pub fn add_user_id(
         return Err(Error::invalid(format!("{user_id} is already on this key")));
     }
 
+    let policy = policy();
+
+    // What a certificate says about its own primary key — the key flags, the
+    // expiry, the preferred algorithms, the features — lives in the primary
+    // user ID's binding signature, with a direct-key signature as the fallback.
+    // A bare `SignatureBuilder::new` carries none of it, and on a key whose
+    // bindings claim no primary user ID, which is every key GnuPG makes, the
+    // new binding is then the newest and becomes the primary one: the key loses
+    // its certify and sign flags, loses the expiry its owner set, and is
+    // published with neither. Sequoia-based tools, this one included, then
+    // refuse to sign or certify with it. Keys generated here escape only
+    // because `CertBuilder` flags their first user ID, which is why every test
+    // passed.
+    //
+    // So copy the primary user ID's binding and re-sign it over the new name.
+    // That is sequoia's own move when it re-issues a binding — `set_expiry`
+    // goes through the same template — and what it copies is exactly what the
+    // key claims about itself.
+    let (template, pin) = {
+        let valid = cert.with_policy(&policy, None).map_err(|_| {
+            Error::invalid("this certificate is not valid under the standard policy")
+        })?;
+        let primary = valid.primary_userid().ok();
+        let template = match &primary {
+            Some(primary) => primary.binding_signature().clone(),
+            // No user ID the policy accepts, so there is nothing to copy but the
+            // direct-key signature. A certificate with neither has nothing to
+            // say about its own key and cannot be templated from at all.
+            None => valid
+                .direct_key_signature()
+                .map_err(|_| {
+                    Error::invalid(
+                        "this certificate carries no self-signature to copy the key's \
+                         flags and preferences from",
+                    )
+                })?
+                .clone(),
+        };
+
+        // Copying the subpackets is not enough on its own: with identical
+        // subpackets the new binding is still the newest, and sequoia ranks a
+        // claimed primary user ID above a newer one but has nothing else to go
+        // on. So where no binding claims it, re-issue the current primary's own
+        // binding with the claim made explicit, and the primary stays where it
+        // was. A certificate that already names a primary is left alone.
+        //
+        // A retired identity is left alone too, and that one is not a nicety.
+        // Sequoia settles a user ID's revocation status from the newest binding
+        // over it, so a binding dated now overrides a soft revocation —
+        // UIDRetired, which is this app's own default — exactly as the
+        // direct-key signature in `set_expiry` overrides a soft revocation of
+        // the whole certificate. On a key whose identities have all been
+        // withdrawn, pinning would put the retired name back in service, claim
+        // it as the primary one, and write that to both halves of the store and
+        // into whatever is published next. Nothing is lost by skipping it:
+        // sequoia ranks a live identity above a revoked one whatever the dates
+        // say, so the name just added becomes the primary one, which is the only
+        // honest answer when every other name on the key has been withdrawn.
+        let pin = primary
+            .filter(|primary| !matches!(primary.revocation_status(), RevocationStatus::Revoked(_)))
+            .filter(|primary| primary.binding_signature().primary_userid() != Some(true))
+            .map(|primary| {
+                (
+                    primary.userid().clone(),
+                    primary.binding_signature().clone(),
+                )
+            });
+        (template, pin)
+    };
+
+    // Both signatures are dated together, and one second on where the binding
+    // being replaced was made in this same second. Signature timestamps are
+    // whole seconds and a self-signature supersedes only one made strictly
+    // earlier, so a re-issued binding that ties with its predecessor is settled
+    // by comparing the two signatures' MPIs — a coin toss that, lost, leaves
+    // the primary user ID unclaimed and moves it to the new name after all.
+    // Dating both alike keeps the claim, not the clock, deciding which identity
+    // is primary, so the one second the pair can spend in the future costs
+    // nothing: until it arrives the certificate reads as it did before the call,
+    // rather than briefly reading with the wrong primary.
+    //
+    // This is not the general fix for same-second self-signatures, which is a
+    // change of its own; it is this operation not adding another instance.
+    let now = SystemTime::now();
+    let second = Duration::from_secs(1);
+    let when = match pin
+        .as_ref()
+        .and_then(|(_, sig)| sig.signature_creation_time())
+    {
+        Some(created) if created + second > now => now + second,
+        _ => now,
+    };
+
     let mut signer = unlock_primary(&cert, password)?;
     let userid = UserID::from(user_id);
-    let binding = SignatureBuilder::new(SignatureType::PositiveCertification).sign_userid_binding(
-        &mut signer,
-        cert.primary_key().key(),
-        &userid,
-    )?;
+
+    let mut builder = SignatureBuilder::from(template)
+        .set_type(SignatureType::PositiveCertification)
+        .set_signature_creation_time(when)?;
+    {
+        // Nothing in the template's unhashed area is this signature's to carry.
+        // That area is covered by no signature, so anyone who handles a
+        // certificate can append to it in flight, and `SignatureBuilder` copies
+        // the whole of it across — it drops only the creation time and the
+        // issuers. Sequoia reads it for the issuers and for an embedded
+        // signature, and signing writes the issuers this signature needs into
+        // the hashed area, so emptying it loses nothing the new binding is
+        // entitled to and keeps a stranger's packets out of a signature this
+        // key makes.
+        builder.unhashed_area_mut().clear();
+
+        // What the template says about the key is the point of copying it; what
+        // it says about the identity it was made over is not the new identity's
+        // to inherit — above all the primary-user-ID claim, which would make
+        // the certificate name two. This is the list sequoia strips when it
+        // templates a direct-key signature out of a user ID binding: the same
+        // question, asked of a subject that is not the identity signed over.
+        use sequoia_openpgp::packet::signature::subpacket::SubpacketTag::*;
+        for tag in [
+            PrimaryUserID,
+            SignersUserID,
+            ExportableCertification,
+            Revocable,
+            TrustSignature,
+            RegularExpression,
+            ReasonForRevocation,
+            SignatureTarget,
+            EmbeddedSignature,
+        ] {
+            builder.hashed_area_mut().remove_all(tag);
+        }
+    }
+    let binding = builder.sign_userid_binding(&mut signer, cert.primary_key().key(), &userid)?;
+
+    let mut packets = vec![Packet::from(userid), Packet::from(binding)];
+    if let Some((primary, binding)) = pin {
+        // Re-issued from its own binding, so it keeps the type it had and every
+        // subpacket it carried; only the claim and the date are new. Including
+        // the unhashed area, unlike the binding above, because the subject here
+        // is the very identity that binding was already made over and this is
+        // what sequoia's own re-issue does. It does leave this the one place
+        // where a packet appended in flight is carried into a signature this key
+        // makes, which is a question for whoever revisits the re-issue.
+        packets.push(Packet::from(
+            SignatureBuilder::from(binding)
+                .set_signature_creation_time(when)?
+                .set_primary_userid(true)?
+                .sign_userid_binding(&mut signer, cert.primary_key().key(), &primary)?,
+        ));
+    }
 
     // secret_cert is where `cert` came from, so the certificate always has a
     // secret half here — the has_secret test that used to guard the write
@@ -174,9 +330,7 @@ pub fn add_user_id(
     // reconstructing a certificate that had already been built one line
     // above. insert_secret writes the public half itself, so one call does
     // what three did.
-    let updated = cert
-        .insert_packets(vec![Packet::from(userid), Packet::from(binding)])?
-        .0;
+    let updated = cert.insert_packets(packets)?.0;
     store.insert_secret(&updated)?;
     Ok(updated)
 }
@@ -185,6 +339,12 @@ pub fn add_user_id(
 ///
 /// The user ID stays on the key — it has to, so anyone holding an old copy can
 /// see it was withdrawn rather than simply not knowing about it.
+///
+/// The last live identity cannot be retired this way. Where the standard policy
+/// cannot evaluate the certificate at all — a legacy key whose self-signatures
+/// are all SHA-1, say — which identities are still standing cannot be answered,
+/// and the guard falls back to the cruder count it used to keep, so such a key
+/// is left exactly the operation it always had.
 pub fn revoke_user_id(
     store: &Store,
     fingerprint: &str,
@@ -193,13 +353,56 @@ pub fn revoke_user_id(
     password: Option<&str>,
 ) -> Result<Cert> {
     let cert = store.secret_cert(fingerprint)?;
-    let userid = cert
-        .userids()
-        .map(|ua| ua.userid().clone())
-        .find(|uid| String::from_utf8_lossy(uid.value()) == user_id)
-        .ok_or_else(|| Error::invalid(format!("{user_id} is not a user ID on this key")))?;
 
-    if cert.userids().count() < 2 {
+    // Exactly one user ID, or none. Taking the first row whose lossy rendering
+    // matched retired whichever sorted first — which, since the GUI hides the
+    // button on the primary and on already-revoked rows, could be the primary
+    // identity the user was not offered the choice of retiring, or a second
+    // revocation of one already retired while the row they clicked stayed live
+    // and the status bar said it had been revoked. `cert::resolve_user_id`
+    // carries the reasoning.
+    let userid = crate::cert::resolve_user_id(&cert, user_id)?
+        .userid()
+        .clone();
+
+    // Which identities are actually standing. The count used to be
+    // `cert.userids()`, which is every user ID the certificate carries,
+    // including ones revoked years ago and ones with no binding signature at
+    // all — sequoia keeps a name anyone appended in flight. A key whose second
+    // identity was retired last year therefore passed a guard whose own message
+    // promises it will not, and the last live name on the key went with it.
+    //
+    // The refusal comes only where this would take the last live identity
+    // away, so retiring a name already retired now goes through where the old
+    // count would sometimes have refused it. That writes a second UIDRetired
+    // over a name already withdrawn, which leaves the certificate saying
+    // exactly what it said before, and the GUI hides the button on those rows
+    // in any case.
+    let policy = policy();
+    let refuse = match cert.with_policy(&policy, None) {
+        Ok(valid) => {
+            let mut target_is_live = false;
+            let mut others_live = 0usize;
+            for ua in valid.userids().revoked(false) {
+                if ua.userid() == &userid {
+                    target_is_live = true;
+                } else {
+                    others_live += 1;
+                }
+            }
+            target_is_live && others_live == 0
+        }
+        // Nothing here can read the certificate, so which identities are still
+        // standing has no answer and the count above cannot be taken. Falling
+        // back to the one this replaces rather than refusing outright: the old
+        // count is crude, but a retirement it lets through is one it has always
+        // let through, and a legacy key keeps the only way this app offers of
+        // retiring an address on it. `set_expiry` refuses such a certificate,
+        // but that is a different case — it has to read the key's own account
+        // of itself in order to rewrite it, while nothing here does.
+        Err(_) => cert.userids().count() < 2,
+    };
+    if refuse {
         return Err(Error::invalid(
             "this is the only user ID; revoking the whole certificate is the honest \
              way to retire it",
@@ -351,18 +554,19 @@ mod tests {
     /// answer the question differently.
     ///
     /// Sequoia settles a certificate's revocation status from the newest
-    /// self-signature on the *primary user ID*, so whether a newly bound name
-    /// supersedes a soft revocation depends on whether it becomes the primary
-    /// one — and `ValidComponentAmalgamation::primary` ranks the
-    /// primary-user-ID subpacket above creation time. A key generated here
-    /// flags its first user ID and so happens to be safe; a certificate whose
-    /// bindings carry no such subpacket, which is how a fair number of imported
-    /// keys look, is not. With the guard removed the second half of this test
-    /// reads `Valid` again after the call, which is the harm — a key retired
-    /// with the default reason back in service, and the app suggesting it be
-    /// published. Both halves are refused, because the difference between them
-    /// is an accident of how the certificate was made and not something a
-    /// guarantee should rest on.
+    /// self-signature on the *primary user ID*, so whether adding a name
+    /// supersedes a soft revocation turns on whether this puts a signature
+    /// there. A key generated here flags its first user ID, so that binding
+    /// already claims the primary identity, no re-issue is taken, and nothing
+    /// at all reaches the primary user ID: that shape is safe by accident. A
+    /// certificate whose bindings carry no such subpacket, which is how a fair
+    /// number of imported keys look, has its primary user ID re-signed so that
+    /// the primary does not move, and that re-signature is dated now. With the
+    /// guard removed the second half of this test reads `Valid` again after the
+    /// call, which is the harm — a key retired with the default reason back in
+    /// service, and the app suggesting it be published. Both halves are
+    /// refused, because the difference between them is an accident of how the
+    /// certificate was made and not something a guarantee should rest on.
     #[test]
     fn refuses_to_add_a_user_id_to_a_revoked_certificate() {
         let (_dir, store, cert) = scratch();
@@ -776,6 +980,273 @@ mod tests {
         assert!(add_user_id(&store, &fingerprint, "   ", None).is_err());
     }
 
+    /// Pinning the primary identity means re-issuing its binding, and a
+    /// re-issued self-signature has to supersede the one it replaces. Signature
+    /// timestamps are whole seconds and a self-signature supersedes only one
+    /// made strictly earlier, so a binding written in the same second as the
+    /// one it replaces ties, and sequoia settles the tie by comparing the two
+    /// signatures' MPIs. Losing that toss leaves the primary user ID unclaimed
+    /// and hands the title to the name just added, which is what pinning it
+    /// exists to prevent.
+    ///
+    /// The binding is replaced in the same second on purpose: the call follows
+    /// it immediately, the way a second click does.
+    #[test]
+    fn the_re_issued_primary_binding_supersedes_the_one_it_replaces() {
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let policy = policy();
+
+        // Reshape the key to look like one that came in through Import: re-bind
+        // its user ID with a signature claiming no primary user ID, so that
+        // adding a name has to pin it. The wait is what makes this binding the
+        // active one rather than a tie with the one keygen made.
+        std::thread::sleep(Duration::from_millis(1100));
+        let secret = store.secret_cert(&fingerprint).unwrap();
+        let userid = secret.userids().next().unwrap().userid().clone();
+        let mut signer = unlock_primary(&secret, None).unwrap();
+        let unflagged = SignatureBuilder::new(SignatureType::PositiveCertification)
+            .sign_userid_binding(&mut signer, secret.primary_key().key(), &userid)
+            .unwrap();
+        let replaced = unflagged.signature_creation_time().unwrap();
+        let reshaped = secret
+            .insert_packets(vec![Packet::from(unflagged)])
+            .unwrap()
+            .0;
+        store.insert_secret(&reshaped).unwrap();
+        assert!(
+            reshaped
+                .with_policy(&policy, None)
+                .unwrap()
+                .primary_userid()
+                .unwrap()
+                .binding_signature()
+                .primary_userid()
+                .is_none(),
+            "the point of the shape is a binding that claims nothing"
+        );
+
+        let updated =
+            add_user_id(&store, &fingerprint, "Alice <alice@work.example>", None).unwrap();
+
+        let pinned = updated
+            .userids()
+            .find(|ua| ua.userid() == &userid)
+            .expect("the identity is still there")
+            .self_signatures()
+            .filter(|sig| sig.primary_userid() == Some(true))
+            .filter_map(|sig| sig.signature_creation_time())
+            .max()
+            .expect("the primary identity must be pinned");
+        assert!(
+            pinned > replaced,
+            "the pinned binding ties with the one it replaces and may lose the tie"
+        );
+        assert_eq!(
+            updated
+                .with_policy(&policy, None)
+                .unwrap()
+                .primary_userid()
+                .unwrap()
+                .userid(),
+            &userid,
+            "the primary identity must not move, during that second or after it"
+        );
+    }
+
+    /// `SignatureBuilder::from` carries the template's unhashed area across
+    /// wholesale, dropping only the creation time and the issuers. Nothing
+    /// covers that area, so anyone who handled the certificate on its way here
+    /// could have appended to it, and stripping the hashed area alone left a
+    /// stranger's packet sitting inside a signature this key had just made and
+    /// published it under the owner's name.
+    ///
+    /// Two are planted, because emptying that area is a wider claim than the
+    /// strip list. An embedded signature is the one that bites: sequoia reads it
+    /// out of the unhashed area as readily as out of the hashed one. A preferred
+    /// key server stands for everything else that can be appended there and
+    /// would have survived a strip by tag.
+    #[test]
+    fn a_new_binding_carries_nothing_that_was_appended_to_the_template() {
+        use sequoia_openpgp::packet::signature::subpacket::{
+            Subpacket, SubpacketTag, SubpacketValue,
+        };
+
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let policy = policy();
+
+        // Re-issue the primary user ID's binding from itself, so that it keeps
+        // the flags and the primary-user-ID claim and is what `add_user_id`
+        // templates from, and append the two packets to the unhashed area of
+        // the re-issue. The wait is what makes the re-issue the active binding
+        // rather than a tie with the one keygen made.
+        std::thread::sleep(Duration::from_millis(1100));
+        let secret = store.secret_cert(&fingerprint).unwrap();
+        let mut signer = unlock_primary(&secret, None).unwrap();
+        let planted = {
+            let primary = secret
+                .with_policy(&policy, None)
+                .unwrap()
+                .primary_userid()
+                .unwrap();
+            let userid = primary.userid().clone();
+            let original = primary.binding_signature().clone();
+            let mut planted = SignatureBuilder::from(original.clone())
+                .sign_userid_binding(&mut signer, secret.primary_key().key(), &userid)
+                .unwrap();
+            planted
+                .unhashed_area_mut()
+                .add(Subpacket::new(SubpacketValue::EmbeddedSignature(original), false).unwrap())
+                .unwrap();
+            planted
+                .unhashed_area_mut()
+                .add(
+                    Subpacket::new(
+                        SubpacketValue::PreferredKeyServer(b"hkps://elsewhere.invalid".to_vec()),
+                        false,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            planted
+        };
+        let reshaped = secret
+            .insert_packets(vec![Packet::from(planted)])
+            .unwrap()
+            .0;
+        store.insert_secret(&reshaped).unwrap();
+        let appended = [
+            SubpacketTag::EmbeddedSignature,
+            SubpacketTag::PreferredKeyServer,
+        ];
+        for tag in appended {
+            assert!(
+                reshaped
+                    .with_policy(&policy, None)
+                    .unwrap()
+                    .primary_userid()
+                    .unwrap()
+                    .binding_signature()
+                    .unhashed_area()
+                    .subpacket(tag)
+                    .is_some(),
+                "the template must carry {tag:?}, or this proves nothing"
+            );
+        }
+
+        let updated =
+            add_user_id(&store, &fingerprint, "Alice <alice@work.example>", None).unwrap();
+        let binding = updated
+            .userids()
+            .find(|ua| String::from_utf8_lossy(ua.userid().value()) == "Alice <alice@work.example>")
+            .expect("the new identity is on the key")
+            .self_signatures()
+            .next()
+            .expect("with a binding signature")
+            .clone();
+        for tag in appended {
+            assert!(
+                binding.hashed_area().subpacket(tag).is_none()
+                    && binding.unhashed_area().subpacket(tag).is_none(),
+                "a new binding must carry no {tag:?} that was appended to the one it was \
+                 copied from"
+            );
+        }
+    }
+
+    /// Pinning an identity is a binding signature dated now, and sequoia
+    /// settles a user ID's revocation status from the newest binding over it:
+    /// a soft revocation loses to a binding made later. UIDRetired, which is
+    /// what retiring a name writes here, is soft. So on a certificate whose
+    /// identities have all been withdrawn — the primary one included, since
+    /// sequoia still names one of them primary when no other is left — pinning
+    /// put the retired address back into service, claimed it as the primary
+    /// identity, and wrote that to both halves of the store and into whatever
+    /// was published next. Adding an address is exactly when a key is in that
+    /// state: retire the old name, then add the new one.
+    ///
+    /// This is the harm the guard at the top of `add_user_id` exists to
+    /// prevent, one level down. That guard asks whether the certificate is
+    /// revoked, and here it is not — only its identities are.
+    #[test]
+    fn adding_a_user_id_does_not_bring_a_retired_identity_back() {
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+
+        // The shape that pins: a binding claiming no primary user ID, as an
+        // imported key has. The wait is what makes this binding the active one
+        // rather than a tie with the one keygen made.
+        std::thread::sleep(Duration::from_millis(1100));
+        let secret = store.secret_cert(&fingerprint).unwrap();
+        let userid = secret.userids().next().unwrap().userid().clone();
+        let mut signer = unlock_primary(&secret, None).unwrap();
+        let unflagged = SignatureBuilder::new(SignatureType::PositiveCertification)
+            .sign_userid_binding(&mut signer, secret.primary_key().key(), &userid)
+            .unwrap();
+
+        // Retired with the reason this app writes by default, and built here
+        // rather than through `revoke_user_id`, which refuses to take the last
+        // live name away.
+        let retirement = UserIDRevocationBuilder::new()
+            .set_reason_for_revocation(ReasonForRevocation::UIDRetired, b"left the job")
+            .unwrap()
+            .build(&mut signer, &secret, &userid, None)
+            .unwrap();
+        let retired_at = retirement.signature_creation_time().unwrap();
+        let reshaped = secret
+            .insert_packets(vec![Packet::from(unflagged), Packet::from(retirement)])
+            .unwrap()
+            .0;
+        store.insert_secret(&reshaped).unwrap();
+        assert!(
+            cert::user_ids(&reshaped).iter().all(|u| u.revoked),
+            "the shape under test is a key with no identity left standing"
+        );
+
+        // A binding written in the same second as the revocation ties with it
+        // and the revocation stands, so without this wait whether the harm
+        // happens at all would depend on which second the call landed in.
+        std::thread::sleep(Duration::from_millis(1100));
+        let updated =
+            add_user_id(&store, &fingerprint, "Alice <alice@newjob.example>", None).unwrap();
+
+        for reloaded in [
+            updated,
+            store.secret_cert(&fingerprint).unwrap(),
+            store.lookup(&fingerprint).unwrap(),
+        ] {
+            let ids = cert::user_ids(&reloaded);
+            let retired = ids
+                .iter()
+                .find(|u| u.text == "Alice <alice@example.org>")
+                .expect("a retired identity stays on the key");
+            assert!(retired.revoked, "a retired identity must stay retired");
+            assert!(
+                !retired.is_primary,
+                "a retired identity must not be named the primary one"
+            );
+            assert!(
+                ids.iter().any(|u| u.text == "Alice <alice@newjob.example>"
+                    && u.is_primary
+                    && !u.revoked),
+                "the name just added is the only one standing, so it is the primary one"
+            );
+
+            // Nothing new was signed over the retired name at all: skipping the
+            // pin is the fix, not out-dating it.
+            assert!(
+                reloaded
+                    .userids()
+                    .find(|ua| ua.userid() == &userid)
+                    .expect("a retired identity stays on the key")
+                    .self_signatures()
+                    .all(|sig| sig.signature_creation_time() <= Some(retired_at)),
+                "no binding may be written over an identity its owner has retired"
+            );
+        }
+    }
+
     #[test]
     fn revokes_one_subkey_and_leaves_the_others() {
         let (_dir, store, cert) = scratch();
@@ -855,6 +1326,228 @@ mod tests {
         assert!(
             ids.iter()
                 .any(|u| u.text == "Alice <alice@example.org>" && !u.revoked)
+        );
+    }
+
+    /// The same guard, over the shape that used to walk straight through it.
+    ///
+    /// It counted `cert.userids()`, which is every user ID the certificate
+    /// carries — including ones retired years ago, and ones with no binding
+    /// signature at all, which sequoia keeps and anyone can append in flight.
+    /// A key whose second identity was already revoked therefore had two by
+    /// that count and one in fact, and retiring the survivor left a certificate
+    /// with no live name on it: precisely what the message this returns
+    /// promises will not happen.
+    #[test]
+    fn refuses_to_revoke_the_last_live_user_id_when_another_is_already_revoked() {
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+
+        add_user_id(&store, &fingerprint, "Alice <alice@work.example>", None).unwrap();
+        revoke_user_id(
+            &store,
+            &fingerprint,
+            "Alice <alice@work.example>",
+            "left the job",
+            None,
+        )
+        .unwrap();
+
+        let refused = revoke_user_id(&store, &fingerprint, "Alice <alice@example.org>", "", None)
+            .map(|_| ())
+            .expect_err("retired the only identity the key had left");
+        assert!(
+            refused.to_string().contains("only user ID"),
+            "the refusal must say why: {refused}"
+        );
+
+        let ids = cert::user_ids(&store.secret_cert(&fingerprint).unwrap());
+        assert!(
+            ids.iter()
+                .any(|u| u.text == "Alice <alice@example.org>" && !u.revoked),
+            "a refused revocation must not reach the store"
+        );
+    }
+
+    /// A store holding nothing but `secret` with its signatures taken away,
+    /// which leaves a certificate the standard policy cannot evaluate:
+    /// `with_policy` wants a binding signature for the primary key and there is
+    /// none. Sequoia keeps the names, as it keeps any user ID with no binding.
+    ///
+    /// That is the same state, as far as this guard can tell, as the key the
+    /// guard is really about: one whose self-signatures are all SHA-1, which
+    /// the standard policy has rejected on a user ID binding since February
+    /// 2023. The SHA-1 key is what a test would rather use and cannot — the
+    /// crypto backend refuses to make a SHA-1 signature to order — and what the
+    /// guard sees of either is the one thing that matters, a `with_policy` that
+    /// fails.
+    ///
+    /// A store of its own because `insert_secret` merges with whatever the
+    /// secret file already holds, as it must: a store that had already seen the
+    /// signed certificate would hand the signatures straight back, and the
+    /// premise this rests on is asserted against what the store returns rather
+    /// than what was handed to it.
+    fn stored_unreadable(secret: &Cert) -> (tempfile::TempDir, Store) {
+        // Through the TSK, because `Cert::into_packets` hands back the public
+        // half alone and the store will not take a certificate with no secret
+        // in it.
+        let stripped = Cert::from_packets(
+            secret
+                .as_tsk()
+                .into_packets()
+                .filter(|packet| !matches!(packet, Packet::Signature(_))),
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        store.insert_secret(&stripped).unwrap();
+        assert!(
+            store
+                .secret_cert(&secret.fingerprint().to_hex())
+                .unwrap()
+                .with_policy(&policy(), None)
+                .is_err(),
+            "the stored certificate must be one the policy cannot read, or this proves nothing"
+        );
+        (dir, store)
+    }
+
+    /// The guard has to know which identities are still standing, and on a
+    /// certificate the standard policy cannot evaluate there is no answer to
+    /// that. Refusing outright there would take away the only way this app
+    /// offers of retiring an address on a legacy key: the details dialog still
+    /// lists such a key's identities and still offers Revoke on every row of
+    /// it, since none of them reads as primary or as revoked, so every click
+    /// would come back talking about the standard policy. The count this
+    /// replaces is taken instead, which leaves that key exactly the operation
+    /// it has always had — crude, but a retirement it lets through is one it
+    /// has always let through.
+    #[test]
+    fn retiring_an_identity_still_works_on_a_key_the_policy_cannot_read() {
+        let (_scratch_dir, scratch_store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        add_user_id(
+            &scratch_store,
+            &fingerprint,
+            "Alice <alice@work.example>",
+            None,
+        )
+        .unwrap();
+
+        let (_dir, store) = stored_unreadable(&scratch_store.secret_cert(&fingerprint).unwrap());
+        revoke_user_id(
+            &store,
+            &fingerprint,
+            "Alice <alice@work.example>",
+            "left the job",
+            None,
+        )
+        .expect("a legacy key keeps the retirement it has always had");
+        assert!(
+            store
+                .secret_cert(&fingerprint)
+                .unwrap()
+                .userids()
+                .find(|ua| String::from_utf8_lossy(ua.userid().value())
+                    == "Alice <alice@work.example>")
+                .expect("the retired name stays on the key")
+                .self_revocations()
+                .next()
+                .is_some(),
+            "the retirement must reach the store"
+        );
+
+        // And the count is still a guard where it can answer at all: one
+        // identity on a key nothing can read is still the only one it has.
+        let last = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        let last_fingerprint = last.fingerprint().to_hex();
+        let (_last_dir, last_store) = stored_unreadable(&last);
+        let refused = revoke_user_id(
+            &last_store,
+            &last_fingerprint,
+            "Alice <alice@example.org>",
+            "",
+            None,
+        )
+        .map(|_| ())
+        .expect_err("retired the only identity a legacy key had");
+        assert!(
+            refused.to_string().contains("only user ID"),
+            "the refusal must say why: {refused}"
+        );
+    }
+
+    /// `certify`'s rule, on the path that retires an identity of your own.
+    ///
+    /// The details dialog renders every user ID lossily and hands that text
+    /// back when Revoke is clicked, and sequoia orders user IDs by their raw
+    /// bytes — so of two that display alike the lower-sorting one was retired,
+    /// whichever row the user clicked. The dialog hides Revoke on the primary
+    /// identity and on rows already revoked, so the click could retire an
+    /// identity the user was never offered the choice of retiring, or add a
+    /// second revocation to one already gone and report success while the row
+    /// they clicked stayed live. Neither is undoable from here: `add_user_id`
+    /// takes a `&str` and cannot put the invalid bytes back.
+    #[test]
+    fn revoking_a_user_id_refuses_a_name_that_matches_two_of_them() {
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+
+        // Two more user IDs, different bytes, identical rendering: 0xFE and
+        // 0xFF are both invalid UTF-8 and both display as U+FFFD. A key like
+        // this is imported, not made here — a legacy Latin-1 GnuPG key is the
+        // usual way to come by one.
+        let secret = store.secret_cert(&fingerprint).unwrap();
+        let mut signer = unlock_primary(&secret, None).unwrap();
+        let mut packets: Vec<Packet> = Vec::new();
+        for byte in [0xFEu8, 0xFF] {
+            let userid = UserID::from([b"Alice <alice@", &[byte][..], b".example>"].concat());
+            let binding = SignatureBuilder::new(SignatureType::PositiveCertification)
+                .sign_userid_binding(&mut signer, secret.primary_key().key(), &userid)
+                .unwrap();
+            packets.push(Packet::from(userid));
+            packets.push(Packet::from(binding));
+        }
+        store
+            .insert_secret(&secret.insert_packets(packets).unwrap().0)
+            .unwrap();
+
+        let displayed = String::from_utf8_lossy(
+            &[b"Alice <alice@".to_vec(), vec![0xFE], b".example>".to_vec()].concat(),
+        )
+        .into_owned();
+
+        let refused = revoke_user_id(&store, &fingerprint, &displayed, "", None)
+            .map(|_| ())
+            .expect_err("retired one of two identities that display alike");
+        assert!(
+            refused.to_string().contains("more than one user ID"),
+            "an ambiguous identity must be refused, not guessed at: {refused}"
+        );
+        assert!(
+            cert::user_ids(&store.secret_cert(&fingerprint).unwrap())
+                .iter()
+                .all(|u| !u.revoked),
+            "a refused revocation must not reach the store"
+        );
+
+        // An unambiguous one is still retired, or this is only a wall.
+        add_user_id(&store, &fingerprint, "Alice <alice@work.example>", None).unwrap();
+        let updated = revoke_user_id(
+            &store,
+            &fingerprint,
+            "Alice <alice@work.example>",
+            "left the job",
+            None,
+        )
+        .unwrap();
+        assert!(
+            cert::user_ids(&updated)
+                .iter()
+                .any(|u| u.text == "Alice <alice@work.example>" && u.revoked)
         );
     }
 }

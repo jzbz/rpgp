@@ -185,10 +185,12 @@ pub fn revoke_certification(
 
     let mut signatures = Vec::new();
     for wanted in user_ids {
-        let amalgamation = target
-            .userids()
-            .find(|ua| String::from_utf8_lossy(ua.userid().value()) == wanted.as_str())
-            .ok_or_else(|| Error::invalid(format!("{wanted} is not a user ID on this key")))?;
+        // The mirror of certify()'s rule, which this path used to lack: the
+        // first user ID whose lossy rendering matched was the one revoked, so a
+        // withdrawal could be signed over a user ID this certifier never
+        // certified while the real certification stood and the status bar said
+        // it had been withdrawn. `cert::resolve_user_id` carries the reasoning.
+        let amalgamation = crate::cert::resolve_user_id(&target, wanted)?;
         let userid = amalgamation.userid().clone();
 
         // A revocation only supersedes a certification made strictly earlier.
@@ -989,6 +991,93 @@ mod tests {
             under(&a),
             crate::Authentication::Unknown,
             "the withdrawal must take effect now; a packet A did not sign cannot date it into the future"
+        );
+    }
+
+    /// `certify`'s rule, on the path that withdraws what `certify` made.
+    ///
+    /// The user ID is chosen by its lossy rendering, which is not injective,
+    /// and sequoia orders user IDs by their raw bytes — so of two that display
+    /// alike the lower-sorting one was always the one signed over. A
+    /// CertificationRevocation over a user ID this certifier never certified
+    /// asserts nothing and retracts nothing: the endorsement the user asked to
+    /// withdraw kept authenticating while the status bar said it was withdrawn,
+    /// and the GUI, keying its withdrawn set on the same rendering, then took
+    /// the Withdraw button away so it could not be tried again.
+    #[test]
+    fn withdrawing_a_certification_refuses_a_name_that_matches_two_user_ids() {
+        use sequoia_openpgp::packet::UserID;
+
+        let (_dir, store) = scratch();
+        let me = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        let them = generate(&KeyGenRequest::new("Them <them@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&me).unwrap();
+
+        // Two user IDs on their key, different bytes, identical rendering:
+        // 0xFE and 0xFF are both invalid UTF-8 and both display as U+FFFD.
+        let mut theirs = certification_signer(&them, None).unwrap();
+        let mut packets: Vec<Packet> = Vec::new();
+        let mut user_ids: Vec<UserID> = Vec::new();
+        for byte in [0xFEu8, 0xFF] {
+            let userid = UserID::from([b"Them <them@", &[byte][..], b".example>"].concat());
+            let binding = SignatureBuilder::new(SignatureType::PositiveCertification)
+                .sign_userid_binding(&mut theirs, them.primary_key().key(), &userid)
+                .unwrap();
+            packets.push(Packet::from(userid.clone()));
+            packets.push(Packet::from(binding));
+            user_ids.push(userid);
+        }
+
+        // The endorsement sits on the second of the two, which is the one the
+        // first match never reaches. Signed here rather than through certify(),
+        // which refuses the ambiguity this test is built on.
+        let mut mine = certification_signer(&me, None).unwrap();
+        packets.push(Packet::from(
+            SignatureBuilder::new(SignatureType::GenericCertification)
+                .sign_userid_binding(&mut mine, them.primary_key().key(), &user_ids[1])
+                .unwrap(),
+        ));
+        let them = them.insert_packets(packets).unwrap().0;
+        store.insert(&them).unwrap();
+
+        let displayed = String::from_utf8_lossy(user_ids[0].value()).into_owned();
+        let refused = revoke_certification(
+            &store,
+            &me.fingerprint().to_hex(),
+            &them.fingerprint().to_hex(),
+            std::slice::from_ref(&displayed),
+            Reason::Superseded,
+            "",
+            None,
+        )
+        .map(|_| ())
+        .expect_err("withdrew an endorsement of an identity that displays like another");
+        assert!(
+            refused.to_string().contains("more than one user ID"),
+            "an ambiguous identity must be refused, not guessed at: {refused}"
+        );
+
+        let reloaded = store.lookup(&them.fingerprint().to_hex()).unwrap();
+        assert!(
+            reloaded
+                .userids()
+                .all(|ua| ua.other_revocations().count() == 0),
+            "a refused withdrawal must not sign a revocation over the wrong identity"
+        );
+        // And the endorsement it was meant to retract is still there to retract.
+        assert_eq!(
+            reloaded
+                .userids()
+                .filter(|ua| ua
+                    .certifications()
+                    .any(|sig| crate::cert::issued_by(sig, &me)))
+                .count(),
+            1,
+            "the certification must be untouched by a refused withdrawal"
         );
     }
 

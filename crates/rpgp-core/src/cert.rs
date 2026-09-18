@@ -3,9 +3,11 @@
 use std::time::SystemTime;
 
 use sequoia_openpgp::Cert;
+use sequoia_openpgp::cert::amalgamation::UserIDAmalgamation;
 use sequoia_openpgp::policy::Policy;
 use sequoia_openpgp::types::RevocationStatus;
 
+use crate::error::{Error, Result};
 use crate::policy;
 
 /// The name to show for a certificate: its policy-valid primary user ID, else
@@ -500,6 +502,45 @@ pub fn user_ids_with(cert: &Cert, policy: &dyn Policy) -> Vec<UserIdDetail> {
                 .max(),
         })
         .collect()
+}
+
+/// The one user ID on `cert` that [`user_ids_with`] renders as `wanted`.
+///
+/// A user ID is bytes; the text every dialog shows is those bytes rendered
+/// lossily, and that is not injective — every invalid byte becomes U+FFFD. Two
+/// user IDs differing only there display identically, so picking the first
+/// match signs over whichever came first while the list named the other, and
+/// nothing in the dialog could have told the user which one they picked. Refuse
+/// instead, and say why.
+///
+/// Sequoia sorts a certificate's user IDs by their raw bytes, so "whichever came
+/// first" was not even arbitrary: it was always the lower-sorting one, silently,
+/// whichever row was clicked. [`crate::certify`] has refused ambiguity since it
+/// learned this; the two paths that retract something — withdrawing a
+/// certification, retiring one of your own identities — kept the first match,
+/// so Withdraw could sign a revocation over a user ID that carries no
+/// certification of ours, and Revoke on one row could retire the row above it,
+/// both reporting success. One copy of the rule, so the three cannot drift
+/// apart again.
+///
+/// Every user ID the certificate carries is considered, including those with no
+/// binding signature, because those are exactly what an ambiguous match is made
+/// of: sequoia keeps a user ID anyone appended in flight, and resolving to it
+/// silently is the failure this prevents.
+pub(crate) fn resolve_user_id<'a>(cert: &'a Cert, wanted: &str) -> Result<UserIDAmalgamation<'a>> {
+    let mut candidates = cert
+        .userids()
+        .filter(|ua| String::from_utf8_lossy(ua.userid().value()) == wanted);
+    let found = candidates
+        .next()
+        .ok_or_else(|| Error::invalid(format!("{wanted} is not a user ID on this key")))?;
+    if candidates.next().is_some() {
+        return Err(Error::invalid(format!(
+            "{wanted} matches more than one user ID on this key; they differ in \
+             bytes that do not display, so there is no way to say which you meant"
+        )));
+    }
+    Ok(found)
 }
 
 fn describe_revocation(cert: &Cert) -> Option<String> {

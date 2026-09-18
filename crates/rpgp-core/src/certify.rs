@@ -156,23 +156,11 @@ pub fn certify(store: &Store, request: &CertifyRequest) -> Result<Cert> {
 
     let mut signatures: Vec<Signature> = Vec::new();
     for wanted in &request.user_ids {
-        // A user ID is bytes; this string is those bytes rendered lossily, and
-        // that is not injective — every invalid byte becomes U+FFFD. Two user
-        // IDs differing only there display identically, so `find` would sign
-        // whichever came first and report the other's text. Refuse instead:
-        // nothing in the dialog could have told the user which one they picked.
-        let mut candidates = target
-            .userids()
-            .filter(|ua| String::from_utf8_lossy(ua.userid().value()) == wanted.as_str());
-        let amalgamation = candidates
-            .next()
-            .ok_or_else(|| Error::invalid(format!("{wanted} is not a user ID on this key")))?;
-        if candidates.next().is_some() {
-            return Err(Error::invalid(format!(
-                "{wanted} matches more than one user ID on this key; they differ in \
-                 bytes that do not display, so there is no way to say which you meant"
-            )));
-        }
+        // Exactly one user ID, or none. The displayed text is a lossy rendering
+        // of bytes and two user IDs can share one, which is not a guess to make
+        // on somebody's behalf; the rule and its history live in
+        // `cert::resolve_user_id`, which the withdrawal paths ask as well.
+        let amalgamation = crate::cert::resolve_user_id(&target, wanted)?;
         let userid = amalgamation.userid().clone();
 
         // A user ID its owner has retracted is not ours to vouch for. Signing
