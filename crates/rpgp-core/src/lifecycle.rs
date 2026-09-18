@@ -10,8 +10,9 @@ use std::time::{Duration, SystemTime};
 
 use sequoia_openpgp::cert::amalgamation::ValidAmalgamation;
 use sequoia_openpgp::cert::{SubkeyRevocationBuilder, UserIDRevocationBuilder};
+use sequoia_openpgp::packet::key::{PrimaryRole, PublicParts, SubordinateRole};
 use sequoia_openpgp::packet::signature::SignatureBuilder;
-use sequoia_openpgp::packet::{Signature, UserID};
+use sequoia_openpgp::packet::{Key, Signature, UserID};
 use sequoia_openpgp::types::{ReasonForRevocation, RevocationStatus, SignatureType};
 use sequoia_openpgp::{Cert, Packet};
 
@@ -69,7 +70,20 @@ pub fn set_expiry(
         .with_policy(&policy, None)
         .map_err(|_| Error::invalid("this certificate is not valid under the standard policy"))?;
 
-    let expiration = expires_in.map(|d| SystemTime::now() + d);
+    // `SystemTime + Duration` panics on overflow, and this is a public entry
+    // point whose signature offers to take any lifetime at all. The GUI only
+    // ever passes one, two or five years, so nothing in the app can reach it;
+    // a panic is still not an answer to an argument, and the check costs a
+    // line. A lifetime that fits here but overruns the four-byte field a key
+    // expiry is written into is left to sequoia, which measures it from each
+    // key's own creation time and says so.
+    let expiration = expires_in
+        .map(|d| {
+            SystemTime::now()
+                .checked_add(d)
+                .ok_or_else(|| Error::invalid("that expiry is too far in the future"))
+        })
+        .transpose()?;
 
     // The primary key first: a direct-key signature plus one self-signature
     // per user ID, which is where a primary key's expiry actually lives.
@@ -87,38 +101,78 @@ pub fn set_expiry(
     // original date — the user believes they extended it and a month later
     // nobody can encrypt to them.
     //
-    // A subkey that can certify, sign or authenticate has to countersign its
-    // own new binding (the primary key binding signature, or "back-sig"), so
-    // it needs its own signer; anything else must be passed none. That is
-    // sequoia's condition verbatim, and it refuses either mismatch. Testing
+    // Sequoia's call rebuilds a subkey's binding out of the old one, and for a
+    // subkey that can certify, sign or authenticate it puts a fresh
+    // countersignature in it — the primary key binding signature, or
+    // "back-sig" — which only that subkey's own secret can make. So it demands
+    // a signer for exactly those and refuses one for anything else. Testing
     // for_signing() alone missed authentication subkeys, so every GnuPG
     // [S][E][A] key — which is what `gpg --export-secret-keys` produces —
     // failed the whole change with "requires subkey signer", naming a
     // capability the subkey does not have. Keys generated here have only
     // [S] and [E], so nothing in the tree exercised it.
     //
+    // A *fresh* back-sig is what needs the secret, and the secret is often not
+    // here. `gpg --export-secret-keys` writes a stub in place of every subkey
+    // held on a smartcard, and a key split across machines arrives with plain
+    // public subkey packets. Such a subkey used to be skipped, which brought
+    // back, for [S], [C] and [A], the very failure encryption subkeys were
+    // fixed for — the pane showing the new date over a subkey that lapses on
+    // the old one — or, for a stub, aborted the whole change by asking for a
+    // passphrase that no passphrase answers, leaving a laptop-held primary
+    // unable to re-date anything.
+    //
+    // Neither is necessary, because the back-sig already there can be carried
+    // into the new binding: it covers the (primary, subkey) pair and nothing
+    // of the binding it travels in, so moving it does not invalidate it, and
+    // `SignatureBuilder::from` keeps it — hashed area, where sequoia puts it,
+    // or unhashed, where GnuPG does. Two things have to hold for that to be
+    // enough, and both are guaranteed by this subkey having come out of
+    // `valid`: sequoia requires a back-sig only of a binding whose flags
+    // include signing, and it refuses such a binding whose back-sig the policy
+    // rejects, so a binding the policy accepted today carries one if it needs
+    // one and the copy will be accepted again. GnuPG writes no back-sig for an
+    // [A] subkey at all, which is why the requirement must not be read off
+    // `needs_backsig`.
+    //
     // Revoked subkeys are left alone: a new expiry on a revoked key is noise.
-    // Subkeys with no local secret are not filtered out up front, because an
-    // encryption subkey does not need one — only the primary signs its
-    // binding — and skipping it left it to lapse on the original date while
-    // the pane showed the new one. Only the back-sig branch needs it.
     for ka in valid.keys().subkeys().revoked(false) {
         let needs_backsig = ka.for_signing() || ka.for_certification() || ka.for_authentication();
-        let mut subkey_signer = if needs_backsig {
-            let Ok(secret) = ka.key().clone().parts_into_secret() else {
-                continue;
-            };
-            Some(crate::secret::keypair(secret, password)?)
-        } else {
-            None
-        };
-        let subkey_signer = subkey_signer
-            .as_mut()
-            .map(|s| s as &mut dyn sequoia_openpgp::crypto::Signer);
-        signatures.extend(
-            ka.set_expiration_time(&mut signer, subkey_signer, expiration)
-                .map_err(Error::OpenPgp)?,
-        );
+
+        // Not `parts_into_secret` alone: that succeeds on a GnuPG stub as
+        // readily as on real key material, which is the whole trouble with
+        // stubs. See [`crate::secret::is_usable`].
+        let secret = ka
+            .key()
+            .clone()
+            .parts_into_secret()
+            .ok()
+            .filter(|key| crate::secret::is_usable(key.secret()));
+
+        match (needs_backsig, secret) {
+            (true, None) => signatures.push(rebind_subkey(
+                &mut signer,
+                cert.primary_key().key(),
+                ka.key(),
+                ka.binding_signature(),
+                expiration,
+            )?),
+            // A secret that is real but will not open — no passphrase, or the
+            // wrong one — is still an error rather than a reason to fall back.
+            // The user has the key on this machine and typed something wrong,
+            // and reusing the old back-sig would hide that.
+            (true, Some(secret)) => {
+                let mut subkey_signer = crate::secret::keypair(secret, password)?;
+                signatures.extend(
+                    ka.set_expiration_time(&mut signer, Some(&mut subkey_signer), expiration)
+                        .map_err(Error::OpenPgp)?,
+                );
+            }
+            (false, _) => signatures.extend(
+                ka.set_expiration_time(&mut signer, None, expiration)
+                    .map_err(Error::OpenPgp)?,
+            ),
+        }
     }
 
     store_both(store, cert, signatures)
@@ -469,6 +523,46 @@ fn store_both(store: &Store, cert: Cert, signatures: Vec<Signature>) -> Result<C
     Ok(updated)
 }
 
+/// Re-issue a subkey's binding with a new expiry, using the primary key alone.
+///
+/// What sequoia's own call does, minus the fresh back-signature it would make
+/// with the subkey's secret: the template is the binding the policy currently
+/// accepts, so whatever that carries — including a back-signature, which stays
+/// valid wherever it is moved to — comes across into the replacement.
+///
+/// The unhashed area comes across with it, which [`add_user_id`] deliberately
+/// refuses to do for the binding it copies. It is the opposite question here.
+/// There the template was made over another identity and anything appended to
+/// it in flight is a stranger's; here the template is this subkey's own
+/// binding, and the one packet most likely to be sitting in that area is the
+/// back-signature GnuPG puts there.
+fn rebind_subkey(
+    signer: &mut (dyn sequoia_openpgp::crypto::Signer + Send + Sync),
+    primary: &Key<PublicParts, PrimaryRole>,
+    subkey: &Key<PublicParts, SubordinateRole>,
+    binding: &Signature,
+    expiration: Option<SystemTime>,
+) -> Result<Signature> {
+    // A key expiry is stored as a lifetime counted from that key's own
+    // creation, which is why this is per subkey rather than one figure for the
+    // certificate. An imported subkey can predate the primary, or carry a
+    // creation time in the future, so the subtraction is fallible.
+    let validity = expiration
+        .map(|expires| expires.duration_since(subkey.creation_time()))
+        .transpose()
+        .map_err(|_| {
+            Error::invalid(format!(
+                "that expiry is earlier than subkey {} was created",
+                subkey.fingerprint().to_hex()
+            ))
+        })?;
+
+    Ok(SignatureBuilder::from(binding.clone())
+        .set_signature_creation_time(SystemTime::now())?
+        .set_key_validity_period(validity)?
+        .sign_subkey_binding(signer, primary, subkey)?)
+}
+
 fn unlock_primary(
     cert: &Cert,
     password: Option<&str>,
@@ -479,6 +573,22 @@ fn unlock_primary(
         .clone()
         .parts_into_secret()
         .map_err(|_| Error::NoSecretKey(cert.fingerprint().to_hex()))?;
+
+    // `gpg --export-secret-subkeys` — how a keyring whose primary is kept
+    // offline is moved — puts a stub where the primary's secret belongs, and a
+    // stub passes every test for secret key material sequoia applies: the call
+    // above succeeds, the store files the certificate with the secret keys,
+    // and the GUI offers its owner all of these operations. Saying so here is
+    // the whole of the fix, because none of them can be done without the
+    // primary. Left to `secret::unlock` the answer was a passphrase prompt the
+    // key has no passphrase for, and then, for anyone who typed one anyway, a
+    // malformed-packet error from the S2K that reads like a corrupt file.
+    if !crate::secret::is_usable(key.secret()) {
+        return Err(Error::invalid(
+            "this key's primary secret is a GnuPG stub: the primary key itself is \
+             offline or on a smartcard",
+        ));
+    }
 
     crate::secret::signer(key, password)
 }
@@ -880,6 +990,118 @@ mod tests {
                 .count(),
             1,
             "the encryption subkey lapsed while the pane showed the new date"
+        );
+    }
+
+    /// The same failure, for the subkey it costs the most. A signing subkey
+    /// does countersign its own binding, so with no secret to countersign
+    /// with, the loop used to skip it and report success: the pane showed the
+    /// new date, and the user's signatures stopped verifying as live on the
+    /// original one.
+    ///
+    /// The countersignature already on the binding is what makes this
+    /// unnecessary. It covers the pair of keys and says nothing about the
+    /// binding carrying it, so the replacement can keep it.
+    #[test]
+    fn a_signing_subkey_without_a_local_secret_is_still_re_dated() {
+        use sequoia_openpgp::policy::StandardPolicy;
+        use sequoia_openpgp::{Packet, cert::CertBuilder};
+        let policy = StandardPolicy::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let (cert, _) = CertBuilder::new()
+            .add_userid("Alice <alice@example.org>")
+            .add_signing_subkey()
+            .add_transport_encryption_subkey()
+            .set_validity_period(Duration::from_secs(1))
+            .generate()
+            .unwrap();
+
+        // The signing subkey this time, the way a key whose signing half was
+        // moved to another machine arrives.
+        let signing = cert
+            .with_policy(&policy, None)
+            .unwrap()
+            .keys()
+            .subkeys()
+            .for_signing()
+            .next()
+            .unwrap()
+            .key()
+            .fingerprint();
+        let stripped: Vec<Packet> = cert
+            .as_tsk()
+            .into_packets()
+            .map(|p| match p {
+                Packet::SecretSubkey(k) if k.fingerprint() == signing => {
+                    Packet::PublicSubkey(k.take_secret().0)
+                }
+                other => other,
+            })
+            .collect();
+        let cert = Cert::try_from(stripped).unwrap();
+        store.insert_secret(&cert).unwrap();
+        let fingerprint = cert.fingerprint().to_hex();
+        std::thread::sleep(Duration::from_millis(1500));
+
+        let extended = set_expiry(
+            &store,
+            &fingerprint,
+            Some(Duration::from_secs(31_536_000)),
+            None,
+        )
+        .unwrap();
+
+        let valid = extended.with_policy(&policy, None).unwrap();
+        assert_eq!(
+            valid.keys().subkeys().alive().for_signing().count(),
+            1,
+            "the signing subkey lapsed while the pane showed the new date"
+        );
+        assert_eq!(
+            valid
+                .keys()
+                .subkeys()
+                .for_signing()
+                .next()
+                .unwrap()
+                .binding_signature()
+                .embedded_signatures()
+                .count(),
+            1,
+            "which works only because the countersignature was carried over"
+        );
+        // A reload reads the store, not the value returned here.
+        let stored = store.secret_cert(&fingerprint).unwrap();
+        assert_eq!(
+            stored
+                .with_policy(&policy, None)
+                .unwrap()
+                .keys()
+                .subkeys()
+                .alive()
+                .for_signing()
+                .count(),
+            1
+        );
+    }
+
+    /// `SystemTime + Duration` panics on overflow, and `expires_in` is an
+    /// argument a caller chooses. The GUI offers one, two and five years, so
+    /// nothing in the app can reach this; the argument is still part of what
+    /// this function offers to take, and a panic is not an answer to it.
+    #[test]
+    fn an_expiry_too_far_in_the_future_is_refused_rather_than_panicking() {
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let before = CertSummary::from_cert(&cert).expires;
+
+        assert!(set_expiry(&store, &fingerprint, Some(Duration::MAX), None).is_err());
+        assert_eq!(
+            CertSummary::from_cert(&store.secret_cert(&fingerprint).unwrap()).expires,
+            before,
+            "a refused change must not reach the store"
         );
     }
 
