@@ -639,6 +639,43 @@ impl Store {
         Ok(Cert::from_file(&path)?)
     }
 
+    /// Everything the store knows about `fingerprint`, both halves at once.
+    ///
+    /// [`Store::secret_cert`] and [`Store::lookup`] read different files, and
+    /// the two drift apart: [`Store::insert`] writes cert-d and never the
+    /// secret file, so a signature that arrives by import or by a keyserver
+    /// refresh reaches the public half alone. For one's own revocation that
+    /// matters, because the list and the details pane read cert-d and show
+    /// `Revoked` while the secret file still looks live — and it is the secret
+    /// file that signing, certifying and the lifecycle operations work from.
+    /// Anything resolving a fingerprint in order to make *new* use of the key
+    /// — a signature, a certification, a lifecycle self-signature — resolves
+    /// it here, so that the certificate reaching [`crate::ops`],
+    /// [`crate::certify`] and [`crate::lifecycle`] is the whole of what the
+    /// store holds. Withdrawals read the secret half alone and are meant to:
+    /// revoking a certificate, a user ID or a subkey, and retracting a
+    /// certification, are what the owner of a revoked key may still need to
+    /// do, and none of them asks [`crate::revoke::refuse_if_revoked`], so
+    /// there is nothing there for a merge to feed. This is the only place both
+    /// files are in reach.
+    ///
+    /// The secret half is the base, so its key material is what survives and
+    /// the public half contributes signatures only. Where there is no secret
+    /// half this is [`Store::lookup`].
+    pub fn full_cert(&self, fingerprint: &str) -> Result<Cert> {
+        let Ok(secret) = self.secret_cert(fingerprint) else {
+            return self.lookup(fingerprint);
+        };
+        let Ok(public) = self.lookup(fingerprint) else {
+            return Ok(secret);
+        };
+        // `lookup` searches subkeys as well, so it can answer with a
+        // certificate other than the one asked for; `merge_public` reports that
+        // as a primary key mismatch, and the secret half is then the whole of
+        // what this store knows about the fingerprint.
+        Ok(secret.clone().merge_public(public).unwrap_or(secret))
+    }
+
     pub fn has_secret(&self, fingerprint: &str) -> bool {
         self.secret_path(fingerprint).exists()
     }
@@ -2670,5 +2707,65 @@ mod tests {
                 .unwrap()
                 .is_tsk()
         );
+    }
+
+    /// The two halves drift apart, and anything about to *act* with a key has
+    /// to see both.
+    ///
+    /// `insert` writes cert-d and never the secret key file, so one's own
+    /// revocation can arrive on the public half alone — the Import button
+    /// taking back a published copy, or a keyserver refresh — and the list and
+    /// the details pane then read `revoked` from cert-d while `secret_cert`
+    /// still looks live. Signing, certifying and the lifecycle operations all
+    /// work from the secret half, so the certificate they are given is put
+    /// together here, where both files are in reach.
+    #[test]
+    fn the_full_certificate_carries_a_revocation_that_reached_only_cert_d() {
+        let (_dir, store) = scratch();
+        let generated = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap();
+        let fingerprint = generated.cert.fingerprint().to_hex();
+        store.insert_secret(&generated.cert).unwrap();
+
+        // The revocation as it comes back from elsewhere: made on the owner's
+        // other machine, met here as a public certificate. `insert` is the
+        // entry point both Import and the keyserver use for one.
+        let revoked = generated
+            .cert
+            .clone()
+            .insert_packets(generated.revocation.clone())
+            .unwrap()
+            .0;
+        store.insert(&revoked).unwrap();
+
+        let validity = |cert: &Cert| crate::CertSummary::from_cert(cert).validity;
+        assert_eq!(
+            validity(&store.lookup(&fingerprint).unwrap()),
+            crate::Validity::Revoked,
+            "cert-d is where the revocation landed"
+        );
+        assert_eq!(
+            validity(&store.secret_cert(&fingerprint).unwrap()),
+            crate::Validity::Valid,
+            "and the secret half is the copy that does not know — the premise here"
+        );
+
+        let full = store.full_cert(&fingerprint).unwrap();
+        assert_eq!(validity(&full), crate::Validity::Revoked);
+        assert!(
+            full.is_tsk(),
+            "the secret material must survive the merge, or nothing can sign with it"
+        );
+
+        // No secret half at all is the other shape, and the commonest one:
+        // every certificate belonging to somebody else. `full_cert` is then
+        // `lookup`, rather than the error `secret_cert` would return for it.
+        let (_dir, store) = scratch();
+        store.insert(&revoked).unwrap();
+        let full = store.full_cert(&fingerprint).unwrap();
+        assert_eq!(validity(&full), crate::Validity::Revoked);
+        assert!(!full.is_tsk(), "there was no secret half to find");
     }
 }

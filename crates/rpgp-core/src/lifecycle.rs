@@ -25,6 +25,8 @@ use crate::store::Store;
 /// fact: a key that lapsed last week can be brought back by setting a date in
 /// the future.
 ///
+/// A revoked certificate is refused outright; see the guard below for why.
+///
 /// One wrinkle: signature timestamps have one-second resolution and a new
 /// self-signature only supersedes one made strictly earlier, so two expiry
 /// changes within the same second leave the first standing. It matters only to
@@ -37,6 +39,28 @@ pub fn set_expiry(
     password: Option<&str>,
 ) -> Result<Cert> {
     let cert = store.secret_cert(fingerprint)?;
+
+    // The refusal is not merely tidy. Sequoia decides revocation status from
+    // the newest of the primary key's self-signatures, and the direct-key
+    // signature written below is dated now, so on a soft revocation —
+    // KeyRetired, which is this app's default, or KeySuperseded — it overrides
+    // the revocation and the certificate reads as live again, here and for
+    // everyone who refreshes it afterwards. `revoke` opens by saying there is
+    // no un-revoke; this is where that stopped being true.
+    //
+    // Asked of `full_cert` and not of `cert`, because one's own revocation can
+    // reach the public half alone — by import, or by a keyserver refresh — and
+    // `secret_cert`, which is the copy changed here, would still look live. The
+    // change is still made to `cert`: `store_both` writes back whatever it is
+    // handed, and folding cert-d's third-party signatures into the secret key
+    // file is not this refusal's business.
+    //
+    // Ahead of `unlock_primary`, which is not about prompts — it unlocks with
+    // the passphrase it is given and never reaches the agent — but so that a
+    // refused change unlocks no secret, and so that the owner of a revoked key
+    // is told it is revoked rather than that the passphrase is wrong.
+    crate::revoke::refuse_if_revoked(&store.full_cert(fingerprint)?)?;
+
     let policy = policy();
     let mut signer = unlock_primary(&cert, password)?;
 
@@ -100,6 +124,9 @@ pub fn set_expiry(
 }
 
 /// Bind a new identity to a certificate.
+///
+/// A revoked certificate is refused, as in [`set_expiry`] and for the same
+/// reason.
 pub fn add_user_id(
     store: &Store,
     fingerprint: &str,
@@ -112,6 +139,19 @@ pub fn add_user_id(
     }
 
     let cert = store.secret_cert(fingerprint)?;
+
+    // The new binding signature is dated now, and the primary user ID's binding
+    // overrides a soft revocation exactly as a direct-key signature does. On a
+    // certificate whose existing bindings carry no primary-user-ID subpacket —
+    // which is how a fair number of imported keys look — the newest binding
+    // becomes the primary one, so the new name un-revokes the key. Keys
+    // generated here flag their first user ID and so happen to be safe, which
+    // is precisely the kind of accident not to leave a guarantee resting on.
+    //
+    // Both halves of the store are asked, and the guard sits ahead of
+    // `unlock_primary`, for the reasons set out in [`set_expiry`].
+    crate::revoke::refuse_if_revoked(&store.full_cert(fingerprint)?)?;
+
     if cert
         .userids()
         .any(|ua| String::from_utf8_lossy(ua.userid().value()) == user_id)
@@ -256,6 +296,232 @@ mod tests {
             .cert;
         store.insert_secret(&cert).unwrap();
         (dir, store, cert)
+    }
+
+    /// `revoke` opens by saying there is no un-revoke, and this is where that
+    /// stopped being true. Sequoia settles a certificate's revocation status
+    /// from the newest of the primary key's self-signatures, so the direct-key
+    /// signature this writes, dated now, supersedes a soft revocation. The
+    /// status bar then said "Expiry updated. Publish the key again so others see
+    /// it." over a certificate that had just come back to life — and publishing
+    /// it is what brings correspondents back to a key its owner retired.
+    #[test]
+    fn refuses_to_change_the_expiry_of_a_revoked_certificate() {
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let before = CertSummary::from_cert(&cert).expires;
+
+        // Retired is the default and is soft, which is the case that undid the
+        // revocation; a hard one survived a new self-signature by itself.
+        let mut request = crate::revoke::RevokeRequest::new(&fingerprint);
+        request.reason = Reason::Retired;
+        crate::revoke::revoke_cert(&store, &request).unwrap();
+
+        // A self-signature only supersedes one made strictly earlier and the
+        // timestamps are whole seconds, so without this wait the revocation
+        // would survive on a tie rather than on the guard, and the assertions
+        // below would hold whether or not the guard exists.
+        std::thread::sleep(Duration::from_millis(1100));
+
+        let ten_years = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        // Mapped to `()` before `expect_err` so that a broken guard reports the
+        // assertion rather than `Debug`-printing the whole certificate over it.
+        let refused = set_expiry(&store, &fingerprint, Some(ten_years), None)
+            .map(|_| ())
+            .expect_err("changed the expiry of a revoked certificate");
+        let message = refused.to_string();
+        assert!(
+            message.contains("Alice <alice@example.org>") && message.contains("revoked"),
+            "the refusal must say whose key and why: {message}"
+        );
+
+        // Both halves of the store still say revoked, and the expiry is where
+        // it was.
+        for reloaded in [
+            store.lookup(&fingerprint).unwrap(),
+            store.secret_cert(&fingerprint).unwrap(),
+        ] {
+            let summary = CertSummary::from_cert(&reloaded);
+            assert_eq!(summary.validity, Validity::Revoked);
+            assert_eq!(summary.expires, before);
+        }
+    }
+
+    /// The same guard for the same reason, over the two certificate shapes that
+    /// answer the question differently.
+    ///
+    /// Sequoia settles a certificate's revocation status from the newest
+    /// self-signature on the *primary user ID*, so whether a newly bound name
+    /// supersedes a soft revocation depends on whether it becomes the primary
+    /// one — and `ValidComponentAmalgamation::primary` ranks the
+    /// primary-user-ID subpacket above creation time. A key generated here
+    /// flags its first user ID and so happens to be safe; a certificate whose
+    /// bindings carry no such subpacket, which is how a fair number of imported
+    /// keys look, is not. With the guard removed the second half of this test
+    /// reads `Valid` again after the call, which is the harm — a key retired
+    /// with the default reason back in service, and the app suggesting it be
+    /// published. Both halves are refused, because the difference between them
+    /// is an accident of how the certificate was made and not something a
+    /// guarantee should rest on.
+    #[test]
+    fn refuses_to_add_a_user_id_to_a_revoked_certificate() {
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+
+        crate::revoke::revoke_cert(&store, &crate::revoke::RevokeRequest::new(&fingerprint))
+            .unwrap();
+
+        let refused = add_user_id(&store, &fingerprint, "Alice <alice@newjob.example>", None)
+            .map(|_| ())
+            .expect_err("bound a new name to a revoked certificate");
+        let message = refused.to_string();
+        assert!(
+            message.contains("Alice <alice@example.org>") && message.contains("revoked"),
+            "the refusal must say whose key and why: {message}"
+        );
+
+        let reloaded = store.secret_cert(&fingerprint).unwrap();
+        assert_eq!(
+            CertSummary::from_cert(&reloaded).validity,
+            Validity::Revoked
+        );
+        assert!(
+            !reloaded
+                .userids()
+                .any(|ua| String::from_utf8_lossy(ua.userid().value())
+                    == "Alice <alice@newjob.example>"),
+            "a refused change must not reach the store"
+        );
+
+        // Now the shape that un-revokes. Re-bind the existing user ID with a
+        // signature carrying no primary-user-ID subpacket, so the certificate
+        // looks like one that came in through Import rather than one this app
+        // generated.
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let secret = store.secret_cert(&fingerprint).unwrap();
+        let userid = secret.userids().next().unwrap().userid().clone();
+        let mut signer = unlock_primary(&secret, None).unwrap();
+
+        // A self-signature supersedes one made strictly earlier and the
+        // timestamps are whole seconds, so each of these waits is what makes
+        // the next signature count rather than tie. Without them the shape
+        // under test is never actually built and the revocation would survive
+        // on a tie rather than on the guard.
+        std::thread::sleep(Duration::from_millis(1100));
+        let unflagged = SignatureBuilder::new(SignatureType::PositiveCertification)
+            .sign_userid_binding(&mut signer, secret.primary_key().key(), &userid)
+            .unwrap();
+        let reshaped = secret
+            .insert_packets(vec![Packet::from(unflagged)])
+            .unwrap()
+            .0;
+        store.insert_secret(&reshaped).unwrap();
+
+        let policy = policy();
+        let reshaped = store.lookup(&fingerprint).unwrap();
+        assert!(
+            reshaped
+                .with_policy(&policy, None)
+                .unwrap()
+                .primary_userid()
+                .unwrap()
+                .binding_signature()
+                .primary_userid()
+                .is_none(),
+            "the point of this half is a binding with no primary-user-ID subpacket"
+        );
+
+        crate::revoke::revoke_cert(&store, &crate::revoke::RevokeRequest::new(&fingerprint))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+
+        add_user_id(&store, &fingerprint, "Alice <alice@newjob.example>", None)
+            .map(|_| ())
+            .expect_err("brought a revoked certificate back by naming it again");
+        assert_eq!(
+            CertSummary::from_cert(&store.lookup(&fingerprint).unwrap()).validity,
+            Validity::Revoked,
+            "the certificate must not come back to life"
+        );
+    }
+
+    /// Both refusals again, over a revocation that is only half in the store.
+    ///
+    /// `Store::insert` writes cert-d and never the secret key file, so one's
+    /// own revocation can arrive on the public half alone — Import of a copy
+    /// that was published before it was retracted, or a keyserver refresh —
+    /// and `secret_cert`, which is the copy these two operations read and
+    /// write, still looks live. Asking that copy alone leaves the un-revoke
+    /// open in the one configuration where the user can watch it happen: the
+    /// list and the details pane read cert-d and say `revoked`, the dialogs
+    /// gate on ownership rather than on validity, and the status bar then
+    /// invites the owner to publish what it just brought back.
+    ///
+    /// Retired, because it is the default and it is soft: a hard revocation
+    /// survives a later self-signature by itself, so it would prove nothing
+    /// here.
+    #[test]
+    fn refuses_a_lifecycle_change_when_the_revocation_reached_only_cert_d() {
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let before = CertSummary::from_cert(&cert).expires;
+
+        // Revoked where the key also lives — the owner's other machine — and
+        // met here as a public certificate, which is all `insert` ever writes.
+        let elsewhere_dir = tempfile::tempdir().unwrap();
+        let elsewhere = Store::open(
+            elsewhere_dir.path().join("certs.d"),
+            elsewhere_dir.path().join("secrets"),
+        )
+        .unwrap();
+        elsewhere.insert_secret(&cert).unwrap();
+        let mut request = crate::revoke::RevokeRequest::new(&fingerprint);
+        request.reason = Reason::Retired;
+        crate::revoke::revoke_cert(&elsewhere, &request).unwrap();
+        store
+            .insert(&elsewhere.lookup(&fingerprint).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            CertSummary::from_cert(&store.secret_cert(&fingerprint).unwrap()).validity,
+            Validity::Valid,
+            "the secret half not knowing is the premise of this test"
+        );
+
+        // As in the expiry test above: a self-signature supersedes one made
+        // strictly earlier and the timestamps are whole seconds, so without
+        // this wait the revocation would survive a missing guard on a tie.
+        std::thread::sleep(Duration::from_millis(1100));
+
+        let ten_years = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        let refused = set_expiry(&store, &fingerprint, Some(ten_years), None)
+            .map(|_| ())
+            .expect_err("changed the expiry of a key whose revocation was in cert-d");
+        assert!(
+            refused.to_string().contains("revoked"),
+            "the refusal must say why: {refused}"
+        );
+
+        let refused = add_user_id(&store, &fingerprint, "Alice <alice@newjob.example>", None)
+            .map(|_| ())
+            .expect_err("named a key whose revocation was in cert-d");
+        assert!(
+            refused.to_string().contains("revoked"),
+            "the refusal must say why: {refused}"
+        );
+
+        let public = store.lookup(&fingerprint).unwrap();
+        assert_eq!(
+            CertSummary::from_cert(&public).validity,
+            Validity::Revoked,
+            "the certificate must not come back to life"
+        );
+        assert_eq!(
+            CertSummary::from_cert(&public).expires,
+            before,
+            "and a refused change must not reach the store"
+        );
     }
 
     #[test]

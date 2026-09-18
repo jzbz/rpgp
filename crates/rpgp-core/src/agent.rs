@@ -223,6 +223,25 @@ pub fn certifier_for(cert: &Cert) -> Result<sequoia_gpg_agent::KeyPair> {
     keypair_for(cert, Purpose::Certify)
 }
 
+/// [`certifier_for`] for a signature that *withdraws* a certification.
+///
+/// The same key chosen by the same filter; the one difference is that a revoked
+/// certificate is not refused. Taking back what a key already said is not new
+/// use of it, so revoking your own certificate must not also freeze every
+/// endorsement you ever issued with it. See [`crate::revoke::revoke_certification`].
+///
+/// The filter is the limit of that, and it is a real one: it drops a revoked
+/// certificate's primary key like any other, so what survives here is a
+/// certification *subkey* on a card. `revoke::certification_signer` says what
+/// that leaves out.
+///
+/// `pub(crate)` where its neighbours are `pub`: it is the one entry point here
+/// that does not ask about revocation, and a bypass is not something to offer
+/// outside the crate that decides when it applies.
+pub(crate) fn certification_withdrawer_for(cert: &Cert) -> Result<sequoia_gpg_agent::KeyPair> {
+    keypair_for(cert, Purpose::WithdrawCertification)
+}
+
 /// A decryptor for `cert`, backed by the agent. The returned `KeyPair`
 /// implements Sequoia's `Decryptor` as well as `Signer`.
 pub fn decryptor_for(cert: &Cert) -> Result<sequoia_gpg_agent::KeyPair> {
@@ -239,6 +258,10 @@ pub fn decryptor_for_with(cert: &Cert, held: &[AgentKey]) -> Result<sequoia_gpg_
 enum Purpose {
     Sign,
     Certify,
+    /// Certification again, for a signature that retracts one. The same key and
+    /// the same filter as [`Purpose::Certify`]; it is a variant of its own only
+    /// so that the revocation check can let it through.
+    WithdrawCertification,
     Decrypt,
 }
 
@@ -251,7 +274,29 @@ pub fn signer_for(cert: &Cert) -> Result<sequoia_gpg_agent::KeyPair> {
 }
 
 fn keypair_for(cert: &Cert, purpose: Purpose) -> Result<sequoia_gpg_agent::KeyPair> {
+    // Ahead of `keys()`, which is what opens the socket: a request that is going
+    // to be refused should not enumerate the agent's keys first, and should fail
+    // saying the certificate is revoked rather than saying whatever the agent
+    // says when it is not running at all.
+    refuse_if_revoked_for(cert, purpose)?;
     keypair_for_with(cert, purpose, &keys()?)
+}
+
+/// Refuses `cert` when `purpose` is new use of a key its owner has withdrawn.
+///
+/// The per-key filters in [`keypair_for_with`] cannot see a certificate-level
+/// revocation on a subkey, so this asks separately. Refusing before the keypair
+/// is built is what keeps the card quiet: it is never returned and so never
+/// used, and per the note on [`keypair_for_with`] it is use that raises the
+/// prompt. The two purposes that are not new use of the key are let through —
+/// reading, for the reason given on its arm there, and withdrawing a
+/// certification, for the reason given on [`Purpose::WithdrawCertification`].
+/// Matched exhaustively so that a purpose added later has to say which it is.
+fn refuse_if_revoked_for(cert: &Cert, purpose: Purpose) -> Result<()> {
+    match purpose {
+        Purpose::Sign | Purpose::Certify => crate::revoke::refuse_if_revoked(cert),
+        Purpose::WithdrawCertification | Purpose::Decrypt => Ok(()),
+    }
 }
 
 /// [`keypair_for`] against a key listing the caller already has.
@@ -269,6 +314,13 @@ fn keypair_for_with(
     purpose: Purpose,
     held: &[AgentKey],
 ) -> Result<sequoia_gpg_agent::KeyPair> {
+    // Asked again here, having already been asked by `keypair_for`: this is the
+    // entry point that takes a listing, and the only caller passing one today
+    // wants `Purpose::Decrypt`, which is exempt anyway. One revocation status
+    // against an IPC round trip is a price worth paying so that a caller added
+    // here later cannot reach the agent around the back.
+    refuse_if_revoked_for(cert, purpose)?;
+
     let policy = crate::policy();
     let valid = cert
         .with_policy(&policy, None)
@@ -276,7 +328,7 @@ fn keypair_for_with(
 
     let usable: Vec<_> = match purpose {
         Purpose::Sign => valid.keys().alive().revoked(false).for_signing().collect(),
-        Purpose::Certify => valid
+        Purpose::Certify | Purpose::WithdrawCertification => valid
             .keys()
             .alive()
             .revoked(false)

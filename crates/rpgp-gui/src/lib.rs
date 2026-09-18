@@ -909,18 +909,20 @@ fn run_sign_encrypt(
     let input = input.ok_or_else(|| "Choose a file first".to_string())?;
     let password = Some(password).filter(|p| !p.is_empty());
 
-    // The signer is resolved from the *secret* store: cert-d only holds the
-    // public half, which cannot produce a signature.
+    // The signer is everything the store knows about the chosen key: the local
+    // secret where there is one, which is what actually signs, and cert-d's
+    // signatures over it. A card key has no local secret half at all and the
+    // public certificate is enough, since the agent finds the secret by
+    // keygrip; and a revocation that arrived by import or by a keyserver
+    // refresh reaches cert-d alone, so folding that in is what puts it in front
+    // of the refusal in `ops`.
     let signer = if sign {
         let (fingerprint, _) = signers
             .get(signer_index.max(0) as usize)
             .ok_or_else(|| "Choose a key to sign with".to_string())?;
-        // Local secret if we have it; otherwise the public certificate, which
-        // is all the agent needs — it finds the secret by keygrip.
         Some(
             store
-                .secret_cert(fingerprint)
-                .or_else(|_| store.lookup(fingerprint))
+                .full_cert(fingerprint)
                 .map_err(|e| format!("Signing key unavailable: {e}"))?,
         )
     } else {
@@ -2200,9 +2202,11 @@ fn run_notepad(
         let (fingerprint, _) = signers
             .get(signer_index.max(0) as usize)
             .ok_or_else(|| "Choose a key to sign with".to_string())?;
+        // Everything the store knows, as in `run_sign_encrypt` and for the same
+        // reasons: the local secret signs, and a revocation that reached cert-d
+        // alone is still in the certificate `ops` is asked to sign with.
         store
-            .secret_cert(fingerprint)
-            .or_else(|_| store.lookup(fingerprint))
+            .full_cert(fingerprint)
             .map_err(|e| format!("Signing key unavailable: {e}"))
     };
 
@@ -3688,5 +3692,92 @@ mod tests {
         );
         assert!(!elsewhere.has_secret(&fingerprint));
         assert!(elsewhere.reopen().unwrap().lookup(&fingerprint).is_err());
+    }
+
+    /// Both Sign paths resolve the signer from the whole certificate, so a
+    /// revocation the store holds is one `ops` gets to refuse.
+    ///
+    /// `Store::insert` writes cert-d and never the secret key file, and it is
+    /// what Import and a keyserver refresh both go through — so one's own
+    /// revocation, coming back from wherever it was made, reaches the public
+    /// half alone. Resolving the signer from the secret half first picked the
+    /// one copy that did not know: the list drew `revoked` against the row, the
+    /// picker still offered the key, and the app signed with it.
+    ///
+    /// Retired is the default and is soft, which is the worse case — those
+    /// signatures keep verifying for anyone who has not seen the revocation,
+    /// so nothing downstream announces that the key was withdrawn.
+    #[test]
+    fn signing_sees_a_revocation_that_reached_only_cert_d() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let cert = rpgp_core::keygen::generate(&rpgp_core::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        let fingerprint = cert.fingerprint().to_hex();
+        store.insert_secret(&cert).unwrap();
+
+        let input = dir.path().join("treaty.txt");
+        std::fs::write(&input, b"the treaty text").unwrap();
+        let output = ops::signature_name(&input);
+
+        let state = state_for(store);
+        {
+            let mut guard = lock(&state);
+            guard.se_signers = vec![(fingerprint.clone(), "Alice <alice@example.org>".to_string())];
+            guard.se_input = Some(input.clone());
+        }
+
+        // Live, both paths sign — otherwise the refusals below would prove
+        // nothing about the revocation.
+        let signed =
+            run_notepad(&state, 0, "the treaty text", 0, "", "").expect("a live key signs");
+        assert!(signed.0.contains("-----BEGIN PGP SIGNED MESSAGE-----"));
+        run_sign_encrypt(&state, false, true, 0, "", "").expect("a live key signs a file too");
+        std::fs::remove_file(&output).unwrap();
+
+        // The owner retires the key on another machine, and this one meets the
+        // result the way Import does: as a public certificate, which `insert`
+        // writes to cert-d and nowhere else.
+        let elsewhere_dir = tempfile::tempdir().unwrap();
+        let elsewhere = Store::open(
+            elsewhere_dir.path().join("certs.d"),
+            elsewhere_dir.path().join("secrets"),
+        )
+        .unwrap();
+        elsewhere.insert_secret(&cert).unwrap();
+        let mut request = rpgp_core::revoke::RevokeRequest::new(&fingerprint);
+        request.reason = rpgp_core::revoke::Reason::Retired;
+        rpgp_core::revoke::revoke_cert(&elsewhere, &request).unwrap();
+        let store = lock(&state).store.clone();
+        store
+            .insert(&elsewhere.lookup(&fingerprint).unwrap())
+            .unwrap();
+        assert!(
+            store.secret_cert(&fingerprint).is_ok(),
+            "the secret half is still there, and still unaware — the premise here"
+        );
+
+        let refused = run_notepad(&state, 0, "the treaty text", 0, "", "")
+            .map(|_| ())
+            .expect_err("signed with a key its owner had retired");
+        assert!(
+            refused.contains("Alice <alice@example.org>") && refused.contains("has been revoked"),
+            "the status bar has to say whose key and why: {refused}"
+        );
+
+        let refused = run_sign_encrypt(&state, false, true, 0, "", "")
+            .map(|_| ())
+            .expect_err("signed a file with a key its owner had retired");
+        assert!(
+            refused.contains("has been revoked"),
+            "the status bar has to say why: {refused}"
+        );
+        assert!(
+            !output.exists(),
+            "a refused signature must leave no file behind"
+        );
     }
 }

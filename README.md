@@ -259,6 +259,31 @@ retracted, and the UI keeps them apart:
   published. The Import button takes it: a revocation is a bare signature rather
   than a certificate, so it falls through `CertParser` to `apply_revocation_file`.
 
+A revoked certificate is then refused for anything **new**: encrypting to it,
+signing with it, certifying it or vouching with it, changing its expiry, adding
+a user ID. Soft reasons are refused alongside hard ones, because *replaced by a
+newer key* still says the owner has stopped using this one. Two things are
+deliberately left out of that. Reading is one — a revoked key still opens what
+it was sent, and whether its old signatures still verify is the reason's
+business rather than the refusal's, a soft revocation leaving them standing
+where a hard one does not, exactly as the first bullet above says. Withdrawing
+a certification is the other: taking back what a key already said is not new
+use of it, so it does not go through the refusal at all. The refusal needs a
+check of its own because Sequoia's per-key filters cannot express it:
+`revoked(false)` asks a *subkey* about its own revocation, and revoking a
+certificate as a whole leaves its subkeys unmarked.
+
+That second exemption preserves only what already worked. The key signing the
+withdrawal still has to be one the certificate offers for certification, and
+`revoked(false)` asked of the *primary* key does consult the certificate — so a
+key generated here, which certifies with its primary and has no certification
+subkey, cannot withdraw its certifications once it has been revoked: the attempt
+reports that there is no usable secret key. What survives is the shape that
+filter does not catch, a certification *subkey*, held locally or on a card.
+**Withdraw first, revoke second**, therefore — and the order matters most
+after a soft revocation, where every certification the key made still stands
+and withdrawing them is the only remedy there is.
+
 A **revocation certificate** is now written at key generation, to
 `$XDG_DATA_HOME/rpgp/revocations/<fingerprint>.rev`, and can be exported from
 the details pane. It is the way back if the secret key or its passphrase is

@@ -114,6 +114,11 @@ fn encrypt_stream(
     // producing a message they cannot read.
     let mut recipient_keys: Vec<Recipient> = Vec::new();
     for cert in recipients {
+        // Asked before the subkey walk below, because that walk cannot see it:
+        // a certificate revoked as a whole still carries unrevoked encryption
+        // subkeys, and encrypting to one hands the message to whoever holds a
+        // key its owner has declared stolen, or has simply stopped reading.
+        crate::revoke::refuse_if_revoked(cert)?;
         let valid = cert
             .with_policy(&policy, None)
             .map_err(|_| Error::NoEncryptionKey(cert.fingerprint().to_hex()))?;
@@ -393,10 +398,22 @@ pub fn verify_detached(store: &Store, signature: &[u8], data: &[u8]) -> Result<V
 /// user's gpg-agent is asked, which is how a smartcard signs: the secret never
 /// leaves the card, and the PIN prompt is the agent's own pinentry rather than
 /// anything rpgp draws.
+///
+/// Every signing path in this module comes through here — detached, cleartext
+/// and the signer inside [`encrypt_stream`] — so the revocation guard sits here
+/// once rather than at each of the three.
 fn signing_keypair(
     cert: &Cert,
     password: Option<&str>,
 ) -> Result<Box<dyn sequoia_openpgp::crypto::Signer + Send + Sync>> {
+    // Ahead of everything else, and in particular ahead of the agent fallback
+    // below: keys generated here sign with a subkey, which survives a
+    // certificate-level revocation untouched, so without this the app happily
+    // produced signatures that every verifier holding the revocation — rpgp's
+    // own included — reports as bad. Refusing here also means a card never
+    // raises its PIN prompt for a signature that cannot be trusted anyway.
+    crate::revoke::refuse_if_revoked(cert)?;
+
     let policy = policy();
     let valid = cert
         .with_policy(&policy, None)
@@ -1695,6 +1712,123 @@ mod tests {
         decrypt(&store, &ciphertext, &[], &mut plaintext).unwrap();
         assert_eq!(plaintext, b"written while current");
         let _ = dir;
+    }
+
+    /// The other half of the rule the test above states: a message written now
+    /// *is* future use. Sequoia's own filters do not catch this. `revoked(false)`
+    /// asks each key about its own revocation, and the encryption subkey of a
+    /// certificate revoked as a whole carries none — so the recipient stayed in
+    /// the picker, the message went out, and whoever holds the key its owner
+    /// declared stolen can read it.
+    ///
+    /// Both kinds of reason are refused. A soft one says the owner has stopped
+    /// reading this key, which makes the message no more deliverable than a
+    /// hard one makes it private.
+    #[test]
+    fn refuses_to_encrypt_to_a_certificate_its_owner_revoked() {
+        for (reason, name) in [
+            (crate::revoke::Reason::Compromised, "Bob <bob@example.org>"),
+            (crate::revoke::Reason::Retired, "Carol <carol@example.org>"),
+        ] {
+            let (_dir, store) = scratch_store();
+            let cert = generate(&KeyGenRequest::new(name)).unwrap().cert;
+            let fingerprint = cert.fingerprint().to_hex();
+            store.insert_secret(&cert).unwrap();
+
+            let mut request = crate::revoke::RevokeRequest::new(&fingerprint);
+            request.reason = reason;
+            crate::revoke::revoke_cert(&store, &request).unwrap();
+            let cert = store.lookup(&fingerprint).unwrap();
+
+            let mut ciphertext = Vec::new();
+            let refused = encrypt(
+                std::slice::from_ref(&cert),
+                &[],
+                None,
+                b"meet at noon",
+                &mut ciphertext,
+            )
+            .expect_err("encrypted to a certificate its owner had revoked");
+
+            // The GUI prints this after "Encryption failed: ", and someone who
+            // ticked several recipients has to be told which one was refused.
+            let message = refused.to_string();
+            assert!(
+                message.contains(name) && message.contains("revoked"),
+                "the refusal must say whose key and why: {message}"
+            );
+            assert!(
+                ciphertext.is_empty(),
+                "a refused encryption must write nothing"
+            );
+        }
+    }
+
+    /// Signing, which is the same rule seen from the other side. The shape of a
+    /// key generated here is what made it bite: the primary key certifies and a
+    /// subkey signs, so a certificate-level revocation leaves a perfectly usable
+    /// signing subkey in place. The app said "Signed." while every verifier
+    /// holding the revocation — rpgp's own included — called the result bad,
+    /// and the only readers who accepted it were the ones with a stale copy of
+    /// the certificate, which is exactly who revoking was meant to reach.
+    #[test]
+    fn refuses_to_sign_with_a_certificate_its_owner_revoked() {
+        let (_dir, store) = scratch_store();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        let bob = generate(&KeyGenRequest::new("Bob <bob@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+        store.insert(&bob).unwrap();
+        let fingerprint = alice.fingerprint().to_hex();
+
+        // The default reason, which is soft: past signatures stand, which is
+        // precisely why a new one must not be made.
+        crate::revoke::revoke_cert(&store, &crate::revoke::RevokeRequest::new(&fingerprint))
+            .unwrap();
+
+        // From the secret half, so the local signing subkey is the one on offer
+        // and no part of this reaches the user's gpg-agent.
+        let alice = store.secret_cert(&fingerprint).unwrap();
+        assert!(alice.is_tsk(), "the local secret is what is under test");
+
+        let mut detached = Vec::new();
+        let refused = sign_detached(&alice, None, b"the treaty text", &mut detached)
+            .expect_err("signed with a certificate its owner had retired");
+        let message = refused.to_string();
+        assert!(
+            message.contains("Alice <alice@example.org>") && message.contains("revoked"),
+            "the refusal must say whose key and why: {message}"
+        );
+        assert!(
+            detached.is_empty(),
+            "a refused signature must write nothing"
+        );
+
+        let mut cleartext = Vec::new();
+        assert!(
+            sign_cleartext(&alice, None, b"the treaty text", &mut cleartext).is_err(),
+            "cleartext signing goes through the same guard"
+        );
+        assert!(cleartext.is_empty());
+
+        // And the signer inside an encryption, the third caller of that guard.
+        // Bob is not revoked, so the recipient half of the operation is sound
+        // and only the signer can be what refuses it.
+        let mut signed_and_encrypted = Vec::new();
+        assert!(
+            encrypt(
+                std::slice::from_ref(&bob),
+                &[],
+                Some((&alice, None)),
+                b"the treaty text",
+                &mut signed_and_encrypted,
+            )
+            .is_err(),
+            "sign-and-encrypt goes through the same guard"
+        );
     }
 
     #[test]

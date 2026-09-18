@@ -108,12 +108,31 @@ pub fn certify(store: &Store, request: &CertifyRequest) -> Result<Cert> {
     }
 
     let policy = policy();
-    // The certifier may be a card key, which has no local secret half; the
-    // public certificate is enough for the agent to find it by keygrip.
-    let certifier = store
-        .secret_cert(&request.certifier)
-        .or_else(|_| store.lookup(&request.certifier))?;
+    // Both halves of the certifier: the secret one may be missing altogether,
+    // since a card key has no local secret half and the public certificate is
+    // enough for the agent to find it by keygrip — and where it is present it
+    // can still be behind cert-d by a revocation the user imported or fetched,
+    // which the guard below has to see.
+    let certifier = store.full_cert(&request.certifier)?;
     let target = store.lookup(&request.target)?;
+
+    // Neither end may be a certificate its owner has withdrawn, and both are
+    // checked here so that a card is never asked for its PIN on behalf of a
+    // certification that cannot count. sequoia-wot judges the target as it was
+    // when the certification was made and discards the certification outright
+    // if the target was revoked then (TargetHardRevoked, TargetSoftRevoked), and
+    // it drops every certification of a revoked target at the reference time
+    // besides — so what the status bar used to report as "Certified 1 user
+    // ID(s)", with a green tick beside it, was a signature that could never move
+    // the trust column. The reason the per-user-ID guard below gives, that a
+    // claim its own subject has withdrawn is not ours to make, applies with more
+    // force to a whole certificate revoked as compromised.
+    //
+    // Both are named by role, because this is the one operation where the
+    // status bar shows two people's keys and "Certification failed: Carol has
+    // been revoked" would leave the reader guessing which of them Carol was.
+    crate::revoke::refuse_if_revoked_as(&certifier, Some("the certifier"))?;
+    crate::revoke::refuse_if_revoked_as(&target, Some("the key being certified"))?;
 
     let valid = certifier
         .with_policy(&policy, None)
@@ -492,6 +511,173 @@ mod tests {
         let found = certifications(&store, &bob).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].user_id, "Bob <bob@example.org>");
+    }
+
+    /// The same reasoning one level up. A certification of a revoked
+    /// certificate is born dead: sequoia-wot resolves the target as it stood
+    /// when the signature was made and discards the certification if it was
+    /// revoked then, and drops every certification of a revoked target at the
+    /// reference time besides. So the status bar reported "Certified 1 user
+    /// ID(s)" and the list drew a tick while the trust column never moved —
+    /// and for a hard revocation an exportable attestation over a key its owner
+    /// had declared stolen went into the store, and into exports.
+    ///
+    /// Looking outwards the answer is the same: a certificate its owner has
+    /// withdrawn has no standing left to vouch for anyone.
+    #[test]
+    fn refuses_to_certify_when_either_end_has_been_revoked() {
+        let (_dir, store) = scratch();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        let bob = generate(&KeyGenRequest::new("Bob <bob@example.org>"))
+            .unwrap()
+            .cert;
+        let dave = generate(&KeyGenRequest::new("Dave <dave@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+        store.insert_secret(&bob).unwrap();
+        store.insert(&dave).unwrap();
+        let (alice_fp, bob_fp, dave_fp) = (
+            alice.fingerprint().to_hex(),
+            bob.fingerprint().to_hex(),
+            dave.fingerprint().to_hex(),
+        );
+
+        // Bob's laptop is stolen and he publishes the revocation.
+        let mut request = crate::revoke::RevokeRequest::new(&bob_fp);
+        request.reason = crate::revoke::Reason::Compromised;
+        crate::revoke::revoke_cert(&store, &request).unwrap();
+
+        let mut request = CertifyRequest::new(&alice_fp, &bob_fp);
+        request.user_ids = vec!["Bob <bob@example.org>".to_string()];
+        // Mapped to `()` before `expect_err` so that a broken guard reports the
+        // assertion rather than `Debug`-printing the whole certificate over it.
+        let refused = certify(&store, &request)
+            .map(|_| ())
+            .expect_err("certified a key its owner had revoked");
+        let message = refused.to_string();
+        assert!(
+            message.contains("Bob <bob@example.org> (the key being certified)")
+                && message.contains("revoked"),
+            "the refusal must say which key, in which role, and why: {message}"
+        );
+        assert!(
+            certifications(&store, &store.lookup(&bob_fp).unwrap())
+                .unwrap()
+                .is_empty(),
+            "a refused certification must not be written to the store"
+        );
+
+        // A live target is still certifiable, or the guard is just a wall.
+        let mut request = CertifyRequest::new(&alice_fp, &dave_fp);
+        request.user_ids = vec!["Dave <dave@example.org>".to_string()];
+        certify(&store, &request).unwrap();
+
+        // Now the certifier's end. The primary key of a revoked certificate is
+        // already filtered out — for the primary key alone `revoked(false)` does
+        // consult the certificate — so the reachable shape is a certificate
+        // whose *subkey* certifies, which plenty of imported keys have.
+        let (carol, _) = sequoia_openpgp::cert::CertBuilder::new()
+            .add_userid("Carol <carol@example.org>")
+            .add_subkey(
+                sequoia_openpgp::types::KeyFlags::empty().set_certification(),
+                None,
+                None,
+            )
+            .generate()
+            .unwrap();
+        let carol_fp = carol.fingerprint().to_hex();
+        store.insert_secret(&carol).unwrap();
+        crate::revoke::revoke_cert(&store, &crate::revoke::RevokeRequest::new(&carol_fp)).unwrap();
+
+        let mut request = CertifyRequest::new(&carol_fp, &dave_fp);
+        request.user_ids = vec!["Dave <dave@example.org>".to_string()];
+        let refused = certify(&store, &request)
+            .map(|_| ())
+            .expect_err("vouched for someone with a revoked key");
+        let message = refused.to_string();
+        assert!(
+            message.contains("Carol <carol@example.org> (the certifier)"),
+            "the refusal must name the certifier as the certifier: {message}"
+        );
+        assert!(
+            !message.contains("Dave <dave@example.org>"),
+            "and must not point at the target, which is fine: {message}"
+        );
+        assert_eq!(
+            certifications(&store, &store.lookup(&dave_fp).unwrap())
+                .unwrap()
+                .len(),
+            1,
+            "only Alice's certification should be on Dave"
+        );
+    }
+
+    /// The certifier is resolved from both of the store's halves, so a
+    /// revocation that reached cert-d alone still refuses.
+    ///
+    /// `Store::insert` writes cert-d and never the secret key file, so this is
+    /// the shape a revocation takes when it arrives by import or by a keyserver
+    /// refresh: the secret half, which is where the certification key lives,
+    /// looks live. Retired rather than the default, because a soft revocation
+    /// is the one that still reads as usable to anyone who has not seen it.
+    #[test]
+    fn refuses_to_certify_when_the_certifiers_revocation_reached_only_cert_d() {
+        let (_dir, store) = scratch();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        let dave = generate(&KeyGenRequest::new("Dave <dave@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+        store.insert(&dave).unwrap();
+        let (alice_fp, dave_fp) = (alice.fingerprint().to_hex(), dave.fingerprint().to_hex());
+
+        // Retired where the key also lives — the owner's other machine — and
+        // met here as the public certificate, which is all `insert` ever
+        // writes.
+        let elsewhere_dir = tempfile::tempdir().unwrap();
+        let elsewhere = Store::open(
+            elsewhere_dir.path().join("certs.d"),
+            elsewhere_dir.path().join("secrets"),
+        )
+        .unwrap();
+        elsewhere.insert_secret(&alice).unwrap();
+        let mut request = crate::revoke::RevokeRequest::new(&alice_fp);
+        request.reason = crate::revoke::Reason::Retired;
+        crate::revoke::revoke_cert(&elsewhere, &request).unwrap();
+        store.insert(&elsewhere.lookup(&alice_fp).unwrap()).unwrap();
+
+        assert!(
+            !matches!(
+                store
+                    .secret_cert(&alice_fp)
+                    .unwrap()
+                    .revocation_status(&policy(), None),
+                RevocationStatus::Revoked(_)
+            ),
+            "the secret half not knowing is the premise of this test"
+        );
+
+        let mut request = CertifyRequest::new(&alice_fp, &dave_fp);
+        request.user_ids = vec!["Dave <dave@example.org>".to_string()];
+        let refused = certify(&store, &request)
+            .map(|_| ())
+            .expect_err("vouched for someone with a key whose revocation was in cert-d");
+        let message = refused.to_string();
+        assert!(
+            message.contains("Alice <alice@example.org> (the certifier)"),
+            "the refusal must name the certifier as the certifier: {message}"
+        );
+        assert!(
+            certifications(&store, &store.lookup(&dave_fp).unwrap())
+                .unwrap()
+                .is_empty(),
+            "a refused certification must not be written to the store"
+        );
     }
 
     /// A user ID is bytes, and everything above the storage layer handles it

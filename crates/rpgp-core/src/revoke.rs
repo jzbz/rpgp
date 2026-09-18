@@ -62,12 +62,27 @@ impl Reason {
         Reason::Unspecified,
     ];
 
+    /// The dialog and details-pane label: capitalised, and standing alone.
     pub fn label(self) -> &'static str {
         match self {
             Reason::Retired => "No longer used",
             Reason::Superseded => "Replaced by a newer key",
             Reason::Compromised => "Secret key may be compromised",
             Reason::Unspecified => "No reason given (treated as compromised)",
+        }
+    }
+
+    /// The same reason set inside a sentence, for [`Error::Revoked`].
+    ///
+    /// [`Reason::label`] cannot serve both: dropped mid-sentence it puts a
+    /// capital letter where none belongs, and `Unspecified`'s parenthetical
+    /// lands inside whatever punctuation the sentence already uses.
+    pub(crate) fn clause(self) -> &'static str {
+        match self {
+            Reason::Retired => "no longer used",
+            Reason::Superseded => "replaced by a newer key",
+            Reason::Compromised => "the secret key may be compromised",
+            Reason::Unspecified => "no reason given, which the standard treats as a compromise",
         }
     }
 
@@ -389,6 +404,83 @@ pub fn revocation_reason(cert: &Cert) -> Option<(Reason, String)> {
     })
 }
 
+/// Refuse a certificate whose owner has withdrawn it.
+///
+/// Every operation that makes something *new* — a message encrypted to a key, a
+/// signature, a certification, a fresh self-signature — asks this first.
+/// Sequoia's key iterators cannot answer it. `revoked(false)` reports each
+/// key's own revocation, and for a subkey that says nothing about the
+/// certificate's: `ValidKeyAmalgamation::revocation_status` (sequoia-openpgp
+/// 2.4.1) consults the certificate only for the primary key. A certificate
+/// revoked as a whole therefore keeps offering healthy-looking signing and
+/// encryption subkeys. `alive()` *does* consult the certificate, which is why
+/// expiry was caught all along and revocation was not.
+///
+/// The soft reasons are refused with the hard ones. "Replaced by a newer key"
+/// and "no longer used" still say the owner has stopped using this key, so a
+/// message encrypted to it is as unreadable to them as one encrypted to a key
+/// that was stolen, and a signature from it is one every verifier holding the
+/// revocation rejects.
+///
+/// Two kinds of work are deliberately left out. Reading is one: [`crate::ops`]
+/// decrypts and verifies through revoked certificates on purpose, because
+/// revoking withdraws a key from future use and does not burn the archive.
+/// Withdrawing is the other: [`revoke_certification`] takes back something the
+/// key already said, which is the one thing its owner may still want to do with
+/// it the day after revoking it, so its signer does not come through here.
+///
+/// `RevocationStatus::CouldBe` is not treated as a revocation. Sequoia puts
+/// every signature in `other_revocations` there without verifying any of them
+/// — `revocation_status_intern` (cert/bundle.rs, sequoia-openpgp 2.4.1) never
+/// promotes one to `Revoked` — so it collects third-party packets in general
+/// and not only the designated-revoker case. Anyone can write such a packet, so
+/// acting on one would let a stranger take a key out of service. It also means
+/// this agrees exactly with the Revoked pill [`crate::CertSummary`] already
+/// draws, and no one meets a refusal for a certificate the app shows as valid.
+pub(crate) fn refuse_if_revoked(cert: &Cert) -> Result<()> {
+    refuse_if_revoked_as(cert, None)
+}
+
+/// [`refuse_if_revoked`] where the operation has two certificates in play and
+/// the message has to say which of them it means.
+///
+/// `role` is a noun phrase parenthesised after the name — "Bob
+/// <bob@example.org> (the certifier)" — because "Certification failed: Carol
+/// has been revoked" leaves the reader to guess whether Carol was the one being
+/// vouched for or the one vouching.
+pub(crate) fn refuse_if_revoked_as(cert: &Cert, role: Option<&str>) -> Result<()> {
+    let policy = policy();
+    if !matches!(
+        cert.revocation_status(&policy, None),
+        RevocationStatus::Revoked(_)
+    ) {
+        return Ok(());
+    }
+
+    // `revocation_reason` reads the same status, so the only way it says
+    // nothing here is a Revoked set with no signatures in it, which sequoia
+    // does not build. Naming the harshest reading of a missing reason keeps the
+    // message honest if that ever changes.
+    let reason = revocation_reason(cert).map_or(Reason::Unspecified, |(reason, _)| reason);
+    let valid = cert.with_policy(&policy, None).ok();
+    // A certificate need carry no user ID at all — nothing on the import path
+    // asks for one — and for such a certificate `primary_user_id` answers
+    // "(no user ID)", which names nothing in a status bar that has room for
+    // one identifier. The fingerprint is what the rest of the crate falls back
+    // to when there is no name, as `Error::NoSecretKey` does.
+    let name = match cert.userids().next() {
+        Some(_) => crate::cert::primary_user_id(cert, valid.as_ref()),
+        None => cert.fingerprint().to_hex(),
+    };
+    Err(Error::Revoked {
+        name: match role {
+            Some(role) => format!("{name} ({role})"),
+            None => name,
+        },
+        reason: reason.clause().to_string(),
+    })
+}
+
 fn primary_signer(cert: &Cert, password: Option<&str>) -> Result<sequoia_openpgp::crypto::KeyPair> {
     let key = cert
         .primary_key()
@@ -401,6 +493,14 @@ fn primary_signer(cert: &Cert, password: Option<&str>) -> Result<sequoia_openpgp
     crate::secret::keypair(key, password)
 }
 
+/// A signer for [`revoke_certification`].
+///
+/// Deliberately does not ask [`refuse_if_revoked`], and takes the agent's
+/// withdrawal entry point rather than `certifier_for` so that the agent does
+/// not ask on its behalf either. Retracting a certification is taking back
+/// something already said, not making new use of the key, and someone who has
+/// just revoked their own certificate is exactly the person who may now want to
+/// withdraw what it vouched for.
 fn certification_signer(
     cert: &Cert,
     password: Option<&str>,
@@ -419,13 +519,24 @@ fn certification_signer(
         .next();
 
     // No local secret half means a card key: hand the agent the certificate and
-    // let it find the key by keygrip, exactly as certify() does.
+    // let it find the key by keygrip, as certify() does — but through the
+    // withdrawal entry point, which alone among the agent's signing paths does
+    // not refuse a revoked certificate.
+    //
+    // The filter above is a separate matter and predates that check: for the
+    // primary key `revoked(false)` *is* the certificate's status, so a revoked
+    // certificate whose primary key certifies — which is every key this app
+    // generates — already falls through to the agent here and fails there
+    // unless the agent happens to hold it. Withdrawing a certification made
+    // with a key since revoked therefore still does not work in general; what
+    // this entry point preserves is the case that did work, a card-held
+    // certification subkey.
     match ka {
         Some(ka) => Ok(Box::new(crate::secret::keypair(
             ka.key().clone(),
             password,
         )?)),
-        None => Ok(Box::new(crate::agent::certifier_for(cert)?)),
+        None => Ok(Box::new(crate::agent::certification_withdrawer_for(cert)?)),
     }
 }
 
@@ -955,6 +1066,31 @@ mod tests {
         assert_eq!(
             CertSummary::from_cert(&store.lookup(&mine.fingerprint().to_hex()).unwrap()).validity,
             Validity::Valid
+        );
+    }
+
+    /// The refusal exists to tell the user which key was refused, and a
+    /// certificate carrying no user ID has no name to tell them.
+    #[test]
+    fn the_refusal_names_a_certificate_with_no_user_id_by_its_fingerprint() {
+        let (_dir, store) = scratch();
+        // No `add_userid`: a certificate is a key and its self-signatures, and
+        // a user ID is not required of one. `import_file` takes such a
+        // certificate like any other.
+        let (cert, _) = sequoia_openpgp::cert::CertBuilder::new()
+            .add_signing_subkey()
+            .generate()
+            .unwrap();
+        let fingerprint = cert.fingerprint().to_hex();
+        store.insert_secret(&cert).unwrap();
+        revoke_cert(&store, &RevokeRequest::new(&fingerprint)).unwrap();
+
+        let refused = refuse_if_revoked(&store.lookup(&fingerprint).unwrap())
+            .expect_err("a revoked certificate must be refused for new use");
+        let message = refused.to_string();
+        assert!(
+            message.contains(&fingerprint),
+            "the refusal must identify the certificate it means: {message}"
         );
     }
 }
