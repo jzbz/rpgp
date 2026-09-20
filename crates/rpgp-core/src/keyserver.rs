@@ -8,22 +8,28 @@
 //! everywhere else. `reqwest` with `rustls-tls` keeps it pure Rust.
 //!
 //! WKD is tried before a keyserver. A certificate served from the domain of
-//! the address itself carries more weight than one anybody could upload.
+//! the address itself carries more weight than one anybody could upload —
+//! which is a claim about the address and not about the host, so what a WKD
+//! host serves is kept only where it carries the address that was asked for.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sequoia_openpgp::Cert;
 use sequoia_openpgp::cert::CertParser;
+use sequoia_openpgp::cert::amalgamation::UserIDAmalgamation;
+use sequoia_openpgp::packet::UserID;
 use sequoia_openpgp::parse::Parse;
+use sequoia_openpgp::{Cert, KeyHandle};
 
 use crate::error::{Error, Result};
 
 /// Where a certificate was found, so the UI can say so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    /// Served by the domain of the address itself.
+    /// Served by the domain of the address itself, and carrying it: see
+    /// [`only_the_requested_address`], which is what makes this label mean
+    /// what the lookup dialog shows it to mean.
     WebKeyDirectory,
     Keyserver,
 }
@@ -372,7 +378,25 @@ pub fn lookup(query: &str) -> Result<Vec<Found>> {
 }
 
 /// Fetch from the address's own domain.
+///
+/// Nothing is believed on the strength of where it came from: the reply is cut
+/// down to the address that was asked for before any of it is handed back, and
+/// a reply with nothing of the kind in it is nothing found rather than an
+/// error, so [`lookup`] goes on to the keyserver.
 pub fn lookup_wkd(address: &str) -> Result<Vec<Found>> {
+    lookup_wkd_resolving(address, resolves)
+}
+
+/// [`lookup_wkd`], told by its caller which names have an address.
+///
+/// The seam is here because the choice [`wkd_url`] makes decides which host the
+/// fetch names, and so which host the guards are asked about — while whether
+/// `openpgpkey.localhost` resolves is a property of the machine the tests run
+/// on rather than of this code. systemd-resolved synthesises every `*.localhost`
+/// name; a resolver without that answers only `localhost` itself. A test about
+/// the hosts a lookup may reach has to fix that choice rather than inherit it,
+/// or it silently asserts about whichever URL the machine happened to pick.
+fn lookup_wkd_resolving(address: &str, resolves: impl FnOnce(&str) -> bool) -> Result<Vec<Found>> {
     let (local, domain) = address
         .rsplit_once('@')
         .ok_or_else(|| Error::invalid(format!("{address} is not an e-mail address")))?;
@@ -386,9 +410,6 @@ pub fn lookup_wkd(address: &str) -> Result<Vec<Found>> {
     let hash = wkd_hash(local);
     let encoded = percent_encode(local);
 
-    // The advanced method is tried first, as the specification requires: a
-    // domain that delegates to openpgpkey.<domain> should win over the direct
-    // URL, which may be served by unrelated web hosting.
     let advanced = format!(
         "https://openpgpkey.{domain}/.well-known/openpgpkey/{domain}/hu/{hash}?l={encoded}"
     );
@@ -407,23 +428,241 @@ pub fn lookup_wkd(address: &str) -> Result<Vec<Found>> {
         )));
     }
 
-    let urls = [advanced, direct];
+    let url = wkd_url(advanced, direct, resolves);
 
-    for url in urls {
-        if let Ok(bytes) = get(&url, Peer::Elsewhere)
-            && let Ok(certs) = parse(&bytes)
-            && !certs.is_empty()
-        {
-            return Ok(certs
-                .into_iter()
-                .map(|cert| Found {
-                    cert,
-                    source: Source::WebKeyDirectory,
-                })
-                .collect());
-        }
+    // A host that cannot be reached, refuses, or answers with something that is
+    // not a certificate has no key for this address, which is not a failure to
+    // report: `lookup` falls through to the keyserver either way.
+    let Ok(bytes) = get(&url, Peer::Elsewhere) else {
+        return Ok(Vec::new());
+    };
+    let Ok(certs) = parse(&bytes) else {
+        return Ok(Vec::new());
+    };
+
+    Ok(only_the_requested_address(certs, address)
+        .into_iter()
+        .map(|cert| Found {
+            cert,
+            source: Source::WebKeyDirectory,
+        })
+        .collect())
+}
+
+/// Which of the two WKD URLs to fetch: the advanced one whenever
+/// `openpgpkey.<domain>` has an address at all, the direct one only when it has
+/// none.
+///
+/// The choice is a question about DNS rather than about what a host answers.
+/// The specification is explicit: implementations must try the advanced method
+/// first, and "Only if an address for the required sub-domain does not exist,
+/// they SHOULD fall back to the direct method. A non-responding server does not
+/// mean that the fall back should be carried out." Trying the advanced URL and
+/// moving on whenever it did not yield a certificate — a 404, a TLS failure, a
+/// timeout, a body that did not parse — handed every address a delegating
+/// domain has not published to whoever runs the apex web site, which is the
+/// party the delegation exists to keep out. The comment that stood over that
+/// loop named exactly this risk and claimed the order alone answered it.
+///
+/// The host is taken from the parsed URL rather than pasted together again,
+/// because the domain half of an address may carry a port: `openpgpkey.` plus
+/// `example.org:8443` is a name and a port, not a name.
+///
+/// The cost is a domain that wildcards its DNS and publishes by the direct
+/// method: `openpgpkey.<domain>` then resolves to a host serving no key, and
+/// there is no second attempt. The specification puts that on the site — it
+/// requires such a site to keep the `openpgpkey` sub-domain out of the wildcard
+/// — and a lookup that finds nothing here still goes on to the keyserver.
+///
+/// `resolves` is a parameter so the rule can be put to the question without a
+/// resolver, the way [`redirect_refusal`] is tested without a socket.
+fn wkd_url(advanced: String, direct: String, resolves: impl FnOnce(&str) -> bool) -> String {
+    let subdomain = reqwest::Url::parse(&advanced)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+    match subdomain {
+        Some(host) if resolves(&host) => advanced,
+        _ => direct,
     }
-    Ok(Vec::new())
+}
+
+/// Whether a name has an address at all.
+///
+/// A resolver error reads as "no such name", because the system resolver will
+/// not say which error it was: on Unix every `getaddrinfo` failure but
+/// `EAI_SYSTEM` reaches std as an uncategorised `io::Error`, so NXDOMAIN and
+/// SERVFAIL arrive alike. That makes the rule above a mitigation rather than a
+/// guarantee — an on-path attacker who can forge a DNS answer can still force
+/// the direct method, since nothing here validates DNSSEC — but it closes the
+/// case that needs nobody on the wire: a delegated host answering 404 while the
+/// apex host answers with a certificate.
+///
+/// Silence is not an error and is not read as absence. A resolver that has said
+/// nothing within [`TIMEOUT`] has not said the name is missing, and falling
+/// back on that would hand the address to the apex host for no better reason
+/// than a slow network. The lookup then asks for the advanced URL, whose fetch
+/// will resolve the same name under its own timeout and most likely find
+/// nothing, and the keyserver still gets its turn afterwards.
+///
+/// The bound is why this runs on a thread of its own. `getaddrinfo` cannot be
+/// cancelled, and with glibc's defaults against three unanswering nameservers
+/// it takes about thirty seconds; on the caller's thread that is thirty
+/// seconds the lookup cannot be brought back from, with the main window
+/// disabled meanwhile. Abandoned here, it is bounded at ten like every fetch —
+/// the same trade the `shutdown_background` in [`get`] makes, and the reason a
+/// lookup's worst case is what it was before this pre-resolution existed: two
+/// stalls on the WKD path where there used to be two WKD fetches.
+///
+/// It is [`Guarded`], on the connection that follows, that decides whether the
+/// addresses may be reached; nothing is connected to here. The addresses found
+/// here are dropped, and the fetch resolves the name again through the guard,
+/// so the advanced host is looked up twice on a WKD fetch. That is the price
+/// of leaving the judgement at the connection, where what is judged is the
+/// address actually dialled rather than one found a moment earlier.
+fn resolves(host: &str) -> bool {
+    let host = host.to_owned();
+    let (answer, waiting) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Port 0 because the port is not part of the question: std passes a
+        // null service to `getaddrinfo` whatever number is written here.
+        let _ = answer.send(
+            (host.as_str(), 0u16)
+                .to_socket_addrs()
+                .is_ok_and(|mut addrs| addrs.next().is_some()),
+        );
+    });
+    // A thread that was abandoned, or that died without answering, has said
+    // nothing, which is not absence either.
+    waiting.recv_timeout(TIMEOUT).unwrap_or(true)
+}
+
+/// Keep only what a WKD reply was entitled to return: certificates carrying
+/// `address`, each stripped of every other identity on it.
+///
+/// The specification makes both halves a MUST — "A client MUST check that the
+/// received key has the requested User-Id and MUST drop all other User-Ids
+/// found in the received key" — and neither was done. A host serving
+/// `alice@evil.example` could answer with `Bob <bob@bank.example>`, and the
+/// lookup dialog listed it as coming from the web key directory, which is the
+/// strongest provenance this application displays and the one the module doc
+/// above claims. Importing it stored every user ID on it, and the certify
+/// dialog offers those pre-ticked, so a certification meant for one identity
+/// could be made over a name from a domain the server does not control.
+///
+/// A user ID counts only where the certificate signed for it. `cert.userids()`
+/// includes a name anybody appended in flight, so matching on those alone would
+/// let an unsigned `alice@example.org` stapled to a stranger's certificate pass
+/// the check and be the one thing left after the strip. As in
+/// [`crate::cert::primary_user_id`], the question asked is the cryptographic
+/// one and not the policy one: a SHA-1 self-signature is still the holder's
+/// own, and a certificate carrying one is exactly what someone looks up in
+/// order to replace it.
+///
+/// A matching identity that has been revoked is kept. The specification allows
+/// a revoked key to be served, and a revocation is the one thing about a key
+/// its owner most wants seen.
+fn only_the_requested_address(certs: Vec<Cert>, address: &str) -> Vec<Cert> {
+    // An address this library cannot parse cannot be compared with a user ID,
+    // and a check worded as a MUST fails closed rather than open.
+    let Some(wanted) = normalized_address(address) else {
+        return Vec::new();
+    };
+    certs
+        .into_iter()
+        .map(|cert| {
+            cert.retain_userids(|ua| names_address(&ua, &wanted))
+                // A photo is an identity claim as much as a name is, and this
+                // reply is entitled to carry exactly one identity.
+                .retain_user_attributes(|_| false)
+        })
+        .filter(|cert| cert.userids().next().is_some())
+        .collect()
+}
+
+/// Keep only the certificates that answer `query`.
+///
+/// A keyserver is not held to the WKD rule: `keys.openpgp.org` serves only
+/// addresses whose owner confirmed them, and dropping every other user ID is
+/// something the WKD specification asks of a WKD client. But a reply still has
+/// to be an answer to the question that was asked. `RPGP_KEYSERVER` may name
+/// any HKP server, verifying or not, and a fingerprint query answered with an
+/// entirely different certificate was listed as found.
+///
+/// Only a query this module can interpret is filtered on. A fingerprint or key
+/// ID is matched against the certificate's primary key and against every
+/// subkey the certificate has signed for, because HKP servers answer subkey
+/// handles too and dropping those would lose genuine results. The binding is
+/// required for the reason a self-signature is in [`names_address`]: a key
+/// packet costs nothing to append, so an unbound one let anybody's key be
+/// stapled to a stranger's certificate and that certificate be listed as the
+/// answer to the stapled key's fingerprint — a genuine, often already-stored
+/// certificate offered as the holder of a key it has never carried. An address
+/// is matched as a WKD reply is, minus the strip. Anything else is a free-text
+/// search, where the server decides what matches and a filter here could only
+/// empty the list.
+///
+/// What this cannot decide is whose key a properly bound subkey is: two
+/// certificates may bind the same key, and a handle is all an HKP query says,
+/// so a certificate that has signed for a key it was given still answers for
+/// it. Only the holder's own certification could tell those apart, and a
+/// keyserver reply carries no authentication this module could weigh.
+///
+/// Something that looks like an address but does not parse as one — a quoted
+/// local part, a host carrying a port — counts as free text too, and passes
+/// unfiltered. That is the opposite of [`only_the_requested_address`], which
+/// keeps nothing when it cannot read the address, and the difference is
+/// deliberate: there the check is the whole of what makes the label honest, so
+/// it fails closed, while here the server was asked a question this module
+/// cannot restate and dropping its answer would only lose results.
+fn answers_the_query(certs: Vec<Cert>, query: &str) -> Vec<Cert> {
+    if let Ok(handle) = query.parse::<KeyHandle>()
+        && !handle.is_invalid()
+    {
+        return certs
+            .into_iter()
+            .filter(|cert| {
+                handle.aliases(cert.key_handle())
+                    || cert.keys().subkeys().any(|ka| {
+                        ka.self_signatures().next().is_some()
+                            && handle.aliases(ka.key().key_handle())
+                    })
+            })
+            .collect();
+    }
+    if query.contains('@')
+        && let Some(wanted) = normalized_address(query)
+    {
+        return certs
+            .into_iter()
+            .filter(|cert| cert.userids().any(|ua| names_address(&ua, &wanted)))
+            .collect();
+    }
+    certs
+}
+
+/// The address written the way [`UserID::email_normalized`] writes one, which
+/// is how two addresses are compared here: punycoded domain, lowercased without
+/// locale tailoring.
+///
+/// Both sides of every comparison go through sequoia's own rule rather than a
+/// hand-written one, so that this module agrees with the rest of the OpenPGP
+/// stack about when two addresses are the same address. `None` for anything
+/// that is not an address at all.
+fn normalized_address(address: &str) -> Option<String> {
+    UserID::from_address(None, None, address)
+        .ok()?
+        .email_normalized()
+        .ok()
+        .flatten()
+}
+
+/// Whether `ua` is an identity the certificate signed for itself, naming
+/// `wanted` — which must already be normalised by [`normalized_address`].
+fn names_address(ua: &UserIDAmalgamation<'_>, wanted: &str) -> bool {
+    // Sequoia hands out no self-signature it has not verified, so this is the
+    // certificate speaking rather than whoever last handled it.
+    ua.self_signatures().next().is_some()
+        && ua.userid().email_normalized().ok().flatten().as_deref() == Some(wanted)
 }
 
 /// Fetch from a HKPS keyserver.
@@ -434,7 +673,7 @@ pub fn lookup_keyserver(query: &str) -> Result<Vec<Found>> {
         percent_encode(query)
     );
     let bytes = get(&url, Peer::Keyserver)?;
-    Ok(parse(&bytes)?
+    Ok(answers_the_query(parse(&bytes)?, query)
         .into_iter()
         .map(|cert| Found {
             cert,
@@ -443,11 +682,20 @@ pub fn lookup_keyserver(query: &str) -> Result<Vec<Found>> {
         .collect())
 }
 
-/// The local part hashed and z-base-32 encoded, as WKD defines it: lowercased,
-/// SHA-1, then 32 characters of z-base-32.
+/// The local part hashed and z-base-32 encoded, as WKD defines it:
+/// ASCII-lowercased, SHA-1, then 32 characters of z-base-32.
+///
+/// ASCII and nothing else. The specification maps "all upper-case ASCII
+/// characters" to lower case and leaves non-ASCII characters alone, while
+/// `str::to_lowercase` applies the whole Unicode mapping. The two disagree
+/// about any local part carrying a non-ASCII capital — `Ärger` was hashed as
+/// `ärger`, a different `hu` path from the one a conforming publisher wrote, so
+/// a key that was published was quietly not found — and Unicode folds U+212A
+/// KELVIN SIGN to `k`, so a look-alike `Kevin` fetched the real `kevin`'s key
+/// instead.
 fn wkd_hash(local: &str) -> String {
     use sha1::{Digest, Sha1};
-    let digest = Sha1::digest(local.to_lowercase().as_bytes());
+    let digest = Sha1::digest(local.to_ascii_lowercase().as_bytes());
     zbase32::encode(digest)
 }
 
@@ -515,10 +763,10 @@ fn get(url: &str, peer: Peer) -> Result<Vec<u8>> {
     // `getaddrinfo` is one of those, so a fetch whose timeout had already
     // fired still sat here for as long as the *system* resolver took — with
     // glibc's defaults against three unanswering nameservers, about thirty
-    // seconds rather than TIMEOUT's ten, and three times over for a lookup
-    // that tries both WKD URLs and then the keyserver, with the whole main
-    // window disabled meanwhile. Handed off, the stuck thread finishes and
-    // exits on its own.
+    // seconds rather than TIMEOUT's ten, twice over for a lookup that tries a
+    // WKD URL and then the keyserver, with the whole main window disabled
+    // meanwhile. Handed off, the stuck thread finishes and exits on its own.
+    // [`resolves`] abandons its own resolution for the same reason.
     runtime.shutdown_background();
     outcome
 }
@@ -696,6 +944,33 @@ mod tests {
         assert_eq!(wkd_hash("Joe.Doe"), "iy9q119eutrkn8s1mk4r39qejnbu3n5q");
     }
 
+    /// Only ASCII is mapped to lower case, which is what the specification says
+    /// and what a publisher's tooling does.
+    ///
+    /// The vectors are `gpg-wks-client --print-wkd-hash` (GnuPG 2.4.9) for
+    /// `ÄRGER@example.de` and for a `Kevin` whose K is U+212A KELVIN SIGN. The
+    /// draft's own `Joe.Doe` vector cannot catch this, since both mappings
+    /// agree on it: `str::to_lowercase` lowercases the `Ä`, which asks the
+    /// publisher's host for a path it never wrote, and folds the Kelvin sign
+    /// into ASCII `k`, which asks it for somebody else's key.
+    #[test]
+    fn maps_only_ascii_to_lower_case_in_the_wkd_hash() {
+        assert_eq!(wkd_hash("ÄRGER"), "ewd7piirpeasam9iz8or84x4be3xhxqw");
+        assert_eq!(wkd_hash("Ärger"), wkd_hash("ÄRGER"));
+        assert_ne!(
+            wkd_hash("ärger"),
+            wkd_hash("ÄRGER"),
+            "a non-ASCII capital is a different local part, not the same one"
+        );
+
+        assert_eq!(wkd_hash("\u{212a}evin"), "zsoj3njigu43ez6rcptj7rdb4z9kbtih");
+        assert_ne!(
+            wkd_hash("\u{212a}evin"),
+            wkd_hash("kevin"),
+            "a Kelvin sign was folded into ASCII k and fetched another mailbox"
+        );
+    }
+
     #[test]
     fn escapes_the_query() {
         assert_eq!(percent_encode("a b+c@d"), "a%20b%2Bc%40d");
@@ -792,19 +1067,32 @@ mod tests {
     /// the guards: a redirect that is followed has to *succeed*, or the test
     /// cannot tell a guard from a dead socket.
     fn bait_reply() -> Vec<u8> {
-        use sequoia_openpgp::serialize::SerializeInto;
         let cert = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
             "Alice <alice@example.org>",
         ))
         .unwrap()
         .cert;
-        let bait = cert.armored().export_to_vec().unwrap();
+        armored_reply(&cert)
+    }
+
+    /// `cert` armored, wrapped in the 200 reply a keyserver or WKD host would
+    /// send. What the *body* says is the point of the filtering tests below,
+    /// which is why the certificate is the caller's to choose.
+    ///
+    /// Serialised rather than exported, because a hostile server sends what it
+    /// likes: sequoia's export rules drop any component carrying no exportable
+    /// self-signature, which is precisely the packet a splicing test staples
+    /// on. For a certificate that was generated rather than assembled the two
+    /// produce the same bytes.
+    fn armored_reply(cert: &Cert) -> Vec<u8> {
+        use sequoia_openpgp::serialize::SerializeInto;
+        let body = cert.armored().to_vec().unwrap();
         let mut reply = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/pgp-keys\r\nContent-Length: {}\r\n\r\n",
-            bait.len()
+            body.len()
         )
         .into_bytes();
-        reply.extend_from_slice(&bait);
+        reply.extend_from_slice(&body);
         reply
     }
 
@@ -982,11 +1270,22 @@ mod tests {
         let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
         // (1) A WKD address whose domain is the configured keyserver's host.
+        // The resolver is pinned so the fetch is the direct URL, the one whose
+        // host is `localhost` and so the one the exemption would cover: left
+        // to the machine's own resolver this asserts about whichever URL that
+        // machine picks, and systemd-resolved answers for
+        // `openpgpkey.localhost`, whose host the exemption never named.
         let (port, hits) = serve_counting(bait_reply());
         unsafe { std::env::set_var("RPGP_KEYSERVER", format!("https://localhost:{port}")) };
-        let found = lookup_wkd(&format!("alice@localhost:{port}"))
+        let found = lookup_wkd_resolving(&format!("alice@localhost:{port}"), |_| false)
             .expect("a WKD fetch that is refused is not an error, it is nothing found");
-        assert!(found.is_empty(), "the guarded host served a certificate");
+        // A shape check and not a guard check: an address whose domain half
+        // carries a port does not parse, so the filter keeps nothing whatever
+        // the fetch did. The hit count below is what has teeth here.
+        assert!(
+            found.is_empty(),
+            "an address that does not parse must match no user ID"
+        );
         assert_eq!(
             hits.load(Ordering::SeqCst),
             0,
@@ -1405,5 +1704,271 @@ mod tests {
         assert!(lookup_wkd("not-an-address").is_err());
         assert!(lookup_wkd("@example.org").is_err());
         assert!(lookup("   ").is_err());
+    }
+
+    /// A WKD host answers for the address it was asked about and for nothing
+    /// else, which is a MUST the code did not honour: whatever it served was
+    /// listed under the "web key directory" label with every user ID on it.
+    ///
+    /// The filter is exercised here rather than through a socket because every
+    /// WKD URL is https, so a local stand-in would need a certificate
+    /// authority of its own to be reached at all; what a fetch that does
+    /// happen hands to this function is covered by the keyserver test below,
+    /// which runs over plain HTTP.
+    #[test]
+    fn a_wkd_reply_keeps_only_the_address_it_was_asked_for() {
+        use sequoia_openpgp::Packet;
+        use sequoia_openpgp::cert::{CertBuilder, UserIDRevocationBuilder};
+        use sequoia_openpgp::types::{ReasonForRevocation, RevocationStatus};
+
+        let (alice, _) = CertBuilder::new()
+            .add_userid("Alice <alice@example.org>")
+            .add_userid("Bob <bob@bank.example>")
+            .generate()
+            .unwrap();
+        let (mallory, _) = CertBuilder::new()
+            .add_userid("Mallory <mallory@evil.example>")
+            .generate()
+            .unwrap();
+
+        // Asked in another case, and with the domain in another case again:
+        // both sides are normalised, so this is the same address.
+        let kept =
+            only_the_requested_address(vec![alice.clone(), mallory.clone()], "ALICE@Example.ORG");
+
+        assert_eq!(
+            kept.len(),
+            1,
+            "a certificate for an address nobody asked about was kept"
+        );
+        assert_eq!(kept[0].fingerprint(), alice.fingerprint());
+        let names: Vec<String> = kept[0]
+            .userids()
+            .map(|ua| String::from_utf8_lossy(ua.userid().value()).into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["Alice <alice@example.org>"],
+            "an identity from another domain survived the strip"
+        );
+
+        // A user ID with no self-signature is a name anybody can staple to a
+        // certificate in flight, and is not the certificate claiming it.
+        let stapled = mallory
+            .insert_packets(vec![Packet::from(UserID::from(
+                "Alice <alice@example.org>",
+            ))])
+            .unwrap()
+            .0;
+        assert!(
+            stapled
+                .userids()
+                .any(|ua| ua.userid().email().ok().flatten() == Some("alice@example.org")),
+            "the fixture must carry the appended name, or this proves nothing"
+        );
+        assert!(
+            only_the_requested_address(vec![stapled], "alice@example.org").is_empty(),
+            "a name nobody signed passed as the certificate's own"
+        );
+
+        // A revoked identity is still the identity that was asked for. The
+        // specification allows a revoked key to be served, and a revocation is
+        // the one thing about a key its owner most wants seen, so the filter
+        // must not be what hides it.
+        let mut signer = alice
+            .primary_key()
+            .key()
+            .clone()
+            .parts_into_secret()
+            .unwrap()
+            .into_keypair()
+            .unwrap();
+        let revocation = UserIDRevocationBuilder::new()
+            .set_reason_for_revocation(ReasonForRevocation::UIDRetired, b"no longer used")
+            .unwrap()
+            .build(
+                &mut signer,
+                &alice,
+                &UserID::from("Alice <alice@example.org>"),
+                None,
+            )
+            .unwrap();
+        let revoked = alice.insert_packets(revocation).unwrap().0;
+        assert!(
+            matches!(
+                revoked
+                    .userids()
+                    .find(|ua| ua.userid().email().ok().flatten() == Some("alice@example.org"))
+                    .unwrap()
+                    .revocation_status(&crate::policy(), None),
+                RevocationStatus::Revoked(_)
+            ),
+            "the fixture must carry the revocation, or this proves nothing"
+        );
+        assert_eq!(
+            only_the_requested_address(vec![revoked], "alice@example.org").len(),
+            1,
+            "a revoked identity was dropped, hiding the revocation"
+        );
+    }
+
+    /// The direct URL is for a domain that has no `openpgpkey` sub-domain, not
+    /// for one whose delegated host merely said no.
+    ///
+    /// A pure function for the reason [`redirect_refusal`] is one: the answer
+    /// turns on a resolver, and a test that drove a socket could only assert
+    /// that a fetch failed, which it does either way.
+    #[test]
+    fn falls_back_to_the_direct_url_only_where_the_subdomain_has_no_address() {
+        let advanced = "https://openpgpkey.company.example:8443/.well-known/openpgpkey/\
+                        company.example/hu/kei1q4tipxxu1yj79k9kfukdhfy631xe?l=bob"
+            .to_string();
+        let direct = "https://company.example:8443/.well-known/openpgpkey/hu/\
+                      kei1q4tipxxu1yj79k9kfukdhfy631xe?l=bob"
+            .to_string();
+
+        let mut asked = String::new();
+        let chosen = wkd_url(advanced.clone(), direct.clone(), |host| {
+            asked = host.to_string();
+            true
+        });
+        assert_eq!(
+            asked, "openpgpkey.company.example",
+            "the name asked about must be the sub-domain, without the port"
+        );
+        assert_eq!(
+            chosen, advanced,
+            "a domain that delegates must be answered by the host it delegates to"
+        );
+
+        assert_eq!(
+            wkd_url(advanced, direct.clone(), |_| false),
+            direct,
+            "a domain with no openpgpkey sub-domain publishes at the direct URL"
+        );
+    }
+
+    /// A keyserver answer has to be an answer to the question that was asked.
+    ///
+    /// `RPGP_KEYSERVER` may name any HKP server, verifying or not, and nothing
+    /// compared a reply with the query: a fingerprint query answered with an
+    /// unrelated certificate was listed as found, and so was an address query
+    /// answered with a certificate that does not carry the address. A key
+    /// stapled on as an unbound packet is the same borrowing on the key side,
+    /// and what a certificate has signed for is again where the line falls.
+    #[test]
+    fn a_keyserver_answer_that_is_not_what_was_asked_for_is_not_a_result() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+        use sequoia_openpgp::Packet;
+        use sequoia_openpgp::cert::CertBuilder;
+        use sequoia_openpgp::serialize::SerializeInto;
+
+        let (mallory, _) = CertBuilder::new()
+            .add_userid("Mallory <mallory@evil.example>")
+            .add_transport_encryption_subkey()
+            .generate()
+            .unwrap();
+        let reply = armored_reply(&mallory);
+
+        // A key packet is as cheap to append as a name is: Alice's key, given
+        // the subordinate role, on Mallory's certificate, with no binding
+        // signature because appending one needs Alice's secret.
+        let (alice, _) = CertBuilder::new()
+            .add_userid("Alice <alice@example.org>")
+            .generate()
+            .unwrap();
+        let spliced = mallory
+            .clone()
+            .insert_packets(vec![Packet::from(
+                alice.primary_key().key().clone().role_into_subordinate(),
+            )])
+            .unwrap()
+            .0;
+        let spliced_reply = armored_reply(&spliced);
+        // Asserted on the armoring the stand-in serves rather than on the
+        // certificate in hand, because a splice that did not survive the trip
+        // would leave the fetch below passing for the wrong reason.
+        let served = parse(&spliced.armored().to_vec().unwrap()).unwrap();
+        assert!(
+            served.iter().any(|cert| {
+                cert.keys().any(|ka| {
+                    ka.key().fingerprint() == alice.fingerprint()
+                        && ka.self_signatures().next().is_none()
+                })
+            }),
+            "the fixture must carry the stapled key unsigned, or this proves nothing"
+        );
+
+        // Each stand-in serves one reply and is then done with, so every query
+        // gets one of its own. They are all asked before anything is asserted,
+        // and the variable is put back first, so that a failure here does not
+        // leave the rest of the process pointed at a dead port.
+        let ask = |reply: &[u8], query: &str| {
+            unsafe { std::env::set_var("RPGP_KEYSERVER", serve_once(reply.to_vec())) };
+            lookup_keyserver(query)
+        };
+        // (1) An address query, and a fingerprint query, each answered with a
+        // certificate that is not the one asked about, and a fingerprint query
+        // answered with a certificate carrying that very key as a packet it
+        // never signed for.
+        let other_address = ask(&reply, "alice@example.org");
+        let other_fingerprint = ask(&reply, "653909A2F0E37C106F5FAF546C8857E0D8E8F074");
+        let stapled_key = ask(&spliced_reply, &alice.fingerprint().to_hex());
+        // (2) And what must still come back: the queries this certificate does
+        // answer, and a free-text search, where the server decides what
+        // matches and filtering here could only empty the list.
+        let own_fingerprint = ask(&reply, &mallory.fingerprint().to_hex());
+        let own_address = ask(&reply, "mallory@evil.example");
+        let name_search = ask(&reply, "Mallory");
+        // A subkey the certificate did sign for is still an answer: HKP
+        // servers are asked by handle and answer for subkeys too.
+        let bound_subkey = ask(
+            &reply,
+            &mallory
+                .keys()
+                .subkeys()
+                .next()
+                .expect("the generated certificate must have a subkey")
+                .key()
+                .fingerprint()
+                .to_hex(),
+        );
+
+        unsafe { std::env::remove_var("RPGP_KEYSERVER") };
+
+        assert!(
+            other_address.unwrap().is_empty(),
+            "a certificate for another address was reported as found"
+        );
+        assert!(
+            other_fingerprint.unwrap().is_empty(),
+            "a certificate with another fingerprint was reported as found"
+        );
+        assert!(
+            stapled_key.unwrap().is_empty(),
+            "a key nobody bound passed as the certificate's own"
+        );
+
+        let found = own_fingerprint.unwrap();
+        assert_eq!(found.len(), 1, "the certificate asked for was dropped");
+        assert_eq!(found[0].cert.fingerprint(), mallory.fingerprint());
+        assert_eq!(found[0].source, Source::Keyserver);
+
+        assert_eq!(
+            own_address.unwrap().len(),
+            1,
+            "the address the certificate carries was filtered out"
+        );
+        assert_eq!(
+            name_search.unwrap().len(),
+            1,
+            "a name search was answered by the server and dropped here"
+        );
+        assert_eq!(
+            bound_subkey.unwrap().len(),
+            1,
+            "a subkey handle the certificate signed for was filtered out"
+        );
     }
 }

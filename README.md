@@ -329,6 +329,31 @@ to `keys.openpgp.org`. `RPGP_KEYSERVER` overrides the server, for an internal
 one or for testing against a local stand-in rather than uploading to public
 infrastructure.
 
+What a WKD host serves is kept only where it **carries the address that was
+asked for**, and only that identity is kept on it — both are requirements of
+the specification, and neither was applied. A domain serving
+`alice@evil.example` could answer with `Bob <bob@bank.example>`, and the result
+was listed as coming from the web key directory, which is the strongest
+provenance this app shows; an import then stored every user ID on it, and the
+certify dialog offers those pre-ticked. Which of the two WKD URLs is fetched is
+decided by whether `openpgpkey.<domain>` **resolves**, not by trying the
+delegated host and moving on when it does not answer with a key: a 404 there is
+an answer, and treating it as a failure handed every unpublished address at a
+delegating domain to whoever runs the apex web site. A domain that wildcards
+its DNS and publishes by the direct method loses WKD by this rule, which the
+specification puts on the site; the lookup falls through to the keyserver as it
+does for any address with no WKD key.
+
+A keyserver reply is held to the weaker half of the same rule: it must be an
+answer to the question. `RPGP_KEYSERVER` may name any HKP server, verifying or
+not, and a fingerprint query answered with an unrelated certificate used to be
+listed as found. A certificate answers for a fingerprint or key ID only where
+it is that certificate's own primary key or a subkey it has signed for, since
+appending a key packet to somebody else's certificate takes no signature at
+all. What this cannot settle is whose a properly bound subkey is, as two
+certificates may bind one key. A free-text name search is left as the server
+returned it.
+
 A lookup is the least trusted fetch the app makes: a WKD URL is built from the
 domain half of whatever address was typed, and a redirect names whatever the
 server chooses. So neither is allowed to reach this machine or its network. An
