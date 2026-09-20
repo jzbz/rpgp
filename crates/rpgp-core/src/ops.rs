@@ -37,13 +37,18 @@ pub struct SignatureReport {
     /// Human-readable reason, filled in for bad and unverifiable signatures.
     pub detail: String,
     /// SHA-1 was load-bearing in accepting this signature: either the message
-    /// was hashed with it, or the signer's certificate only validated because
-    /// the user opted it into [`crate::sha1`].
+    /// was hashed with it, or the key that made it reaches its certificate
+    /// only through a SHA-1 binding, which the user opted that certificate
+    /// into under [`crate::sha1`].
     ///
     /// A good signature carrying this is weaker than a good signature without
     /// it, and by a margin worth telling the reader about: SHA-1 collisions are
     /// practical, so what it establishes is that the signer's key was involved,
     /// not that the signer approved this particular document.
+    ///
+    /// It is also set on the signature this refuses: one that leaned on SHA-1
+    /// from a certificate nobody opted in is reported bad, and saying why is
+    /// the whole of `detail` there.
     pub sha1: bool,
 }
 
@@ -302,14 +307,16 @@ pub fn decrypt_stream<R: std::io::Read + Send + Sync>(
     mut sink: impl Write,
 ) -> Result<VerifyResult> {
     // The signature half of a decryption is still verification, so an opted-in
-    // sender is honoured here too. Our own decryption key is unaffected: the
-    // relaxation is keyed on the issuer of each signature, and nothing in the
-    // store opts our key in unless the user did so deliberately.
+    // sender is honoured here too. Our own decryption key is unaffected:
+    // `Helper::decrypt` builds `crate::policy` for itself and never sees this
+    // one, and the relaxation this one carries decides nothing on its own —
+    // `Helper::check` settles every signature against the certificate that
+    // made it.
     let policy = sha1_policy_or_strict(store);
-    let helper = Helper::new(store, passwords);
+    let helper = Helper::new(store, passwords, &policy);
 
     let mut decryptor =
-        DecryptorBuilder::from_reader(source)?.with_policy(&policy, None, helper)?;
+        DecryptorBuilder::from_reader(source)?.with_policy(policy.verification(), None, helper)?;
     std::io::copy(&mut decryptor, &mut sink).map_err(|e| Error::io("decrypting message", e))?;
 
     let helper = decryptor.into_helper();
@@ -410,9 +417,10 @@ fn sha1_policy_or_strict(store: &Store) -> crate::Sha1Policy {
 /// wrapped. Returns the text alongside the verdict.
 pub fn verify_inline(store: &Store, signed: &[u8]) -> Result<(Vec<u8>, VerifyResult)> {
     let policy = sha1_policy_or_strict(store);
-    let helper = Helper::new(store, &[]);
+    let helper = Helper::new(store, &[], &policy);
 
-    let mut verifier = VerifierBuilder::from_bytes(signed)?.with_policy(&policy, None, helper)?;
+    let mut verifier =
+        VerifierBuilder::from_bytes(signed)?.with_policy(policy.verification(), None, helper)?;
     let mut text = Vec::new();
     // Bounded like decrypt_to_memory. The notepad routes some armored input
     // here rather than through the decrypt path, and an inline-signed message
@@ -442,10 +450,13 @@ pub fn verify_inline(store: &Store, signed: &[u8]) -> Result<(Vec<u8>, VerifyRes
 /// Verify a detached signature over `data`.
 pub fn verify_detached(store: &Store, signature: &[u8], data: &[u8]) -> Result<VerifyResult> {
     let policy = sha1_policy_or_strict(store);
-    let helper = Helper::new(store, &[]);
+    let helper = Helper::new(store, &[], &policy);
 
-    let mut verifier =
-        DetachedVerifierBuilder::from_bytes(signature)?.with_policy(&policy, None, helper)?;
+    let mut verifier = DetachedVerifierBuilder::from_bytes(signature)?.with_policy(
+        policy.verification(),
+        None,
+        helper,
+    )?;
     verifier.verify_bytes(data)?;
 
     let helper = verifier.into_helper();
@@ -505,6 +516,10 @@ fn signing_keypair(
 /// `check` is handed the message structure once the body has been read.
 struct Helper<'a> {
     store: &'a Store,
+    /// The user's SHA-1 opt-in, to settle each good signature against the
+    /// certificate that made it. The policy the verifier itself runs under
+    /// cannot do this: see [`crate::sha1::Sha1Policy::verification`].
+    sha1: &'a crate::Sha1Policy,
     /// Every secret the caller could offer: a passphrase that unlocks one of
     /// our keys, a password the message was encrypted to, or both. A single
     /// slot forced the UI to guess which role the user meant, and it guessed
@@ -518,9 +533,10 @@ struct Helper<'a> {
 }
 
 impl<'a> Helper<'a> {
-    fn new(store: &'a Store, passwords: &[&str]) -> Self {
+    fn new(store: &'a Store, passwords: &[&str], sha1: &'a crate::Sha1Policy) -> Self {
         Helper {
             store,
+            sha1,
             passwords: passwords
                 .iter()
                 .filter(|p| !p.is_empty())
@@ -567,13 +583,36 @@ impl VerificationHelper for Helper<'_> {
                         // certificate as ordinary in the one place the reader
                         // most needs to hear that it is not.
                         let summary = crate::CertSummary::from_cert(cert);
+
+                        // Where the SHA-1 opt-in is actually applied, and the
+                        // only place it can be. The policy the verifier ran
+                        // under was told nothing about certificates — a
+                        // sequoia policy is handed a signature alone, and the
+                        // issuer it could read from one is a claim anyone may
+                        // write into the unhashed area of somebody else's
+                        // signature. Here the certificate is no longer a
+                        // claim: `good.ka` is the key the bytes actually
+                        // verified against. So a signature that needed SHA-1
+                        // stands only if the user opted *that* certificate in,
+                        // and is otherwise reported exactly as it would have
+                        // been had nobody opted anything in.
+                        let sha1 =
+                            crate::sha1::load_bearing(good.sig, cert, good.ka.key().key_handle());
+                        let refused = sha1 && !self.sha1.accepts(cert);
                         SignatureReport {
-                            good: true,
-                            signer: summary.primary_user_id.clone(),
-                            fingerprint: Some(summary.fingerprint),
-                            detail: String::new(),
-                            sha1: crate::sha1::hashed_with_sha1(good.sig)
-                                || crate::sha1::blocked(cert),
+                            good: !refused,
+                            signer: summary.primary_user_id,
+                            fingerprint: Some(summary.fingerprint.clone()),
+                            detail: if refused {
+                                format!(
+                                    "SHA-1 was needed to accept this signature, and {} is not a \
+                                     certificate you have accepted SHA-1 from",
+                                    summary.fingerprint
+                                )
+                            } else {
+                                String::new()
+                            },
+                            sha1,
                         }
                     }
                     Err(err) => SignatureReport {
@@ -1059,9 +1098,12 @@ pub fn verify_detached_files(
     // verify_file reaches the same verdict as verify_bytes; this writes
     // nothing, so there is no output to keep intact.
     let policy = sha1_policy_or_strict(store);
-    let helper = Helper::new(store, &[]);
-    let mut verifier =
-        DetachedVerifierBuilder::from_bytes(&signature)?.with_policy(&policy, None, helper)?;
+    let helper = Helper::new(store, &[], &policy);
+    let mut verifier = DetachedVerifierBuilder::from_bytes(&signature)?.with_policy(
+        policy.verification(),
+        None,
+        helper,
+    )?;
     verifier.verify_file(data_path)?;
 
     let helper = verifier.into_helper();

@@ -190,12 +190,12 @@ impl CertSummary {
     /// [`crate::ops::encrypt`] and [`crate::ops`]'s signing paths would refuse
     /// it, and a picker that offered it would be offering a refusal.
     ///
-    /// Taking the concrete type rather than `&dyn Policy` is what lets the
-    /// strict answer be reused rather than recomputed. A [`crate::Sha1Policy`]
-    /// with nothing opted in *is* the standard policy — it delegates every
-    /// question — so when it says so, the certificate under it is already the
-    /// certificate under the standard policy, and the extra pass is skipped for
-    /// every store where nobody has opted anything in.
+    /// Taking the opt-in list rather than a `&dyn Policy` is what makes the
+    /// relaxation stop at the certificate the user named. The list is asked
+    /// which policy *this* certificate is to be judged under and answers from
+    /// its fingerprint, so a certificate nobody opted in is judged strictly
+    /// however its signatures are addressed — which a policy handed in ready
+    /// to use could not arrange, having only the signature to go on.
     pub fn from_cert_with(cert: &Cert, policy: &crate::Sha1Policy) -> Self {
         let now = SystemTime::now();
 
@@ -205,14 +205,21 @@ impl CertSummary {
         let created = cert.primary_key().key().creation_time();
         let has_secret = cert.is_tsk();
 
+        // The one question the opt-in list answers here, asked once: is this
+        // the certificate the user accepted SHA-1 from? Everything below is
+        // judged under `judged`, which is the standard policy for every other
+        // certificate in the store.
+        let relaxed = policy.accepts(cert);
+        let judged = policy.for_cert(cert);
+
         // Everything below needs the certificate interpreted under the policy.
         // A certificate that fails to validate still gets a row in the list —
         // Kleopatra shows unusable certificates rather than hiding them — so
         // fall back to the unpoliced parts instead of returning an error.
-        let valid = cert.with_policy(policy, now).ok();
+        let valid = cert.with_policy(judged, now).ok();
 
         let revoked = matches!(
-            cert.revocation_status(policy, now),
+            cert.revocation_status(judged, now),
             RevocationStatus::Revoked(_)
         );
 
@@ -270,17 +277,17 @@ impl CertSummary {
         // certificate's expiry into every subkey.
         //
         // The second pass costs nothing where it can decide nothing: not for a
-        // revoked certificate, and not for a caller whose policy has nothing
-        // opted in, because such a policy *is* the standard policy and `valid`
-        // is already the answer.
-        let strict_policy = (!revoked && !policy.is_strict()).then(crate::policy);
+        // revoked certificate, and not for a certificate nobody opted in,
+        // because that one was judged strictly to begin with and `valid` is
+        // already the answer.
+        let strict_policy = (!revoked && relaxed).then(crate::policy);
         let strictly_valid = strict_policy
             .as_ref()
             .and_then(|strict| cert.with_policy(strict, now).ok());
-        let usable = match (revoked, policy.is_strict()) {
+        let usable = match (revoked, relaxed) {
             (true, _) => None,
-            (false, true) => valid.as_ref(),
-            (false, false) => strictly_valid.as_ref(),
+            (false, false) => valid.as_ref(),
+            (false, true) => strictly_valid.as_ref(),
         };
 
         // One traversal for two of the three. Each `alive()` rebuilds the whole

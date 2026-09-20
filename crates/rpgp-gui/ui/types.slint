@@ -80,6 +80,10 @@ export struct SignatureRow {
     /// SHA-1 was load-bearing in accepting this signature. A good signature
     /// carrying this establishes that the signer's key was involved, not that
     /// the signer approved this document — SHA-1 collisions are practical.
+    ///
+    /// Set on a bad signature too, for the one refusal it explains: a
+    /// signature that needed SHA-1 from a certificate the user has not
+    /// accepted SHA-1 from is reported bad, and `detail` names it.
     sha1: bool,
 }
 

@@ -327,20 +327,44 @@ impl Store {
         write_private_atomic(&self.sha1_path, &text)
     }
 
-    /// The policy the verification paths run under.
+    /// The user's SHA-1 opt-in, resolved against the store.
     ///
-    /// Strict for every certificate except those the user opted in by
-    /// fingerprint, and strict for all of them when nothing is opted in — which
+    /// Not a policy sequoia is handed, despite the name: [`crate::Sha1Policy`]
+    /// is the list of opted-in certificates, and hands out a policy per
+    /// question asked of it. Empty until the user names a certificate, which
     /// is the default and stays the default until someone acts.
     ///
     /// An opted-in fingerprint that no longer resolves to a certificate is
     /// skipped rather than treated as an error: the user may have deleted the
     /// key and left the line behind, and a stale entry should cost them a
     /// silently strict verification, not a failed one.
+    ///
+    /// What comes back is then checked against the line that asked for it,
+    /// because [`Store::lookup`] answers a broader question than this one is
+    /// asking. It resolves a key to whichever certificate carries it, subkeys
+    /// included — verification has to find a certificate from the subkey that
+    /// signed — so where no certificate's own fingerprint matches, it hands
+    /// back one that merely binds that key as a subkey. Taking that answer
+    /// here would move the opt-in onto a certificate the user never named, and
+    /// binding somebody else's key as a subkey of your own takes none of their
+    /// secret key material.
+    ///
+    /// One behaviour falls out of that check and is worth stating: a line
+    /// written as a key ID rather than a full fingerprint is ignored, where it
+    /// used to resolve, because no certificate's fingerprint can equal one.
+    /// Nothing here writes such a line — [`Store::set_sha1_accepted`] stores
+    /// the full fingerprint the GUI hands it — so this costs a hand-edited
+    /// file a silently strict verification, which is what a stale line costs
+    /// too.
     pub fn sha1_policy(&self) -> Result<crate::Sha1Policy> {
         let mut policy = crate::Sha1Policy::strict();
         for fingerprint in self.sha1_accepted()? {
-            if let Ok(cert) = self.lookup(&fingerprint) {
+            if let Ok(cert) = self.lookup(&fingerprint)
+                && cert
+                    .fingerprint()
+                    .to_hex()
+                    .eq_ignore_ascii_case(&fingerprint)
+            {
                 policy.accept(&cert);
             }
         }
