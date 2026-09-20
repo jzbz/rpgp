@@ -10,7 +10,7 @@
 //! WKD is tried before a keyserver. A certificate served from the domain of
 //! the address itself carries more weight than one anybody could upload.
 
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,28 +54,102 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// received are held to it, because the two need not agree.
 const MAX_REPLY: usize = 8 * 1024 * 1024;
 
-/// One client for both directions: same timeout, same identity, same rule for
-/// redirects. Five hops is generous for a keyserver; a hop that leaves HTTPS
-/// is refused outright, since a downgrade on the way to fetch key material is
-/// exactly what a network attacker would arrange.
-fn client() -> Result<reqwest::Client> {
+/// Who a fetch is aimed at, which is what decides whether the configured
+/// keyserver's own name is exempt from the guard.
+///
+/// The exemption used to belong to every client rather than to the fetch that
+/// earned it. Matching by name alone, it therefore also covered a WKD address
+/// whose domain happened to be the keyserver's host, and any redirect naming
+/// that host from anywhere at all — the opposite of what this module and the
+/// README both say. The keyserver is the one host the *user* configured;
+/// everything else is somebody else's choice.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Peer {
+    /// A URL this module built out of `RPGP_KEYSERVER`.
+    Keyserver,
+    /// A host somebody else named: the domain half of an address typed into
+    /// the lookup field, or wherever a server's `Location` points.
+    Elsewhere,
+}
+
+/// One client per fetch: same timeout, same identity, same rule for redirects.
+fn client(peer: Peer) -> Result<reqwest::Client> {
+    // Read once, here, so that neither the resolver nor the redirect policy
+    // can straddle a change to the variable part way through a fetch.
+    let configured = match peer {
+        Peer::Keyserver => reqwest::Url::parse(&keyserver()).ok(),
+        Peer::Elsewhere => None,
+    };
+    let exempt = configured
+        .as_ref()
+        .and_then(|url| url.host_str().map(str::to_lowercase));
+
     reqwest::Client::builder()
         .timeout(TIMEOUT)
         .user_agent(concat!("rpgp/", env!("CARGO_PKG_VERSION")))
-        .dns_resolver(Arc::new(Guarded::new()))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 {
-                attempt.error("too many redirects")
-            } else if attempt.url().scheme() != "https" {
-                attempt.error("redirected off HTTPS")
-            } else if inward_literal(attempt.url()) {
-                attempt.error("redirected to a private address")
-            } else {
-                attempt.follow()
-            }
-        }))
+        // A proxy from the environment would undo the guard completely. For an
+        // HTTPS URL reqwest opens a CONNECT tunnel, so only the proxy's own
+        // host reaches the resolver below: the target name travels to the
+        // proxy as text and is resolved there, on the far side, wherever it
+        // points. The same variables break the ordinary case too, since a
+        // proxy named `proxy.corp` resolves to a private address and the guard
+        // then refuses the proxy itself, failing every lookup. Neither is a
+        // trade worth making for a fetch whose whole risk is that somebody
+        // else chose the host.
+        .no_proxy()
+        .dns_resolver(Arc::new(Guarded { exempt }))
+        .redirect(reqwest::redirect::Policy::custom(
+            move |attempt| match redirect_refusal(
+                attempt.url(),
+                attempt.previous().len(),
+                configured.as_ref(),
+            ) {
+                Some(reason) => attempt.error(reason),
+                None => attempt.follow(),
+            },
+        ))
         .build()
         .map_err(|e| Error::invalid(format!("cannot build an HTTP client: {e}")))
+}
+
+/// Why a redirect must not be followed, or `None` to follow it.
+///
+/// A function of its own rather than the body of the policy closure, because
+/// through a socket these clauses hide each other: the one redirect target
+/// that is easy to stand up, a plain-HTTP server on loopback, trips the scheme
+/// test and the literal test at once, so deleting either left the test that
+/// named it green. Each clause can be put to the question separately here.
+fn redirect_refusal(
+    url: &reqwest::Url,
+    hops: usize,
+    keyserver: Option<&reqwest::Url>,
+) -> Option<&'static str> {
+    // Five hops is generous for a keyserver.
+    if hops >= 5 {
+        Some("too many redirects")
+    } else if url.scheme() != "https" {
+        // A downgrade on the way to fetch key material is exactly what a
+        // network attacker would arrange, and reqwest refuses none on its own:
+        // `https_only` is off by default, and all it does about an https to
+        // http hop is drop the Referer header.
+        Some("redirected off HTTPS")
+    } else if inward_literal(url) {
+        Some("redirected to a private address")
+    } else if keyserver.is_some_and(|base| {
+        base.host_str() == url.host_str()
+            && (base.scheme() != url.scheme()
+                || base.port_or_known_default() != url.port_or_known_default())
+    }) {
+        // [`Guarded`] exempts the keyserver by name, because a name is all
+        // reqwest hands a resolver; the port is visible only here. Without
+        // this, a redirect naming the keyserver's host on some other port
+        // reached every port on an internal keyserver with the guard switched
+        // off. A hop to any other host is left alone: that one still faces the
+        // guard, which is the whole point of not exempting it.
+        Some("redirected to another port on the keyserver's host")
+    } else {
+        None
+    }
 }
 
 /// A resolver that refuses a name resolving inside the machine or its network.
@@ -91,26 +165,19 @@ fn client() -> Result<reqwest::Client> {
 /// and the connection: reqwest connects to exactly the addresses handed back,
 /// so a second DNS answer cannot arrive in between.
 ///
-/// The configured keyserver is exempt, and only it. `RPGP_KEYSERVER` exists for
-/// an organisation's internal server, which is precisely a name that resolves
-/// to a private address; refusing that would break the documented reason the
-/// variable exists. A WKD domain and a redirect target are somebody else's
-/// choice, so neither is exempt — including a redirect away from the keyserver,
-/// which matches how a redirect to a private *literal* has always been treated.
+/// The configured keyserver is exempt, and only it, and only while this client
+/// is the one fetching from it. `RPGP_KEYSERVER` exists for an organisation's
+/// internal server, which is precisely a name that resolves to a private
+/// address; refusing that would break the documented reason the variable
+/// exists. A WKD domain and a redirect target are somebody else's choice, so
+/// neither is exempt — hence [`Peer`], which is what keeps a lookup of
+/// `alice@keys.corp.internal:8443`, or a hostile server's `Location` naming
+/// that host, from inheriting an exemption meant for the keyserver alone.
 struct Guarded {
-    /// The configured keyserver's host, lowercased, read once when the client
-    /// is built so a resolution cannot straddle a change to the variable.
+    /// The configured keyserver's host, lowercased, filled in by [`client`]
+    /// when it builds this resolver so a resolution cannot straddle a change
+    /// to the variable, and only for [`Peer::Keyserver`].
     exempt: Option<String>,
-}
-
-impl Guarded {
-    fn new() -> Self {
-        Self {
-            exempt: reqwest::Url::parse(&keyserver())
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_lowercase)),
-        }
-    }
 }
 
 impl reqwest::dns::Resolve for Guarded {
@@ -181,12 +248,30 @@ fn inward_literal(url: &reqwest::Url) -> bool {
 fn inward(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => {
+            let octets = v4.octets();
             v4.is_private()
                 || v4.is_loopback()
                 || v4.is_link_local()
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || v4.is_unspecified()
+                // 100.64.0.0/10, shared address space. A carrier's NAT puts
+                // the subscriber's own network in here, and Tailscale gives
+                // every node on a tailnet an address in it and routes it over
+                // tailscale0 — so a name answering with one of these reaches
+                // this machine's network as surely as RFC1918 does, and the
+                // NAS on the other end is exactly what the guard is for. The
+                // tailnet's IPv6 half was already refused as unique-local; it
+                // was only the IPv4 half that walked through. `is_shared` is
+                // still unstable, hence the arithmetic.
+                || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
+                // 0.0.0.0/8, "this network": `is_unspecified` covers only
+                // 0.0.0.0 itself, and nothing in the rest of the block is a
+                // destination anybody legitimately serves from.
+                || octets[0] == 0
+                // 192.0.0.0/24, IETF protocol assignments, which is where a
+                // DS-Lite home router answers on 192.0.0.1.
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
         }
         IpAddr::V6(v6) => {
             // These first, and before any IPv4 unwrapping: to_ipv4() reads ::1
@@ -204,9 +289,52 @@ fn inward(addr: IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
                 return inward(IpAddr::V4(v4));
             }
-            // Unique-local (fc00::/7) and link-local (fe80::/10). The std
-            // predicates for these are still unstable, so test directly.
-            (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80
+            let seg = v6.segments();
+            // Local-use NAT64, 64:ff9b:1::/48 (RFC 8215). A site's translator
+            // maps this onto whatever IPv4 space that site chose, so the
+            // address names something inside the site and the embedded bits
+            // say nothing about what: refuse the prefix outright.
+            if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001 {
+                return true;
+            }
+            // The well-known NAT64 prefix, 64:ff9b::/96 (RFC 6052), where the
+            // last 32 bits *are* the IPv4 address the translator will send to.
+            // Ask the IPv4 question of them rather than refusing the prefix:
+            // on an IPv6-only network DNS64 answers every public name from
+            // here, and refusing it would break lookups outright.
+            if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0] {
+                return inward(IpAddr::V4(Ipv4Addr::new(
+                    (seg[6] >> 8) as u8,
+                    seg[6] as u8,
+                    (seg[7] >> 8) as u8,
+                    seg[7] as u8,
+                )));
+            }
+            // 6to4, 2002::/16 (RFC 3056): the IPv4 address is the two segments
+            // after the prefix. A host with a 6to4 tunnel of its own
+            // encapsulates straight to that address instead of handing the
+            // packet to a relay, so a private one names this machine's own
+            // network again.
+            if seg[0] == 0x2002 {
+                return inward(IpAddr::V4(Ipv4Addr::new(
+                    (seg[1] >> 8) as u8,
+                    seg[1] as u8,
+                    (seg[2] >> 8) as u8,
+                    seg[2] as u8,
+                )));
+            }
+            // Teredo, 2001:0::/32 (RFC 4380): the client's IPv4 address is the
+            // last 32 bits with every bit flipped. A Teredo client sends
+            // straight to a peer at that address once it has one, so the same
+            // reasoning as 6to4 applies to it.
+            if seg[0] == 0x2001 && seg[1] == 0x0000 {
+                let client = !(((seg[6] as u32) << 16) | seg[7] as u32);
+                return inward(IpAddr::V4(Ipv4Addr::from(client)));
+            }
+            // Unique-local (fc00::/7), link-local (fe80::/10) and site-local
+            // (fec0::/10). The last is deprecated, but a host that still
+            // honours it routes those addresses into the site.
+            v6.is_unique_local() || v6.is_unicast_link_local() || (seg[0] & 0xffc0) == 0xfec0
         }
     }
 }
@@ -282,7 +410,7 @@ pub fn lookup_wkd(address: &str) -> Result<Vec<Found>> {
     let urls = [advanced, direct];
 
     for url in urls {
-        if let Ok(bytes) = get(&url)
+        if let Ok(bytes) = get(&url, Peer::Elsewhere)
             && let Ok(certs) = parse(&bytes)
             && !certs.is_empty()
         {
@@ -305,7 +433,7 @@ pub fn lookup_keyserver(query: &str) -> Result<Vec<Found>> {
         keyserver(),
         percent_encode(query)
     );
-    let bytes = get(&url)?;
+    let bytes = get(&url, Peer::Keyserver)?;
     Ok(parse(&bytes)?
         .into_iter()
         .map(|cert| Found {
@@ -338,14 +466,14 @@ fn percent_encode(value: &str) -> String {
     out
 }
 
-fn get(url: &str) -> Result<Vec<u8>> {
+fn get(url: &str, peer: Peer) -> Result<Vec<u8>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| Error::invalid(format!("cannot start the network runtime: {e}")))?;
 
-    runtime.block_on(async {
-        let mut response = client()?
+    let outcome = runtime.block_on(async {
+        let mut response = client(peer)?
             .get(url)
             .send()
             .await
@@ -381,7 +509,18 @@ fn get(url: &str) -> Result<Vec<u8>> {
             body.extend_from_slice(&chunk);
         }
         Ok(body)
-    })
+    });
+    // Hand the runtime off rather than dropping it here. Dropping one blocks
+    // until every blocking task has finished, and the resolver's
+    // `getaddrinfo` is one of those, so a fetch whose timeout had already
+    // fired still sat here for as long as the *system* resolver took — with
+    // glibc's defaults against three unanswering nameservers, about thirty
+    // seconds rather than TIMEOUT's ten, and three times over for a lookup
+    // that tries both WKD URLs and then the keyserver, with the whole main
+    // window disabled meanwhile. Handed off, the stuck thread finishes and
+    // exits on its own.
+    runtime.shutdown_background();
+    outcome
 }
 
 fn parse(bytes: &[u8]) -> Result<Vec<Cert>> {
@@ -487,8 +626,10 @@ fn post(url: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         .build()
         .map_err(|e| Error::invalid(format!("cannot start the network runtime: {e}")))?;
 
-    runtime.block_on(async {
-        let mut response = client()?
+    // Both callers build this URL out of `keyserver()`, so the exemption is
+    // this fetch's to use.
+    let outcome = runtime.block_on(async {
+        let mut response = client(Peer::Keyserver)?
             .post(url)
             .json(&body)
             .send()
@@ -537,11 +678,16 @@ fn post(url: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         }
         serde_json::from_str(&text)
             .map_err(|e| Error::invalid(format!("the keyserver replied with unexpected data: {e}")))
-    })
+    });
+    // Handed off rather than dropped, for the reason given in `get`.
+    runtime.shutdown_background();
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[test]
@@ -614,18 +760,73 @@ mod tests {
         origin
     }
 
-    /// The size cap and the redirect policy are claims the module doc makes.
-    /// They were made on the upload path only, and the lookup path — the one
-    /// reachable by any WKD domain a user types — quietly had neither for
-    /// several commits, because nothing tested them. Hence this.
+    /// [`serve_once`] with a tally of the connections it accepted, and its
+    /// port rather than its origin.
     ///
-    /// Serial with the other env-var tests by way of a mutex: RPGP_KEYSERVER
-    /// is process-wide state.
-    /// RPGP_KEYSERVER is process-wide, so every test that sets it takes this.
+    /// Several guards below are proved by what does *not* happen: the fetch
+    /// fails either way, so what has to be asserted is that the client never
+    /// reached the host it was steered at. A count of accepted connections
+    /// says that where an error string cannot — and the port is what is handed
+    /// back because these tests point a *name* at this listener, which is the
+    /// only way a resolver is asked anything at all.
+    fn serve_counting(reply: Vec<u8>) -> (u16, Arc<AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let tally = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut socket) = stream else { break };
+                tally.fetch_add(1, Ordering::SeqCst);
+                let mut scratch = [0u8; 2048];
+                let _ = socket.read(&mut scratch);
+                let _ = socket.write_all(&reply);
+                let _ = socket.flush();
+            }
+        });
+        (port, hits)
+    }
+
+    /// An armored certificate, as a reply a fetch would accept. Used to bait
+    /// the guards: a redirect that is followed has to *succeed*, or the test
+    /// cannot tell a guard from a dead socket.
+    fn bait_reply() -> Vec<u8> {
+        use sequoia_openpgp::serialize::SerializeInto;
+        let cert = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        let bait = cert.armored().export_to_vec().unwrap();
+        let mut reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/pgp-keys\r\nContent-Length: {}\r\n\r\n",
+            bait.len()
+        )
+        .into_bytes();
+        reply.extend_from_slice(&bait);
+        reply
+    }
+
+    /// Serialises every test here that touches process-wide state.
+    ///
+    /// `RPGP_KEYSERVER` and the proxy variables are process-wide, so every
+    /// test that sets one takes this. So does every test that merely *resolves
+    /// a name*, which is less obvious: `set_var` is unsafe precisely because
+    /// the C environment can be read without any lock of std's, and
+    /// `getaddrinfo` is one of those readers — glibc's resolver reads
+    /// `LOCALDOMAIN` and `RES_OPTIONS`, and an NSS module its own variables,
+    /// on the blocking thread [`Guarded`] resolves on. A resolving test that
+    /// skipped this mutex was the one reader nothing covered.
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The size cap is a claim the module doc makes. It was made on the upload
+    /// path only, and the lookup path — the one reachable by any WKD domain a
+    /// user types — quietly had neither cap nor redirect policy for several
+    /// commits, because nothing tested them. Hence this and the guard tests
+    /// that follow it.
     #[test]
-    fn a_lookup_refuses_an_oversized_reply_and_a_downgrade() {
+    fn a_lookup_refuses_an_oversized_reply() {
         let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
         // (1) An announced length past the cap is refused before a byte of
@@ -654,42 +855,213 @@ mod tests {
             .to_string();
         assert!(err.contains("too large"), "streamed body not capped: {err}");
 
-        // (3) A redirect that leaves HTTPS is refused rather than followed.
-        //
-        // The target has to be a server that would actually answer, and answer
-        // with something the caller would accept. Pointing at a dead port made
-        // this vacuous: every transport error is formatted through the same
-        // "lookup failed: {e}" line at get(), so deleting the redirect policy
-        // left reqwest to follow the redirect, fail to connect, and produce the
-        // very string the assertion accepted. Here, following it *succeeds* —
-        // so the policy is the only thing that can turn this into an error.
-        use sequoia_openpgp::serialize::SerializeInto;
-        let bait = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
-            "Alice <alice@example.org>",
-        ))
-        .unwrap()
-        .cert;
-        let bait = bait.armored().export_to_vec().unwrap();
-        let mut answer = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/pgp-keys\r\nContent-Length: {}\r\n\r\n",
-            bait.len()
+        unsafe { std::env::remove_var("RPGP_KEYSERVER") };
+    }
+
+    /// The scheme clause of the redirect policy, on a redirect that nothing
+    /// else in the policy would refuse.
+    ///
+    /// The target has to be a server that would actually answer, and answer
+    /// with something the caller would accept. Pointing at a dead port made
+    /// this vacuous: every transport error is formatted through the same
+    /// "lookup failed: {e}" line at get(), so deleting the redirect policy left
+    /// reqwest to follow the redirect, fail to connect, and produce the very
+    /// string the assertion accepted.
+    ///
+    /// Answering was not enough either. The obvious target, `serve_once` on
+    /// loopback, is an IP literal, so the private-address clause refused it
+    /// too and the test stayed green with the scheme clause deleted. Here the
+    /// target is a *name*, which is therefore no literal; it is the configured
+    /// keyserver's host, so the resolver lets it through; and it is that
+    /// keyserver's own origin, so the port clause does not fire either. The
+    /// scheme is all that is left.
+    #[test]
+    fn a_redirect_off_https_is_refused_where_nothing_else_would_refuse_it() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+        let (port, hits) = serve_counting(bait_reply());
+        unsafe { std::env::set_var("RPGP_KEYSERVER", format!("http://localhost:{port}")) };
+
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/evil\r\nContent-Length: 0\r\n\r\n"
         )
         .into_bytes();
-        answer.extend_from_slice(&bait);
-        let target = serve_once(answer);
+        let source = serve_once(redirect);
+        let outcome = get(&format!("{source}/pks/lookup"), Peer::Keyserver);
 
-        let redirect =
-            format!("HTTP/1.1 302 Found\r\nLocation: {target}/evil\r\nContent-Length: 0\r\n\r\n")
-                .into_bytes();
-        unsafe { std::env::set_var("RPGP_KEYSERVER", serve_once(redirect)) };
-        let outcome = lookup_keyserver("alice@example.org");
+        unsafe { std::env::remove_var("RPGP_KEYSERVER") };
+
         assert!(
             outcome.is_err(),
             "a redirect off HTTPS was followed and returned {:?}",
-            outcome.map(|found| found.len())
+            outcome.map(|body| body.len())
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the http target was contacted despite the policy"
+        );
+    }
+
+    /// Each clause of the redirect policy, on a URL that trips that clause and
+    /// no other.
+    ///
+    /// Through a socket the clauses mask each other, which is how the test
+    /// above spent several commits unable to detect the loss of the guard it
+    /// was named for. Here they are separable, and each reason is pinned to
+    /// the input that should produce it.
+    #[test]
+    fn the_redirect_policy_names_one_reason_for_each_refusal() {
+        let url = |text: &str| reqwest::Url::parse(text).unwrap();
+        let keyserver = url("https://keys.corp.internal/");
+
+        assert_eq!(
+            redirect_refusal(&url("https://keys.openpgp.org/x"), 5, None),
+            Some("too many redirects")
+        );
+        assert_eq!(
+            redirect_refusal(&url("http://cdn.example.net/key"), 0, None),
+            Some("redirected off HTTPS")
+        );
+        assert_eq!(
+            redirect_refusal(&url("https://10.0.0.5/key"), 0, None),
+            Some("redirected to a private address")
+        );
+        assert_eq!(
+            redirect_refusal(
+                &url("https://keys.corp.internal:8443/admin/export"),
+                0,
+                Some(&keyserver)
+            ),
+            Some("redirected to another port on the keyserver's host")
         );
 
+        // And what must still be followed. A hop away from the keyserver to
+        // some other host is one of them: it is not exempt, so it faces the
+        // resolver's guard like any other name, which is what the README
+        // promises rather than a refusal here.
+        assert_eq!(
+            redirect_refusal(&url("https://keys.openpgp.org/x"), 4, None),
+            None
+        );
+        assert_eq!(
+            redirect_refusal(
+                &url("https://keys.corp.internal/other"),
+                0,
+                Some(&keyserver)
+            ),
+            None
+        );
+        assert_eq!(
+            redirect_refusal(&url("https://mirror.example.org/x"), 0, Some(&keyserver)),
+            None
+        );
+        // Nothing is exempt on a fetch that is not the keyserver's, so there
+        // the same off-port URL is an ordinary hop, refused or allowed by the
+        // resolver on its merits.
+        assert_eq!(
+            redirect_refusal(
+                &url("https://keys.corp.internal:8443/admin/export"),
+                0,
+                None
+            ),
+            None
+        );
+    }
+
+    /// The exemption belongs to the keyserver fetch, not to every fetch.
+    ///
+    /// It is decided from a hostname, because a hostname is all reqwest hands
+    /// a resolver. So while every client carried it, anyone who could steer a
+    /// lookup could borrow it: a WKD address whose domain is the keyserver's
+    /// host reached any port on that host, and so did a redirect from a
+    /// hostile server naming it. Both are somebody else's choice, which is
+    /// exactly what the exemption is not for.
+    #[test]
+    fn the_keyserver_exemption_covers_only_the_keyserver() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+        // (1) A WKD address whose domain is the configured keyserver's host.
+        let (port, hits) = serve_counting(bait_reply());
+        unsafe { std::env::set_var("RPGP_KEYSERVER", format!("https://localhost:{port}")) };
+        let found = lookup_wkd(&format!("alice@localhost:{port}"))
+            .expect("a WKD fetch that is refused is not an error, it is nothing found");
+        assert!(found.is_empty(), "the guarded host served a certificate");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a WKD lookup borrowed the keyserver's exemption"
+        );
+
+        // (2) A redirect naming that host, from a server that is not it.
+        let (port, hits) = serve_counting(bait_reply());
+        unsafe { std::env::set_var("RPGP_KEYSERVER", format!("https://localhost:{port}")) };
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: https://localhost:{port}/evil\r\nContent-Length: 0\r\n\r\n"
+        )
+        .into_bytes();
+        let source = serve_once(redirect);
+        let err = get(
+            &format!("{source}/.well-known/openpgpkey/hu/x"),
+            Peer::Elsewhere,
+        )
+        .expect_err("a redirect to a name resolving inward was followed")
+        .to_string();
+
         unsafe { std::env::remove_var("RPGP_KEYSERVER") };
+
+        assert!(
+            err.contains("lookup failed"),
+            "refused for the wrong reason: {err}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a redirect borrowed the keyserver's exemption"
+        );
+    }
+
+    /// A proxy in the environment must not carry a fetch around the guard.
+    ///
+    /// reqwest reads `HTTPS_PROXY` and friends by default, and for an HTTPS URL
+    /// it opens a CONNECT tunnel: the target name goes to the proxy as text and
+    /// is resolved there, so the resolver below never sees it and the guard
+    /// decides nothing. `localhost` is the one name every machine resolves
+    /// inward, so it stands in for the hostile domain.
+    ///
+    /// What the fetch returns cannot tell the two apart — it fails either way,
+    /// and `get` formats a transport error without its source chain, so the
+    /// guard's own words never reach the caller. What the *proxy* received can:
+    /// a listener that counts connections is silent when the guard decided the
+    /// fetch and has a CONNECT in hand when a proxy did.
+    #[test]
+    fn an_environment_proxy_cannot_carry_a_fetch_around_the_guard() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+        let (port, hits) = serve_counting(b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec());
+        unsafe {
+            std::env::set_var("HTTPS_PROXY", format!("http://127.0.0.1:{port}"));
+            // Whatever the developer's own environment exempts, this test's
+            // host must not be exempt from the proxy, or it would pass by
+            // never being intercepted at all.
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+        }
+
+        let outcome = get("https://localhost/pks/lookup", Peer::Elsewhere);
+
+        unsafe { std::env::remove_var("HTTPS_PROXY") };
+
+        assert!(
+            outcome.is_err(),
+            "a name resolving to loopback was fetched and returned {:?}",
+            outcome.map(|body| body.len())
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the fetch was handed to a proxy, which resolves the name itself"
+        );
     }
 
     /// A reply that stops mid-body must say the read failed, not that the
@@ -860,6 +1232,28 @@ mod tests {
             "https://[::ffff:169.254.169.254]/latest/meta-data/",
             "https://[::ffff:10.0.0.5]/",
             "https://[::ffff:192.168.1.1]/",
+            // Shared address space, 100.64.0.0/10: a carrier's NAT, and every
+            // node on a Tailscale tailnet, including the fixed MagicDNS
+            // address. The tailnet's IPv6 half was already refused as
+            // unique-local; its IPv4 half was not refused at all.
+            "https://100.64.0.1/",
+            "https://100.100.100.100/",
+            "https://100.127.255.255:5000/",
+            "https://[::ffff:100.64.0.1]/",
+            // 0.0.0.0/8 beyond the unspecified address itself, and the block
+            // a DS-Lite router answers from.
+            "https://0.1.2.3/",
+            "https://192.0.0.1/",
+            // Local-use NAT64 (RFC 8215), and the three transition forms that
+            // carry an IPv4 address inside them: the well-known NAT64 prefix,
+            // 6to4 and Teredo, each here wrapping 10.0.0.5.
+            "https://[64:ff9b:1::a00:5]/",
+            "https://[64:ff9b::a00:5]/",
+            "https://[2002:a00:5::1]/",
+            "https://[2001:0:4136:e378:8000:63bf:f5ff:fffa]/",
+            // Site-local, deprecated but still routed into the site by a host
+            // that honours it.
+            "https://[fec0::1]/",
         ];
         for url in inward {
             let parsed = reqwest::Url::parse(url).unwrap();
@@ -871,6 +1265,20 @@ mod tests {
             "https://openpgpkey.example.org/.well-known/openpgpkey/",
             "https://8.8.8.8/",
             "https://[2606:4700:4700::1111]/",
+            // The edges of the shared block, so the mask cannot quietly widen
+            // to 100.0.0.0/8 or narrow to 100.64.0.0/16.
+            "https://100.63.255.255/",
+            "https://100.128.0.0/",
+            "https://192.0.1.1/",
+            // The same three transition forms wrapping 8.8.8.8, which must
+            // still be reachable. Refusing the well-known NAT64 prefix
+            // outright would break every lookup on an IPv6-only network,
+            // where DNS64 answers public names from it.
+            "https://[64:ff9b::808:808]/",
+            "https://[2002:808:808::1]/",
+            "https://[2001:0:4136:e378:8000:63bf:f7f7:f7f7]/",
+            // Teredo is 2001:0::/32, not 2001::/16.
+            "https://[2001:4860:4860::8888]/",
         ];
         for url in outward {
             let parsed = reqwest::Url::parse(url).unwrap();
@@ -888,6 +1296,11 @@ mod tests {
     /// which is exactly a name resolving to a private address.
     #[test]
     fn refuses_a_name_that_resolves_inward_unless_it_is_the_keyserver() {
+        // Not for the variable, which this test never reads: for the
+        // resolution, which reads the environment through libc while a
+        // sibling test may be writing it. See the note on SERIAL.
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
         use reqwest::dns::Resolve;
         use std::str::FromStr;
 
@@ -951,7 +1364,7 @@ mod tests {
         let origin = serve_once(reply);
         let port = origin.rsplit_once(':').expect("origin carries a port").1;
 
-        let err = get(&format!("http://localhost:{port}/"))
+        let err = get(&format!("http://localhost:{port}/"), Peer::Keyserver)
             .expect_err("a name resolving to loopback was fetched")
             .to_string();
         assert!(
@@ -974,6 +1387,7 @@ mod tests {
             "alice@10.0.0.5",
             "alice@169.254.169.254",
             "alice@[::ffff:127.0.0.1]",
+            "alice@100.100.100.100:5000",
         ] {
             let err = lookup_wkd(address)
                 .err()

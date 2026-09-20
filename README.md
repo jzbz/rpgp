@@ -338,10 +338,27 @@ also means no second DNS answer can arrive between the check and the connection.
 Without this, `alice@127.0.0.1:8080` was a port probe and `evil.example` with an
 A record of 127.0.0.1 was the same probe wearing a name.
 
+"This machine or its network" is loopback, RFC1918, link-local and the rest of
+the usual list, and also shared address space, 100.64.0.0/10: a carrier's NAT
+puts the subscriber's own network there, and so does Tailscale, whose tailnet
+addresses were refused on the IPv6 side as unique-local and not refused at all
+on the IPv4 side. An IPv6 address that carries an IPv4 one inside it is judged
+by the address inside — IPv4-mapped, the well-known NAT64 prefix, 6to4 and
+Teredo — while local-use NAT64 and site-local are refused outright. Proxy
+environment variables are ignored, for the same reason: `HTTPS_PROXY` would put
+the target name in a `CONNECT` line for the proxy to resolve on the far side,
+which is the guard switched off, and it broke ordinary lookups besides, since a
+proxy named by a host that resolves privately was itself refused.
+
 The server named by `RPGP_KEYSERVER` is the one exception, because an internal
 keyserver is precisely a name that resolves to a private address and that is
-what the variable is for. Nothing else is exempt, including a redirect away from
-that server.
+what the variable is for. It is exempt only on the fetches this app aims at it,
+and the exemption is decided from a hostname, because a hostname is all a
+resolver is handed. So a WKD address whose domain happens to be that host does
+not inherit it, nor does a redirect naming that host from anywhere else; on the
+keyserver's own fetches a redirect to another port on that host is refused in
+the redirect policy, which is the one place the port is visible. Nothing else is
+exempt, including a redirect away from that server.
 
 Publishing cannot be undone — a keyserver has no delete — so the dialog says so
 and uses the same danger styling as revocation. Only the public half is ever
