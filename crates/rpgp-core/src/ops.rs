@@ -8,7 +8,7 @@ use sequoia_openpgp::cert::ValidCert;
 use sequoia_openpgp::cert::amalgamation::key::{
     ValidErasedKeyAmalgamation, ValidKeyAmalgamationIter,
 };
-use sequoia_openpgp::crypto::{Password, SessionKey};
+use sequoia_openpgp::crypto::{Password, S2K, SessionKey};
 use sequoia_openpgp::packet::{PKESK, SKESK, key};
 use sequoia_openpgp::parse::Parse;
 use sequoia_openpgp::parse::stream::{
@@ -530,6 +530,10 @@ struct Helper<'a> {
     /// Set from the message structure, not from whether decrypt() ran: a
     /// message encrypted only to a password we do not hold still had a layer.
     encrypted: bool,
+    /// What the sender's Argon2 parameters may still cost, for this whole
+    /// message rather than for one of its encryption containers. See
+    /// [`Argon2Budget`].
+    argon2: Argon2Budget,
 }
 
 impl<'a> Helper<'a> {
@@ -545,6 +549,7 @@ impl<'a> Helper<'a> {
             signatures: Vec::new(),
             decrypted_with: None,
             encrypted: false,
+            argon2: Argon2Budget::new(),
         }
     }
 }
@@ -629,6 +634,132 @@ impl VerificationHelper for Helper<'_> {
     }
 }
 
+/// The largest exponent of the Argon2 memory size, in KiB, that a message may
+/// ask a recipient for.
+///
+/// 21 is 2 GiB, which is what RFC 9580's own sample locked key uses (`t = 1,
+/// p = 4, m = 21`, RFC 9106's first recommendation); its alternative for
+/// memory-constrained machines is `t = 3, p = 4, m = 16`, 64 MiB. Anything
+/// above 21 is a request nobody following the specification makes.
+///
+/// The work budget below would refuse nearly all of it on its own, since
+/// `t * 2^m` passes the ceiling for every `t` of 1 or more once `m` reaches 22.
+/// What this check is load-bearing for is the arithmetic underneath it: `m`
+/// arrives as a raw octet, and `1 << m` is not a number at all above 63. It
+/// also answers a packet naming `t = 0`, which has no work to weigh however
+/// much memory it asks for, and it lets the refusal name memory rather than
+/// work — the half of this that ends in an OOM kill rather than a wait.
+const MAX_ARGON2_M: u8 = 21;
+
+/// What one Argon2 derivation may cost, in KiB-passes — `t` passes over 2^`m`
+/// KiB of memory.
+///
+/// 2^21 is 2 GiB hashed once. Both of RFC 9106's recommended parameter sets
+/// fit: `t = 1, m = 21` exactly, and `t = 3, m = 16` with room to spare. It
+/// was measured at about 2.7 s in a release build on a 2020s x86-64 desktop,
+/// which is what admitting the stronger of the two costs.
+const MAX_ARGON2_WORK: u64 = 1 << 21;
+
+/// What every Argon2 derivation in one decryption may cost together — across
+/// every session-key packet, every candidate password, and every encryption
+/// container the message nests.
+///
+/// Four derivations at the per-attempt ceiling. The largest honest shape is a
+/// message sealed to two passwords tried against the two candidates the
+/// notepad offers, and that is four; a message that wants more than this is
+/// spending the recipient's machine, not protecting its own password.
+const MAX_ARGON2_TOTAL_WORK: u64 = 4 * MAX_ARGON2_WORK;
+
+/// Charges every Argon2 derivation a decryption asks for against a budget for
+/// the whole message.
+///
+/// Each charge is settled before the derivation that would pay it, so a packet
+/// priced past the limits never reaches the allocator, and a message cannot
+/// spend more of the recipient's machine than [`MAX_ARGON2_TOTAL_WORK`]
+/// however many packets and candidate passwords it multiplies together.
+///
+/// This is a field of [`Helper`] rather than a local in its `decrypt`, because
+/// `decrypt` is not called once per message. Sequoia calls it for every
+/// encryption container it descends into, against every session-key packet
+/// accumulated so far, and it descends as far as its default recursion limit
+/// of sixteen. A budget scoped to the method is handed back full at each
+/// layer, so sixteen nested containers would buy sixteen times what the limit
+/// says, out of a message a couple of kilobytes long.
+struct Argon2Budget {
+    /// KiB-passes still unspent.
+    remaining: u64,
+}
+
+impl Argon2Budget {
+    fn new() -> Self {
+        Argon2Budget {
+            remaining: MAX_ARGON2_TOTAL_WORK,
+        }
+    }
+
+    /// Settle what deriving `skesk`'s key will cost, before doing it.
+    ///
+    /// Everything that is not Argon2 is free, which is everything rpgp or its
+    /// correspondents normally produce: sequoia's own encryptor writes every
+    /// SKESK, v4 and v6, with `S2K::default()`, and GnuPG 2.4.9 does the same
+    /// and offers no way to ask for anything else — `--s2k-mode` accepts 0, 1
+    /// and 3, and there is no 4. Both of those are `Iterated`, whose cost its
+    /// own encoding already caps at 0x3e00000 bytes of hashing. Argon2 is the
+    /// one S2K whose price the sender sets, and sequoia bounds neither `t` nor
+    /// `m`: it reads both as raw octets and hands them to `argon2`, whose own
+    /// maxima are `u32::MAX`, so without this the only thing between a message
+    /// and several gigabytes held for minutes is that the allocation might
+    /// fail.
+    ///
+    /// `p`, the degree of parallelism, is deliberately not part of the price.
+    /// It divides the same 2^`m` KiB into lanes rather than adding any, and
+    /// the `argon2` crate is built here without `rayon`, so the lanes run one
+    /// after another and the total work is unchanged.
+    fn charge(&mut self, skesk: &SKESK) -> anyhow::Result<()> {
+        let s2k = match skesk {
+            SKESK::V4(s) => s.s2k(),
+            SKESK::V6(s) => s.s2k(),
+            // `SKESK` is `#[non_exhaustive]`. A version sequoia adds later is
+            // one whose S2K cannot be read here, so it is left to `decrypt` as
+            // it was before rather than charged a price that cannot be known.
+            _ => return Ok(()),
+        };
+        // `S2K` is `#[non_exhaustive]` too, so this matches the one variant
+        // that needs a budget rather than listing the ones that do not.
+        let &S2K::Argon2 { t, m, .. } = s2k else {
+            return Ok(());
+        };
+
+        if m > MAX_ARGON2_M {
+            return Err(anyhow::anyhow!(
+                "this message's password hashing asks for 2^{m} KiB of memory for every \
+                 attempt to open it, above the 2 GiB rpgp will allocate — the password \
+                 was not tried against it"
+            ));
+        }
+        // `m` is 21 or less from here on, so the shift cannot overflow and
+        // the memory size is a number of megabytes a reader can picture.
+        let work = u64::from(t) * (1u64 << m);
+        if work > MAX_ARGON2_WORK {
+            let mib = (1u64 << m) / 1024;
+            return Err(anyhow::anyhow!(
+                "this message's password hashing asks for {mib} MiB of memory hashed {t} \
+                 times over for every attempt to open it, more work than rpgp will spend — \
+                 the password was not tried against it"
+            ));
+        }
+        let Some(left) = self.remaining.checked_sub(work) else {
+            return Err(anyhow::anyhow!(
+                "this message's password hashing asks for more work in total than rpgp will \
+                 spend on one message — the password was not tried against the packets that \
+                 asked for it"
+            ));
+        };
+        self.remaining = left;
+        Ok(())
+    }
+}
+
 impl DecryptionHelper for Helper<'_> {
     fn decrypt(
         &mut self,
@@ -643,13 +774,28 @@ impl DecryptionHelper for Helper<'_> {
         // per password — single digits. Every loop below is O(packets × keys)
         // with a key derivation inside: the local path runs our S2K once per
         // protected key, and the symmetric path runs the *sender's* S2K once
-        // per (packet × password), which a v6 Argon2 SKESK can make arbitrarily
-        // expensive. Nothing in sequoia bounds the count, so a padded message
-        // is a decrypt-side amplifier: 128 wildcard packets in a 14 KB file
-        // pinned a core for ~9s, and the message still decrypted, so nothing
-        // looked wrong. 256 is a chosen ceiling, not a constant of nature: it
-        // is far above any real recipient list and keeps the residual worst
-        // case in seconds.
+        // per (packet × password). Nothing in sequoia bounds the count, so a
+        // padded message is a decrypt-side amplifier: 128 wildcard packets in a
+        // 14 KB file pinned a core for ~9s, and the message still decrypted, so
+        // nothing looked wrong. 256 is a chosen ceiling, not a constant of
+        // nature: it is far above any real recipient list.
+        //
+        // What it bounds is how many derivations run, not what each one costs.
+        // On the symmetric path those are two different questions, because the
+        // S2K there is the sender's and an Argon2 one prices it freely; that is
+        // [`Argon2Budget`]'s job, not this cap's.
+        //
+        // Nor does it bound them once per message. Sequoia calls this method
+        // for every encryption container it descends into, against every
+        // session-key packet accumulated so far, and descends up to sixteen
+        // levels, so 256 packets placed ahead of sixteen nested containers are
+        // tried sixteen times over. What the two caps together leave is
+        // therefore 4096 iterated-SHA-256 derivations per candidate password —
+        // each one capped by its own encoding at 0x3e00000 bytes of hashing,
+        // about 350 ms on the machine sequoia benchmarks against, so something
+        // like twenty-five minutes per candidate. That is arithmetic from the
+        // two ceilings rather than a measurement, and it is a residual this cap
+        // does not close, not the "seconds" this comment used to claim.
         const MAX_ESK: usize = 256;
         let esks = pkesks.len() + skesks.len();
         if esks > MAX_ESK {
@@ -738,9 +884,30 @@ impl DecryptionHelper for Helper<'_> {
         // A password-encrypted message carries no recipient at all, so try the
         // supplied passphrase against the symmetric envelopes before deciding
         // this message was not meant for us.
+        //
+        // Each attempt is charged against [`Helper::argon2`], which is a budget
+        // for the whole message and not for this call, and every charge is
+        // settled before the derivation it pays for, so an Argon2 packet over
+        // the limit never reaches the allocator. The budget is four
+        // derivations at the per-attempt ceiling, which covers the largest
+        // honest shape — a message sealed to two passwords, tried against the
+        // two candidates the notepad offers — while holding the symmetric path
+        // of an entire message to about ten seconds of hashing rather than the
+        // hours 256 packets at t=255 would otherwise buy.
+        //
+        // A packet nobody can afford is passed over rather than ending the
+        // decrypt here: one over-priced envelope is no reason to refuse a
+        // message that a cheaper envelope, or the card key the agent loop
+        // below asks about, would still open. The price is remembered and
+        // reported at the end if nothing does.
+        let mut too_expensive = None;
         for candidate in &self.passwords {
             let password = Password::from(candidate.as_str());
             for skesk in skesks {
+                if let Err(price) = self.argon2.charge(skesk) {
+                    too_expensive.get_or_insert(price);
+                    continue;
+                }
                 if let Ok((algo, session_key)) = skesk.decrypt(&password)
                     && decrypt(algo, &session_key)
                 {
@@ -801,6 +968,14 @@ impl DecryptionHelper for Helper<'_> {
                     return Ok(Some((**cert).clone()));
                 }
             }
+        }
+
+        // What an envelope cost beats "no password opens this message", which
+        // sends the reader off to check a password that was never the problem
+        // — the same reasoning this file gives for not collapsing an unreadable
+        // secrets directory into "no key".
+        if let Some(price) = too_expensive {
+            return Err(price);
         }
 
         Err(anyhow::anyhow!(
@@ -1126,6 +1301,10 @@ fn write(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::keygen::{KeyGenRequest, generate};
+    use sequoia_openpgp::packet::skesk::{SKESK4, SKESK6};
+    use sequoia_openpgp::serialize::Serialize;
+    use sequoia_openpgp::types::AEADAlgorithm;
+    use sequoia_openpgp::{Packet, PacketPile};
 
     fn scratch_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -1294,6 +1473,457 @@ mod tests {
         assert!(
             message.contains("session-key packets"),
             "a padded message must be refused up front, got: {message:?}"
+        );
+    }
+
+    /// Rebuild the session-key envelope of a password-encrypted message around
+    /// `s2k`, leaving the rest of the message exactly as sequoia wrote it.
+    ///
+    /// Sequoia cannot be asked for an Argon2 envelope — its encryptor writes
+    /// `S2K::default()`, iterated SHA-256 — so a test that needs one has to
+    /// recover the session key from the packet sequoia did write and seal it
+    /// again. Building the packet derives the key once, so `s2k` wants to be a
+    /// cheap one even in a test about expensive ones; `set_s2k` re-prices the
+    /// packet afterwards without deriving anything.
+    fn resealed(message: &[u8], password: &Password, s2k: S2K) -> Vec<Packet> {
+        let pile = PacketPile::from_bytes(message).unwrap();
+        let mut packets: Vec<Packet> = pile.into_children().collect();
+        let sealed = packets
+            .iter()
+            .find_map(|p| match p {
+                Packet::SKESK(SKESK::V4(skesk)) => Some(skesk.clone()),
+                _ => None,
+            })
+            .expect("a password-only message is sealed with a v4 SKESK");
+        let (payload_algo, session_key) = sealed.decrypt(password).unwrap();
+        let replacement = SKESK4::with_password(
+            payload_algo,
+            sealed.symmetric_algo(),
+            s2k,
+            &session_key,
+            password,
+        )
+        .unwrap();
+        for packet in &mut packets {
+            if matches!(packet, Packet::SKESK(_)) {
+                *packet = Packet::from(replacement.clone());
+            }
+        }
+        packets
+    }
+
+    /// The wire form of a packet sequence a test has assembled by hand.
+    fn packet_bytes(packets: &[Packet]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for packet in packets {
+            packet.serialize(&mut bytes).unwrap();
+        }
+        bytes
+    }
+
+    /// An Argon2 envelope that charges its full stated price and derives
+    /// nothing.
+    ///
+    /// `p = 0` is what makes that possible: `p` is a raw octet on the wire, and
+    /// `argon2` rejects a parallelism below one while building its parameters,
+    /// before it asks the allocator for anything. So a test can put several of
+    /// these in a message, spend the budget exactly as a real message would,
+    /// and still finish in milliseconds.
+    fn free_but_dear() -> Packet {
+        Packet::from(
+            SKESK4::new(
+                SymmetricAlgorithm::AES256,
+                S2K::Argon2 {
+                    salt: [0u8; 16],
+                    t: 1,
+                    p: 0,
+                    m: MAX_ARGON2_M,
+                },
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A session-key packet's S2K is the *sender's* choice, and Argon2 lets it
+    /// name a memory size and a pass count that the recipient pays — once for
+    /// every (packet × candidate password), and before the password is checked
+    /// at all, so a wrong guess costs exactly as much as a right one. Sequoia
+    /// reads `t` and `m` as raw octets and bounds neither, and `argon2`'s own
+    /// maxima are `u32::MAX`, so the limits have to be rpgp's own.
+    ///
+    /// They are drawn where nobody following the specification lands: what a
+    /// correctly built message asks for has to go through, or the guard costs
+    /// more than the attack.
+    #[test]
+    fn the_argon2_budget_admits_what_the_specification_recommends_and_refuses_more() {
+        // `new` rather than `with_password`, which would run the S2K it is
+        // handed. Nothing here derives anything, which is the point: the
+        // budget answers before any derivation, so the test can name
+        // parameters no machine would survive.
+        let asking = |t: u8, p: u8, m: u8| -> SKESK {
+            SKESK4::new(
+                SymmetricAlgorithm::AES256,
+                S2K::Argon2 {
+                    salt: [0u8; 16],
+                    t,
+                    p,
+                    m,
+                },
+                None,
+            )
+            .unwrap()
+            .into()
+        };
+
+        // RFC 9580 specifies Argon2 for v6, so a v6 envelope is the one an
+        // over-priced packet actually arrives in. It carries its S2K in the
+        // same place and is priced from the same match arm; the fields around
+        // it are never read here, so they can be anything.
+        let asking_v6 = |t: u8, p: u8, m: u8| -> SKESK {
+            SKESK6::new(
+                SymmetricAlgorithm::AES256,
+                AEADAlgorithm::OCB,
+                S2K::Argon2 {
+                    salt: [0u8; 16],
+                    t,
+                    p,
+                    m,
+                },
+                vec![0u8; 15].into_boxed_slice(),
+                vec![0u8; 48].into_boxed_slice(),
+            )
+            .unwrap()
+            .into()
+        };
+
+        // RFC 9580's own sample locked key asks for t=1, p=4, m=21, and its
+        // alternative for memory-constrained machines for t=3, p=4, m=16 —
+        // RFC 9106's two recommendations. Refusing either would mean refusing
+        // a message somebody had produced correctly.
+        let mut budget = Argon2Budget::new();
+        budget
+            .charge(&asking(1, 4, 21))
+            .expect("RFC 9106's first recommendation is what the ceiling is set to");
+        budget
+            .charge(&asking(3, 4, 16))
+            .expect("RFC 9106's recommendation for constrained machines is far inside it");
+        Argon2Budget::new()
+            .charge(&asking_v6(1, 4, 21))
+            .expect("a v6 envelope is admitted on the same terms as a v4 one");
+
+        // An iterated S2K costs nothing against the budget: its own encoding
+        // caps it at 0x3e00000 bytes of hashing, and it is what every SKESK
+        // sequoia and GnuPG write carries. A message padded to the packet
+        // ceiling must not be refused for asking for Argon2 it never asked
+        // for.
+        let iterated: SKESK = SKESK4::new(SymmetricAlgorithm::AES256, S2K::default(), None)
+            .unwrap()
+            .into();
+        let mut budget = Argon2Budget::new();
+        for _ in 0..256 {
+            budget
+                .charge(&iterated)
+                .expect("an iterated S2K is bounded by its own encoding");
+        }
+
+        // Memory past the recommendation is refused before anything is asked
+        // of the allocator, which is the half of this that ends in an
+        // OOM kill rather than a wait.
+        let refused = Argon2Budget::new()
+            .charge(&asking(1, 4, 22))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            refused.contains("2^22 KiB of memory") && refused.contains("rpgp will allocate"),
+            "4 GiB for one attempt must be refused as memory, got: {refused:?}"
+        );
+
+        // A packet naming no passes at all is the one the work check cannot
+        // answer, because its work is zero whatever memory it asks for. The
+        // memory check is what stops `1 << m` being evaluated for an `m` that
+        // is not a shift distance.
+        let refused = Argon2Budget::new()
+            .charge(&asking(0, 4, 200))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            refused.contains("2^200 KiB of memory"),
+            "a zero-pass packet must still be refused on its memory, got: {refused:?}"
+        );
+
+        // And so is a pass count that stays inside the memory limit and
+        // multiplies the work instead. This is the shape a memory cap alone
+        // misses: 16 MiB is nothing, 16 MiB hashed 255 times over is twice
+        // the ceiling.
+        for over in [asking(255, 4, 14), asking_v6(255, 4, 14)] {
+            let refused = Argon2Budget::new()
+                .charge(&over)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(
+                refused.contains("16 MiB of memory hashed 255 times over")
+                    && refused.contains("more work than rpgp will spend"),
+                "a high pass count must be refused as work, got: {refused:?}"
+            );
+        }
+
+        // Four derivations at the per-attempt ceiling is the whole allowance
+        // for one decryption, so a fifth is refused however legal it is on its
+        // own. Without this, 256 packets tried against two candidates are 512
+        // individually legal derivations.
+        let mut budget = Argon2Budget::new();
+        for _ in 0..4 {
+            budget
+                .charge(&asking(1, 4, 21))
+                .expect("four at the ceiling is what the allowance is");
+        }
+        let refused = budget
+            .charge(&asking(1, 4, 21))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            refused.contains("more work in total"),
+            "the fifth derivation must exhaust the budget, got: {refused:?}"
+        );
+    }
+
+    /// The other half of the same guard: that it is wired into the decrypt
+    /// path ahead of the derivation, rather than sitting in a type nothing
+    /// asks. A message of a few hundred bytes could otherwise hold the app for
+    /// minutes behind a modal whose Cancel button is disabled while it works.
+    #[test]
+    fn a_message_that_prices_its_password_hashing_beyond_the_budget_is_refused() {
+        let (_dir, store) = scratch_store();
+        let password = Zeroizing::new("correct horse battery staple".to_string());
+        let secret = Password::from(password.as_str());
+
+        let mut ciphertext = Vec::new();
+        encrypt(
+            &[],
+            std::slice::from_ref(&password),
+            None,
+            b"the quarterly figures",
+            &mut ciphertext,
+        )
+        .unwrap();
+
+        // Deliberately tiny, because building the packet derives the key: the
+        // test pays once for whatever it asks for here, and the parameters it
+        // is re-priced to below are never derived at all.
+        let mut packets = resealed(
+            &ciphertext,
+            &secret,
+            S2K::Argon2 {
+                salt: [7u8; 16],
+                t: 1,
+                p: 4,
+                m: 10,
+            },
+        );
+
+        // An Argon2 message inside the budget is untouched by any of this.
+        let mut plaintext = Vec::new();
+        decrypt_to_memory(
+            &store,
+            &packet_bytes(&packets),
+            &[password.as_str()],
+            &mut plaintext,
+        )
+        .expect("Argon2 within the budget is ordinary password-encrypted mail");
+        assert_eq!(plaintext, b"the quarterly figures");
+
+        // The same message, with the sender asking for 16 MiB hashed 255 times
+        // over for every attempt to open it. The password is the right one, so
+        // a refusal that mentioned the password would be a lie as well as a
+        // dead end.
+        for packet in &mut packets {
+            if let Packet::SKESK(SKESK::V4(skesk)) = packet {
+                skesk.set_s2k(S2K::Argon2 {
+                    salt: [7u8; 16],
+                    t: 255,
+                    p: 4,
+                    m: 14,
+                });
+            }
+        }
+        let priced = packet_bytes(&packets);
+        let started = std::time::Instant::now();
+        let mut plaintext = Vec::new();
+        let refused = decrypt_to_memory(&store, &priced, &[password.as_str()], &mut plaintext);
+        let elapsed = started.elapsed();
+        let detail = refused.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            detail.contains("more work than rpgp will spend"),
+            "an over-priced message must be refused as over-priced, got: {detail:?}"
+        );
+        assert!(
+            !detail.contains("no secret key, and no password"),
+            "the refusal must not read as a wrong password, got: {detail:?}"
+        );
+        // Refusing after the derivation rather than before it would produce
+        // this same sentence, having already spent everything it refuses to
+        // spend, so the wording alone does not establish the guard. The
+        // measured separation is not subtle: the derivation this skips takes
+        // about 30 s in an unoptimised build, against 16 ms measured here for
+        // the guarded path, most of it asking the agent about card keys.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the refusal has to come before the derivation, not after it: took {elapsed:?}"
+        );
+    }
+
+    /// An envelope rpgp will not pay for is passed over, not fatal.
+    ///
+    /// A message can carry several, and the over-priced one need not be the one
+    /// that would have opened it — nor is the symmetric path the last thing
+    /// tried, since the card keys the agent holds are asked about after it.
+    /// Ending the decrypt at the first packet with a price on it would refuse
+    /// messages that were always readable, so the price is remembered and
+    /// reported only if nothing else works.
+    #[test]
+    fn an_over_priced_envelope_does_not_condemn_the_rest_of_the_message() {
+        let (_dir, store) = scratch_store();
+        let password = Zeroizing::new("correct horse battery staple".to_string());
+
+        let mut ciphertext = Vec::new();
+        encrypt(
+            &[],
+            std::slice::from_ref(&password),
+            None,
+            b"the quarterly figures",
+            &mut ciphertext,
+        )
+        .unwrap();
+
+        // The envelope sequoia wrote, left exactly as it was — iterated
+        // SHA-256, which costs the budget nothing — behind one asking for
+        // 16 MiB hashed 255 times over. Built with `new`, so the parameters it
+        // names are derived neither here nor in the decrypt that declines
+        // them.
+        let sealed: Vec<Packet> = PacketPile::from_bytes(&ciphertext)
+            .unwrap()
+            .into_children()
+            .collect();
+        let mixed: Vec<Packet> = std::iter::once(Packet::from(
+            SKESK4::new(
+                SymmetricAlgorithm::AES256,
+                S2K::Argon2 {
+                    salt: [0u8; 16],
+                    t: 255,
+                    p: 4,
+                    m: 14,
+                },
+                None,
+            )
+            .unwrap(),
+        ))
+        .chain(sealed)
+        .collect();
+
+        let mut plaintext = Vec::new();
+        decrypt_to_memory(
+            &store,
+            &packet_bytes(&mixed),
+            &[password.as_str()],
+            &mut plaintext,
+        )
+        .expect("an envelope rpgp declined to price is not the only envelope");
+        assert_eq!(plaintext, b"the quarterly figures");
+    }
+
+    /// The budget has to span the message rather than the call it is charged
+    /// in, and those are not the same thing.
+    ///
+    /// Sequoia calls the decryption helper once for every encryption container
+    /// it descends into, handing it every session-key packet accumulated so
+    /// far, and it descends as far as its default recursion limit of sixteen.
+    /// A budget held in that method is therefore handed back full at each
+    /// layer, and a message that nests its containers buys one budget per
+    /// layer out of a couple of kilobytes — a smaller copy of exactly the
+    /// thing the budget exists to stop.
+    #[test]
+    fn a_nested_encryption_container_does_not_buy_a_second_hashing_budget() {
+        let (_dir, store) = scratch_store();
+        let password = Zeroizing::new("correct horse battery staple".to_string());
+        let secret = Password::from(password.as_str());
+
+        // The inner message, sealed under an Argon2 envelope cheap enough to
+        // derive for real. It is the only thing that opens the inner
+        // container, so whether the budget still has room for it when the
+        // second container is reached is the whole question here.
+        let mut inner_plain = Vec::new();
+        encrypt(
+            &[],
+            std::slice::from_ref(&password),
+            None,
+            b"the quarterly figures",
+            &mut inner_plain,
+        )
+        .unwrap();
+        let inner = packet_bytes(&resealed(
+            &inner_plain,
+            &secret,
+            S2K::Argon2 {
+                salt: [7u8; 16],
+                t: 1,
+                p: 4,
+                m: 10,
+            },
+        ));
+
+        // A second container around it, written by sequoia, whose contents are
+        // that message rather than a literal packet. Nesting is what makes the
+        // helper's `decrypt` run twice.
+        let mut nested = Vec::new();
+        {
+            let message = Message::new(&mut nested);
+            let mut message = Encryptor::with_passwords(message, vec![secret.clone()])
+                .build()
+                .unwrap();
+            message.write_all(&inner).unwrap();
+            message.finalize().unwrap();
+        }
+        let outer: Vec<Packet> = PacketPile::from_bytes(&nested)
+            .unwrap()
+            .into_children()
+            .collect();
+
+        // Nesting on its own changes nothing: both layers ask for parameters
+        // well inside the budget, so the message reads exactly as it would
+        // unwrapped. Without this the rest of the test would pass on a message
+        // that was simply malformed.
+        let mut plaintext = Vec::new();
+        decrypt_to_memory(&store, &nested, &[password.as_str()], &mut plaintext)
+            .expect("two layers of ordinary parameters are two layers of ordinary mail");
+        assert_eq!(plaintext, b"the quarterly figures");
+
+        // Three envelopes at the per-attempt ceiling, ahead of the outer
+        // container, leave one of the four the budget holds. The outer
+        // container spends the three and opens on its own iterated envelope;
+        // the inner one is then handed all three again, and a budget scoped to
+        // the call would hand it the same four back and let its Argon2
+        // envelope through.
+        let priced: Vec<Packet> = std::iter::repeat_with(free_but_dear)
+            .take(3)
+            .chain(outer)
+            .collect();
+        let mut plaintext = Vec::new();
+        let refused = decrypt_to_memory(
+            &store,
+            &packet_bytes(&priced),
+            &[password.as_str()],
+            &mut plaintext,
+        );
+        let detail = refused.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            detail.contains("more work in total"),
+            "the second container must be charged against what the first one spent, \
+             got: {detail:?}"
         );
     }
 

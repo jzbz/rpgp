@@ -242,6 +242,19 @@ That is one field doing two jobs on the way in and two on the way out. In Sign
 *anyone* will need are deliberately separate fields, because confusing them
 would hand out the wrong secret.
 
+Reading such a message costs whatever its sender decided it should. The packet
+names the password-hashing parameters, and Argon2's are a memory size and a
+pass count that the recipient pays once for every (envelope × candidate
+password) — before the password is checked, so a wrong guess costs as much as a
+right one. rPGP spends at most what RFC 9580's own recommended parameters ask
+for: 2 GiB hashed once per attempt, and four such attempts for the whole
+message however many envelopes it carries or encryption layers it nests. An
+envelope priced above that is passed over, and if nothing else opens the
+message the failure says so rather than reporting a wrong password, because
+from the outside the two look identical. Nothing in ordinary use comes near the
+limit: GnuPG and the library rPGP is built on both hash passwords with iterated
+SHA-256, whose cost its own encoding already bounds.
+
 ## Revocation
 
 Revocation is one-way and public: the signature becomes part of the certificate,
