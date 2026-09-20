@@ -556,13 +556,32 @@ impl<'a> Helper<'a> {
 
 impl VerificationHelper for Helper<'_> {
     fn get_certs(&mut self, ids: &[KeyHandle]) -> anyhow::Result<Vec<Cert>> {
-        // A signer we do not have is not an error here: it surfaces as a
-        // MissingKey verification error in `check`, which is a better message
-        // than aborting the whole read.
-        Ok(ids
-            .iter()
-            .filter_map(|id| self.store.lookup(&id.to_string()).ok())
-            .collect())
+        // Every certificate that carries the issuer key, not the one
+        // [`Store::lookup`] would single out. An issuer names the key that
+        // signed, usually a subkey, and a key can hang off more than one
+        // certificate — including one a stranger built by attaching the
+        // signer's public subkey to a certificate of their own, which takes
+        // no secret of the signer's and no back-signature as long as the
+        // binding claims encryption. One certificate per issuer means such a
+        // certificate can be the only one the verifier ever sees, and the
+        // genuine signature then comes back "key is not signing capable".
+        // Sequoia walks the candidates and stops at the first signature that
+        // checks out, so the rejected ones cost only the attempt.
+        //
+        // A signer we do not have is still not an error here: it surfaces as
+        // a MissingKey verification error in `check`, which is a better
+        // message than aborting the whole read.
+        let mut certs: Vec<Cert> = Vec::new();
+        for id in ids {
+            for cert in self.store.lookup_all(&id.to_string()).unwrap_or_default() {
+                // Deduplicated across the whole list rather than per issuer:
+                // two issuers in one message can pull in the same certificate.
+                if !certs.iter().any(|c| c.fingerprint() == cert.fingerprint()) {
+                    certs.push(cert);
+                }
+            }
+        }
+        Ok(certs)
     }
 
     fn check(&mut self, structure: MessageStructure) -> anyhow::Result<()> {
@@ -2782,5 +2801,112 @@ mod tests {
 
         let tampered = verify_detached(&store, &signature, b"minutes of the meating");
         assert!(tampered.is_err() || !tampered.unwrap().all_good());
+    }
+
+    /// A genuine signature still verifies when another certificate in the
+    /// store carries the subkey that made it.
+    ///
+    /// A signature's issuer names the key that signed, which for every key
+    /// this app generates is a subkey — and a subkey can hang off more than
+    /// one certificate. Mallory needs no secret of Alice's to arrange that:
+    /// her public subkey plus a binding claiming encryption, which carries no
+    /// primary-key back-signature, makes a certificate of his own answer to
+    /// her issuer. Candidates come back sorted by certificate fingerprint, so
+    /// generating until his sorts first — two tries on average — makes his the
+    /// one a single-certificate resolution picks, and Alice's the one the
+    /// verifier never sees. Give `get_certs` back its old `lookup` and this
+    /// fails: the signature is reported bad, "key is not signing capable",
+    /// for as long as his certificate is in the store.
+    #[test]
+    fn a_signature_verifies_though_another_certificate_carries_the_subkey() {
+        use sequoia_openpgp::packet::signature::SignatureBuilder;
+        use sequoia_openpgp::types::{KeyFlags, SignatureType};
+
+        let (_dir, store) = scratch_store();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert(&alice).unwrap();
+
+        let mut signature = Vec::new();
+        sign_detached(&alice, None, b"minutes of the meeting", &mut signature).unwrap();
+        assert!(
+            verify_detached(&store, &signature, b"minutes of the meeting")
+                .unwrap()
+                .all_good(),
+            "the signature is good before Mallory's certificate arrives"
+        );
+
+        // The subkey that signed. It is Alice's public key and nothing more,
+        // which is all Mallory needs.
+        let signing = alice
+            .keys()
+            .with_policy(&policy(), None)
+            .alive()
+            .revoked(false)
+            .for_signing()
+            .next()
+            .expect("a generated key signs with a subkey")
+            .key()
+            .clone()
+            .role_into_subordinate();
+
+        // Mallory, generated until his primary fingerprint sorts below
+        // Alice's; the bound only stops a hang if key generation ever stopped
+        // being random.
+        let mut mallory = None;
+        for _ in 0..64 {
+            let candidate = generate(&KeyGenRequest::new("Mallory <mallory@example.org>"))
+                .unwrap()
+                .cert;
+            if candidate.fingerprint() < alice.fingerprint() {
+                mallory = Some(candidate);
+                break;
+            }
+        }
+        let mallory = mallory.expect("64 generated keys all sorted above Alice's");
+        let mut signer = mallory
+            .primary_key()
+            .key()
+            .clone()
+            .parts_into_secret()
+            .unwrap()
+            .into_keypair()
+            .unwrap();
+        let binding = signing
+            .bind(
+                &mut signer,
+                &mallory,
+                SignatureBuilder::new(SignatureType::SubkeyBinding)
+                    .set_key_flags(KeyFlags::empty().set_transport_encryption())
+                    .unwrap(),
+            )
+            .unwrap();
+        let mallory = mallory
+            .insert_packets(vec![Packet::from(signing.clone()), binding.into()])
+            .unwrap()
+            .0;
+        store.insert(&mallory).unwrap();
+
+        assert_eq!(
+            store
+                .lookup(&signing.fingerprint().to_hex())
+                .unwrap()
+                .fingerprint(),
+            mallory.fingerprint(),
+            "resolving the issuer to one certificate really does answer with Mallory's"
+        );
+
+        let result = verify_detached(&store, &signature, b"minutes of the meeting").unwrap();
+        assert!(
+            result.all_good(),
+            "Alice's certificate has to reach the verifier as well: {:?}",
+            result.signatures
+        );
+        assert_eq!(
+            result.signatures[0].fingerprint.as_deref(),
+            Some(alice.fingerprint().to_hex().as_str()),
+            "and the signature is still attributed to Alice"
+        );
     }
 }

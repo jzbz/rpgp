@@ -52,6 +52,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use sequoia_cert_store::store::StoreError;
 use sequoia_cert_store::{CertStore, LazyCert, Store as _, StoreUpdate as _};
 use sequoia_openpgp::Cert;
 use sequoia_openpgp::parse::Parse;
@@ -526,10 +527,13 @@ impl Store {
         // certify, revoke and the details pane all pass a fingerprint
         // precisely when they mean one particular certificate.
         //
-        // The subkey-tolerant search still has to happen, though: verification
-        // resolves a signature's issuer, which names the *subkey* that signed,
-        // and the certificate has to be found from it. So the search is kept
-        // and the choice is made afterwards, primary match first.
+        // The subkey-tolerant search still has to happen, though: a
+        // certification or a revocation names the *key* that made it, which
+        // may well be a subkey, and the certificate has to be found from it.
+        // So the search is kept and the choice is made afterwards, primary
+        // match first. Verification is not one of those callers — it wants
+        // every certificate that could have made the signature rather than
+        // the best guess at one, and goes through [`Store::lookup_all`].
         let found = self.certs.lookup_by_cert_or_subkey(&handle)?;
         let chosen = found
             .iter()
@@ -538,6 +542,52 @@ impl Store {
             .or_else(|| found.into_iter().next())
             .ok_or_else(|| Error::NoSuchCert(handle.to_string()))?;
         Ok(chosen.to_cert()?.clone())
+    }
+
+    /// Every certificate in the store that carries the key a handle names.
+    ///
+    /// [`Store::lookup`] answers "which certificate did the user mean"; this
+    /// answers "which certificates could have made this signature", and only
+    /// a verifier asks the second question. It has to be asked, because the
+    /// same key can hang off more than one certificate and nothing stops that
+    /// being somebody else's doing: cert-d indexes every key packet it parses
+    /// without looking at the binding, so a certificate carrying a stranger's
+    /// signing subkey — bound for encryption, which needs no back-signature,
+    /// or not bound at all — is indexed under that subkey like any other.
+    /// Handed only the first of those, a verifier finds the key in the wrong
+    /// certificate, rejects it as not signing-capable, and reports a genuine
+    /// signature as bad. Handed all of them it tries each in turn and stops at
+    /// the first that checks out, so the extra candidates cost nothing.
+    ///
+    /// Unlike `lookup`, a handle no certificate carries is not an error: the
+    /// question was which certificates carry the key, and none is an answer.
+    /// A candidate that will not parse is dropped rather than failing the
+    /// call, for the same reason the list exists — one certificate must not be
+    /// able to speak for another, and a stranger's unparseable certificate
+    /// keeping the owner's out of the list would be that failure by another
+    /// route.
+    pub fn lookup_all(&self, handle: &str) -> Result<Vec<Cert>> {
+        let handle: sequoia_openpgp::KeyHandle = handle
+            .parse()
+            .map_err(|_| Error::invalid(format!("{handle} is not a fingerprint or key ID")))?;
+        let found = match self.certs.lookup_by_cert_or_subkey(&handle) {
+            Ok(found) => found,
+            // Told apart from a store that could not be read, which is a real
+            // failure and still propagates.
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<StoreError>(),
+                    Some(StoreError::NotFound(_))
+                ) =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        Ok(found
+            .iter()
+            .filter_map(|c| c.to_cert().ok().cloned())
+            .collect())
     }
 
     /// Insert or merge a public certificate.
@@ -2274,6 +2324,181 @@ mod tests {
     fn deleting_something_absent_is_not_an_error() {
         let (_dir, store) = scratch();
         store.delete(&"AB".repeat(20), true).unwrap();
+    }
+
+    /// Alice, and a Mallory whose primary fingerprint sorts below hers.
+    ///
+    /// `lookup_by_cert_or_subkey` sorts its candidates by certificate
+    /// fingerprint, so which certificate comes first is not decided by who was
+    /// inserted first — it is decided by the fingerprint, which an attacker
+    /// picks by generating keys until one sorts where he wants it. Two tries
+    /// on average, so the loop here is what he would do and not a contrivance;
+    /// the bound only stops a test hanging if key generation ever stopped
+    /// being random.
+    fn alice_and_a_lower_sorting_mallory() -> (Cert, Cert) {
+        let alice = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        for _ in 0..64 {
+            let mallory = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+                "Mallory <mallory@example.org>",
+            ))
+            .unwrap()
+            .cert;
+            if mallory.fingerprint() < alice.fingerprint() {
+                return (alice, mallory);
+            }
+        }
+        panic!("64 generated keys all sorted above Alice's");
+    }
+
+    /// `carrier`, with `key` attached to it as an encryption subkey.
+    ///
+    /// Anyone can build this over anyone else's *public* key: a binding that
+    /// claims encryption needs no primary-key back-signature, so nothing but
+    /// the carrier's own secret goes into it. cert-d would index the key even
+    /// with no binding at all, so this is the realistic shape rather than the
+    /// cheapest one.
+    fn carrying(
+        carrier: &Cert,
+        key: sequoia_openpgp::packet::Key<key::PublicParts, key::SubordinateRole>,
+    ) -> Cert {
+        use sequoia_openpgp::packet::signature::SignatureBuilder;
+        use sequoia_openpgp::types::{KeyFlags, SignatureType};
+
+        let mut signer = carrier
+            .primary_key()
+            .key()
+            .clone()
+            .parts_into_secret()
+            .unwrap()
+            .into_keypair()
+            .unwrap();
+        let binding = key
+            .bind(
+                &mut signer,
+                carrier,
+                SignatureBuilder::new(SignatureType::SubkeyBinding)
+                    .set_key_flags(KeyFlags::empty().set_transport_encryption())
+                    .unwrap(),
+            )
+            .unwrap();
+        carrier
+            .clone()
+            .insert_packets(vec![Packet::from(key), binding.into()])
+            .unwrap()
+            .0
+    }
+
+    /// A store holding Alice, and a Mallory that sorts first and carries
+    /// Alice's primary key as a subkey of his own.
+    fn store_with_a_carrier() -> (tempfile::TempDir, Store, Cert, Cert) {
+        let (dir, store) = scratch();
+        let (alice, mallory) = alice_and_a_lower_sorting_mallory();
+        let mallory = carrying(
+            &mallory,
+            alice.primary_key().key().clone().role_into_subordinate(),
+        );
+        store.insert(&alice).unwrap();
+        store.insert(&mallory).unwrap();
+        (dir, store, alice, mallory)
+    }
+
+    /// A handle names one certificate, and `lookup` must return that one even
+    /// when another certificate in the store carries the same key.
+    ///
+    /// Nothing stops a stranger hanging somebody else's public key off a
+    /// certificate of his own, and cert-d indexes every key packet it parses
+    /// without looking at the binding, so both certificates answer to Alice's
+    /// fingerprint. Drop the primary-match-first choice for the plain "first
+    /// candidate" it replaced and this fails: `lookup` returns Mallory, and
+    /// with him the wrong certificate to export, certify, revoke, or hand
+    /// SHA-1 acceptance to.
+    #[test]
+    fn lookup_prefers_the_certificate_a_handle_names_over_one_carrying_its_key() {
+        let (_dir, store, alice, mallory) = store_with_a_carrier();
+
+        // The test proves nothing unless both certificates really are indexed
+        // under Alice's fingerprint with Mallory's first, which is the whole
+        // situation the choice exists for.
+        let handle = sequoia_openpgp::KeyHandle::from(alice.fingerprint());
+        let candidates = store.certs.lookup_by_cert_or_subkey(&handle).unwrap();
+        let order: Vec<_> = candidates.iter().map(|c| c.fingerprint()).collect();
+        assert_eq!(
+            order,
+            vec![mallory.fingerprint(), alice.fingerprint()],
+            "cert-d should offer both certificates, Mallory's first"
+        );
+
+        assert_eq!(
+            store
+                .lookup(&alice.fingerprint().to_hex())
+                .unwrap()
+                .fingerprint(),
+            alice.fingerprint(),
+            "a fingerprint names a certificate, not a key some other certificate also carries"
+        );
+        assert_eq!(
+            store.lookup(&alice.keyid().to_hex()).unwrap().fingerprint(),
+            alice.fingerprint(),
+            "the key ID is the second way to name the same certificate"
+        );
+
+        // The subkey-tolerant half of the search still has to work: certify
+        // and revoke resolve the key that made a signature, which is usually a
+        // subkey and belongs to no primary fingerprint at all.
+        let own_subkey = mallory
+            .keys()
+            .subkeys()
+            .map(|ka| ka.key().fingerprint())
+            .find(|fp| *fp != alice.fingerprint())
+            .expect("Mallory has subkeys of his own");
+        assert_eq!(
+            store.lookup(&own_subkey.to_hex()).unwrap().fingerprint(),
+            mallory.fingerprint(),
+            "a subkey still resolves to the certificate carrying it"
+        );
+    }
+
+    /// Verification asks the other question, and gets every candidate.
+    ///
+    /// Return only the first and a verifier handed a certificate that merely
+    /// carries the signer's subkey never gets to look at the signer's own; see
+    /// `a_signature_verifies_though_another_certificate_carries_the_subkey`
+    /// in [`crate::ops`] for what that costs.
+    #[test]
+    fn lookup_all_returns_every_certificate_carrying_the_key() {
+        let (_dir, store, alice, mallory) = store_with_a_carrier();
+
+        let found: Vec<_> = store
+            .lookup_all(&alice.fingerprint().to_hex())
+            .unwrap()
+            .iter()
+            .map(|c| c.fingerprint())
+            .collect();
+        assert_eq!(
+            found,
+            vec![mallory.fingerprint(), alice.fingerprint()],
+            "both certificates carry the key, so a verifier has to be offered both"
+        );
+
+        // A key nothing carries is an empty answer rather than an error: the
+        // caller turns it into a MissingKey report on that one signature
+        // instead of abandoning the whole message.
+        let absent = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Nobody <nobody@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        assert!(
+            store
+                .lookup_all(&absent.fingerprint().to_hex())
+                .unwrap()
+                .is_empty(),
+            "nothing carries this key, and that is an answer"
+        );
     }
 
     /// The Windows counterpart of `private_files_are_not_world_readable`.
