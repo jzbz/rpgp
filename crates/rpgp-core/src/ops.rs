@@ -2991,20 +2991,31 @@ mod tests {
     /// her public subkey plus a binding claiming encryption, which carries no
     /// primary-key back-signature, makes a certificate of his own answer to
     /// her issuer. Candidates come back sorted by certificate fingerprint, so
-    /// generating until his sorts first — two tries on average — makes his the
-    /// one a single-certificate resolution picks, and Alice's the one the
-    /// verifier never sees. Give `get_certs` back its old `lookup` and this
-    /// fails: the signature is reported bad, "key is not signing capable",
-    /// for as long as his certificate is in the store.
+    /// drawing his from below hers makes his the one a single-certificate
+    /// resolution picks, and Alice's the one the verifier never sees. Give
+    /// `get_certs` back its old `lookup` and this fails: the signature is
+    /// reported bad, "key is not signing capable", for as long as his
+    /// certificate is in the store.
     #[test]
     fn a_signature_verifies_though_another_certificate_carries_the_subkey() {
         use sequoia_openpgp::packet::signature::SignatureBuilder;
         use sequoia_openpgp::types::{KeyFlags, SignatureType};
 
         let (_dir, store) = scratch_store();
-        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
-            .unwrap()
-            .cert;
+        // Alice from the upper half of the fingerprint space and Mallory from
+        // the lower, so his sorts first whatever hers turns out to be. Drawing
+        // Mallory until he merely sorts below a fixed Alice runs out whenever
+        // hers lands near the bottom, which over 64 draws is one run in
+        // sixty-five. Each draw here takes two tries on average; the bound
+        // only stops a hang if key generation ever stopped being random.
+        let alice = (0..64)
+            .map(|_| {
+                generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+                    .unwrap()
+                    .cert
+            })
+            .find(|cert| cert.fingerprint().as_bytes()[0] >= 0x80)
+            .expect("64 generated keys all sorted into the lower half");
         store.insert(&alice).unwrap();
 
         let mut signature = Vec::new();
@@ -3030,20 +3041,16 @@ mod tests {
             .clone()
             .role_into_subordinate();
 
-        // Mallory, generated until his primary fingerprint sorts below
-        // Alice's; the bound only stops a hang if key generation ever stopped
-        // being random.
-        let mut mallory = None;
-        for _ in 0..64 {
-            let candidate = generate(&KeyGenRequest::new("Mallory <mallory@example.org>"))
-                .unwrap()
-                .cert;
-            if candidate.fingerprint() < alice.fingerprint() {
-                mallory = Some(candidate);
-                break;
-            }
-        }
-        let mallory = mallory.expect("64 generated keys all sorted above Alice's");
+        // Mallory, from the lower half of the fingerprint space, so his
+        // primary fingerprint sorts below Alice's.
+        let mallory = (0..64)
+            .map(|_| {
+                generate(&KeyGenRequest::new("Mallory <mallory@example.org>"))
+                    .unwrap()
+                    .cert
+            })
+            .find(|cert| cert.fingerprint().as_bytes()[0] < 0x80)
+            .expect("64 generated keys all sorted into the upper half");
         let mut signer = mallory
             .primary_key()
             .key()
