@@ -1566,6 +1566,11 @@ export component LifecycleDialog inherits DialogShell {
     /// 0 change expiry, 1 add a user ID, 2 revoke a user ID
     in property <int> mode;
     in property <string> target;
+    /// The key the dialog was opened for. Publish names it in its warning:
+    /// that is the step that cannot be undone, and without it nothing in the
+    /// dialog says which key is about to become public.
+    in property <string> key-name;
+    in property <string> key-id;
     in property <bool> busy;
     /// mode, expiry-index, value, password, reason-index. The reason is
     /// meaningful for mode 4 (revoke a subkey) only.
@@ -1594,10 +1599,11 @@ export component LifecycleDialog inherits DialogShell {
                     ? "Retract subkey " + root.target + ". The rest of the key "
                       + "keeps working — use this when one subkey's secret is "
                       + "exposed but the primary is not."
-                    : "Upload this certificate to keys.openpgp.org. This cannot "
-                      + "be undone: a keyserver has no delete, so the key and "
-                      + "every user ID on it become public permanently. Only "
-                      + "the public half is sent.";
+                    : "Upload " + root.key-name + " (" + root.key-id + ") to "
+                      + "keys.openpgp.org. This cannot be undone: a keyserver "
+                      + "has no delete, so the key and every user ID on it "
+                      + "become public permanently. Only the public half is "
+                      + "sent.";
     card-width: 480px;
 
     VerticalLayout {

@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -145,6 +145,10 @@ struct State {
     /// for and checked when its worker comes back, so two mutations in quick
     /// succession cannot have the slower read put an older keyring back.
     reload_generation: u64,
+    /// Bumped every time the user picks a row, so a reload can tell whether
+    /// they have moved since it was asked for. One that carries a row of its
+    /// own to select only gets to select it if they have not.
+    selection_generation: u64,
     filter: String,
     scope: Scope,
     sort: Sort,
@@ -162,6 +166,11 @@ struct State {
     dv_input: Option<PathBuf>,
     dv_data: Option<PathBuf>,
     dv_kind: InputKind,
+    /// Which choice of files the Decrypt / Verify dialog is showing. Bumped
+    /// whenever it opens or a file is chosen, and taken by the worker in the
+    /// same snapshot as the paths, so a result that comes back for files the
+    /// user has since replaced is not shown beside the new ones.
+    dv_generation: u64,
 
     /// Fingerprint of the certificate the certify dialog is about.
     certify_target: Option<String>,
@@ -177,6 +186,12 @@ struct State {
     /// certification rather than revoking the key itself.
     revoke_target: Option<String>,
     revoke_certification: bool,
+
+    /// (fingerprint, warned): the certificate the delete dialog is about, and
+    /// whether it warned that a secret key goes with it.
+    delete_target: Option<(String, bool)>,
+    /// Fingerprint of the certificate the lifecycle dialog is about.
+    lifecycle_fingerprint: Option<String>,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -372,6 +387,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         all: Vec::new(),
         shown: Vec::new(),
         reload_generation: 0,
+        selection_generation: 0,
         filter: String::new(),
         scope: Scope::All,
         sort: Sort::MineFirst,
@@ -382,12 +398,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         dv_input: None,
         dv_data: None,
         dv_kind: InputKind::NotOpenPgp,
+        dv_generation: 0,
         certify_target: None,
         certify_user_ids: Vec::new(),
         certify_certifiers: Vec::new(),
         lookup_results: Vec::new(),
         revoke_target: None,
         revoke_certification: false,
+        delete_target: None,
+        lifecycle_fingerprint: None,
     }));
 
     ui.set_version(env!("CARGO_PKG_VERSION").into());
@@ -517,7 +536,11 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
             // acting on what is there now would act on state that is already
             // stale — and the reselect that follows would fight this callback
             // for the selection. These read-only callbacks therefore bow out
-            // until it lands.
+            // until its worker comes back. The reload it then asks for is not
+            // waited out: busy is already clear while that reads the store,
+            // and a row picked in that window stays picked, because the
+            // reload checks `selection_generation` before it selects a row of
+            // its own.
             //
             // Not, as this used to say, because a worker holds the state lock
             // across a card PIN prompt: run_sign_encrypt and run_certify both
@@ -527,7 +550,11 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
             if ui.get_busy() {
                 return;
             }
-            let guard = lock(&state);
+            let mut guard = lock(&state);
+            // Before anything can fail, because a click on a row that turns
+            // out not to be one still moves the user off the row they were
+            // on — and a reload still in flight must not put them back.
+            guard.selection_generation += 1;
 
             let Some(summary) = usize::try_from(row)
                 .ok()
@@ -1044,6 +1071,9 @@ fn wire_decrypt_verify(ui: &AppWindow, state: &Shared) {
             guard.dv_input = None;
             guard.dv_data = None;
             guard.dv_kind = InputKind::NotOpenPgp;
+            // A fresh dialog is a fresh choice of files, so a run still in
+            // flight from before it was closed has nothing to show in it.
+            guard.dv_generation += 1;
             ui.set_dv_result(SharedString::new());
             ui.set_dv_tone(0);
             ui.set_dv_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
@@ -1076,12 +1106,7 @@ fn wire_decrypt_verify(ui: &AppWindow, state: &Shared) {
                 let Some(ui) = ui_weak.upgrade() else {
                     return;
                 };
-                let mut guard = lock(&state);
-                guard.dv_input = Some(path);
-                guard.dv_kind = kind;
-                ui.set_dv_result(SharedString::new());
-                ui.set_dv_tone(0);
-                push_decrypt_verify(&ui, &guard);
+                choose_dv_input(&ui, &state, path, kind);
             });
         }
     });
@@ -1101,9 +1126,7 @@ fn wire_decrypt_verify(ui: &AppWindow, state: &Shared) {
                 let Some(ui) = ui_weak.upgrade() else {
                     return;
                 };
-                let mut guard = lock(&state);
-                guard.dv_data = Some(file.path().to_path_buf());
-                push_decrypt_verify(&ui, &guard);
+                choose_dv_data(&ui, &state, file.path().to_path_buf());
             });
         }
     });
@@ -1121,58 +1144,168 @@ fn wire_decrypt_verify(ui: &AppWindow, state: &Shared) {
             let password = password.to_string();
             std::thread::spawn(move || {
                 let _busy = BusyGuard(ui_weak.clone());
-                let outcome = run_decrypt_verify(&state, &password);
+                let (read, outcome) = run_decrypt_verify(&state, &password);
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(ui) = ui_weak.upgrade() else {
                         return;
                     };
                     ui.set_busy(false);
-                    match outcome {
-                        Ok((summary, tone, result)) => {
-                            let rows = signature_rows(&lock(&state).all, &result.signatures);
-                            ui.set_dv_signatures(ModelRc::new(VecModel::from(rows)));
-                            ui.set_dv_result(summary.clone().into());
-                            ui.set_dv_tone(tone);
-                            ui.set_status(summary.into());
-                        }
-                        Err(message) => {
-                            ui.set_dv_signatures(ModelRc::new(VecModel::from(
-                                Vec::<SignatureRow>::new(),
-                            )));
-                            ui.set_dv_result(message.clone().into());
-                            ui.set_dv_tone(3);
-                            ui.set_status(message.into());
-                        }
-                    }
+                    show_decrypt_verify(&ui, &state, read, outcome);
                 });
             });
         }
     });
 }
 
-/// The blocking half of Decrypt / Verify. Returns a summary line, a tone for
-/// the result banner (1 good, 2 needs attention, 3 bad) and the signatures.
-fn run_decrypt_verify(
-    state: &Shared,
-    password: &str,
-) -> Result<(String, i32, VerifyResult), String> {
+/// What a Decrypt / Verify run found: a summary line, a tone for the result
+/// banner (1 good, 2 needs attention, 3 bad) and the signatures, or the line
+/// saying why it failed.
+type DvOutcome = Result<(String, i32, VerifyResult), String>;
+
+/// Which choice of files a Decrypt / Verify run read.
+struct DvRead {
+    /// The generation they were chosen under, held against the dialog's when
+    /// the result comes back.
+    generation: u64,
+    /// Their names, "a.tar.sig against a.tar", for a result that comes back
+    /// after the dialog has moved on to other files. A verify's own summary
+    /// names none, so without these it would read as a verdict on whatever
+    /// the dialog shows by then.
+    names: String,
+}
+
+/// Take a newly chosen message or signature, as the input picker does once
+/// the file dialog answers.
+///
+/// Split out of the picker, like [`choose_dv_data`], because the dialog cannot
+/// be driven without a display and this half is what a test needs to reach.
+fn choose_dv_input(ui: &AppWindow, state: &Shared, path: PathBuf, kind: InputKind) {
+    let mut guard = lock(state);
+    guard.dv_input = Some(path);
+    guard.dv_kind = kind;
+    // A different choice of files: a run still in flight against the previous
+    // one is no longer about what the dialog shows.
+    guard.dv_generation += 1;
+    ui.set_dv_result(SharedString::new());
+    ui.set_dv_tone(0);
+    push_decrypt_verify(ui, &guard);
+}
+
+/// Take a newly chosen signed file, as the data picker does once the file
+/// dialog answers.
+fn choose_dv_data(ui: &AppWindow, state: &Shared, path: PathBuf) {
+    let mut guard = lock(state);
+    guard.dv_data = Some(path);
+    // As for the input: whatever is running was started on other files.
+    guard.dv_generation += 1;
+    push_decrypt_verify(ui, &guard);
+}
+
+/// The event-loop half of Decrypt / Verify: show what a run found.
+///
+/// In the dialog only if the files it read are still the ones chosen. The
+/// Choose buttons are disabled while a run is in flight, but that only stops a
+/// picker opening: one opened before Run can still come back during it,
+/// because on Linux and Windows the file dialog has no parent window and the
+/// main window stays live behind it. Painted beside the new files, a verdict
+/// about the old ones reads as "Signature verified" next to a file nothing
+/// checked. It still goes on the status line, because a decrypt has already
+/// written its output by the time it gets here and hiding that would hide a
+/// plaintext file. There it says first that it is not about the files now
+/// chosen, because the status line elides and the tail is what goes, and then
+/// names the files it is about.
+fn show_decrypt_verify(ui: &AppWindow, state: &Shared, read: DvRead, outcome: DvOutcome) {
+    if lock(state).dv_generation != read.generation {
+        let message = match outcome {
+            Ok((summary, _, _)) => summary,
+            Err(message) => message,
+        };
+        let message = if read.names.is_empty() {
+            message
+        } else {
+            format!("{}: {message}", read.names)
+        };
+        ui.set_status(format!("Not for the files now chosen. {message}").into());
+        return;
+    }
+
+    match outcome {
+        Ok((summary, tone, result)) => {
+            let rows = signature_rows(&lock(state).all, &result.signatures);
+            ui.set_dv_signatures(ModelRc::new(VecModel::from(rows)));
+            ui.set_dv_result(summary.clone().into());
+            ui.set_dv_tone(tone);
+            ui.set_status(summary.into());
+        }
+        Err(message) => {
+            ui.set_dv_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
+            ui.set_dv_result(message.clone().into());
+            ui.set_dv_tone(3);
+            ui.set_status(message.into());
+        }
+    }
+}
+
+/// The blocking half of Decrypt / Verify. Returns which choice of files it
+/// ran against and what it found.
+fn run_decrypt_verify(state: &Shared, password: &str) -> (DvRead, DvOutcome) {
     // Snapshot what is needed and release the lock: everything below is I/O,
-    // and a card PIN prompt can hold it for a minute while the UI waits.
-    let (store, input, kind, data) = {
+    // and a card PIN prompt can hold it for a minute while the UI waits. The
+    // generation comes out of the same snapshot as the paths, so it names
+    // exactly the files read below and nothing chosen since.
+    let (store, generation, input, kind, data) = {
         let guard = lock(state);
         (
             guard.store.clone(),
+            guard.dv_generation,
             guard.dv_input.clone(),
             guard.dv_kind,
             guard.dv_data.clone(),
         )
     };
+    let read = DvRead {
+        generation,
+        names: dv_names(input.as_deref(), kind, data.as_deref()),
+    };
+    (
+        read,
+        decrypt_or_verify(state, &store, input, kind, data, password),
+    )
+}
+
+/// How a status line names the files a run read. The file names alone: the
+/// dialog shows full paths, and a status line has no room for two of them.
+fn dv_names(input: Option<&Path>, kind: InputKind, data: Option<&Path>) -> String {
+    let name = |path: &Path| {
+        path.file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned()
+    };
+    match (input, data) {
+        (Some(input), Some(data)) if kind == InputKind::DetachedSignature => {
+            format!("{} against {}", name(input), name(data))
+        }
+        (Some(input), _) => name(input),
+        (None, _) => String::new(),
+    }
+}
+
+/// What [`run_decrypt_verify`] does with its snapshot.
+fn decrypt_or_verify(
+    state: &Shared,
+    store: &Store,
+    input: Option<PathBuf>,
+    kind: InputKind,
+    data: Option<PathBuf>,
+    password: &str,
+) -> DvOutcome {
     let input = input.ok_or_else(|| "Choose a file first".to_string())?;
 
     if kind == InputKind::DetachedSignature {
         let data = data.ok_or_else(|| "Choose the file the signature covers".to_string())?;
 
-        let result = ops::verify_detached_files(&store, &input, &data)
+        let result = ops::verify_detached_files(store, &input, &data)
             .map_err(|e| format!("Verification failed: {e}"))?;
 
         let summary = if result.signatures.is_empty() {
@@ -1191,7 +1324,7 @@ fn run_decrypt_verify(
         .filter(|p| !p.is_empty())
         .into_iter()
         .collect();
-    let result = ops::decrypt_file(&store, &input, &candidates, &output)
+    let result = ops::decrypt_file(store, &input, &candidates, &output)
         .map_err(|e| format!("Decryption failed: {e}"))?;
 
     // A message with no encryption layer opens just as cleanly, so saying
@@ -1377,14 +1510,20 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
                 return;
             }
 
+            // Which way to flip it is asked of the store, not of `all`: the
+            // list is only replaced when the reload this toggle starts lands,
+            // and nothing stops a second click before then. Read from the
+            // list, that click saw the value from before the first and wrote
+            // the first click's answer again, so two clicks left a
+            // certificate a trust root rather than back where it started.
+            // `detail` holds the bare hex fingerprint, so uppercased it is
+            // the key the store's own list is written under.
             let outcome = {
                 let guard = lock(&state);
-                let was_root = guard
-                    .all
-                    .iter()
-                    .find(|c| c.fingerprint == fingerprint)
-                    .is_some_and(|c| c.is_trust_root);
-                guard.store.set_trust_root(&fingerprint, !was_root)
+                guard.store.trust_roots().and_then(|roots| {
+                    let was_root = roots.contains(&fingerprint.to_uppercase());
+                    guard.store.set_trust_root(&fingerprint, !was_root)
+                })
             };
 
             match outcome {
@@ -1411,26 +1550,27 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            let fingerprint = ui.get_detail().fingerprint.to_string();
+            let detail = ui.get_detail();
+            let fingerprint = detail.fingerprint.to_string();
             if fingerprint.is_empty() {
                 return;
             }
 
-            let (accepted, outcome) = {
+            // From the store rather than the list, as the trust-root toggle
+            // does and for the same reason.
+            let outcome = {
                 let guard = lock(&state);
-                let was_accepted = guard
-                    .all
-                    .iter()
-                    .find(|c| c.fingerprint == fingerprint)
-                    .is_some_and(|c| c.sha1_accepted);
-                (
-                    !was_accepted,
-                    guard.store.set_sha1_accepted(&fingerprint, !was_accepted),
-                )
+                guard.store.sha1_accepted().and_then(|list| {
+                    let accepted = !list.contains(&fingerprint.to_uppercase());
+                    guard
+                        .store
+                        .set_sha1_accepted(&fingerprint, accepted)
+                        .map(|()| accepted)
+                })
             };
 
             match outcome {
-                Ok(()) => {
+                Ok(accepted) => {
                     // A full reload for the same reason the trust-root toggle
                     // takes one: the certificate is re-summarised under a
                     // different policy, so its user IDs, subkeys and
@@ -1440,19 +1580,25 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
                     // from reading the row back. It used to read `detail` after
                     // reselect, which only worked while the reload was
                     // synchronous; the store is the authority either way.
+                    //
+                    // It names the certificate rather than saying "this one",
+                    // because it appears when the reload lands, and a user who
+                    // has picked another row by then stays on it. "No longer
+                    // accepted" beside a certificate that still is would be
+                    // read as a withdrawal that never happened.
+                    let name = &detail.primary_user_id;
                     reload_after(
                         &ui,
                         &state,
                         AfterReload {
                             select: Some(fingerprint),
-                            status: Some(
-                                if accepted {
-                                    "SHA-1 accepted for this certificate. Signatures from it can now be checked; it still cannot be trusted or encrypted to."
-                                } else {
-                                    "SHA-1 no longer accepted for this certificate."
-                                }
-                                .to_string(),
-                            ),
+                            status: Some(if accepted {
+                                format!(
+                                    "SHA-1 accepted for {name}. Signatures from it can now be checked; it still cannot be trusted or encrypted to."
+                                )
+                            } else {
+                                format!("SHA-1 no longer accepted for {name}.")
+                            }),
                         },
                     );
                 }
@@ -1768,55 +1914,84 @@ fn wire_lookup(ui: &AppWindow, state: &Shared) {
 // ------------------------------------------------------------------ lifecycle
 
 fn wire_lifecycle(ui: &AppWindow, state: &Shared) {
-    let open = |ui: &AppWindow, mode: i32, target: SharedString| {
+    // The certificate a lifecycle action works on is fixed here, when the
+    // dialog opens, from the one the details pane is showing — the same moment
+    // the user ID or subkey a revoke mode acts on is handed over, so for as
+    // long as this dialog is open the two belong together. They can already
+    // disagree when it opens: the Details dialog's lists, which the user ID or
+    // subkey was picked from, were filled when that dialog opened, and an
+    // assistive-technology activation of a list row can move the pane behind
+    // its scrim in between. Keeping focus and activation inside an open
+    // dialog is what closes that, and it is not done here.
+    //
+    // The run used to read the pane again when its button was pressed, and a
+    // reload landing behind the scrim put the selection back wherever it had
+    // been asked to. An expiry or a new user ID could then go to another of
+    // the user's keys, and Publish could upload a certificate the dialog was
+    // never opened for, which cannot be taken back. Reloads now defer to a row
+    // the user has picked, but what the dialog acts on must not depend on
+    // nothing else moving the pane. The scrim stops only the pointer: an
+    // assistive-technology activation of a list row still reaches
+    // row_selected, and a reload can still be asked to select a row read from
+    // a highlight that has drifted away from the pane. The name the dialog
+    // shows comes from the same read, rather than being bound to the pane,
+    // for the same reason.
+    let open = |ui: &AppWindow, state: &Shared, mode: i32, target: SharedString| {
+        let detail = ui.get_detail();
+        if detail.fingerprint.is_empty() {
+            return;
+        }
+        lock(state).lifecycle_fingerprint = Some(detail.fingerprint.to_string());
+        ui.set_lifecycle_key_name(detail.primary_user_id);
+        ui.set_lifecycle_key_id(detail.key_id);
         ui.set_lifecycle_mode(mode);
         ui.set_lifecycle_target(target);
         ui.set_lifecycle_open(true);
     };
 
     ui.on_open_expiry({
-        let ui_weak = ui.as_weak();
+        let (ui_weak, state) = (ui.as_weak(), state.clone());
         move || {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            open(&ui, 0, SharedString::new());
+            open(&ui, &state, 0, SharedString::new());
         }
     });
     ui.on_open_revoke_subkey({
-        let ui_weak = ui.as_weak();
+        let (ui_weak, state) = (ui.as_weak(), state.clone());
         move |subkey| {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            open(&ui, 4, subkey);
+            open(&ui, &state, 4, subkey);
         }
     });
     ui.on_open_publish({
-        let ui_weak = ui.as_weak();
+        let (ui_weak, state) = (ui.as_weak(), state.clone());
         move || {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            open(&ui, 3, SharedString::new());
+            open(&ui, &state, 3, SharedString::new());
         }
     });
     ui.on_open_add_user_id({
-        let ui_weak = ui.as_weak();
+        let (ui_weak, state) = (ui.as_weak(), state.clone());
         move || {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            open(&ui, 1, SharedString::new());
+            open(&ui, &state, 1, SharedString::new());
         }
     });
     ui.on_open_revoke_user_id({
-        let ui_weak = ui.as_weak();
+        let (ui_weak, state) = (ui.as_weak(), state.clone());
         move |user_id| {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            open(&ui, 2, user_id);
+            open(&ui, &state, 2, user_id);
         }
     });
 
@@ -1826,7 +2001,15 @@ fn wire_lifecycle(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            let fingerprint = ui.get_detail().fingerprint.to_string();
+            // What the dialog was opened for, not what the pane shows now.
+            // Written every time the dialog opens, which is the only way to
+            // reach this button, and dropped when an action goes through, so
+            // it never answers for an earlier dialog.
+            let fingerprint = lock(&state).lifecycle_fingerprint.clone();
+            let Some(fingerprint) = fingerprint else {
+                ui.set_status("No certificate selected".into());
+                return;
+            };
             let target = ui.get_lifecycle_target().to_string();
             ui.set_busy(true);
             ui.set_status("Working…".into());
@@ -1851,6 +2034,15 @@ fn wire_lifecycle(ui: &AppWindow, state: &Shared) {
                     ui.set_busy(false);
                     match outcome {
                         Ok((message, fingerprint)) => {
+                            // The record goes when a success closes the dialog.
+                            // Were the button ever reached again without an
+                            // opener writing a fresh one, it would then find
+                            // nothing to act on rather than this dialog's key.
+                            // A dialog dismissed without acting keeps its
+                            // record, since dismissing never reaches Rust; the
+                            // opener, which is the way back to the button,
+                            // writes over it.
+                            lock(&state).lifecycle_fingerprint = None;
                             ui.set_lifecycle_open(false);
                             reload_after(
                                 &ui,
@@ -1874,6 +2066,7 @@ fn wire_lifecycle(ui: &AppWindow, state: &Shared) {
 /// the ones its mode needs.
 struct LifecycleInput {
     mode: i32,
+    /// The certificate the dialog was opened for.
     fingerprint: String,
     /// The user ID or subkey fingerprint a revoke mode is about.
     target: String,
@@ -1956,6 +2149,7 @@ fn run_lifecycle(state: &Shared, input: &LifecycleInput) -> Result<(String, Stri
         // which meant any mode this function did not recognise performed an
         // irreversible upload to a public keyserver.
         3 => {
+            own_key_or_refuse(&store, fingerprint)?;
             // Only ever the public half — `keyserver::publish` strips
             // secret key material before it serialises anything.
             let cert = store
@@ -1999,6 +2193,30 @@ fn run_lifecycle(state: &Shared, input: &LifecycleInput) -> Result<(String, Stri
         // the only safe response: every arm above either writes to the store
         // or uploads to the network.
         other => Err(format!("Unknown lifecycle action {other}")),
+    }
+}
+
+/// Refuse to publish a certificate that is not one of the user's own keys.
+///
+/// The details pane offers Publish only when the store holds the secret half.
+/// The rule is kept here too, where the upload happens, because an upload
+/// cannot be taken back: it makes the certificate public for good and asks the
+/// keyserver to mail every address on it, which for someone else's key is a
+/// publication its holder may have chosen not to make. A rule that lives only
+/// on a button holds only for as long as nothing reaches the dialog another
+/// way.
+///
+/// Its own function, not a line in [`run_lifecycle`], so that a test can hold
+/// it to the rule without a failing run reaching a real keyserver.
+fn own_key_or_refuse(store: &Store, fingerprint: &str) -> Result<(), String> {
+    if store.has_secret(fingerprint) {
+        Ok(())
+    } else {
+        Err(
+            "Nothing was uploaded: this is not one of your keys, and only your own \
+             are published from here."
+                .to_string(),
+        )
     }
 }
 
@@ -2405,19 +2623,30 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
             }
 
             let (has_secret, has_revocation) = {
-                let guard = lock(&state);
-                (
-                    guard.store.has_secret(&fingerprint),
-                    guard.store.has_revocation(&fingerprint),
-                )
+                let mut guard = lock(&state);
+                let has_secret = guard.store.has_secret(&fingerprint);
+                // The record the delete is performed against: the certificate
+                // this dialog names, and whether it warned that a secret key
+                // goes with it and asked for the key ID to be typed. It comes
+                // from the same read of the pane as everything the dialog
+                // says. The delete used to read the pane again when its button
+                // was pressed, and a reload landing behind the scrim put the
+                // selection back wherever it had been asked to, so the dialog
+                // went on naming one certificate while the delete removed
+                // another. Reloads now defer to a row the user has picked, but
+                // the delete must not depend on nothing else moving the pane:
+                // the scrim stops only the pointer, so an assistive-technology
+                // activation of a list row still reaches row_selected, and a
+                // reload can still be asked to select a row read from a
+                // highlight that has drifted away from the pane. Written afresh
+                // every time the dialog opens, which is the only way to reach
+                // its Delete button, and dropped once a delete goes through, so
+                // it never answers for an earlier one.
+                guard.delete_target = Some((fingerprint.clone(), has_secret));
+                (has_secret, guard.store.has_revocation(&fingerprint))
             };
 
             ui.set_delete_target(detail.primary_user_id.clone());
-            // This write is not only what the dialog says. The delete is
-            // performed against it, so it is the record of what the user was
-            // warned about and agreed to, and it has to be written afresh for
-            // every target the dialog opens on rather than left holding an
-            // answer about a previous one.
             ui.set_delete_has_secret(has_secret);
             ui.set_delete_has_revocation(has_revocation);
             ui.set_delete_confirm_word(detail.key_id.clone());
@@ -2431,15 +2660,17 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            // What the dialog named and what it warned about, as recorded when
+            // it opened, not whatever the pane shows now.
+            let target = lock(&state).delete_target.clone();
+            let Some((fingerprint, confirmed_secret)) = target else {
+                ui.set_status("No certificate selected".into());
+                return;
+            };
             ui.set_busy(true);
             ui.set_status("Deleting…".into());
 
             let (ui_weak, state) = (ui_weak.clone(), state.clone());
-            let fingerprint = ui.get_detail().fingerprint.to_string();
-            // Read here, on the event loop, because this is the value the
-            // dialog was built from: whether it warned about a secret key and
-            // asked for the key ID to be typed. Nothing else writes it.
-            let confirmed_secret = ui.get_delete_has_secret();
             std::thread::spawn(move || {
                 let _busy = BusyGuard(ui_weak.clone());
                 let outcome = run_delete(&state, &fingerprint, confirmed_secret);
@@ -2450,6 +2681,12 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
                     ui.set_busy(false);
                     match outcome {
                         Ok(message) => {
+                            // As for the lifecycle dialog: the record goes when
+                            // a success closes the dialog, so a button reached
+                            // again without a fresh one finds nothing rather
+                            // than this dialog's certificate. A dismissed
+                            // dialog keeps it until the opener writes over it.
+                            lock(&state).delete_target = None;
                             ui.set_delete_open(false);
                             reload_after(
                                 &ui,
@@ -2475,7 +2712,8 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
 /// current view, and it is I/O, so it happens off the lock like every other
 /// worker here.
 ///
-/// `confirmed_secret` is what the dialog warned about when it opened, not what
+/// `fingerprint` is the certificate the dialog named and `confirmed_secret` is
+/// what it warned about, both recorded when it opened; the second is not what
 /// is on disk now. Asking the store again here would hand [`Store::delete`]
 /// the very answer its guard compares against, so the guard could never
 /// refuse — and a secret key that appeared after the dialog opened, which is
@@ -2500,16 +2738,15 @@ fn run_delete(state: &Shared, fingerprint: &str, confirmed_secret: bool) -> Resu
     // The guard refuses because a secret key is there that the dialog did not
     // warn about, and its wording — that deleting it needs to be confirmed —
     // describes a confirmation the user was never offered. So say what is true
-    // of the store, and say it without guessing at how it came to be true:
-    // this fires both for a secret key written since the dialog opened and,
-    // until the delete target is captured with the dialog, for a target that
-    // moved under it. What to do comes first, because the status line elides
-    // and the tail is what goes; it names the buttons that are on screen,
-    // since a failed delete leaves the dialog open and dismissing it is what
-    // makes reopening re-read the store and put the warning back. The state is
-    // read here rather than before the call so that a failure past the guard,
-    // with the certificate already unlinked, is not reported as having deleted
-    // nothing.
+    // of the store. The target is the one the dialog named when it opened, so
+    // this is a secret key written since then by some other writer, and which
+    // one is not something this can know. What to do comes first, because the
+    // status line elides and the tail is what goes; it names the buttons that
+    // are on screen, since a failed delete leaves the dialog open and
+    // dismissing it is what makes reopening re-read the store and put the
+    // warning back. The state is read here rather than before the call so that
+    // a failure past the guard, with the certificate already unlinked, is not
+    // reported as having deleted nothing.
     store.delete(fingerprint, confirmed_secret).map_err(|e| {
         if !confirmed_secret && store.has_secret(fingerprint) {
             "Cancel, then open Delete again: nothing was deleted, because this \
@@ -2765,7 +3002,10 @@ fn run_revoke(
 struct AfterReload {
     /// The row to put the selection back on. `None` keeps whichever row the
     /// user is on, which is not the same as clearing it: a reload no longer
-    /// blocks them, so they are free to move while one is in flight.
+    /// blocks them, so they are free to move while one is in flight. For the
+    /// same reason a row given here is put back only if they have not moved
+    /// since the reload was asked for; once they have picked another, theirs
+    /// wins.
     select: Option<String>,
     /// The confirmation the mutation wants shown — "Imported 3 certificates".
     /// Set by the caller after `apply_filter` has had its say, exactly as it
@@ -2803,12 +3043,13 @@ fn reload(ui: &AppWindow, state: &Shared) {
 
 /// [`reload`], with something to do when it lands.
 fn reload_after(ui: &AppWindow, state: &Shared, after: AfterReload) {
-    let (store, generation, first) = {
+    let (store, generation, selection, first) = {
         let mut guard = lock(state);
         guard.reload_generation += 1;
         (
             guard.store.clone(),
             guard.reload_generation,
+            guard.selection_generation,
             guard.all.is_empty(),
         )
     };
@@ -2847,8 +3088,14 @@ fn reload_after(ui: &AppWindow, state: &Shared, after: AfterReload) {
             };
             lock(&state).all = loaded.all;
 
-            // Read before apply_filter, which clears it.
-            let select = after.select.or_else(|| {
+            // Read before apply_filter, which clears it. The caller's row is
+            // honoured only while the user is where they were when the reload
+            // was asked for. Put back regardless, it took the details pane off
+            // a row the user had moved to in the meantime — and off the
+            // certificate a dialog they had opened since then was naming,
+            // behind that dialog's back.
+            let moved = lock(&state).selection_generation != selection;
+            let select = after.select.filter(|_| !moved).or_else(|| {
                 ui.get_has_selection()
                     .then(|| ui.get_detail().fingerprint.to_string())
             });
@@ -3612,14 +3859,16 @@ mod tests {
         assert!(!rows[0].authenticated);
     }
 
-    /// A `State` holding nothing but the store, which is all `run_delete`
-    /// touches: it takes the store out and puts the reopened one back.
+    /// A `State` holding nothing but the store, with everything else as `run`
+    /// starts it. A test that needs the list fills `all` itself, or builds a
+    /// window over the state with `window_for`, which reads it in.
     fn state_for(store: Store) -> Shared {
         Arc::new(Mutex::new(State {
             store: Arc::new(store),
             all: Vec::new(),
             shown: Vec::new(),
             reload_generation: 0,
+            selection_generation: 0,
             filter: String::new(),
             scope: Scope::All,
             sort: Sort::MineFirst,
@@ -3630,12 +3879,15 @@ mod tests {
             dv_input: None,
             dv_data: None,
             dv_kind: InputKind::NotOpenPgp,
+            dv_generation: 0,
             certify_target: None,
             certify_user_ids: Vec::new(),
             certify_certifiers: Vec::new(),
             lookup_results: Vec::new(),
             revoke_target: None,
             revoke_certification: false,
+            delete_target: None,
+            lifecycle_fingerprint: None,
         }))
     }
 
@@ -3831,6 +4083,436 @@ mod tests {
         assert!(
             !signs_with(&retired),
             "nor as a signer: signing refuses it too"
+        );
+    }
+
+    fn generated(user_id: &str) -> rpgp_core::keygen::GeneratedKey {
+        rpgp_core::keygen::generate(&rpgp_core::keygen::KeyGenRequest::new(user_id)).unwrap()
+    }
+
+    /// The window `run` builds, over `state`, with the callbacks these tests
+    /// drive wired as `run` wires them, and showing the list a finished
+    /// reload leaves on screen.
+    ///
+    /// The caller sets up the Slint platform first, because which backend a
+    /// test needs depends on whether it runs an event loop.
+    fn window_for(state: &Shared) -> AppWindow {
+        let ui = AppWindow::new().expect("the window builds on the testing backend");
+        let store = lock(state).store.clone();
+        lock(state).all = read_store(&store).expect("a healthy store reads").all;
+        apply_filter(&ui, state);
+        wire_list(&ui, state);
+        wire_decrypt_verify(&ui, state);
+        wire_certify(&ui, state);
+        wire_delete(&ui, state);
+        wire_lifecycle(&ui, state);
+        ui
+    }
+
+    /// Click the list row showing `fingerprint`, as `CertListRow` does.
+    fn click_row(ui: &AppWindow, state: &Shared, fingerprint: &str) {
+        let row = {
+            let guard = lock(state);
+            guard
+                .shown
+                .iter()
+                .position(|&i| guard.all[i].fingerprint == fingerprint)
+                .expect("the certificate is in the list")
+        };
+        ui.set_current_row(row as i32);
+        ui.invoke_row_selected(row as i32);
+    }
+
+    /// The row the details pane would show for `fingerprint`.
+    fn row_for(state: &Shared, fingerprint: &str) -> CertRow {
+        lock(state)
+            .all
+            .iter()
+            .find(|c| c.fingerprint == fingerprint)
+            .map(to_row)
+            .expect("the certificate is in the list")
+    }
+
+    /// Wait for a worker, judged by what it leaves behind.
+    ///
+    /// With no event loop a worker's completion is never delivered, so a test
+    /// that starts one watches for its effect instead.
+    fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The delete dialog names one certificate, so the delete removes that
+    /// one, even when the details pane behind it has moved to another by the
+    /// time the button is pressed.
+    ///
+    /// The pane is moved by hand here, standing in for what used to move it: a
+    /// reload landing behind the scrim with a row of its own to select. The
+    /// delete read the pane afresh when pressed, so the dialog went on saying
+    /// "Remove Bob" while it removed Alice.
+    #[test]
+    fn deleting_removes_the_certificate_the_dialog_named() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let (certs, secrets) = (dir.path().join("certs.d"), dir.path().join("secrets"));
+        let store = Store::open(&certs, &secrets).unwrap();
+        let alice = generated("Alice <alice@example.org>").cert;
+        let bob = generated("Bob <bob@example.org>").cert;
+        store.insert(&alice).unwrap();
+        store.insert(&bob).unwrap();
+        let (alice, bob) = (alice.fingerprint().to_hex(), bob.fingerprint().to_hex());
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        click_row(&ui, &state, &bob);
+        ui.invoke_open_delete();
+        assert!(ui.get_delete_open());
+        assert_eq!(ui.get_delete_target(), "Bob <bob@example.org>");
+
+        ui.set_detail(row_for(&state, &alice));
+        let before = lock(&state).store.clone();
+        ui.invoke_delete_run();
+        // run_delete swaps in a reopened store once the delete has gone through.
+        wait_for("the delete", || !Arc::ptr_eq(&lock(&state).store, &before));
+
+        let after = Store::open(&certs, &secrets).unwrap();
+        assert!(
+            after.lookup(&bob).is_err(),
+            "the certificate the dialog named should be gone"
+        );
+        assert!(
+            after.lookup(&alice).is_ok(),
+            "the one the pane moved to should not have been touched"
+        );
+    }
+
+    /// A lifecycle action changes the key its dialog was opened for, not
+    /// whichever key the details pane has moved to since.
+    ///
+    /// Adding a user ID stands in for every mode, since they all take the key
+    /// from the same place and this is the one whose result is easy to read
+    /// back; Publish would upload. Both keys are the user's own and neither has
+    /// a passphrase, so the wrong one is not saved by failing to unlock — the
+    /// case of an old and a new key kept for the same address.
+    #[test]
+    fn a_lifecycle_action_changes_the_key_its_dialog_opened_for() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let old = generated("Jo Old <jo@example.org>").cert;
+        let new = generated("Jo New <jo@example.org>").cert;
+        store.insert_secret(&old).unwrap();
+        store.insert_secret(&new).unwrap();
+        let (old, new) = (old.fingerprint().to_hex(), new.fingerprint().to_hex());
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        click_row(&ui, &state, &new);
+        ui.invoke_open_add_user_id();
+        assert!(ui.get_lifecycle_open());
+
+        ui.set_detail(row_for(&state, &old));
+        ui.invoke_lifecycle_run(
+            1,
+            "0".into(),
+            "Jo Work <jo@work.example>".into(),
+            SharedString::new(),
+            0,
+        );
+
+        let store = lock(&state).store.clone();
+        let added = |fingerprint: &str| {
+            store.secret_cert(fingerprint).is_ok_and(|cert| {
+                rpgp_core::cert::user_ids(&cert)
+                    .iter()
+                    .any(|uid| uid.text == "Jo Work <jo@work.example>")
+            })
+        };
+        wait_for("the user ID to be added", || added(&old) || added(&new));
+        assert!(
+            added(&new),
+            "the key the dialog opened for should carry the user ID"
+        );
+        assert!(!added(&old), "the key the pane moved to should not");
+    }
+
+    /// The Publish warning is given the key its dialog was opened for, and
+    /// keeps it after the details pane behind the scrim has moved.
+    ///
+    /// Asked of the two properties the opener sets for the warning rather than
+    /// of the warning's text, because the window is compiled without the debug
+    /// information the testing backend needs to read its element tree. What
+    /// the dialog says with them is the accessibility suite's
+    /// `the_publish_warning_names_the_key_it_uploads`; the window's binding
+    /// that hands them from one to the other is covered by neither. Nothing is
+    /// uploaded, since the dialog is only opened, never run.
+    #[test]
+    fn the_publish_warning_is_given_the_key_its_dialog_opened_for() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let old = generated("Jo Old <jo@example.org>").cert;
+        let new = generated("Jo New <jo@example.org>").cert;
+        store.insert_secret(&old).unwrap();
+        store.insert_secret(&new).unwrap();
+        let (old, new) = (old.fingerprint().to_hex(), new.fingerprint().to_hex());
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        click_row(&ui, &state, &new);
+        ui.invoke_open_publish();
+        assert!(ui.get_lifecycle_open());
+        assert_eq!(ui.get_lifecycle_mode(), 3);
+
+        ui.set_detail(row_for(&state, &old));
+        let opened_for = row_for(&state, &new);
+        assert_eq!(
+            ui.get_lifecycle_key_name(),
+            opened_for.primary_user_id,
+            "the warning should name the key the dialog opened for"
+        );
+        assert_eq!(
+            ui.get_lifecycle_key_id(),
+            opened_for.key_id,
+            "and give that key's ID"
+        );
+    }
+
+    /// Publish refuses a certificate that is not one of the user's own keys,
+    /// as the button that opens it does.
+    ///
+    /// Asked of the check itself rather than of a Publish run: a test that
+    /// went through the upload would reach a real keyserver the day the check
+    /// stopped working.
+    #[test]
+    fn only_your_own_keys_are_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let mine = generated("Me <me@example.org>").cert;
+        let theirs = generated("Them <them@example.org>").cert;
+        store.insert_secret(&mine).unwrap();
+        store.insert(&theirs).unwrap();
+
+        assert!(own_key_or_refuse(&store, &mine.fingerprint().to_hex()).is_ok());
+        let refused = own_key_or_refuse(&store, &theirs.fingerprint().to_hex())
+            .expect_err("someone else's certificate must not be uploaded");
+        assert!(refused.contains("not one of your keys"), "{refused}");
+    }
+
+    /// Two clicks on a toggle leave the certificate where it started, however
+    /// soon the second follows the first.
+    ///
+    /// No event loop runs here, so the reload each click starts never lands.
+    /// That is the state a second click meets whenever the store takes longer
+    /// to read than a double-click takes to make: the list still holds the
+    /// value from before the first click.
+    #[test]
+    fn two_clicks_on_a_toggle_before_the_list_catches_up_cancel_out() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let cert = generated("Old <old@example.org>").cert;
+        store.insert(&cert).unwrap();
+        let fingerprint = cert.fingerprint().to_hex();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        click_row(&ui, &state, &fingerprint);
+        let store = lock(&state).store.clone();
+
+        let is_root = || store.trust_roots().unwrap().contains(&fingerprint);
+        ui.invoke_toggle_trust_root();
+        assert!(is_root(), "the first click makes it a trust root");
+        ui.invoke_toggle_trust_root();
+        assert!(
+            !is_root(),
+            "the second, before the list has caught up, should take it back"
+        );
+
+        let accepted = || store.sha1_accepted().unwrap().contains(&fingerprint);
+        ui.invoke_toggle_sha1_accepted();
+        assert!(accepted(), "the first click accepts SHA-1");
+        ui.invoke_toggle_sha1_accepted();
+        assert!(
+            !accepted(),
+            "the second, before the list has caught up, should withdraw it"
+        );
+    }
+
+    /// A Decrypt / Verify result is shown in the dialog only beside the files
+    /// it was about, and otherwise only on the status line, naming them.
+    ///
+    /// Each run here is made first and its result handed back afterwards, with
+    /// the dialog's files changed in between: the order a picker opened before
+    /// Run produces when it comes back while the run is still going. Changing
+    /// the signed file, the signature, and closing and reopening the dialog are
+    /// each tried, since each is its own way for the files to change.
+    #[test]
+    fn a_verdict_is_not_shown_beside_files_chosen_while_it_ran() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let alice = generated("Alice <alice@example.org>").cert;
+        store.insert_secret(&alice).unwrap();
+
+        let (release, other) = (dir.path().join("a.tar"), dir.path().join("b.tar"));
+        std::fs::write(&release, b"the release").unwrap();
+        std::fs::write(&other, b"something else entirely").unwrap();
+        let signature = dir.path().join("a.tar.sig");
+        ops::sign_detached_file(&alice, None, &release, &signature).unwrap();
+        let kind = ops::classify_file(&signature);
+        assert_eq!(kind, InputKind::DetachedSignature);
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let not_shown = |ui: &AppWindow, how: &str| {
+            assert_eq!(
+                ui.get_dv_result(),
+                "",
+                "{how}: the verdict was shown beside files it never read"
+            );
+            assert_eq!(ui.get_dv_tone(), 0, "{how}");
+            assert_eq!(slint::Model::row_count(&ui.get_dv_signatures()), 0, "{how}");
+            // What it is not about first, then what it is about: a verify's
+            // summary names no file, and the old signature can be the one
+            // still chosen.
+            let status = ui.get_status();
+            assert!(
+                status.starts_with("Not for the files now chosen")
+                    && status.contains("a.tar.sig against a.tar"),
+                "{how}: the status line should say whose result it was: {status}"
+            );
+        };
+
+        // The signed file is changed while the signature is being checked.
+        ui.invoke_open_decrypt_verify();
+        choose_dv_input(&ui, &state, signature.clone(), kind);
+        choose_dv_data(&ui, &state, release.clone());
+        let (read, outcome) = run_decrypt_verify(&state, "");
+        assert!(outcome.is_ok(), "the release does verify: {outcome:?}");
+        choose_dv_data(&ui, &state, other.clone());
+        show_decrypt_verify(&ui, &state, read, outcome);
+        not_shown(&ui, "a new signed file");
+
+        // With nothing changed in between, the result is shown — and for the
+        // file now chosen it is the opposite of the one just withheld.
+        let (read, outcome) = run_decrypt_verify(&state, "");
+        show_decrypt_verify(&ui, &state, read, outcome);
+        assert_eq!(ui.get_dv_result(), "Signature is NOT valid");
+        assert_eq!(ui.get_dv_tone(), 3);
+
+        // The signature is changed instead.
+        ui.invoke_open_decrypt_verify();
+        choose_dv_input(&ui, &state, signature.clone(), kind);
+        choose_dv_data(&ui, &state, release.clone());
+        let (read, outcome) = run_decrypt_verify(&state, "");
+        choose_dv_input(&ui, &state, other.clone(), ops::classify_file(&other));
+        show_decrypt_verify(&ui, &state, read, outcome);
+        not_shown(&ui, "a new signature");
+
+        // The dialog is closed and opened again.
+        choose_dv_input(&ui, &state, signature.clone(), kind);
+        choose_dv_data(&ui, &state, release.clone());
+        let (read, outcome) = run_decrypt_verify(&state, "");
+        ui.invoke_open_decrypt_verify();
+        show_decrypt_verify(&ui, &state, read, outcome);
+        not_shown(&ui, "a reopened dialog");
+    }
+
+    /// Run the event loop until `done`, or give up after a minute.
+    fn run_until(done: impl Fn() -> bool + 'static) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(5),
+            move || {
+                if done() || std::time::Instant::now() > deadline {
+                    let _ = slint::quit_event_loop();
+                }
+            },
+        );
+        slint::run_event_loop().expect("the testing backend runs an event loop");
+    }
+
+    /// A reload that lands after the user has moved leaves them where they
+    /// moved to, even when it was asked for with a row of its own to select,
+    /// and the confirmation it brings names the certificate it was about.
+    ///
+    /// Accepting SHA-1 asks for a reload that puts the selection back on that
+    /// certificate, and nothing stops the user clicking another row before it
+    /// lands. Put back regardless, it took the details pane off the row they
+    /// had moved to, and off whatever a dialog opened since then was naming.
+    /// Left where they are, they read the confirmation beside another
+    /// certificate, which is why it has to name the one it was about.
+    ///
+    /// The one test here that runs an event loop, because a reload's result
+    /// only lands through one. The testing backend gives an event loop to a
+    /// single thread per process, and a second test setting one up would
+    /// panic, so the others drive the two halves of an operation directly.
+    ///
+    /// It is also the one GUI test that can talk to gpg-agent. A reload that
+    /// lands starts the agent survey on a thread of its own, which asks
+    /// whichever agent `GNUPGHOME` names for the keys it holds and may start
+    /// one if none is running; whether it gets that far before the test
+    /// process exits varies from run to run. That is the same `KEYINFO
+    /// --list` rpgp-core's `lists_whatever_the_local_agent_holds` sends, and
+    /// as with that test, GnuPG 2.4.9's agent starts scdaemon to answer it.
+    /// Run with `GNUPGHOME` unset, it is the developer's own agent that
+    /// answers.
+    #[test]
+    fn a_reload_leaves_the_selection_where_the_user_moved_it() {
+        i_slint_backend_testing::init_integration_test_with_system_time();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let alice = generated("Alice <alice@example.org>").cert;
+        let bob = generated("Bob <bob@example.org>").cert;
+        store.insert(&alice).unwrap();
+        store.insert(&bob).unwrap();
+        let (alice, bob) = (alice.fingerprint().to_hex(), bob.fingerprint().to_hex());
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        click_row(&ui, &state, &alice);
+        ui.invoke_toggle_sha1_accepted();
+        // The event loop has not run, so the reload cannot have landed yet.
+        click_row(&ui, &state, &bob);
+
+        // Its list is the first to show SHA-1 accepted for Alice.
+        let landed = {
+            let (state, alice) = (state.clone(), alice.clone());
+            move || {
+                lock(&state)
+                    .all
+                    .iter()
+                    .any(|c| c.fingerprint == alice && c.sha1_accepted)
+            }
+        };
+        run_until(landed.clone());
+        assert!(landed(), "the reload never landed");
+
+        assert!(ui.get_has_selection());
+        assert_eq!(
+            ui.get_detail().fingerprint,
+            bob,
+            "the reload took the selection back from the row the user moved to"
+        );
+        let row = usize::try_from(ui.get_current_row()).expect("a row is highlighted");
+        assert_eq!(
+            lock(&state).shown_at(row).map(|c| c.fingerprint.clone()),
+            Some(bob),
+            "the highlighted row should be the one the pane shows"
+        );
+        let status = ui.get_status();
+        assert!(
+            status.starts_with("SHA-1 accepted for Alice <alice@example.org>."),
+            "the confirmation, shown beside Bob, should say it was about Alice: {status}"
         );
     }
 }

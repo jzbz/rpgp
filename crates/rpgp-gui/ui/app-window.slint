@@ -341,6 +341,10 @@ export component AppWindow inherits Window {
     in-out property <bool> lifecycle-open: false;
     in property <int> lifecycle-mode: 0;
     in property <string> lifecycle-target: "";
+    // The key the dialog was opened for, set when it opens rather than bound to
+    // `detail`, which can move while the dialog is up.
+    in property <string> lifecycle-key-name: "";
+    in property <string> lifecycle-key-id: "";
     // --- Network lookup ---------------------------------------------------
     in-out property <bool> lookup-open: false;
     in property <[LookupRow]> lookup-results;
@@ -1147,6 +1151,8 @@ export component AppWindow inherits Window {
         busy: root.busy;
         mode: root.lifecycle-mode;
         target: root.lifecycle-target;
+        key-name: root.lifecycle-key-name;
+        key-id: root.lifecycle-key-id;
         dismissed => { root.lifecycle-open = false; }
         run(mode, expiry, value, password, reason) => {
             root.lifecycle-run(mode, expiry, value, password, reason);

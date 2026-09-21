@@ -398,12 +398,13 @@ keyserver's own fetches a redirect to another port on that host is refused in
 the redirect policy, which is the one place the port is visible. Nothing else is
 exempt, including a redirect away from that server.
 
-Publishing cannot be undone — a keyserver has no delete — so the dialog says so
-and uses the same danger styling as revocation. Only the public half is ever
-sent, and no local certification goes with it: `publish` serialises the
-certificate rather than the transferable secret key, and uses `export_to_vec`,
-which omits signatures marked non-exportable. A test asserts on the upload body
-itself, parsing it back to check both properties.
+Publishing cannot be undone — a keyserver has no delete — so the dialog says so,
+names the key it is about to upload, and uses the same danger styling as
+revocation. Only your own keys are offered, and the upload refuses any other.
+Only the public half is ever sent, and no local certification goes with it:
+`publish` serialises the certificate rather than the transferable secret key,
+and uses `export_to_vec`, which omits signatures marked non-exportable. A test
+asserts on the upload body itself, parsing it back to check both properties.
 
 ## Where certificates live
 

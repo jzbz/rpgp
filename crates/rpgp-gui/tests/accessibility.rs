@@ -270,6 +270,36 @@ fn the_notepad_recipient_row_carries_the_same_contract() {
     assert_eq!(probe.get_toggled_recipient(), 0);
 }
 
+/// The Publish warning names the key it is about to upload.
+///
+/// It is the one lifecycle step that cannot be taken back, and the dialog asks
+/// for nothing that ties it to a particular key: no passphrase, no key ID to
+/// type. Before it carried the name, the only thing saying which key was
+/// about to become public was the details pane behind the scrim, which can
+/// move while the dialog is open.
+#[test]
+fn the_publish_warning_names_the_key_it_uploads() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::ElementQuery;
+
+    let probe = PublishProbe::new().unwrap();
+    probe.show().unwrap();
+
+    let warning = ElementQuery::from_root(&probe)
+        .match_predicate(|element| {
+            element
+                .accessible_label()
+                .is_some_and(|label| label.contains("cannot be undone"))
+        })
+        .find_first()
+        .expect("the publish dialog should warn that it cannot be undone");
+    let warning = warning.accessible_label().unwrap_or_default();
+    assert!(
+        warning.contains("Alice <alice@example.org>") && warning.contains("0123456789ABCDEF"),
+        "the warning should say which key is being published: {warning:?}"
+    );
+}
+
 /// The suppression has two halves: the binding inside `Field`, which the two
 /// tests at the top cover, and the `secret: true` at each call site, which they
 /// do not — they exercise the probe's own copy of a passphrase field, so every

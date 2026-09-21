@@ -169,3 +169,17 @@ export component LifecycleProbe inherits Window {
     // Every mode but publish carries the passphrase field.
     LifecycleDialog { width: 100%; height: 100%; mode: 0; target: "Alice"; }
 }
+
+// Publish, the lifecycle mode that cannot be undone, so that a test can ask
+// what its warning says about which key is going.
+export component PublishProbe inherits Window {
+    width: 620px;
+    height: 720px;
+    LifecycleDialog {
+        width: 100%;
+        height: 100%;
+        mode: 3;
+        key-name: "Alice <alice@example.org>";
+        key-id: "0123456789ABCDEF";
+    }
+}
