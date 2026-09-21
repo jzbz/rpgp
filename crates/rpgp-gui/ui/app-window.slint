@@ -283,6 +283,11 @@ export component AppWindow inherits Window {
     callback generate-key(string, string, string, int, int, int);
 
     // --- Sign / Encrypt ---------------------------------------------------
+    // Whether Sign / Encrypt and Decrypt ask where to save their output, as
+    // they do inside a Flatpak, rather than writing it beside the input. The
+    // output names below are then bare file names, the ones the save dialog
+    // will offer.
+    in property <bool> choose-outputs: false;
     in-out property <bool> signenc-open: false;
     in property <string> se-input: "";
     // Both are supplied so the dialog can preview the right one as the
@@ -1126,6 +1131,7 @@ export component AppWindow inherits Window {
     if root.signenc-open: SignEncryptDialog {
         busy: root.busy;
         input-path: root.se-input;
+        choose-output: root.choose-outputs;
         output-encrypt: root.se-output-encrypt;
         output-sign: root.se-output-sign;
         recipients: root.se-recipients;
@@ -1236,6 +1242,7 @@ export component AppWindow inherits Window {
         input-path: root.dv-input;
         data-path: root.dv-data;
         needs-data: root.dv-needs-data;
+        choose-output: root.choose-outputs;
         output-path: root.dv-output;
         signatures: root.dv-signatures;
         result: root.dv-result;

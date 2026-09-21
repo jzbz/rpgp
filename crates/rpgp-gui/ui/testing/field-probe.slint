@@ -107,10 +107,13 @@ export component EnabledProbe inherits Window {
 
 // The two selection lists, driven through the real dialogs rather than through
 // a copy of their markup here: a probe that reproduced the rows would go on
-// passing after the shipped rows lost their accessibility again.
+// passing after the shipped rows lost their accessibility again. `busy` is
+// the window's, so a test can check that a recipient row takes no toggle
+// while a run is in flight.
 export component SelectionProbe inherits Window {
     in-out property <[RecipientRow]> recipients;
     in-out property <int> toggled-recipient: -1;
+    in-out property <bool> busy: false;
 
     width: 620px;
     height: 720px;
@@ -120,6 +123,7 @@ export component SelectionProbe inherits Window {
         height: 100%;
         input-path: "/tmp/message.txt";
         recipients: root.recipients;
+        busy: root.busy;
         toggle-recipient(index) => { root.toggled-recipient = index; }
     }
 }
@@ -144,6 +148,7 @@ export component CertifyProbe inherits Window {
 export component NotepadProbe inherits Window {
     in-out property <[RecipientRow]> recipients;
     in-out property <int> toggled-recipient: -1;
+    in-out property <bool> busy: false;
     // Empty unless a test sets it. The output area exists only while there is
     // output, and it refuses typing, so it would fail the passphrase test,
     // which types into every field it finds, if it were there by default.
@@ -157,6 +162,7 @@ export component NotepadProbe inherits Window {
         height: 100%;
         recipients: root.recipients;
         output: root.output;
+        busy: root.busy;
         toggle-recipient(index) => { root.toggled-recipient = index; }
     }
 }
@@ -222,6 +228,34 @@ export component PublishProbe inherits Window {
         mode: 3;
         key-name: "Alice <alice@example.org>";
         key-id: "0123456789ABCDEF";
+    }
+}
+
+// The line under Sign / Encrypt and under Decrypt that says where the output
+// goes, which inside a Flatpak says instead that Run will ask. Both dialogs
+// take the flag and the names from Rust, so a test sets them here the way
+// Rust does.
+export component OutputProbe inherits Window {
+    in-out property <bool> choose-output: false;
+    in-out property <string> encrypted;
+    in-out property <string> decrypted;
+
+    width: 620px;
+    height: 720px;
+
+    SignEncryptDialog {
+        width: 100%;
+        height: 100%;
+        input-path: "/tmp/message.txt";
+        choose-output: root.choose-output;
+        output-encrypt: root.encrypted;
+    }
+    DecryptVerifyDialog {
+        width: 100%;
+        height: 100%;
+        input-path: "/tmp/message.txt.asc";
+        choose-output: root.choose-output;
+        output-path: root.decrypted;
     }
 }
 

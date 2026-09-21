@@ -162,6 +162,9 @@ export component KeygenDialog inherits DialogShell {
 
 export component SignEncryptDialog inherits DialogShell {
     in property <string> input-path;
+    // Whether Run asks where to save the output, which it does inside a
+    // Flatpak. The outputs are then the names the save dialog will offer.
+    in property <bool> choose-output;
     in property <string> output-encrypt;
     in property <string> output-sign;
     in property <[RecipientRow]> recipients;
@@ -301,7 +304,15 @@ export component SignEncryptDialog inherits DialogShell {
                             accessible-label: entry.label + ", " + entry.sublabel;
                             accessible-checkable: true;
                             accessible-checked: entry.selected;
-                            accessible-action-default => { root.toggle-recipient(index); }
+                            // Inert while a run is in flight, as Check is when disabled. Inside
+                            // a Flatpak the run reads its recipients only once the save dialog
+                            // has answered, and that dialog leaves this list live behind it.
+                            accessible-enabled: !root.busy;
+                            accessible-action-default => {
+                                if (!root.busy) {
+                                    root.toggle-recipient(index);
+                                }
+                            }
 
                             HorizontalLayout {
                                 padding-left: Theme.s3;
@@ -350,6 +361,7 @@ export component SignEncryptDialog inherits DialogShell {
                             }
 
                             pick := TouchArea {
+                                enabled: !root.busy;
                                 mouse-cursor: MouseCursor.pointer;
                                 clicked => { root.toggle-recipient(index); }
                             }
@@ -389,7 +401,8 @@ export component SignEncryptDialog inherits DialogShell {
             }
 
             if root.input-path != "": Text {
-                text: "Writes " + (root.want-encrypt ? root.output-encrypt : root.output-sign);
+                text: (root.choose-output ? "Asks where to save " : "Writes ")
+                    + (root.want-encrypt ? root.output-encrypt : root.output-sign);
                 color: Theme.text-faint;
                 font-size: Theme.t-sm;
                 overflow: elide;
@@ -430,6 +443,9 @@ export component DecryptVerifyDialog inherits DialogShell {
     in property <string> input-path;
     in property <string> data-path;
     in property <bool> needs-data;
+    // As in Sign / Encrypt: whether Decrypt asks where to save the plaintext,
+    // in which case the output is the name the save dialog will offer.
+    in property <bool> choose-output;
     in property <string> output-path;
     in property <[SignatureRow]> signatures;
     in property <string> result;
@@ -478,7 +494,7 @@ export component DecryptVerifyDialog inherits DialogShell {
         }
 
         if root.output-path != "" && !root.needs-data: Text {
-            text: "Writes " + root.output-path;
+            text: (root.choose-output ? "Asks where to save " : "Writes ") + root.output-path;
             color: Theme.text-faint;
             font-size: Theme.t-sm;
             overflow: elide;
@@ -1104,7 +1120,14 @@ export component NotepadDialog inherits DialogShell {
                             accessible-label: entry.label + ", " + entry.sublabel;
                             accessible-checkable: true;
                             accessible-checked: entry.selected;
-                            accessible-action-default => { root.toggle-recipient(index); }
+                            // Inert while a run is in flight, as in Sign / Encrypt, whose
+                            // recipients these are too.
+                            accessible-enabled: !root.busy;
+                            accessible-action-default => {
+                                if (!root.busy) {
+                                    root.toggle-recipient(index);
+                                }
+                            }
                             HorizontalLayout {
                                 padding-left: Theme.s2;
                                 padding-right: Theme.s2;
@@ -1145,6 +1168,7 @@ export component NotepadDialog inherits DialogShell {
                                 }
                             }
                             pick := TouchArea {
+                                enabled: !root.busy;
                                 mouse-cursor: MouseCursor.pointer;
                                 clicked => { root.toggle-recipient(index); }
                             }

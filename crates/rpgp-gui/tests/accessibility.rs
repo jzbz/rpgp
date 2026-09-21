@@ -501,6 +501,106 @@ fn the_notepad_recipient_row_carries_the_same_contract() {
     assert_eq!(probe.get_toggled_recipient(), 0);
 }
 
+/// A recipient row takes no toggle while a run is in flight, whether it is
+/// clicked or activated by assistive technology, in Sign / Encrypt and in the
+/// notepad alike.
+///
+/// The rows draw their own tick box rather than using `Check`, so nothing
+/// made them honour `busy`, and inside a Flatpak Sign / Encrypt reads its
+/// recipients only once the save dialog has answered. That dialog has no
+/// parent window and leaves this one live behind it, so a row that still
+/// answered then changed who the file was encrypted to after Run had been
+/// pressed. The handler in Rust refuses too; this is the half that the
+/// pointer and a screen reader meet.
+#[test]
+fn a_recipient_row_takes_no_toggle_while_a_run_is_in_flight() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let alice = || {
+        slint::ModelRc::new(slint::VecModel::from(vec![RecipientRow {
+            fingerprint: "AAAA".into(),
+            label: "Alice".into(),
+            sublabel: "alice@example.org".into(),
+            initials: "A".into(),
+            tint_index: 0,
+            selected: true,
+        }]))
+    };
+
+    let probe = SelectionProbe::new().unwrap();
+    probe.set_recipients(alice());
+    probe.show().unwrap();
+    row_is_inert_while_busy(
+        "Sign / Encrypt",
+        &probe,
+        |busy| probe.set_busy(busy),
+        || probe.get_toggled_recipient(),
+        || probe.set_toggled_recipient(-1),
+    );
+    probe.hide().unwrap();
+
+    let probe = NotepadProbe::new().unwrap();
+    probe.set_recipients(alice());
+    probe.show().unwrap();
+    row_is_inert_while_busy(
+        "the notepad",
+        &probe,
+        |busy| probe.set_busy(busy),
+        || probe.get_toggled_recipient(),
+        || probe.set_toggled_recipient(-1),
+    );
+}
+
+/// Click Alice's recipient row and activate it as assistive technology does,
+/// once with `busy` set and once without, and check that only the second
+/// pair reached the dialog's toggle. `toggled` reads which row was toggled,
+/// and `reset` forgets it.
+fn row_is_inert_while_busy(
+    dialog: &str,
+    root: &impl i_slint_backend_testing::ElementRoot,
+    set_busy: impl Fn(bool),
+    toggled: impl Fn() -> i32,
+    reset: impl Fn(),
+) {
+    use i_slint_backend_testing::AccessibleRole;
+    use slint::platform::PointerEventButton;
+
+    let row = || control(root, "Alice, alice@example.org", AccessibleRole::Checkbox);
+
+    set_busy(true);
+    assert_eq!(
+        row().accessible_enabled(),
+        Some(false),
+        "{dialog}: a recipient row said it could be changed during a run"
+    );
+    row().mock_single_click(PointerEventButton::Left);
+    assert_eq!(
+        toggled(),
+        -1,
+        "{dialog}: a click changed a recipient during a run"
+    );
+    row().invoke_accessible_default_action();
+    assert_eq!(
+        toggled(),
+        -1,
+        "{dialog}: assistive technology changed a recipient during a run"
+    );
+
+    // The same click and the same action with nothing in flight, so that the
+    // nothing above is the row refusing and not the click missing it.
+    set_busy(false);
+    assert_eq!(row().accessible_enabled(), Some(true));
+    row().mock_single_click(PointerEventButton::Left);
+    assert_eq!(toggled(), 0, "{dialog}: a click should toggle a recipient");
+    reset();
+    row().invoke_accessible_default_action();
+    assert_eq!(
+        toggled(),
+        0,
+        "{dialog}: assistive technology should toggle a recipient"
+    );
+}
+
 /// The Publish warning names the key it is about to upload.
 ///
 /// It is the one lifecycle step that cannot be taken back, and the dialog asks
@@ -529,6 +629,40 @@ fn the_publish_warning_names_the_key_it_uploads() {
         warning.contains("Alice <alice@example.org>") && warning.contains("0123456789ABCDEF"),
         "the warning should say which key is being published: {warning:?}"
     );
+}
+
+/// Inside a Flatpak the Sign / Encrypt and Decrypt dialogs say that Run will
+/// ask where to save, where outside they say which path they write.
+///
+/// Inside the sandbox the path beside the input is a document-portal path, and
+/// an output written there never reached the host under its own name:
+/// "Writes" it was a promise the sandbox did not keep, read out by a screen
+/// reader like any other line.
+#[test]
+fn the_file_dialogs_say_when_run_will_ask_where_to_save() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::ElementHandle;
+
+    let probe = OutputProbe::new().unwrap();
+    probe.show().unwrap();
+    let says = |line: &str| {
+        ElementHandle::find_by_accessible_label(&probe, line)
+            .next()
+            .is_some()
+    };
+
+    probe.set_encrypted("/tmp/message.txt.asc".into());
+    probe.set_decrypted("/tmp/message.txt".into());
+    assert!(says("Writes /tmp/message.txt.asc"));
+    assert!(says("Writes /tmp/message.txt"));
+
+    // As Rust sets them inside the sandbox: the flag, and bare file names.
+    probe.set_choose_output(true);
+    probe.set_encrypted("message.txt.asc".into());
+    probe.set_decrypted("message.txt".into());
+    assert!(says("Asks where to save message.txt.asc"));
+    assert!(says("Asks where to save message.txt"));
+    assert!(!says("Writes message.txt.asc") && !says("Writes message.txt"));
 }
 
 /// Delete key does nothing, however it is activated, until the key ID has

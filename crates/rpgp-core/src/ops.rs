@@ -1088,11 +1088,12 @@ pub fn encrypted_name(input: &Path) -> PathBuf {
 /// The first name in the `name`, `name (1)`, `name (2)` … series that is not
 /// already taken.
 ///
-/// Every output path here is derived from the input rather than chosen by the
-/// user, so without this an operation silently destroys an unrelated file that
-/// happens to sit at the derived name: decrypting `notes.txt.asc` next to a
-/// `notes.txt` you wrote yourself overwrites your notes. Deriving a free name
-/// is quieter than a prompt and loses nothing, since the result is reported.
+/// Outside a Flatpak the GUI derives every output path from the input rather
+/// than asking the user for one, so without this an operation silently
+/// destroys an unrelated file that happens to sit at the derived name:
+/// decrypting `notes.txt.asc` next to a `notes.txt` you wrote yourself
+/// overwrites your notes. Deriving a free name is quieter than a prompt and
+/// loses nothing, since the result is reported.
 ///
 /// Best-effort, and deliberately so: it picks a pleasant name, it does not
 /// enforce the rule. The name can be taken between the check and the write,
@@ -1101,6 +1102,12 @@ pub fn encrypted_name(input: &Path) -> PathBuf {
 /// (`File::create_new` for the staging file, and the `output.exists()` guards
 /// before the renames and the detached-signature write) refuse rather than
 /// trust the name they were handed.
+///
+/// Only a derived name comes through here. Inside a Flatpak the user chooses
+/// each output in a save dialog instead, and that path is written as chosen,
+/// with [`Existing::Replace`]: the dialog has already asked about a file at
+/// that name, and stepping around it would write somewhere the user did not
+/// choose. The staging name beside either kind still comes through here.
 fn free_name(path: PathBuf) -> PathBuf {
     if !path.exists() {
         return path;
@@ -1151,12 +1158,30 @@ fn append_extension(path: &Path, extension: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// What a file operation does about a file already at its output path.
+///
+/// Either way, an operation that fails leaves that file as it was. A refused
+/// file is never written to, and a replaced one is replaced only by renaming
+/// a finished output onto it, never by writing into it, so nothing reaches it
+/// until the operation has succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Existing {
+    /// Refuse, for an output name derived from the input by
+    /// [`encrypted_name`], [`signature_name`] or [`decrypted_name`]. Nobody
+    /// was asked about whatever is there; see `free_name`.
+    Refuse,
+    /// Replace it, for a path the user chose in a save dialog. The dialog has
+    /// already asked whether to, and refusing would overrule the answer.
+    Replace,
+}
+
 pub fn encrypt_file(
     recipients: &[Cert],
     passwords: &[Zeroizing<String>],
     signer: Option<(&Cert, Option<&str>)>,
     input: &Path,
     output: &Path,
+    existing: Existing,
 ) -> Result<()> {
     // Streamed in both directions rather than buffered. The property being
     // preserved is the one the buffering used to provide: nothing is left at
@@ -1189,7 +1214,7 @@ pub fn encrypt_file(
             }
         }
     }
-    if output.exists() {
+    if existing == Existing::Refuse && output.exists() {
         let _ = fs::remove_file(&staging);
         return Err(Error::invalid(format!(
             "{} already exists",
@@ -1206,6 +1231,7 @@ pub fn sign_detached_file(
     password: Option<&str>,
     input: &Path,
     output: &Path,
+    existing: Existing,
 ) -> Result<()> {
     // Only the signature is held — a few hundred bytes — so peak memory does
     // not follow the size of the file being signed.
@@ -1213,13 +1239,35 @@ pub fn sign_detached_file(
         fs::File::open(input).map_err(|e| Error::io(format!("reading {}", input.display()), e))?;
     let mut signature = Vec::new();
     sign_detached_stream(signer, password, &mut source, &mut signature)?;
-    if output.exists() {
-        return Err(Error::invalid(format!(
-            "{} already exists",
-            output.display()
-        )));
+    match existing {
+        Existing::Refuse => {
+            if output.exists() {
+                return Err(Error::invalid(format!(
+                    "{} already exists",
+                    output.display()
+                )));
+            }
+            write(output, &signature)
+        }
+        // Staged and renamed onto the chosen file, as encrypt_file and
+        // decrypt_file stage, rather than written straight into it. A write
+        // truncates its file first, so one that failed part-way, on a full
+        // disk or over quota, would leave the file the user agreed to replace
+        // neither what it was nor a signature.
+        Existing::Replace => {
+            let staging = free_name(append_extension(output, "part"));
+            let mut file = fs::File::create_new(&staging)
+                .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
+            if let Err(e) = file.write_all(&signature) {
+                drop(file);
+                let _ = fs::remove_file(&staging);
+                return Err(Error::io(format!("writing {}", staging.display()), e));
+            }
+            drop(file);
+            fs::rename(&staging, output)
+                .map_err(|e| Error::io(format!("writing {}", output.display()), e))
+        }
     }
-    write(output, &signature)
 }
 
 pub fn decrypt_file(
@@ -1227,6 +1275,7 @@ pub fn decrypt_file(
     input: &Path,
     passwords: &[&str],
     output: &Path,
+    existing: Existing,
 ) -> Result<VerifyResult> {
     // The ciphertext is streamed too, not read whole. The output half of this
     // function has always been streamed; the input half was still a read() of
@@ -1268,7 +1317,7 @@ pub fn decrypt_file(
             }
         }
     };
-    if output.exists() {
+    if existing == Existing::Refuse && output.exists() {
         let _ = fs::remove_file(&staging);
         return Err(Error::invalid(format!(
             "{} already exists",
@@ -2182,14 +2231,14 @@ mod tests {
         let input = dir.path().join("bomb.pgp");
         std::fs::write(&input, &ciphertext).unwrap();
         let output = dir.path().join("bomb.out");
-        decrypt_file(&store, &input, &[], &output).unwrap();
+        decrypt_file(&store, &input, &[], &output, Existing::Refuse).unwrap();
         assert_eq!(std::fs::metadata(&output).unwrap().len(), bulk.len() as u64);
 
         // A failure leaves neither the output nor the staging file.
         let bad = dir.path().join("bad.pgp");
         std::fs::write(&bad, b"-----BEGIN PGP MESSAGE-----\nnonsense\n").unwrap();
         let out = dir.path().join("bad.out");
-        assert!(decrypt_file(&store, &bad, &[], &out).is_err());
+        assert!(decrypt_file(&store, &bad, &[], &out, Existing::Refuse).is_err());
         assert!(!out.exists(), "no output on failure");
         assert!(
             !append_extension(&out, "part").exists(),
@@ -2217,7 +2266,15 @@ mod tests {
         let bystander = dir.path().join("notes.part");
         std::fs::write(&bystander, b"someone else's file").unwrap();
 
-        encrypt_file(std::slice::from_ref(&alice), &[], None, &input, &output).unwrap();
+        encrypt_file(
+            std::slice::from_ref(&alice),
+            &[],
+            None,
+            &input,
+            &output,
+            Existing::Refuse,
+        )
+        .unwrap();
 
         assert!(output.exists(), "the encrypted output should exist");
         assert_eq!(
@@ -2238,7 +2295,8 @@ mod tests {
                 &[],
                 Some((&alice, Some("wrong"))),
                 &input,
-                &output
+                &output,
+                Existing::Refuse,
             )
             .is_err()
         );
@@ -2280,7 +2338,7 @@ mod tests {
         std::fs::write(&bystander, b"someone else's file").unwrap();
 
         let output = decrypted_name(&input);
-        decrypt_file(&store, &input, &[], &output).unwrap();
+        decrypt_file(&store, &input, &[], &output, Existing::Refuse).unwrap();
 
         assert_eq!(std::fs::read(&output).unwrap(), b"hello");
         assert_eq!(
@@ -2407,11 +2465,12 @@ mod tests {
             Some((&alice, None)),
             &input,
             &encrypted,
+            Existing::Refuse,
         )
         .unwrap();
 
         let decrypted = dir.path().join("out.txt");
-        let result = decrypt_file(&store, &encrypted, &[], &decrypted).unwrap();
+        let result = decrypt_file(&store, &encrypted, &[], &decrypted, Existing::Refuse).unwrap();
 
         assert!(result.all_good(), "signatures: {:?}", result.signatures);
         assert_eq!(
@@ -2420,7 +2479,7 @@ mod tests {
         );
 
         let signature = signature_name(&input);
-        sign_detached_file(&alice, None, &input, &signature).unwrap();
+        sign_detached_file(&alice, None, &input, &signature, Existing::Refuse).unwrap();
         assert!(
             verify_detached_files(&store, &signature, &input)
                 .unwrap()
@@ -2445,7 +2504,9 @@ mod tests {
 
         // Signing with the wrong passphrase must fail — and fail *before*
         // touching the file.
-        assert!(sign_detached_file(&alice, Some("wrong"), &input, &output).is_err());
+        assert!(
+            sign_detached_file(&alice, Some("wrong"), &input, &output, Existing::Refuse).is_err()
+        );
         assert_eq!(std::fs::read(&output).unwrap(), b"PRECIOUS EARLIER OUTPUT");
 
         // Likewise sign-and-encrypt with a wrong signing passphrase.
@@ -2455,15 +2516,132 @@ mod tests {
                 &[],
                 Some((&alice, Some("wrong"))),
                 &input,
-                &output
+                &output,
+                Existing::Refuse,
             )
             .is_err()
         );
         assert_eq!(std::fs::read(&output).unwrap(), b"PRECIOUS EARLIER OUTPUT");
 
         // And a nonexistent input, the other easy way to fail.
-        assert!(encrypt_file(&[alice], &[], None, &dir.path().join("nope"), &output).is_err());
+        assert!(
+            encrypt_file(
+                &[alice],
+                &[],
+                None,
+                &dir.path().join("nope"),
+                &output,
+                Existing::Refuse
+            )
+            .is_err()
+        );
         assert_eq!(std::fs::read(&output).unwrap(), b"PRECIOUS EARLIER OUTPUT");
+    }
+
+    /// A path chosen in a save dialog is written over the file already there,
+    /// and a derived one is not.
+    ///
+    /// Inside the Flatpak each output is chosen in a save dialog, which asks
+    /// before it hands back the name of a file that exists. Refusing that name
+    /// again here would turn the user's "Replace" into "already exists", and
+    /// stepping around it would write somewhere they did not choose. A derived
+    /// name was never asked about, so it keeps its refusal. Either way a
+    /// failed operation leaves the file as it was: a chosen file is replaced
+    /// by renaming a finished output onto its name, never by writing into it.
+    #[test]
+    fn a_chosen_output_replaces_the_file_there_and_a_derived_one_does_not() {
+        let (dir, store) = scratch_store();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+        let input = dir.path().join("notes.txt");
+        std::fs::write(&input, b"the plaintext").unwrap();
+        let earlier: &[u8] = b"AN EARLIER FILE";
+        let refused = |result: Result<()>, output: &Path| {
+            let error = result.expect_err("a derived name must not replace a file");
+            assert!(
+                error.to_string().contains("already exists"),
+                "the refusal should say why: {error}"
+            );
+            assert_eq!(std::fs::read(output).unwrap(), earlier);
+        };
+        // A second name for a file about to be replaced. It still reads the
+        // earlier contents afterwards only if the output was renamed onto the
+        // chosen name. Written into the file instead, the output would show
+        // through it, and a write that failed part-way, which nothing here can
+        // provoke, would have been cut short inside the file the user agreed
+        // to replace.
+        let links = dir.path().join("links");
+        std::fs::create_dir(&links).unwrap();
+        let second_name = |path: &Path| {
+            let link = links.join(path.file_name().unwrap());
+            std::fs::hard_link(path, &link).unwrap();
+            link
+        };
+        let untouched = |link: &Path| {
+            assert_eq!(
+                std::fs::read(link).unwrap(),
+                earlier,
+                "the chosen file was written into rather than replaced"
+            );
+        };
+
+        let encrypted = dir.path().join("chosen.asc");
+        std::fs::write(&encrypted, earlier).unwrap();
+        let encrypt = |existing| {
+            let recipients = std::slice::from_ref(&alice);
+            encrypt_file(recipients, &[], None, &input, &encrypted, existing)
+        };
+        refused(encrypt(Existing::Refuse), &encrypted);
+        let kept = second_name(&encrypted);
+        encrypt(Existing::Replace).expect("a chosen name is replaced");
+        assert_eq!(classify_file(&encrypted), InputKind::Message);
+        untouched(&kept);
+
+        let signature = dir.path().join("chosen.sig");
+        std::fs::write(&signature, earlier).unwrap();
+        let sign = |existing| sign_detached_file(&alice, None, &input, &signature, existing);
+        refused(sign(Existing::Refuse), &signature);
+        let kept = second_name(&signature);
+        sign(Existing::Replace).expect("a chosen name is replaced");
+        assert!(
+            verify_detached_files(&store, &signature, &input)
+                .unwrap()
+                .all_good()
+        );
+        untouched(&kept);
+
+        let decrypted = dir.path().join("chosen.txt");
+        std::fs::write(&decrypted, earlier).unwrap();
+        let decrypt =
+            |existing| decrypt_file(&store, &encrypted, &[], &decrypted, existing).map(|_| ());
+        refused(decrypt(Existing::Refuse), &decrypted);
+
+        // The user agreed to replace the file, not to lose it to a message
+        // that does not decrypt.
+        let bad = dir.path().join("bad.asc");
+        std::fs::write(&bad, b"-----BEGIN PGP MESSAGE-----\nnonsense\n").unwrap();
+        assert!(decrypt_file(&store, &bad, &[], &decrypted, Existing::Replace).is_err());
+        assert_eq!(std::fs::read(&decrypted).unwrap(), earlier);
+
+        let kept = second_name(&decrypted);
+        decrypt(Existing::Replace).expect("a chosen name is replaced");
+        assert_eq!(std::fs::read(&decrypted).unwrap(), b"the plaintext");
+        untouched(&kept);
+
+        // Every output went exactly where it was sent, and no staging file
+        // outlived its operation.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .all(|name| !name.contains(" (1)") && !name.ends_with(".part")),
+            "{names:?}"
+        );
     }
 
     #[test]
@@ -2486,11 +2664,12 @@ mod tests {
                 p
             },
             &encrypted,
+            Existing::Refuse,
         )
         .unwrap();
 
         let output = dir.path().join("out.txt");
-        assert!(decrypt_file(&store, &encrypted, &[], &output).is_err());
+        assert!(decrypt_file(&store, &encrypted, &[], &output, Existing::Refuse).is_err());
         assert!(
             !output.exists(),
             "a failed decryption must not create the output file"

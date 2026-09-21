@@ -406,6 +406,21 @@ Only the public half is ever sent, and no local certification goes with it:
 and uses `export_to_vec`, which omits signatures marked non-exportable. A test
 asserts on the upload body itself, parsing it back to check both properties.
 
+## Where outputs go
+
+Sign / Encrypt and Decrypt put their output beside the input: `notes.txt` is
+encrypted to `notes.txt.asc` or signed as `notes.txt.sig`, and `notes.txt.asc`
+decrypts to `notes.txt`. A file already at that name is never overwritten: the
+output steps aside to the next free name, `notes (1).txt` for a decrypted
+`notes.txt`.
+
+The Flatpak asks instead. Run opens a save dialog with that name filled in, and
+the output goes wherever you choose there. The sandbox is given only the files
+you pick in the desktop's file chooser, and the portal standing between it and
+your files keeps anything else written beside one of them to itself: it reaches
+your disk only as a hidden `.xdp-` file, never under the name you would look
+for.
+
 ## Where certificates live
 
 Public certificates go in a [pgp-cert-d][certd] directory, the same layout `sq`

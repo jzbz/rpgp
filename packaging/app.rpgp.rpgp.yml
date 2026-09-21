@@ -49,10 +49,17 @@ finish-args:
   # the agent's socket on the host.
   - --filesystem=xdg-run/gnupg
 
-  # Note what is *not* here: no --filesystem=home. Files to encrypt, decrypt or
-  # export are chosen through the desktop's file chooser portal (rfd is built
-  # with its xdg-portal backend), which hands back access to exactly the file
-  # the user picked and nothing else.
+  # Note what is *not* here: no --filesystem=home. The user's own files are
+  # chosen through the desktop's file chooser portal (rfd is built with its
+  # xdg-portal backend), which hands back access to exactly the file the user
+  # picked and nothing else. Nothing beside it either: the document portal
+  # keeps a name created next to a picked file to itself, and puts the file on
+  # the host only as a hidden .xdp- file, never under that name. So the files
+  # read, to import, encrypt, sign, decrypt or verify, come from the portal's
+  # open dialog, and the files written come from its save dialog: an export, a
+  # revocation certificate, and the output of Sign / Encrypt and Decrypt. A
+  # native build writes that last beside the input instead; the app knows it
+  # is in the Flatpak by /.flatpak-info.
 
 modules:
   # sequoia-ipc runs the Cap'n Proto compiler unconditionally in its build

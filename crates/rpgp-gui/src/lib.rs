@@ -18,7 +18,7 @@ use rpgp_core::cert::format_time;
 use rpgp_core::certify::{self, Certification, CertifyRequest};
 use rpgp_core::keygen::{self, KeyGenRequest, KeyType};
 use rpgp_core::lifecycle;
-use rpgp_core::ops::{self, InputKind, VerifyResult};
+use rpgp_core::ops::{self, Existing, InputKind, VerifyResult};
 use rpgp_core::revoke::{self, Reason, RevokeRequest};
 use rpgp_core::{CertSummary, Sha1Policy, Store, wot};
 use slint::{ModelRc, SharedString, VecModel};
@@ -153,6 +153,23 @@ struct State {
     scope: Scope,
     sort: Sort,
 
+    /// Whether Sign / Encrypt and Decrypt ask where to save their output
+    /// rather than writing it beside their input, which they do inside a
+    /// Flatpak sandbox and nowhere else.
+    ///
+    /// The sandbox has no access to the user's files. The file chooser portal
+    /// hands back a document-portal path such as `/run/flatpak/doc/<id>/a.txt`,
+    /// whose directory holds the picked file and nothing else. The portal
+    /// keeps any other name created there as a hidden `.xdp-<name>-XXXXXX`
+    /// file in the real directory, and renaming one such name onto another
+    /// only relabels it in memory. So an output derived beside the input
+    /// never reached the host under its own name, while the status line said
+    /// it had been written, and a decrypt left its plaintext behind in one of
+    /// those hidden files. A path from the save dialog is a document of its
+    /// own: the output is still staged beside it, but the rename onto it is a
+    /// real one.
+    choose_outputs: bool,
+
     se_input: Option<PathBuf>,
     se_recipients: Vec<Recipient>,
     /// Narrows the recipient list. Held here rather than in the UI because the
@@ -276,11 +293,16 @@ impl Drop for BusyGuard {
 /// So the rule is kept where the work starts. Every handler that sets `busy`
 /// asks here first, Import's included, which gets there only once its file
 /// dialog has answered. So do the pickers that choose an operation's input,
-/// and the two details-pane toggles, which write the store without setting
-/// `busy` because they finish before they return. Export and Save revocation
+/// and the recipient toggle, whose rows are drawn by hand rather than built
+/// from the app's widgets and choose who a run encrypts to. So do the two
+/// details-pane toggles, which write the store without setting `busy`
+/// because they finish before they return. Export and Save revocation
 /// certificate do not ask once their dialogs answer, and that is deliberate:
 /// they start no operation and change nothing in the store, only copying out
-/// of it into the file the user chose. Nothing can come between a handler
+/// of it into the file the user chose. Sign / Encrypt and Decrypt, whose save
+/// dialog in a Flatpak is part of the operation, ask before it opens and set
+/// `busy` as it does, since it asks where to write a run already settled on
+/// screen; see [`ask_where_to_save`]. Nothing can come between a handler
 /// asking and it setting `busy`, since both happen on the event loop, which
 /// runs one callback at a time.
 fn refuse_while_busy(ui: &AppWindow) -> bool {
@@ -426,6 +448,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         filter: String::new(),
         scope: Scope::All,
         sort: Sort::MineFirst,
+        choose_outputs: flatpak_sandbox(Path::new("/")),
         se_input: None,
         se_recipients: Vec::new(),
         se_filter: String::new(),
@@ -844,6 +867,92 @@ fn expiry_from_index(index: i32) -> Option<Duration> {
     }
 }
 
+// --------------------------------------------------------------- file outputs
+
+/// Whether this process runs inside a Flatpak sandbox, judged by the
+/// `.flatpak-info` file Flatpak puts at the root of every sandbox it builds.
+/// That file is the conventional test, the one GLib makes. `root` is `/`
+/// except in a test.
+fn flatpak_sandbox(root: &Path) -> bool {
+    root.join(".flatpak-info").exists()
+}
+
+/// Ask where to save an operation's output, offering `suggested`, and hand
+/// the answer to `then`, which starts the operation there. `what` names the
+/// output in the dialog's title and on the status line.
+///
+/// Asked only inside a Flatpak; see [`State::choose_outputs`]. `busy` goes up
+/// as the dialog opens rather than once it answers, because the dialog has no
+/// parent window and the window behind it stays live, while the run it asks
+/// about was settled on screen when Run was pressed. With `busy` up, the
+/// run's files and recipients stay as they were shown, since the pickers and
+/// the recipient toggle refuse while it is, and the rest of the run, what it
+/// does, as whom and with which passphrases, was taken from the dialog when
+/// Run was pressed. No other operation starts, and Run cannot open a second
+/// dialog. Cancelling ends the operation there, with nothing written.
+///
+/// The folder offered is the input's, which inside the sandbox is a
+/// document-portal path. The portal's interface documents that it replaces
+/// such a path with the folder on the host before the desktop's dialog sees
+/// it, and that the desktop is free to ignore the suggestion.
+fn ask_where_to_save(
+    ui: &AppWindow,
+    suggested: &Path,
+    what: &str,
+    then: impl FnOnce(&AppWindow, PathBuf) + 'static,
+) {
+    ui.set_busy(true);
+    ui.set_status(format!("Choose where to save the {what}…").into());
+    let mut dialog = rfd::AsyncFileDialog::new().set_title(format!("Save {what}"));
+    if let Some(name) = suggested.file_name() {
+        dialog = dialog.set_file_name(name.to_string_lossy());
+    }
+    if let Some(folder) = suggested.parent() {
+        dialog = dialog.set_directory(folder);
+    }
+
+    let ui_weak = ui.as_weak();
+    let spawned = slint::spawn_local(async move {
+        let chosen = dialog.save_file().await;
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        match chosen {
+            Some(file) => then(&ui, file.path().to_path_buf()),
+            None => {
+                ui.set_busy(false);
+                ui.set_status(
+                    "Nothing was written, because no file was chosen to write it to.".into(),
+                );
+            }
+        }
+    });
+    // Only without an event loop, which the app always has. Left up, `busy`
+    // would hold every control in the window disabled for good.
+    if spawned.is_err() {
+        ui.set_busy(false);
+        ui.set_status("Nothing was written, because the save dialog could not open.".into());
+    }
+}
+
+/// How the Sign / Encrypt and Decrypt dialogs name the output a run will
+/// write: in full where it is derived beside the input, and by the name alone
+/// where a save dialog will ask for the rest. The folder is then the user's to
+/// choose, and inside a Flatpak the input's own folder is a document-portal
+/// path that names nothing the user could find on the host.
+fn output_preview(state: &State, output: &Path) -> SharedString {
+    if state.choose_outputs {
+        output
+            .file_name()
+            .unwrap_or(output.as_os_str())
+            .to_string_lossy()
+            .into_owned()
+            .into()
+    } else {
+        output.display().to_string().into()
+    }
+}
+
 // ------------------------------------------------------------- sign / encrypt
 
 fn wire_sign_encrypt(ui: &AppWindow, state: &Shared) {
@@ -896,6 +1005,14 @@ fn wire_sign_encrypt(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            // The run reads its recipients once its worker starts, which
+            // inside a Flatpak is only once the save dialog has answered, and
+            // that dialog leaves the rows behind it live. A tick changed in
+            // between would encrypt the file to recipients other than the
+            // ones on screen when Run was pressed.
+            if refuse_while_busy(&ui) {
+                return;
+            }
             let mut guard = lock(&state);
             // Through the filter: `index` counts shown rows, not recipients.
             if let Some(target) = usize::try_from(index)
@@ -918,17 +1035,7 @@ fn wire_sign_encrypt(ui: &AppWindow, state: &Shared) {
             if refuse_while_busy(&ui) {
                 return;
             }
-            ui.set_busy(true);
-            ui.set_status(
-                if encrypt {
-                    "Encrypting…"
-                } else {
-                    "Signing…"
-                }
-                .into(),
-            );
 
-            let (ui_weak, state) = (ui_weak.clone(), state.clone());
             // These two copies live on the worker for the whole operation,
             // which on a card can be a minute of waiting at a PIN prompt. The
             // Slint string they are copied from cannot be wiped — that is the
@@ -938,24 +1045,71 @@ fn wire_sign_encrypt(ui: &AppWindow, state: &Shared) {
                 Zeroizing::new(password.to_string()),
                 Zeroizing::new(secret.to_string()),
             );
-            std::thread::spawn(move || {
-                let _busy = BusyGuard(ui_weak.clone());
-                let outcome =
-                    run_sign_encrypt(&state, encrypt, sign, signer_index, &password, &secret);
-                let _ = slint::invoke_from_event_loop(move || {
-                    let Some(ui) = ui_weak.upgrade() else {
-                        return;
-                    };
-                    ui.set_busy(false);
-                    match outcome {
-                        Ok(output) => {
-                            ui.set_signenc_open(false);
-                            ui.set_status(format!("Wrote {}", output.display()).into());
+            let start = {
+                let state = state.clone();
+                move |ui: &AppWindow, chosen: Option<PathBuf>| {
+                    ui.set_busy(true);
+                    ui.set_status(
+                        if encrypt {
+                            "Encrypting…"
+                        } else {
+                            "Signing…"
                         }
-                        Err(message) => ui.set_status(message.into()),
+                        .into(),
+                    );
+                    let ui_weak = ui.as_weak();
+                    std::thread::spawn(move || {
+                        let _busy = BusyGuard(ui_weak.clone());
+                        let outcome = run_sign_encrypt(
+                            &state,
+                            encrypt,
+                            sign,
+                            signer_index,
+                            &password,
+                            &secret,
+                            chosen,
+                        );
+                        let _ = slint::invoke_from_event_loop(move || {
+                            let Some(ui) = ui_weak.upgrade() else {
+                                return;
+                            };
+                            ui.set_busy(false);
+                            match outcome {
+                                Ok(output) => {
+                                    ui.set_signenc_open(false);
+                                    ui.set_status(format!("Wrote {}", output.display()).into());
+                                }
+                                Err(message) => ui.set_status(message.into()),
+                            }
+                        });
+                    });
+                }
+            };
+
+            // Inside a Flatpak the output's place is asked for first, offered
+            // under the name it would have been given beside the input. With
+            // no file chosen, or nothing ticked, there is nothing to ask
+            // about, and the worker says so as it does outside.
+            let suggested = {
+                let guard = lock(&state);
+                match &guard.se_input {
+                    Some(input) if guard.choose_outputs && encrypt => {
+                        Some((ops::encrypted_name(input), "encrypted file"))
                     }
-                });
-            });
+                    Some(input) if guard.choose_outputs && sign => {
+                        Some((ops::signature_name(input), "signature"))
+                    }
+                    _ => None,
+                }
+            };
+            match suggested {
+                Some((suggested, what)) => {
+                    ask_where_to_save(&ui, &suggested, what, move |ui, chosen| {
+                        start(ui, Some(chosen))
+                    });
+                }
+                None => start(&ui, None),
+            }
         }
     });
 }
@@ -979,6 +1133,11 @@ fn choose_se_input(ui: &AppWindow, state: &Shared, path: PathBuf) {
 }
 
 /// The blocking half of Sign / Encrypt, run on a worker thread.
+///
+/// `chosen` is where the save dialog said the output goes, and it is used as
+/// it stands: not stepped around a file already there, which the dialog has
+/// asked about, and not refused for one. Without it the output goes beside
+/// the input, under a name that steps around whatever is there.
 fn run_sign_encrypt(
     state: &Shared,
     encrypt: bool,
@@ -986,6 +1145,7 @@ fn run_sign_encrypt(
     signer_index: i32,
     password: &str,
     secret: &str,
+    chosen: Option<PathBuf>,
 ) -> Result<PathBuf, String> {
     // Snapshot what is needed and release the lock: everything below is I/O,
     // and a card PIN prompt can hold it for a minute while the UI waits.
@@ -1047,20 +1207,27 @@ fn run_sign_encrypt(
             return Err("Select a recipient, or set a password".to_string());
         }
 
-        let output = ops::encrypted_name(&input);
+        let (output, existing) = match chosen {
+            Some(output) => (output, Existing::Replace),
+            None => (ops::encrypted_name(&input), Existing::Refuse),
+        };
         ops::encrypt_file(
             &certs,
             &passwords,
             signer.as_ref().map(|cert| (cert, password)),
             &input,
             &output,
+            existing,
         )
         .map_err(|e| format!("Encryption failed: {e}"))?;
         Ok(output)
     } else {
         let signer = signer.ok_or_else(|| "Nothing to do: tick Encrypt or Sign".to_string())?;
-        let output = ops::signature_name(&input);
-        ops::sign_detached_file(&signer, password, &input, &output)
+        let (output, existing) = match chosen {
+            Some(output) => (output, Existing::Replace),
+            None => (ops::signature_name(&input), Existing::Refuse),
+        };
+        ops::sign_detached_file(&signer, password, &input, &output, existing)
             .map_err(|e| format!("Signing failed: {e}"))?;
         Ok(output)
     }
@@ -1114,11 +1281,12 @@ fn push_sign_encrypt(ui: &AppWindow, state: &State) {
     ui.set_se_recipients(ModelRc::new(VecModel::from(rows)));
     ui.set_se_signers(ModelRc::new(VecModel::from(signers)));
 
+    ui.set_choose_outputs(state.choose_outputs);
     match &state.se_input {
         Some(path) => {
             ui.set_se_input(path.display().to_string().into());
-            ui.set_se_output_encrypt(ops::encrypted_name(path).display().to_string().into());
-            ui.set_se_output_sign(ops::signature_name(path).display().to_string().into());
+            ui.set_se_output_encrypt(output_preview(state, &ops::encrypted_name(path)));
+            ui.set_se_output_sign(output_preview(state, &ops::signature_name(path)));
         }
         None => {
             ui.set_se_input(SharedString::new());
@@ -1210,22 +1378,57 @@ fn wire_decrypt_verify(ui: &AppWindow, state: &Shared) {
             if refuse_while_busy(&ui) {
                 return;
             }
-            ui.set_busy(true);
-            ui.set_status("Working…".into());
 
-            let (ui_weak, state) = (ui_weak.clone(), state.clone());
             let password = password.to_string();
-            std::thread::spawn(move || {
-                let _busy = BusyGuard(ui_weak.clone());
-                let (read, outcome) = run_decrypt_verify(&state, &password);
-                let _ = slint::invoke_from_event_loop(move || {
-                    let Some(ui) = ui_weak.upgrade() else {
-                        return;
-                    };
-                    ui.set_busy(false);
-                    show_decrypt_verify(&ui, &state, read, outcome);
-                });
-            });
+            let start = {
+                let state = state.clone();
+                move |ui: &AppWindow, chosen: Option<PathBuf>| {
+                    ui.set_busy(true);
+                    ui.set_status("Working…".into());
+                    let ui_weak = ui.as_weak();
+                    std::thread::spawn(move || {
+                        let _busy = BusyGuard(ui_weak.clone());
+                        let (read, outcome) = run_decrypt_verify(&state, &password, chosen);
+                        let _ = slint::invoke_from_event_loop(move || {
+                            let Some(ui) = ui_weak.upgrade() else {
+                                return;
+                            };
+                            ui.set_busy(false);
+                            show_decrypt_verify(&ui, &state, read, outcome);
+                        });
+                    });
+                }
+            };
+
+            // As in Sign / Encrypt: inside a Flatpak a message's plaintext
+            // goes where the save dialog says. A detached signature writes
+            // nothing, so a verify asks nothing. Everything else is asked
+            // about, since the worker tries to decrypt everything else, not
+            // only what was classified as a message: classification reads a
+            // prefix, and a message it cannot place, such as one that opens
+            // with a marker packet, still decrypts. A file that turns out not
+            // to be OpenPGP at all then fails after the dialog has answered,
+            // with nothing written.
+            let suggested = {
+                let guard = lock(&state);
+                match &guard.dv_input {
+                    Some(input)
+                        if guard.choose_outputs
+                            && guard.dv_kind != InputKind::DetachedSignature =>
+                    {
+                        Some(ops::decrypted_name(input))
+                    }
+                    _ => None,
+                }
+            };
+            match suggested {
+                Some(suggested) => {
+                    ask_where_to_save(&ui, &suggested, "decrypted file", move |ui, chosen| {
+                        start(ui, Some(chosen))
+                    });
+                }
+                None => start(&ui, None),
+            }
         }
     });
 }
@@ -1337,7 +1540,14 @@ fn show_decrypt_verify(ui: &AppWindow, state: &Shared, read: DvRead, outcome: Dv
 
 /// The blocking half of Decrypt / Verify. Returns which choice of files it
 /// ran against and what it found.
-fn run_decrypt_verify(state: &Shared, password: &str) -> (DvRead, DvOutcome) {
+///
+/// A decrypt writes to `chosen` when the save dialog chose it, and beside
+/// its input otherwise; see [`decrypt_or_verify`].
+fn run_decrypt_verify(
+    state: &Shared,
+    password: &str,
+    chosen: Option<PathBuf>,
+) -> (DvRead, DvOutcome) {
     // Snapshot what is needed and release the lock: everything below is I/O,
     // and a card PIN prompt can hold it for a minute while the UI waits. The
     // generation comes out of the same snapshot as the paths, so it names
@@ -1358,7 +1568,7 @@ fn run_decrypt_verify(state: &Shared, password: &str) -> (DvRead, DvOutcome) {
     };
     (
         read,
-        decrypt_or_verify(state, &store, input, kind, data, password),
+        decrypt_or_verify(state, &store, input, kind, data, password, chosen),
     )
 }
 
@@ -1381,6 +1591,11 @@ fn dv_names(input: Option<&Path>, kind: InputKind, data: Option<&Path>) -> Strin
 }
 
 /// What [`run_decrypt_verify`] does with its snapshot.
+///
+/// `chosen` is where the save dialog said the plaintext goes, and it is used
+/// as it stands: not stepped around a file already there, which the dialog
+/// has asked about, and not refused for one. Without it the plaintext goes
+/// beside the input, under a name that steps around whatever is there.
 fn decrypt_or_verify(
     state: &Shared,
     store: &Store,
@@ -1388,6 +1603,7 @@ fn decrypt_or_verify(
     kind: InputKind,
     data: Option<PathBuf>,
     password: &str,
+    chosen: Option<PathBuf>,
 ) -> DvOutcome {
     let input = input.ok_or_else(|| "Choose a file first".to_string())?;
 
@@ -1405,7 +1621,10 @@ fn decrypt_or_verify(
         return Ok((summary.0, summary.1, result));
     }
 
-    let output = ops::decrypted_name(&input);
+    let (output, existing) = match chosen {
+        Some(output) => (output, Existing::Replace),
+        None => (ops::decrypted_name(&input), Existing::Refuse),
+    };
     // One field here, but still a candidate list: the Decrypt/Verify dialog
     // asks for "the passphrase or password", so the single value it collects
     // may be either.
@@ -1413,7 +1632,7 @@ fn decrypt_or_verify(
         .filter(|p| !p.is_empty())
         .into_iter()
         .collect();
-    let result = ops::decrypt_file(store, &input, &candidates, &output)
+    let result = ops::decrypt_file(store, &input, &candidates, &output, existing)
         .map_err(|e| format!("Decryption failed: {e}"))?;
 
     // A message with no encryption layer opens just as cleanly, so saying
@@ -1454,8 +1673,9 @@ fn push_decrypt_verify(ui: &AppWindow, state: &State) {
         Some(path) => path.display().to_string().into(),
         None => SharedString::new(),
     });
+    ui.set_choose_outputs(state.choose_outputs);
     ui.set_dv_output(match &state.dv_input {
-        Some(path) => ops::decrypted_name(path).display().to_string().into(),
+        Some(path) => output_preview(state, &ops::decrypted_name(path)),
         None => SharedString::new(),
     });
 }
@@ -3989,6 +4209,7 @@ mod tests {
             filter: String::new(),
             scope: Scope::All,
             sort: Sort::MineFirst,
+            choose_outputs: false,
             se_input: None,
             se_recipients: Vec::new(),
             se_filter: String::new(),
@@ -4104,7 +4325,8 @@ mod tests {
         let signed =
             run_notepad(&state, 0, "the treaty text", 0, "", "").expect("a live key signs");
         assert!(signed.0.contains("-----BEGIN PGP SIGNED MESSAGE-----"));
-        run_sign_encrypt(&state, false, true, 0, "", "").expect("a live key signs a file too");
+        run_sign_encrypt(&state, false, true, 0, "", "", None)
+            .expect("a live key signs a file too");
         std::fs::remove_file(&output).unwrap();
 
         // The owner retires the key on another machine, and this one meets the
@@ -4137,7 +4359,7 @@ mod tests {
             "the status bar has to say whose key and why: {refused}"
         );
 
-        let refused = run_sign_encrypt(&state, false, true, 0, "", "")
+        let refused = run_sign_encrypt(&state, false, true, 0, "", "", None)
             .map(|_| ())
             .expect_err("signed a file with a key its owner had retired");
         assert!(
@@ -4200,6 +4422,109 @@ mod tests {
         assert!(
             !signs_with(&retired),
             "nor as a signer: signing refuses it too"
+        );
+    }
+
+    /// A Flatpak sandbox is recognised by the file Flatpak puts at its root,
+    /// and without that file nothing changes: a native build writes its
+    /// outputs beside the input, as it always has.
+    #[test]
+    fn a_flatpak_sandbox_is_recognised_by_the_file_at_its_root() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!flatpak_sandbox(root.path()));
+        std::fs::write(
+            root.path().join(".flatpak-info"),
+            b"[Application]\nname=app.rpgp.rpgp\n",
+        )
+        .unwrap();
+        assert!(flatpak_sandbox(root.path()));
+    }
+
+    /// An output chosen in the save dialog is written exactly where it was
+    /// chosen, over the file already there, and nothing is written beside the
+    /// input.
+    ///
+    /// Inside a Flatpak that dialog is the only way an output reaches the
+    /// host under its own name: the document portal puts the chosen name on
+    /// disk and no other, so `notes.txt (1).asc`, the name a derived output
+    /// steps to when its own is taken, would reach the host only as a hidden
+    /// `.xdp-` file. And the dialog has already asked whether to replace a
+    /// file at that name, so refusing it as "already exists" would overrule
+    /// the user's answer.
+    #[test]
+    fn an_output_chosen_in_the_save_dialog_is_written_exactly_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let alice = generated("Alice <alice@example.org>").cert;
+        store.insert_secret(&alice).unwrap();
+        let fingerprint = alice.fingerprint().to_hex();
+
+        let input = dir.path().join("notes.txt");
+        std::fs::write(&input, b"the plaintext").unwrap();
+        // In another folder, as the dialog may well choose, and each already
+        // holding a file the user has agreed to replace.
+        let saved = dir.path().join("saved");
+        std::fs::create_dir(&saved).unwrap();
+        let (encrypted, signature, decrypted) = (
+            saved.join("notes.txt.asc"),
+            saved.join("notes.txt.sig"),
+            saved.join("notes.txt"),
+        );
+        for path in [&encrypted, &signature, &decrypted] {
+            std::fs::write(path, b"AN EARLIER FILE").unwrap();
+        }
+
+        let loaded = read_store(&store).expect("a healthy store reads");
+        let state = state_for(store);
+        {
+            let mut guard = lock(&state);
+            guard.all = loaded.all;
+            build_signing_targets(&mut guard, Some(&fingerprint));
+            guard.se_input = Some(input.clone());
+        }
+
+        let wrote = run_sign_encrypt(&state, true, false, 0, "", "", Some(encrypted.clone()))
+            .expect("encrypting replaces the chosen file");
+        assert_eq!(wrote, encrypted, "the status line names the file written");
+        assert_eq!(ops::classify_file(&encrypted), InputKind::Message);
+
+        let wrote = run_sign_encrypt(&state, false, true, 0, "", "", Some(signature.clone()))
+            .expect("signing replaces the chosen file");
+        assert_eq!(wrote, signature);
+        let store = lock(&state).store.clone();
+        assert!(
+            ops::verify_detached_files(&store, &signature, &input)
+                .unwrap()
+                .all_good()
+        );
+
+        {
+            let mut guard = lock(&state);
+            guard.dv_input = Some(encrypted.clone());
+            guard.dv_kind = InputKind::Message;
+        }
+        let (_, outcome) = run_decrypt_verify(&state, "", Some(decrypted.clone()));
+        let (summary, _, _) = outcome.expect("decrypting replaces the chosen file");
+        assert!(
+            summary.starts_with(&format!("Decrypted to {}.", decrypted.display())),
+            "the status line names the file written: {summary}"
+        );
+        assert_eq!(std::fs::read(&decrypted).unwrap(), b"the plaintext");
+
+        let names = |dir: &Path| {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("notes"))
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(dir.path()), ["notes.txt"], "written beside the input");
+        assert_eq!(
+            names(&saved),
+            ["notes.txt", "notes.txt.asc", "notes.txt.sig"],
+            "written somewhere other than the chosen names"
         );
     }
 
@@ -4490,7 +4815,7 @@ mod tests {
         std::fs::write(&release, b"the release").unwrap();
         std::fs::write(&other, b"something else entirely").unwrap();
         let signature = dir.path().join("a.tar.sig");
-        ops::sign_detached_file(&alice, None, &release, &signature).unwrap();
+        ops::sign_detached_file(&alice, None, &release, &signature, Existing::Refuse).unwrap();
         let kind = ops::classify_file(&signature);
         assert_eq!(kind, InputKind::DetachedSignature);
 
@@ -4519,7 +4844,7 @@ mod tests {
         ui.invoke_open_decrypt_verify();
         choose_dv_input(&ui, &state, signature.clone(), kind);
         choose_dv_data(&ui, &state, release.clone());
-        let (read, outcome) = run_decrypt_verify(&state, "");
+        let (read, outcome) = run_decrypt_verify(&state, "", None);
         assert!(outcome.is_ok(), "the release does verify: {outcome:?}");
         choose_dv_data(&ui, &state, other.clone());
         show_decrypt_verify(&ui, &state, read, outcome);
@@ -4527,7 +4852,7 @@ mod tests {
 
         // With nothing changed in between, the result is shown — and for the
         // file now chosen it is the opposite of the one just withheld.
-        let (read, outcome) = run_decrypt_verify(&state, "");
+        let (read, outcome) = run_decrypt_verify(&state, "", None);
         show_decrypt_verify(&ui, &state, read, outcome);
         assert_eq!(ui.get_dv_result(), "Signature is NOT valid");
         assert_eq!(ui.get_dv_tone(), 3);
@@ -4536,7 +4861,7 @@ mod tests {
         ui.invoke_open_decrypt_verify();
         choose_dv_input(&ui, &state, signature.clone(), kind);
         choose_dv_data(&ui, &state, release.clone());
-        let (read, outcome) = run_decrypt_verify(&state, "");
+        let (read, outcome) = run_decrypt_verify(&state, "", None);
         choose_dv_input(&ui, &state, other.clone(), ops::classify_file(&other));
         show_decrypt_verify(&ui, &state, read, outcome);
         not_shown(&ui, "a new signature");
@@ -4544,7 +4869,7 @@ mod tests {
         // The dialog is closed and opened again.
         choose_dv_input(&ui, &state, signature.clone(), kind);
         choose_dv_data(&ui, &state, release.clone());
-        let (read, outcome) = run_decrypt_verify(&state, "");
+        let (read, outcome) = run_decrypt_verify(&state, "", None);
         ui.invoke_open_decrypt_verify();
         show_decrypt_verify(&ui, &state, read, outcome);
         not_shown(&ui, "a reopened dialog");
@@ -4701,7 +5026,7 @@ mod tests {
         std::fs::write(&release, b"the release").unwrap();
         std::fs::write(&other, b"something else entirely").unwrap();
         let signature = dir.path().join("a.tar.sig");
-        ops::sign_detached_file(&alice, None, &release, &signature).unwrap();
+        ops::sign_detached_file(&alice, None, &release, &signature, Existing::Refuse).unwrap();
         let kind = ops::classify_file(&signature);
 
         let state = state_for(store);
@@ -4712,7 +5037,7 @@ mod tests {
         choose_dv_input(&ui, &state, signature.clone(), kind);
         choose_dv_data(&ui, &state, release.clone());
         ui.set_busy(true);
-        let (read, outcome) = run_decrypt_verify(&state, "");
+        let (read, outcome) = run_decrypt_verify(&state, "", None);
 
         choose_dv_data(&ui, &state, other.clone());
         assert_eq!(
@@ -4745,6 +5070,137 @@ mod tests {
             "the file to sign changed under a running operation"
         );
         assert_eq!(lock(&state).se_input.as_deref(), Some(release.as_path()));
+    }
+
+    /// A recipient toggled while a run is in flight is not taken, and the run
+    /// encrypts to the recipients ticked when Run was pressed.
+    ///
+    /// Inside a Flatpak, Sign / Encrypt reads its recipients only once the
+    /// save dialog has answered, and that dialog has no parent window, so the
+    /// list behind it stays live for as long as it is open. `busy` is set here
+    /// as `ask_where_to_save` sets it, and the worker is handed the path the
+    /// dialog would return. The rows refuse in Slint as well, which
+    /// tests/accessibility.rs checks; this is the handler they call.
+    #[test]
+    fn a_recipient_toggled_while_a_run_is_in_flight_is_not_taken() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        // Alice's secret is in the store and Bob's is not, so the message
+        // opens here only if it was encrypted to Alice.
+        store
+            .insert_secret(&generated("Alice <alice@example.org>").cert)
+            .unwrap();
+        store
+            .insert(&generated("Bob <bob@example.org>").cert)
+            .unwrap();
+        let input = dir.path().join("notes.txt");
+        std::fs::write(&input, b"for Alice alone").unwrap();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        ui.invoke_open_sign_encrypt();
+        choose_se_input(&ui, &state, input);
+        // With no filter typed, a row's index is the recipient's position.
+        let row = |label: &str| {
+            let guard = lock(&state);
+            let position = guard.se_recipients.iter().position(|r| r.label == label);
+            position.expect("both can receive encrypted mail") as i32
+        };
+        let ticked = || {
+            let guard = lock(&state);
+            let mut labels: Vec<String> = guard
+                .se_recipients
+                .iter()
+                .filter(|r| r.selected)
+                .map(|r| r.label.clone())
+                .collect();
+            labels.sort();
+            labels
+        };
+        // Alice alone, as the user leaves the list before pressing Run.
+        for label in ["Alice", "Bob"] {
+            if ticked().contains(&label.to_string()) != (label == "Alice") {
+                ui.invoke_se_toggle_recipient(row(label));
+            }
+        }
+        assert_eq!(ticked(), ["Alice"]);
+
+        ui.set_busy(true);
+        ui.invoke_se_toggle_recipient(row("Alice"));
+        ui.invoke_se_toggle_recipient(row("Bob"));
+        assert_eq!(
+            ticked(),
+            ["Alice"],
+            "the recipients changed under a run in flight"
+        );
+        assert_eq!(ui.get_se_selected_count(), 1);
+
+        let saved = dir.path().join("saved.asc");
+        let wrote = run_sign_encrypt(&state, true, false, 0, "", "", Some(saved.clone()))
+            .expect("the file encrypts");
+        assert_eq!(wrote, saved);
+        let store = lock(&state).store.clone();
+        let opened = dir.path().join("opened.txt");
+        ops::decrypt_file(&store, &saved, &[], &opened, Existing::Refuse)
+            .expect("the message should open with Alice's key");
+        assert_eq!(std::fs::read(&opened).unwrap(), b"for Alice alone");
+
+        // With nothing in flight the same toggle goes through, so the refusal
+        // above is the only thing that kept it out.
+        ui.set_busy(false);
+        ui.invoke_se_toggle_recipient(row("Bob"));
+        assert_eq!(ticked(), ["Alice", "Bob"]);
+    }
+
+    /// Inside a Flatpak the Sign / Encrypt and Decrypt dialogs are told that
+    /// Run will ask where to save, and are given the output as the file name
+    /// the save dialog will offer. Outside, they are given the path beside the
+    /// input, as they always were.
+    ///
+    /// Inside the sandbox the input is a document-portal path, which names
+    /// nothing the user could find on the host, and "Writes" a path beside it
+    /// was the promise the sandbox never kept. What the dialogs make of these
+    /// properties is tested in tests/accessibility.rs, since the window here
+    /// is compiled without the debug information the element tree needs.
+    #[test]
+    fn inside_a_flatpak_the_dialogs_are_told_that_run_will_ask_where_to_save() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+        // Shaped like what the file chooser portal hands back in the sandbox.
+        // Nothing is read from either, so neither needs to exist.
+        let portal = dir.path().join("doc").join("1a2b3c4d");
+        let (input, message) = (portal.join("notes.txt"), portal.join("reply.txt.asc"));
+
+        for inside in [true, false] {
+            lock(&state).choose_outputs = inside;
+            let name = |file: &str| {
+                if inside {
+                    file.to_string()
+                } else {
+                    portal.join(file).display().to_string()
+                }
+            };
+
+            ui.invoke_open_sign_encrypt();
+            choose_se_input(&ui, &state, input.clone());
+            assert_eq!(ui.get_choose_outputs(), inside);
+            assert_eq!(ui.get_se_output_encrypt(), name("notes.txt.asc"));
+            assert_eq!(ui.get_se_output_sign(), name("notes.txt.sig"));
+            ui.set_signenc_open(false);
+
+            // Set afresh by the Decrypt / Verify dialog, which can be the
+            // first one opened.
+            ui.set_choose_outputs(!inside);
+            ui.invoke_open_decrypt_verify();
+            choose_dv_input(&ui, &state, message.clone(), InputKind::Message);
+            assert_eq!(ui.get_choose_outputs(), inside);
+            assert_eq!(ui.get_dv_output(), name("reply.txt"));
+            ui.set_verify_open(false);
+        }
     }
 
     /// Neither details-pane toggle writes the store while an operation is in
