@@ -1,11 +1,12 @@
-// Test-only harness: one passphrase Field and one ordinary Field, so what the
-// accessibility tree publishes can be inspected from a Rust test. Not part of
-// the application.
-import { Field, Btn, Check, Select, FieldRow } from "../widgets.slint";
-import { SignEncryptDialog, CertifyDialog, NotepadDialog } from "../dialogs.slint";
+// Test-only harness: small windows built from the app's own widgets and
+// dialogs, so a Rust test can operate them and inspect what the accessibility
+// tree publishes. Not part of the application.
+import { Field, Btn, Check, Select, FieldRow, TextArea } from "../widgets.slint";
+import { SignEncryptDialog, CertifyDialog, NotepadDialog, DeleteDialog } from "../dialogs.slint";
 import { KeygenDialog, DecryptVerifyDialog, RevokeDialog, LifecycleDialog } from "../dialogs.slint";
 import { RecipientRow, UserIdRow, SignatureRow } from "../types.slint";
 
+// One passphrase Field and one ordinary Field.
 export component FieldProbe inherits Window {
     in-out property <string> secret-text <=> pass-field.text;
     in-out property <string> plain-text <=> plain-field.text;
@@ -69,6 +70,41 @@ export component ControlProbe inherits Window {
     }
 }
 
+// One of each widget from widgets.slint that has an `enabled`, all switched by
+// one property, and a count of everything any of them did. Disabled has to mean
+// inert however a control is reached — by an assistive-technology action, by a
+// key sent to one that had focus before it was disabled, or through a list it
+// had already opened — and a test reads the counts to see that nothing
+// happened.
+export component EnabledProbe inherits Window {
+    in-out property <bool> live: true;
+    in-out property <int> clicks: 0;
+    in-out property <int> toggles: 0;
+    in-out property <int> changes: 0;
+    in-out property <int> edits: 0;
+
+    width: 500px;
+    height: 480px;
+
+    VerticalLayout {
+        Btn { text: "Run"; enabled: root.live; clicked => { root.clicks += 1; } }
+        Check { text: "Sign"; enabled: root.live; toggled => { root.toggles += 1; } }
+        Select {
+            label: "Mode";
+            model: ["Modern", "Compatible"];
+            enabled: root.live;
+            changed(index) => { root.changes += 1; }
+        }
+        Field { placeholder: "Name"; enabled: root.live; edited(text) => { root.edits += 1; } }
+        TextArea {
+            height: 80px;
+            placeholder: "Message";
+            enabled: root.live;
+            edited(text) => { root.edits += 1; }
+        }
+    }
+}
+
 // The two selection lists, driven through the real dialogs rather than through
 // a copy of their markup here: a probe that reproduced the rows would go on
 // passing after the shipped rows lost their accessibility again.
@@ -108,6 +144,10 @@ export component CertifyProbe inherits Window {
 export component NotepadProbe inherits Window {
     in-out property <[RecipientRow]> recipients;
     in-out property <int> toggled-recipient: -1;
+    // Empty unless a test sets it. The output area exists only while there is
+    // output, and it refuses typing, so it would fail the passphrase test,
+    // which types into every field it finds, if it were there by default.
+    in-out property <string> output;
 
     width: 620px;
     height: 720px;
@@ -116,6 +156,7 @@ export component NotepadProbe inherits Window {
         width: 100%;
         height: 100%;
         recipients: root.recipients;
+        output: root.output;
         toggle-recipient(index) => { root.toggled-recipient = index; }
     }
 }
@@ -181,5 +222,27 @@ export component PublishProbe inherits Window {
         mode: 3;
         key-name: "Alice <alice@example.org>";
         key-id: "0123456789ABCDEF";
+    }
+}
+
+// The dialog in which a disabled button is the whole of the confirmation:
+// until the key ID has been typed, Delete key has to do nothing however it is
+// reached, and the same once a delete is under way.
+export component DeleteProbe inherits Window {
+    in-out property <bool> busy: false;
+    in-out property <int> runs: 0;
+
+    width: 620px;
+    height: 720px;
+
+    DeleteDialog {
+        width: 100%;
+        height: 100%;
+        target-name: "Alice <alice@example.org>";
+        has-secret: true;
+        has-revocation: true;
+        confirm-word: "0123456789ABCDEF";
+        busy: root.busy;
+        run => { root.runs += 1; }
     }
 }

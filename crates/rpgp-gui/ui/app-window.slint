@@ -44,7 +44,15 @@ component RailItem inherits Rectangle {
     accessible-enabled: root.enabled;
     accessible-checkable: true;
     accessible-checked: root.active;
-    accessible-action-default => { root.clicked(); }
+    // Gated for the reasons Btn gives. The window's handler sets `scope`
+    // before Rust is asked, and Rust declines while an operation is in
+    // flight, so a switch that got through would leave this tab lit over a
+    // list it does not describe.
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
 
     height: 34px;
     border-radius: Theme.r-sm;
@@ -102,7 +110,15 @@ component CertListRow inherits Rectangle {
     accessible-enabled: root.enabled;
     accessible-item-selectable: true;
     accessible-item-selected: root.selected;
-    accessible-action-default => { root.clicked(); }
+    // Gated for the reasons Btn gives. As with RailItem, the window's handler
+    // sets `current-row` before Rust declines, which would leave the highlight
+    // on one certificate and the details pane on another, and some actions
+    // take their certificate from the one and some from the other.
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
 
     height: 62px;
     background: root.selected ? Theme.selected : (touch.has-hover ? Theme.hover : transparent);

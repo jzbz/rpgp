@@ -1237,11 +1237,12 @@ export component NotepadDialog inherits DialogShell {
             }
             // Kept separate from the input rather than replacing it: pasting
             // ciphertext and having it overwritten by the plaintext loses the
-            // thing you might still need.
+            // thing you might still need. Read-only rather than disabled, so
+            // that part of it can still be selected.
             TextArea {
                 height: 150px;
                 text: root.output;
-                enabled: false;
+                read-only: true;
             }
         }
 

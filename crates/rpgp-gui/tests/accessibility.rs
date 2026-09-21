@@ -149,6 +149,237 @@ fn controls_are_announced_and_operable() {
     );
 }
 
+/// The control called `label` in the given role. A button's own Text carries
+/// the same name as the button, so the name alone can find the wrong one, and
+/// an action invoked on the Text does nothing whether or not the button would
+/// have — which would pass every assertion that nothing happened.
+fn control(
+    root: &impl i_slint_backend_testing::ElementRoot,
+    label: &str,
+    role: i_slint_backend_testing::AccessibleRole,
+) -> i_slint_backend_testing::ElementHandle {
+    i_slint_backend_testing::ElementHandle::find_by_accessible_label(root, label)
+        .find(|element| element.accessible_role() == Some(role))
+        .unwrap_or_else(|| panic!("no {role:?} is called {label:?}"))
+}
+
+/// Send a key to whatever has focus, the way the windowing backend does.
+fn press(probe: &impl slint::ComponentHandle, key: impl Into<slint::SharedString>) {
+    let text = key.into();
+    let window = probe.window();
+    window.dispatch_event(slint::platform::WindowEvent::KeyPressed { text: text.clone() });
+    window.dispatch_event(slint::platform::WindowEvent::KeyReleased { text });
+}
+
+/// Whether the Select's list is open. Each option is a Text of its own, so
+/// the two names are on screen three times with the list open and once, as
+/// the current choice, with it closed.
+fn list_is_open(probe: &EnabledProbe) -> bool {
+    let shown = |name: &str| {
+        i_slint_backend_testing::ElementHandle::find_by_accessible_label(probe, name).count()
+    };
+    shown("Modern") + shown("Compatible") > 1
+}
+
+/// A disabled control does nothing when assistive technology activates it.
+///
+/// Slint hands the activation to the control's handler without looking at
+/// `enabled`, and of the AccessKit adapters only the Windows one refuses a
+/// control it has published as disabled. On Linux and macOS a screen reader
+/// could press a greyed-out Delete key before the key ID had been typed, or a
+/// Run button whose operation was already under way. The testing backend
+/// invokes the same entry point the winit adapter does.
+#[test]
+fn a_disabled_control_ignores_an_assistive_technology_action() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::AccessibleRole;
+
+    let probe = EnabledProbe::new().unwrap();
+    probe.show().unwrap();
+    let run = || control(&probe, "Run", AccessibleRole::Button);
+    let sign = || control(&probe, "Sign", AccessibleRole::Checkbox);
+    let mode = || control(&probe, "Mode", AccessibleRole::Combobox);
+
+    probe.set_live(false);
+    for control in [run(), sign(), mode()] {
+        assert_eq!(control.accessible_enabled(), Some(false));
+        control.invoke_accessible_default_action();
+    }
+    assert_eq!(
+        (probe.get_clicks(), probe.get_toggles()),
+        (0, 0),
+        "a control published as disabled acted on an assistive-technology action"
+    );
+    assert!(!list_is_open(&probe), "a disabled Select opened its list");
+
+    // The same actions on the same elements, enabled, so that the nothing
+    // above is the controls refusing and not the actions going nowhere.
+    probe.set_live(true);
+    for control in [run(), sign(), mode()] {
+        control.invoke_accessible_default_action();
+    }
+    assert_eq!((probe.get_clicks(), probe.get_toggles()), (1, 1));
+    assert!(
+        list_is_open(&probe),
+        "an enabled Select should open its list"
+    );
+}
+
+/// A control that had keyboard focus before it was disabled stops answering
+/// the keys that operate it.
+///
+/// Slint's FocusScope checks `enabled` only when focus arrives, and nothing
+/// takes focus away from a control that is disabled while it holds it. A
+/// button pressed with Enter is disabled by the operation it starts, so a
+/// second Enter, or the auto-repeat of a held one, reached the same button's
+/// handler again, leaving only the busy check in Rust to stop a second run.
+#[test]
+fn a_focused_control_stops_answering_keys_once_it_is_disabled() {
+    i_slint_backend_testing::init_no_event_loop();
+    use slint::platform::Key;
+
+    let probe = EnabledProbe::new().unwrap();
+    probe.show().unwrap();
+
+    // Tab visits the controls in the order the probe declares them. Each is
+    // operated once while it is enabled, which is also what shows that the
+    // keys below reach it.
+    press(&probe, Key::Tab);
+    press(&probe, Key::Return);
+    assert_eq!(probe.get_clicks(), 1, "Enter should press a focused button");
+    probe.set_live(false);
+    press(&probe, Key::Return);
+    press(&probe, Key::Space);
+    assert_eq!(probe.get_clicks(), 1, "a disabled button answered a key");
+
+    probe.set_live(true);
+    press(&probe, Key::Tab);
+    press(&probe, Key::Space);
+    assert_eq!(
+        probe.get_toggles(),
+        1,
+        "Space should toggle a focused checkbox"
+    );
+    probe.set_live(false);
+    press(&probe, Key::Space);
+    press(&probe, Key::Return);
+    assert_eq!(probe.get_toggles(), 1, "a disabled checkbox answered a key");
+
+    probe.set_live(true);
+    press(&probe, Key::Tab);
+    press(&probe, Key::DownArrow);
+    assert_eq!(probe.get_changes(), 1, "Down should move a focused Select");
+    probe.set_live(false);
+    press(&probe, Key::UpArrow);
+    press(&probe, Key::DownArrow);
+    press(&probe, Key::Space);
+    press(&probe, Key::Return);
+    assert_eq!(probe.get_changes(), 1, "a disabled Select answered a key");
+    assert!(!list_is_open(&probe), "a disabled Select opened its list");
+}
+
+/// A Select's list, opened before the Select was disabled, takes no choice
+/// afterwards. Nothing closes the list when `enabled` changes, so its options
+/// are one more way in.
+#[test]
+fn an_open_list_takes_no_choice_once_its_select_is_disabled() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+    use slint::platform::{PointerEventButton, WindowEvent};
+
+    let probe = EnabledProbe::new().unwrap();
+    probe.show().unwrap();
+    let select = || control(&probe, "Mode", AccessibleRole::Combobox);
+    // An item in the open list reports its position within the list rather
+    // than within the window, and the list opens under the Select, so the
+    // click is aimed from there. The gap between the two is a few pixels,
+    // well inside an option's height.
+    let choose_compatible = || {
+        let option = ElementHandle::find_by_accessible_label(&probe, "Compatible")
+            .next()
+            .expect("the list should be open and offer Compatible");
+        let (under, within) = (select().absolute_position(), option.absolute_position());
+        let position = slint::LogicalPosition::new(
+            under.x + within.x + option.size().width / 2.,
+            under.y + select().size().height + within.y + option.size().height / 2.,
+        );
+        let button = PointerEventButton::Left;
+        let window = probe.window();
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        window.dispatch_event(WindowEvent::PointerPressed { position, button });
+        window.dispatch_event(WindowEvent::PointerReleased { position, button });
+    };
+
+    select().invoke_accessible_default_action();
+    probe.set_live(false);
+    choose_compatible();
+    assert_eq!(probe.get_changes(), 0, "a disabled Select took a choice");
+
+    // And the same click with the Select enabled, so the one above is known
+    // to have landed on the option.
+    probe.set_live(true);
+    if !list_is_open(&probe) {
+        select().invoke_accessible_default_action();
+    }
+    choose_compatible();
+    assert_eq!(
+        probe.get_changes(),
+        1,
+        "clicking an option should choose it"
+    );
+}
+
+/// A disabled text field takes no text from assistive technology, and is
+/// published as disabled rather than only read-only.
+///
+/// Slint gives every TextInput a set-value action that writes the text with no
+/// check of `read-only`, and the macOS adapter passes it on for a disabled
+/// field as readily as for an enabled one. Disabling the input itself is also
+/// what stops an input method's composed text, which read-only does not;
+/// composition cannot be sent through the testing backend's public API, so
+/// that half is asserted only as the published state.
+#[test]
+fn a_disabled_text_field_takes_no_text_from_assistive_technology() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::ElementHandle;
+
+    let probe = EnabledProbe::new().unwrap();
+    probe.show().unwrap();
+    // The Field's and then the TextArea's.
+    let inputs: Vec<_> = ElementHandle::find_by_element_type_name(&probe, "TextInput").collect();
+    assert_eq!(inputs.len(), 2, "expected the Field and the TextArea");
+
+    probe.set_live(false);
+    for input in &inputs {
+        assert_eq!(
+            input.accessible_enabled(),
+            Some(false),
+            "a disabled field's input should be published as disabled"
+        );
+        input.set_accessible_value("REPLACED");
+        assert_eq!(
+            input.accessible_value().unwrap_or_default().as_str(),
+            "",
+            "a disabled field took text from assistive technology"
+        );
+    }
+    assert_eq!(probe.get_edits(), 0, "a disabled field reported an edit");
+
+    probe.set_live(true);
+    for input in &inputs {
+        input.set_accessible_value("TYPED");
+        assert_eq!(
+            input.accessible_value().unwrap_or_default().as_str(),
+            "TYPED"
+        );
+    }
+    assert_eq!(
+        probe.get_edits(),
+        2,
+        "an enabled field should take the text"
+    );
+}
+
 /// The recipient and user-ID lists draw a tick box by hand instead of using
 /// `Check`. None of that drawing reaches assistive technology, so each row has
 /// to declare the checkbox contract itself — otherwise choosing who can read a
@@ -297,6 +528,97 @@ fn the_publish_warning_names_the_key_it_uploads() {
     assert!(
         warning.contains("Alice <alice@example.org>") && warning.contains("0123456789ABCDEF"),
         "the warning should say which key is being published: {warning:?}"
+    );
+}
+
+/// Delete key does nothing, however it is activated, until the key ID has
+/// been typed, and nothing again once the delete is under way.
+///
+/// Typing the key ID is the confirmation for deleting a secret key, and the
+/// disabled button is all that enforces it: the delete itself is told only
+/// whether the dialog warned about a secret key, not what was typed. Before
+/// the button checked `enabled` for itself, a screen reader's activation went
+/// straight through on Linux and macOS.
+#[test]
+fn delete_key_does_nothing_until_the_key_id_is_typed() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::AccessibleRole;
+
+    let probe = DeleteProbe::new().unwrap();
+    probe.show().unwrap();
+    let delete = || control(&probe, "Delete key", AccessibleRole::Button);
+
+    assert_eq!(delete().accessible_enabled(), Some(false));
+    delete().invoke_accessible_default_action();
+    assert_eq!(
+        probe.get_runs(),
+        0,
+        "Delete key ran before the key ID was typed"
+    );
+
+    // The confirmation field is labelled with the key ID it asks for.
+    control(&probe, "0123456789ABCDEF", AccessibleRole::TextInput)
+        .set_accessible_value("0123456789ABCDEF");
+    assert_eq!(delete().accessible_enabled(), Some(true));
+    delete().invoke_accessible_default_action();
+    assert_eq!(probe.get_runs(), 1, "a confirmed Delete key should run");
+
+    // What the handler does next, before its worker starts.
+    probe.set_busy(true);
+    let working = control(&probe, "Deleting…", AccessibleRole::Button);
+    assert_eq!(working.accessible_enabled(), Some(false));
+    working.invoke_accessible_default_action();
+    assert_eq!(
+        probe.get_runs(),
+        1,
+        "a second delete started while the first was under way"
+    );
+}
+
+/// The notepad's output can still be selected, and cannot be rewritten by
+/// assistive technology.
+///
+/// It used to be a disabled TextArea, which in practice meant only read-only,
+/// and Slint's set-value action ignores read-only: assistive technology could
+/// replace the text on screen, which also cut it loose from the output it was
+/// bound to, so the next run's result never appeared there while Copy went on
+/// copying it. A TextArea that is actually disabled refuses that, but it also
+/// refuses a selection, which is why the output is read-only instead.
+///
+/// Read-only does not cover everything. Slint's middle-click paste of the
+/// primary selection does not look at it, so on Linux a middle click still
+/// rewrites the output, as it did before; the testing backend has no primary
+/// selection with which to show that.
+#[test]
+fn the_notepad_output_can_be_selected_but_not_rewritten_by_assistive_technology() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::ElementHandle;
+
+    let probe = NotepadProbe::new().unwrap();
+    probe.set_output("PLAINTEXT".into());
+    probe.show().unwrap();
+
+    let output = ElementHandle::find_by_element_type_name(&probe, "TextInput")
+        .find(|input| input.accessible_value().as_deref() == Some("PLAINTEXT"))
+        .expect("the notepad should show its output");
+    assert_eq!(output.accessible_read_only(), Some(true));
+    assert_eq!(
+        output.accessible_enabled(),
+        Some(true),
+        "a disabled TextInput ignores the pointer, so the output could not be selected"
+    );
+
+    output.set_accessible_value("SET-BY-AT");
+    assert_eq!(
+        output.accessible_value().unwrap_or_default().as_str(),
+        "PLAINTEXT",
+        "assistive technology rewrote the notepad's output"
+    );
+    probe.set_output("PLAINTEXT-2".into());
+    assert_eq!(
+        output.accessible_value().unwrap_or_default().as_str(),
+        "PLAINTEXT-2",
+        "the output area should go on showing the output"
     );
 }
 

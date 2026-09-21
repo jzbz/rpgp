@@ -262,13 +262,16 @@ impl Drop for BusyGuard {
 /// window while the other was still writing. Every control that starts an
 /// operation is disabled while `busy` is set, but a rule that lives only on
 /// the controls holds only for as long as nothing reaches a handler another
-/// way, and several things do. A control that had focus still answers Enter
-/// and Space after it is disabled. On Linux and macOS an assistive-technology
-/// activation reaches its callback whatever `enabled` says, as only the
-/// Windows adapter refuses a disabled control. A file dialog's answer arrives
-/// with no control involved at all: the dialogs have no parent window, so on
-/// Linux and Windows the window behind one stays live, and an operation can
-/// start while it is open.
+/// way, and several things can. Slint's own `enabled` keeps the pointer out
+/// and stops a control gaining focus, but a button or checkbox that already
+/// had focus still receives Enter and Space after it is disabled, and on Linux
+/// and macOS an assistive-technology activation reaches its callback whatever
+/// `enabled` says, as only the Windows adapter refuses a disabled control. The
+/// app's own widgets check `enabled` against both themselves, but that covers
+/// a control only for as long as it is built from one of them. A file dialog's
+/// answer arrives with no control involved at all: the dialogs have no parent
+/// window, so on Linux and Windows the window behind one stays live, and an
+/// operation can start while it is open.
 ///
 /// So the rule is kept where the work starts. Every handler that sets `busy`
 /// asks here first, Import's included, which gets there only once its file

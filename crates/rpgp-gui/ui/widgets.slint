@@ -79,7 +79,22 @@ export component Btn inherits Rectangle {
     accessible-role: button;
     accessible-label: root.label != "" ? root.label : root.text;
     accessible-enabled: root.enabled;
-    accessible-action-default => { root.clicked(); }
+    // `enabled` is checked here and in the key handler below because nothing
+    // else checks it on their behalf, and a disabled button is the only thing
+    // holding Delete shut until the key ID has been typed. Slint hands an
+    // assistive-technology activation straight to this handler, and of the
+    // AccessKit adapters only the Windows one refuses a control published as
+    // disabled, so on Linux and macOS a screen reader could press a greyed-out
+    // button. The FocusScope's own `enabled` only keeps it from gaining focus:
+    // one that had focus before the button was disabled goes on receiving
+    // every key. The TouchArea is the one part that enforces `enabled` by
+    // itself. Check, Select and the window's list rows and tabs follow the
+    // same rule for the same reasons.
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
 
     property <bool> filled: root.variant == Variant.primary || root.variant == Variant.danger;
     property <brush> fill-base: root.variant == Variant.danger ? Theme.danger : Theme.accent;
@@ -156,6 +171,11 @@ export component Btn inherits Rectangle {
         width: 0px;
         enabled: root.enabled;
         key-pressed(event) => {
+            // Rejected rather than swallowed, so a disabled button is as if it
+            // were not there. Nothing above it handles Space or Enter today.
+            if (!root.enabled) {
+                return reject;
+            }
             if (event.text == " " || event.text == "\n") {
                 root.clicked();
                 return accept;
@@ -226,6 +246,14 @@ export component Field inherits Rectangle {
         font-size: Theme.t-md;
         single-line: true;
         read-only: !root.enabled;
+        // Disabled as well as read-only, because read-only stops only typed
+        // keys. An input method's composed text is inserted without looking
+        // at it, and a field that had focus before it was disabled keeps its
+        // input method switched on, which Slint's own FIXME admits. A disabled
+        // TextInput ignores every key event, composed text included, and
+        // cannot gain focus. No Field is shown only to be read, so nothing is
+        // lost by the text no longer being selectable while it is disabled.
+        enabled: root.enabled;
         input-type: root.secret ? InputType.password : InputType.text;
         // input-type only masks the glyphs on screen. Slint's accessibility
         // pass binds accessible-value to `text` for every TextInput with no
@@ -238,6 +266,17 @@ export component Field inherits Rectangle {
         // The pass sets no accessible-label for a TextInput, so a secret
         // field would otherwise be announced with neither name nor value.
         accessible-label: root.placeholder;
+        // The same pass also gives every TextInput a set-value action that
+        // writes `text` and fires `edited` without looking at either flag.
+        // Once the input is disabled the Windows adapter refuses it, but the
+        // macOS one passes it on regardless, so this is that action with the
+        // check it lacks.
+        accessible-action-set-value(value) => {
+            if (self.enabled && !self.read-only) {
+                self.text = value;
+                self.edited();
+            }
+        }
         selection-background-color: Theme.accent;
         selection-foreground-color: Theme.accent-ink;
         edited => { root.edited(self.text); }
@@ -270,7 +309,14 @@ export component Check inherits Rectangle {
     accessible-enabled: root.enabled;
     accessible-checkable: true;
     accessible-checked: root.checked;
-    accessible-action-default => { root.toggled(); }
+    // Gated here and in the key handler for the reasons Btn gives. The Trust
+    // root box on a secret key is drawn ticked and is always disabled, so a
+    // toggle that got through would write a trust root the box cannot show.
+    accessible-action-default => {
+        if (root.enabled) {
+            root.toggled();
+        }
+    }
 
     height: 24px;
     // Without this a Check in a row layout expands to an equal share of the
@@ -318,6 +364,9 @@ export component Check inherits Rectangle {
         width: 0px;
         enabled: root.enabled;
         key-pressed(event) => {
+            if (!root.enabled) {
+                return reject;
+            }
             if (event.text == " " || event.text == "\n") {
                 root.toggled();
                 return accept;
@@ -354,7 +403,13 @@ export component Select inherits Rectangle {
     accessible-value: root.current >= 0 && root.current < root.model.length
         ? root.model[root.current]
         : "";
-    accessible-action-default => { popup.show(); }
+    // Gated for the reasons Btn gives, here, in the key handler, and on the
+    // options, since each is a way of changing the choice.
+    accessible-action-default => {
+        if (root.enabled) {
+            popup.show();
+        }
+    }
 
     height: 34px;
     background: Theme.surface-sunken;
@@ -396,6 +451,9 @@ export component Select inherits Rectangle {
         width: 0px;
         enabled: root.enabled;
         key-pressed(event) => {
+            if (!root.enabled) {
+                return reject;
+            }
             if (event.text == " " || event.text == "\n") {
                 popup.show();
                 return accept;
@@ -462,7 +520,10 @@ export component Select inherits Rectangle {
                         }
                     }
 
+                    // The list can already be open when the Select is
+                    // disabled, since nothing closes it when `enabled` changes.
                     option := TouchArea {
+                        enabled: root.enabled;
                         mouse-cursor: MouseCursor.pointer;
                         clicked => {
                             root.current = index;
@@ -715,6 +776,9 @@ export component DialogShell inherits Rectangle {
 export component TextArea inherits Rectangle {
     in property <string> placeholder;
     in property <bool> enabled: true;
+    /// For text shown to be read and copied rather than edited. Not the same
+    /// as disabled: a disabled area cannot have its text selected either.
+    in property <bool> read-only: false;
     in-out property <string> text <=> input.text;
     callback edited(string);
 
@@ -744,7 +808,17 @@ export component TextArea inherits Rectangle {
             font-family: "Source Code Pro";
             single-line: false;
             wrap: word-wrap;
-            read-only: !root.enabled;
+            // Disabled and guarded for the reasons Field gives. The notepad's
+            // editor is disabled while a run is in flight, and its output
+            // is read-only rather than disabled so that it stays selectable.
+            read-only: root.read-only || !root.enabled;
+            enabled: root.enabled;
+            accessible-action-set-value(value) => {
+                if (self.enabled && !self.read-only) {
+                    self.text = value;
+                    self.edited();
+                }
+            }
             selection-background-color: Theme.accent;
             selection-foreground-color: Theme.accent-ink;
             edited => { root.edited(self.text); }
