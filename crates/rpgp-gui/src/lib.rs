@@ -252,6 +252,38 @@ impl Drop for BusyGuard {
     }
 }
 
+/// Whether an operation is already in flight, in which case the caller
+/// returns without doing anything.
+///
+/// `busy` stands for exactly one operation, and more than the look of the
+/// window relies on there never being two: the store's read-merge-write paths
+/// are not safe to run against each other, and every completion clears `busy`
+/// when it lands, so the first of two to finish would re-enable the whole
+/// window while the other was still writing. Every control that starts an
+/// operation is disabled while `busy` is set, but a rule that lives only on
+/// the controls holds only for as long as nothing reaches a handler another
+/// way, and several things do. A control that had focus still answers Enter
+/// and Space after it is disabled. On Linux and macOS an assistive-technology
+/// activation reaches its callback whatever `enabled` says, as only the
+/// Windows adapter refuses a disabled control. A file dialog's answer arrives
+/// with no control involved at all: the dialogs have no parent window, so on
+/// Linux and Windows the window behind one stays live, and an operation can
+/// start while it is open.
+///
+/// So the rule is kept where the work starts. Every handler that sets `busy`
+/// asks here first, Import's included, which gets there only once its file
+/// dialog has answered. So do the pickers that choose an operation's input,
+/// and the two details-pane toggles, which write the store without setting
+/// `busy` because they finish before they return. Export and Save revocation
+/// certificate do not ask once their dialogs answer, and that is deliberate:
+/// they start no operation and change nothing in the store, only copying out
+/// of it into the file the user chose. Nothing can come between a handler
+/// asking and it setting `busy`, since both happen on the event loop, which
+/// runs one callback at a time.
+fn refuse_while_busy(ui: &AppWindow) -> bool {
+    ui.get_busy()
+}
+
 /// Set on the restarted process so the software fallback can only happen once.
 const FALLBACK_GUARD: &str = "RPGP_SOFTWARE_FALLBACK";
 
@@ -466,8 +498,8 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
             // Not, as this used to say, because a worker holds the state lock
             // across a card PIN prompt: run_sign_encrypt and run_certify both
             // take the lock in a scoped block and drop it before any crypto,
-            // so the prompt happens with the lock free. Import is the one
-            // worker that holds it throughout, and import never prompts.
+            // so the prompt happens with the lock free. Import, which used to
+            // hold it throughout, now takes it only to clone the store out.
             if ui.get_busy() {
                 return;
             }
@@ -491,8 +523,8 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
             // Not, as this used to say, because a worker holds the state lock
             // across a card PIN prompt: run_sign_encrypt and run_certify both
             // take the lock in a scoped block and drop it before any crypto,
-            // so the prompt happens with the lock free. Import is the one
-            // worker that holds it throughout, and import never prompts.
+            // so the prompt happens with the lock free. Import, which used to
+            // hold it throughout, now takes it only to clone the store out.
             if ui.get_busy() {
                 return;
             }
@@ -516,8 +548,8 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
             // Not, as this used to say, because a worker holds the state lock
             // across a card PIN prompt: run_sign_encrypt and run_certify both
             // take the lock in a scoped block and drop it before any crypto,
-            // so the prompt happens with the lock free. Import is the one
-            // worker that holds it throughout, and import never prompts.
+            // so the prompt happens with the lock free. Import, which used to
+            // hold it throughout, now takes it only to clone the store out.
             if ui.get_busy() {
                 return;
             }
@@ -545,8 +577,8 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
             // Not, as this used to say, because a worker holds the state lock
             // across a card PIN prompt: run_sign_encrypt and run_certify both
             // take the lock in a scoped block and drop it before any crypto,
-            // so the prompt happens with the lock free. Import is the one
-            // worker that holds it throughout, and import never prompts.
+            // so the prompt happens with the lock free. Import, which used to
+            // hold it throughout, now takes it only to clone the store out.
             if ui.get_busy() {
                 return;
             }
@@ -594,84 +626,7 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
                 let Some(ui) = ui_weak.upgrade() else {
                     return;
                 };
-                // Off the event loop, like key generation above. Parsing a
-                // keyring and writing one cert-d file per certificate is
-                // unbounded work — a GnuPG pubring can hold thousands — and
-                // doing it here held the state lock and froze the window for
-                // the whole import. The file dialog itself has to stay on the
-                // main thread, which is why only this half moves.
-                ui.set_busy(true);
-                ui.set_status("Importing…".into());
-                let path = file.path().to_path_buf();
-                let (ui_weak, state) = (ui_weak.clone(), state.clone());
-                std::thread::spawn(move || {
-                    let _busy = BusyGuard(ui_weak.clone());
-                    // Cloned out under a brief lock, exactly as the comment on
-                    // State::store describes. Importing a GnuPG pubring parses
-                    // and writes thousands of certificates, and holding the
-                    // mutex across all of it blocked every other worker for
-                    // the duration. Nothing below touches the State the lock
-                    // protects — `all` is rebuilt by the reload in the
-                    // completion closure.
-                    let store = lock(&state).store.clone();
-                    let outcome = {
-                        // A revocation certificate is a bare signature, not a
-                        // certificate, so CertParser rejects it. Same button,
-                        // because a user handed a .rev file expects Import to
-                        // take it.
-                        match store.import_file(&path) {
-                            Ok(certs) => {
-                                // Secret keys are called out rather than folded
-                                // into the count: one arriving is the difference
-                                // between adding someone's certificate and taking
-                                // custody of their key, and an imported key is
-                                // deliberately not a trust root.
-                                let secrets = certs.iter().filter(|c| c.is_tsk()).count();
-                                Ok(if secrets == 0 {
-                                    format!("Imported {} certificate(s)", certs.len())
-                                } else {
-                                    format!(
-                                        "Imported {} certificate(s), {secrets} with a secret \
-                                         key. A secret key that arrives in a file is not made \
-                                         a trust root; tick Trust root in its details pane if \
-                                         you meant to trust it.",
-                                        certs.len()
-                                    )
-                                })
-                            }
-                            Err(import_error) => {
-                                match revoke::apply_revocation_file(&store, &path) {
-                                    Ok(cert) => Ok(format!(
-                                        "Revoked {}",
-                                        rpgp_core::CertSummary::from_cert(&cert).primary_user_id
-                                    )),
-                                    Err(_) => Err(import_error),
-                                }
-                            }
-                        }
-                    };
-
-                    // One refresh at the end rather than progressive updates:
-                    // the list stays as it was until the import is complete,
-                    // which is what it did when this ran inline.
-                    let _ = slint::invoke_from_event_loop(move || {
-                        let Some(ui) = ui_weak.upgrade() else {
-                            return;
-                        };
-                        ui.set_busy(false);
-                        match outcome {
-                            Ok(message) => reload_after(
-                                &ui,
-                                &state,
-                                AfterReload {
-                                    status: Some(message),
-                                    ..Default::default()
-                                },
-                            ),
-                            Err(e) => ui.set_status(format!("Import failed: {e}").into()),
-                        }
-                    });
-                });
+                import_chosen_file(&ui, &state, file.path().to_path_buf());
             });
         }
     });
@@ -717,6 +672,96 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
     });
 }
 
+/// Import the file the Import picker came back with.
+///
+/// Split out of the picker, like [`choose_dv_input`], because the dialog
+/// cannot be driven without a display and this half is what a test needs to
+/// reach.
+fn import_chosen_file(ui: &AppWindow, state: &Shared, path: PathBuf) {
+    // The file dialog is not modal, so another operation can have started
+    // while it was open. Two must not run at once, and the user is told rather
+    // than left to wonder why the certificates never arrived.
+    if refuse_while_busy(ui) {
+        ui.set_status(
+            "Nothing was imported, because another operation is still running. \
+             Import the file again when it finishes."
+                .into(),
+        );
+        return;
+    }
+    // Off the event loop, like key generation. Parsing a keyring and writing
+    // one cert-d file per certificate is unbounded work — a GnuPG pubring can
+    // hold thousands — and doing it here held the state lock and froze the
+    // window for the whole import. The file dialog itself has to stay on the
+    // main thread, which is why only this half moves.
+    ui.set_busy(true);
+    ui.set_status("Importing…".into());
+    let (ui_weak, state) = (ui.as_weak(), state.clone());
+    std::thread::spawn(move || {
+        let _busy = BusyGuard(ui_weak.clone());
+        // Cloned out under a brief lock, exactly as the comment on State::store
+        // describes. Importing a GnuPG pubring parses and writes thousands of
+        // certificates, and holding the mutex across all of it blocked every
+        // other worker for the duration. Nothing below touches the State the
+        // lock protects — `all` is rebuilt by the reload in the completion
+        // closure.
+        let store = lock(&state).store.clone();
+        let outcome = {
+            // A revocation certificate is a bare signature, not a certificate,
+            // so CertParser rejects it. Same button, because a user handed a
+            // .rev file expects Import to take it.
+            match store.import_file(&path) {
+                Ok(certs) => {
+                    // Secret keys are called out rather than folded into the
+                    // count: one arriving is the difference between adding
+                    // someone's certificate and taking custody of their key,
+                    // and an imported key is deliberately not a trust root.
+                    let secrets = certs.iter().filter(|c| c.is_tsk()).count();
+                    Ok(if secrets == 0 {
+                        format!("Imported {} certificate(s)", certs.len())
+                    } else {
+                        format!(
+                            "Imported {} certificate(s), {secrets} with a secret \
+                             key. A secret key that arrives in a file is not made \
+                             a trust root; tick Trust root in its details pane if \
+                             you meant to trust it.",
+                            certs.len()
+                        )
+                    })
+                }
+                Err(import_error) => match revoke::apply_revocation_file(&store, &path) {
+                    Ok(cert) => Ok(format!(
+                        "Revoked {}",
+                        rpgp_core::CertSummary::from_cert(&cert).primary_user_id
+                    )),
+                    Err(_) => Err(import_error),
+                },
+            }
+        };
+
+        // One refresh at the end rather than progressive updates: the list
+        // stays as it was until the import is complete, which is what it did
+        // when this ran inline.
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            ui.set_busy(false);
+            match outcome {
+                Ok(message) => reload_after(
+                    &ui,
+                    &state,
+                    AfterReload {
+                        status: Some(message),
+                        ..Default::default()
+                    },
+                ),
+                Err(e) => ui.set_status(format!("Import failed: {e}").into()),
+            }
+        });
+    });
+}
+
 // ------------------------------------------------------------- key generation
 
 fn wire_keygen(ui: &AppWindow, state: &Shared) {
@@ -726,6 +771,9 @@ fn wire_keygen(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            if refuse_while_busy(&ui) {
+                return;
+            }
 
             let request = KeyGenRequest {
                 user_ids: vec![format!("{} <{}>", name.trim(), email.trim())],
@@ -834,9 +882,7 @@ fn wire_sign_encrypt(ui: &AppWindow, state: &Shared) {
                 let Some(ui) = ui_weak.upgrade() else {
                     return;
                 };
-                let mut guard = lock(&state);
-                guard.se_input = Some(file.path().to_path_buf());
-                push_sign_encrypt(&ui, &guard);
+                choose_se_input(&ui, &state, file.path().to_path_buf());
             });
         }
     });
@@ -866,6 +912,9 @@ fn wire_sign_encrypt(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            if refuse_while_busy(&ui) {
+                return;
+            }
             ui.set_busy(true);
             ui.set_status(
                 if encrypt {
@@ -906,6 +955,24 @@ fn wire_sign_encrypt(ui: &AppWindow, state: &Shared) {
             });
         }
     });
+}
+
+/// Take a newly chosen file to sign or encrypt, as the picker does once the
+/// file dialog answers.
+///
+/// Split out of the picker, like [`choose_dv_input`], so that a test can reach
+/// it.
+fn choose_se_input(ui: &AppWindow, state: &Shared, path: PathBuf) {
+    // As for Decrypt / Verify's pickers: a file dialog opened before Run is
+    // not modal and can answer during the run. The run takes its file from
+    // here once its worker starts, so the file shown when Run was pressed is
+    // the one it signs or encrypts only if nothing is taken in the meantime.
+    if refuse_while_busy(ui) {
+        return;
+    }
+    let mut guard = lock(state);
+    guard.se_input = Some(path);
+    push_sign_encrypt(ui, &guard);
 }
 
 /// The blocking half of Sign / Encrypt, run on a worker thread.
@@ -1137,6 +1204,9 @@ fn wire_decrypt_verify(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            if refuse_while_busy(&ui) {
+                return;
+            }
             ui.set_busy(true);
             ui.set_status("Working…".into());
 
@@ -1180,11 +1250,21 @@ struct DvRead {
 /// Split out of the picker, like [`choose_dv_data`], because the dialog cannot
 /// be driven without a display and this half is what a test needs to reach.
 fn choose_dv_input(ui: &AppWindow, state: &Shared, path: PathBuf, kind: InputKind) {
+    // The Choose buttons are disabled while an operation is in flight, but a
+    // file dialog opened before Run is not modal and can answer during the
+    // run. The files the dialog shows are the ones that run is reading, so
+    // they stay as they are, and its verdict lands beside the files it is
+    // about.
+    if refuse_while_busy(ui) {
+        return;
+    }
     let mut guard = lock(state);
     guard.dv_input = Some(path);
     guard.dv_kind = kind;
-    // A different choice of files: a run still in flight against the previous
-    // one is no longer about what the dialog shows.
+    // A different choice of files, so a result for the previous one is no
+    // longer about what the dialog shows. With the refusal above no run on
+    // the previous files should still be going; if one ever is, this is what
+    // keeps its result out of the dialog.
     guard.dv_generation += 1;
     ui.set_dv_result(SharedString::new());
     ui.set_dv_tone(0);
@@ -1194,20 +1274,26 @@ fn choose_dv_input(ui: &AppWindow, state: &Shared, path: PathBuf, kind: InputKin
 /// Take a newly chosen signed file, as the data picker does once the file
 /// dialog answers.
 fn choose_dv_data(ui: &AppWindow, state: &Shared, path: PathBuf) {
+    // Refused while busy, and a new generation otherwise, for the reasons
+    // given for the input.
+    if refuse_while_busy(ui) {
+        return;
+    }
     let mut guard = lock(state);
     guard.dv_data = Some(path);
-    // As for the input: whatever is running was started on other files.
     guard.dv_generation += 1;
     push_decrypt_verify(ui, &guard);
 }
 
 /// The event-loop half of Decrypt / Verify: show what a run found.
 ///
-/// In the dialog only if the files it read are still the ones chosen. The
-/// Choose buttons are disabled while a run is in flight, but that only stops a
-/// picker opening: one opened before Run can still come back during it,
-/// because on Linux and Windows the file dialog has no parent window and the
-/// main window stays live behind it. Painted beside the new files, a verdict
+/// In the dialog only if the files it read are still the ones chosen. They
+/// should be. A picker opened before Run can come back during it, because on
+/// Linux and Windows the file dialog has no parent window and the main window
+/// stays live behind it, but [`choose_dv_input`] and [`choose_dv_data`] refuse
+/// what it brings while the run is in flight. This check does not depend on
+/// those refusals: the dialog can still be closed while a run goes on, and its
+/// opener does not ask whether one is. Painted beside the new files, a verdict
 /// about the old ones reads as "Signature verified" next to a file nothing
 /// checked. It still goes on the status line, because a decrypt has already
 /// written its output by the time it gets here and hiding that would hide a
@@ -1460,6 +1546,9 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            if refuse_while_busy(&ui) {
+                return;
+            }
             ui.set_busy(true);
             ui.set_status("Certifying…".into());
 
@@ -1505,6 +1594,13 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            // Of the two things that disable the checkbox, only `busy` is
+            // kept here. It is also disabled for any key with a secret half,
+            // but a secret key that arrived by import is not a trust root
+            // until it is made one, and making it one is this handler's job.
+            if refuse_while_busy(&ui) {
+                return;
+            }
             let fingerprint = ui.get_detail().fingerprint.to_string();
             if fingerprint.is_empty() {
                 return;
@@ -1550,6 +1646,9 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            if refuse_while_busy(&ui) {
+                return;
+            }
             let detail = ui.get_detail();
             let fingerprint = detail.fingerprint.to_string();
             if fingerprint.is_empty() {
@@ -1805,6 +1904,9 @@ fn wire_lookup(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            if refuse_while_busy(&ui) {
+                return;
+            }
             ui.set_busy(true);
             ui.set_lookup_status("Searching…".into());
 
@@ -2001,6 +2103,9 @@ fn wire_lifecycle(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            if refuse_while_busy(&ui) {
+                return;
+            }
             // What the dialog was opened for, not what the pane shows now.
             // Written every time the dialog opens, which is the only way to
             // reach this button, and dropped when an action goes through, so
@@ -2338,6 +2443,9 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            if refuse_while_busy(&ui) {
+                return;
+            }
             ui.set_busy(true);
             ui.set_status("Working…".into());
 
@@ -2660,6 +2768,9 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            if refuse_while_busy(&ui) {
+                return;
+            }
             // What the dialog named and what it warned about, as recorded when
             // it opened, not whatever the pane shows now.
             let target = lock(&state).delete_target.clone();
@@ -2798,6 +2909,9 @@ fn wire_revoke(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            if refuse_while_busy(&ui) {
+                return;
+            }
             ui.set_busy(true);
             ui.set_status("Revoking…".into());
 
@@ -4090,9 +4204,9 @@ mod tests {
         rpgp_core::keygen::generate(&rpgp_core::keygen::KeyGenRequest::new(user_id)).unwrap()
     }
 
-    /// The window `run` builds, over `state`, with the callbacks these tests
-    /// drive wired as `run` wires them, and showing the list a finished
-    /// reload leaves on screen.
+    /// The window `run` builds, over `state`, wired by every `wire_*` function
+    /// `run` calls and showing the list a finished reload leaves on screen.
+    /// Only the About link is not wired, because it would open a browser.
     ///
     /// The caller sets up the Slint platform first, because which backend a
     /// test needs depends on whether it runs an event loop.
@@ -4102,10 +4216,15 @@ mod tests {
         lock(state).all = read_store(&store).expect("a healthy store reads").all;
         apply_filter(&ui, state);
         wire_list(&ui, state);
+        wire_keygen(&ui, state);
+        wire_sign_encrypt(&ui, state);
         wire_decrypt_verify(&ui, state);
         wire_certify(&ui, state);
+        wire_revoke(&ui, state);
         wire_delete(&ui, state);
+        wire_notepad(&ui, state);
         wire_lifecycle(&ui, state);
+        wire_lookup(&ui, state);
         ui
     }
 
@@ -4350,9 +4469,12 @@ mod tests {
     ///
     /// Each run here is made first and its result handed back afterwards, with
     /// the dialog's files changed in between: the order a picker opened before
-    /// Run produces when it comes back while the run is still going. Changing
-    /// the signed file, the signature, and closing and reopening the dialog are
-    /// each tried, since each is its own way for the files to change.
+    /// Run would produce if what it brought back during the run were taken.
+    /// The pickers refuse it while `busy` is set, which a run does and this
+    /// test does not, so what is tested here is the check that holds whatever
+    /// else changes the files. Changing the signed file, the signature, and
+    /// closing and reopening the dialog are each tried, since each is its own
+    /// way for the files to change.
     #[test]
     fn a_verdict_is_not_shown_beside_files_chosen_while_it_ran() {
         i_slint_backend_testing::init_no_event_loop();
@@ -4423,6 +4545,239 @@ mod tests {
         ui.invoke_open_decrypt_verify();
         show_decrypt_verify(&ui, &state, read, outcome);
         not_shown(&ui, "a reopened dialog");
+    }
+
+    /// While an operation is in flight no handler starts another, however it
+    /// is reached, the running operation's own button included.
+    ///
+    /// `busy` is set by hand, as the running operation's handler would have
+    /// set it. Past the check, each handler writes the status line, or Lookup
+    /// its dialog's line, before it hands anything to a worker, to say what it
+    /// is starting or why it cannot. So a line left as it was means the
+    /// handler returned at the check. Each is then invoked again with `busy`
+    /// clear, so that the unchanged line is known to mean something. Add user
+    /// ID stands in for the lifecycle modes, which share one handler.
+    ///
+    /// Nothing is set up for that second pass, so nothing it starts reaches
+    /// the store or the network. Add user ID and Delete have no target and
+    /// start no worker at all. The rest, key generation apart, start workers
+    /// that fail at once, for want of a file, a key, a target or a query. Key
+    /// generation does make a key, but only its completion would store it,
+    /// and that never gets so far: this thread has no event loop to run it,
+    /// and on another test's loop it returns at once, since this window
+    /// cannot be upgraded on a thread other than its own.
+    #[test]
+    fn nothing_starts_while_an_operation_is_in_flight() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+
+        let empty = SharedString::new;
+        let starts: [(&str, &dyn Fn()); 9] = [
+            ("Create key pair", &|| {
+                ui.invoke_generate_key("Alice".into(), "alice@example.org".into(), empty(), 0, 0, 0)
+            }),
+            ("Sign", &|| {
+                ui.invoke_se_run(false, true, 0, empty(), empty())
+            }),
+            ("Decrypt / Verify", &|| ui.invoke_dv_run(empty())),
+            ("Certify", &|| {
+                ui.invoke_certify_run(0, false, false, 0, empty())
+            }),
+            ("Look up", &|| ui.invoke_lookup_run(empty())),
+            ("Add user ID", &|| {
+                ui.invoke_lifecycle_run(1, "0".into(), "Jo <jo@example.org>".into(), empty(), 0)
+            }),
+            ("the notepad's Sign", &|| {
+                ui.invoke_np_run(0, "a note".into(), 0, empty(), empty())
+            }),
+            ("Delete", &|| ui.invoke_delete_run()),
+            ("Revoke", &|| ui.invoke_revoke_run(0, empty(), empty())),
+        ];
+        // What an import in flight has on the line, which none of these says.
+        let running = "Importing…";
+        let reset = |busy: bool| {
+            ui.set_busy(busy);
+            ui.set_status(running.into());
+            ui.set_lookup_status(empty());
+        };
+
+        for (what, start) in &starts {
+            reset(true);
+            start();
+            assert_eq!(
+                ui.get_status(),
+                running,
+                "{what} started while another operation was in flight"
+            );
+            assert_eq!(
+                ui.get_lookup_status(),
+                "",
+                "{what} started while another operation was in flight"
+            );
+        }
+
+        for (what, start) in &starts {
+            reset(false);
+            start();
+            assert!(
+                ui.get_status() != running || ui.get_lookup_status() != "",
+                "{what} did nothing with nothing in flight either, so the check above proves nothing"
+            );
+        }
+    }
+
+    /// A file the Import dialog comes back with while another operation is
+    /// in flight is not imported, and the status line says so.
+    ///
+    /// The dialog is not modal, so a key generation, say, can be started
+    /// behind it. Import used to start its worker anyway, and whichever
+    /// finished first cleared `busy` with the other still running.
+    #[test]
+    fn a_file_chosen_for_import_while_an_operation_is_in_flight_is_not_imported() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let bob = generated("Bob <bob@example.org>").cert;
+        let fingerprint = bob.fingerprint().to_hex();
+        let file = dir.path().join("bob.asc");
+        let elsewhere = Store::open(
+            dir.path().join("elsewhere"),
+            dir.path().join("elsewhere-secrets"),
+        )
+        .unwrap();
+        elsewhere.insert(&bob).unwrap();
+        elsewhere
+            .export_file(std::slice::from_ref(&fingerprint), &file)
+            .unwrap();
+
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let store = lock(&state).store.clone();
+
+        ui.set_busy(true);
+        ui.set_status("Generating key…".into());
+        import_chosen_file(&ui, &state, file.clone());
+        let status = ui.get_status();
+        assert!(
+            status.starts_with("Nothing was imported"),
+            "the user should be told the import did not happen: {status}"
+        );
+        assert!(
+            ui.get_busy(),
+            "the running operation still holds the window"
+        );
+        assert!(store.lookup(&fingerprint).is_err(), "and nothing went in");
+
+        // With nothing in flight the same file goes in, so the refusal above
+        // is the only thing that kept it out.
+        ui.set_busy(false);
+        import_chosen_file(&ui, &state, file);
+        assert_eq!(ui.get_status(), "Importing…");
+        wait_for("the import", || store.lookup(&fingerprint).is_ok());
+    }
+
+    /// A file dialog that answers while a run is in flight changes nothing the
+    /// run is using, and the run's verdict lands beside the files it read.
+    ///
+    /// On Linux and Windows a file dialog left open does not stop the window
+    /// behind it, so Run can be pressed while a picker is still up. The run is
+    /// made here directly, since without an event loop its result would never
+    /// land, and `busy` is set as the Verify handler sets it.
+    #[test]
+    fn a_file_chosen_while_a_run_is_in_flight_is_not_taken() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let alice = generated("Alice <alice@example.org>").cert;
+        store.insert_secret(&alice).unwrap();
+
+        let (release, other) = (dir.path().join("a.tar"), dir.path().join("b.tar"));
+        std::fs::write(&release, b"the release").unwrap();
+        std::fs::write(&other, b"something else entirely").unwrap();
+        let signature = dir.path().join("a.tar.sig");
+        ops::sign_detached_file(&alice, None, &release, &signature).unwrap();
+        let kind = ops::classify_file(&signature);
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let shown = |path: &Path| SharedString::from(path.display().to_string());
+
+        ui.invoke_open_decrypt_verify();
+        choose_dv_input(&ui, &state, signature.clone(), kind);
+        choose_dv_data(&ui, &state, release.clone());
+        ui.set_busy(true);
+        let (read, outcome) = run_decrypt_verify(&state, "");
+
+        choose_dv_data(&ui, &state, other.clone());
+        assert_eq!(
+            ui.get_dv_data(),
+            shown(&release),
+            "the signed file changed under a running verify"
+        );
+        choose_dv_input(&ui, &state, other.clone(), ops::classify_file(&other));
+        assert_eq!(
+            ui.get_dv_input(),
+            shown(&signature),
+            "the signature changed under a running verify"
+        );
+
+        ui.set_busy(false);
+        show_decrypt_verify(&ui, &state, read, outcome);
+        assert_eq!(
+            ui.get_dv_result(),
+            "Signature verified",
+            "the verdict belongs beside the files it read, which are still the ones shown"
+        );
+
+        // Sign / Encrypt's picker is refused the same way.
+        choose_se_input(&ui, &state, release.clone());
+        ui.set_busy(true);
+        choose_se_input(&ui, &state, other);
+        assert_eq!(
+            ui.get_se_input(),
+            shown(&release),
+            "the file to sign changed under a running operation"
+        );
+        assert_eq!(lock(&state).se_input.as_deref(), Some(release.as_path()));
+    }
+
+    /// Neither details-pane toggle writes the store while an operation is in
+    /// flight.
+    ///
+    /// Both checkboxes are disabled while `busy` is set, which is not enough
+    /// on its own, for the reasons [`refuse_while_busy`] gives. A delete in
+    /// flight writes the trust-root list too.
+    #[test]
+    fn the_details_toggles_write_nothing_while_an_operation_is_in_flight() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let cert = generated("Old <old@example.org>").cert;
+        store.insert(&cert).unwrap();
+        let fingerprint = cert.fingerprint().to_hex();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        click_row(&ui, &state, &fingerprint);
+        let store = lock(&state).store.clone();
+        let is_root = || store.trust_roots().unwrap().contains(&fingerprint);
+        let accepted = || store.sha1_accepted().unwrap().contains(&fingerprint);
+
+        ui.set_busy(true);
+        ui.invoke_toggle_trust_root();
+        assert!(!is_root(), "a trust root was written while busy");
+        ui.invoke_toggle_sha1_accepted();
+        assert!(!accepted(), "SHA-1 was accepted while busy");
+
+        // Both still work once nothing is in flight.
+        ui.set_busy(false);
+        ui.invoke_toggle_trust_root();
+        assert!(is_root());
+        ui.invoke_toggle_sha1_accepted();
+        assert!(accepted());
     }
 
     /// Run the event loop until `done`, or give up after a minute.
