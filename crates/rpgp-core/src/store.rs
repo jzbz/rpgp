@@ -1669,11 +1669,12 @@ fn restrict_if_present(path: &Path, mode: u32) -> Result<()> {
 mod windows_acl {
     use std::fs;
     use std::io;
+    use std::marker::PhantomData;
     use std::mem;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, HandleOrInvalid, OwnedHandle};
     use std::path::Path;
-    use std::ptr;
+    use std::ptr::{self, NonNull};
 
     use windows_sys::Win32::Foundation::{
         ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_WRITE, GetLastError, LocalFree,
@@ -1736,7 +1737,14 @@ mod windows_acl {
     pub(super) fn restrict(path: &Path) -> Result<()> {
         // Which form of the policy applies is decided by what the path *is*,
         // not by the `mode` the caller passed: see the wrapper's doc comment.
-        let container = fs::symlink_metadata(path)
+        // It is judged with any link at its end followed, because
+        // SetNamedSecurityInfoW follows that link and puts the ACL on what it
+        // leads to, as chmod does on Unix. Judged without following it, a
+        // secrets directory moved to another drive with a junction left in its
+        // place looked like a file, since std reports a junction as a symlink
+        // and not a directory, and the real directory got the policy for a
+        // file, with nothing for what is made inside it to inherit.
+        let container = fs::metadata(path)
             .map_err(|e| Error::io(format!("inspecting {}", path.display()), e))?
             .is_dir();
 
@@ -1745,12 +1753,16 @@ mod windows_acl {
         let wide = wide_path(path)?;
 
         // SAFETY: `wide` is a NUL-terminated UTF-16 buffer alive for the call.
-        // `dacl` borrows from `descriptor`, a live local, so the ACL it points
-        // into outlives the call. The owner, group and SACL parameters are
-        // null, which the API documents as "leave this component alone", and
-        // the matching bits are absent from `securityinfo`.
-        // PROTECTED_DACL_SECURITY_INFORMATION is what strips inherited ACEs
-        // already on the object; DACL alone would add ours and keep theirs.
+        // The ACL pointer is taken in the argument list itself, from a `dacl`
+        // that borrows `descriptor`, and `descriptor` is not dropped until the
+        // call has returned, so the allocation it points into outlives the
+        // call. The borrow alone would not ensure that: the raw pointer carries
+        // no lifetime, which is why it is never kept in a local of its own. The
+        // owner, group and SACL parameters are null, which the API documents
+        // as "leave this component alone", and the matching bits are absent
+        // from `securityinfo`. PROTECTED_DACL_SECURITY_INFORMATION is what
+        // strips inherited ACEs already on the object; DACL alone would add
+        // ours and keep theirs.
         let status = unsafe {
             SetNamedSecurityInfoW(
                 wide.as_ptr(),
@@ -1758,7 +1770,7 @@ mod windows_acl {
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 ptr::null_mut(),
                 ptr::null_mut(),
-                dacl,
+                dacl.as_ptr(),
                 ptr::null(),
             )
         };
@@ -1858,11 +1870,11 @@ mod windows_acl {
             Ok(Self(descriptor))
         }
 
-        /// The DACL inside this descriptor.
+        /// The DACL inside this descriptor, borrowed from it.
         ///
-        /// Borrowed, not owned: it points into the same allocation, so it must
-        /// not outlive `self` and must never be freed separately.
-        fn dacl(&self) -> Result<*const ACL> {
+        /// It points into the same allocation, so it must never be freed
+        /// separately, and its lifetime keeps it from outliving `self`.
+        fn dacl(&self) -> Result<BorrowedDacl<'_>> {
             let mut present = 0;
             let mut dacl: *mut ACL = ptr::null_mut();
             let mut defaulted = 0;
@@ -1877,10 +1889,10 @@ mod windows_acl {
             // A descriptor with no DACL grants everyone everything. Our SDDL
             // always has a `D:` component, so this is unreachable — but the
             // failure mode is bad enough to check rather than assume.
-            if present == 0 || dacl.is_null() {
-                return Err(Error::invalid("the ACL policy produced no DACL"));
+            match NonNull::new(dacl) {
+                Some(dacl) if present != 0 => Ok(BorrowedDacl(dacl, PhantomData)),
+                _ => Err(Error::invalid("the ACL policy produced no DACL")),
             }
-            Ok(dacl)
         }
     }
 
@@ -1888,10 +1900,38 @@ mod windows_acl {
         fn drop(&mut self) {
             // SAFETY: the only constructor stores a non-null pointer returned
             // by ConvertStringSecurityDescriptorToSecurityDescriptorW, whose
-            // documented deallocator is LocalFree. Drop runs at most once, so
-            // there is no double free, and `dacl()` hands out borrows that
-            // cannot outlive `self`.
+            // documented deallocator is LocalFree. Drop runs at most once, and
+            // nothing else frees the allocation — the DACL `dacl()` lends out
+            // points into it and has no destructor — so there is no double
+            // free.
             unsafe { LocalFree(self.0.cast()) };
+        }
+    }
+
+    /// The DACL inside a [`SecurityDescriptor`], for as long as the borrow of
+    /// the descriptor lasts, as std's `BorrowedHandle` is a handle for as long
+    /// as its borrow lasts.
+    ///
+    /// `dacl()` used to return a bare `*const ACL`, which carries no
+    /// lifetime, so `SecurityDescriptor::from_sddl(..)?.dacl()?` would have
+    /// compiled, freed the descriptor at the end of that statement, and left
+    /// the pointer for SetNamedSecurityInfoW to read the freed ACL through.
+    /// The borrow makes that a compile error. Not a `&ACL`, though: `ACL` is
+    /// only the header of a variable-length structure whose ACEs follow it,
+    /// and under Stacked Borrows, one model of Rust's aliasing rules, a
+    /// pointer made from a reference to the header may read the header alone,
+    /// where Windows reads the whole ACL through it.
+    struct BorrowedDacl<'a>(NonNull<ACL>, PhantomData<&'a SecurityDescriptor>);
+
+    impl BorrowedDacl<'_> {
+        /// The pointer the Win32 calls take.
+        ///
+        /// It carries no lifetime of its own, so nothing checks that the
+        /// descriptor is still alive where it is used. Take it in the argument
+        /// list of the call it is for, where the borrow has just shown that,
+        /// never into a local that could outlive the descriptor.
+        fn as_ptr(&self) -> *const ACL {
+            self.0.as_ptr()
         }
     }
 
@@ -2684,7 +2724,10 @@ mod tests {
             link.as_mut_os_string().push(".old");
             fs::hard_link(path, &link).unwrap();
             // Windows carries the same property through an ACL rather than a
-            // mode; the acl tests below cover that side.
+            // mode, which the windows_acls tests below check: for the lists in
+            // the_directory_above_the_secrets_and_its_lists_are_owner_only,
+            // and for the replacement the key and the revocation go through
+            // in a_file_written_over_an_exposed_one_is_owner_only.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -4472,7 +4515,10 @@ mod tests {
         );
     }
 
-    /// The Windows counterpart of `private_files_are_not_world_readable`.
+    /// The Windows counterparts of the tests above that check file modes:
+    /// `private_files_are_not_world_readable`,
+    /// `the_directory_above_the_secrets_and_its_lists_are_kept_private`, and the
+    /// mode half of `every_file_the_store_keeps_is_replaced_rather_than_written_into`.
     ///
     /// Windows has no file mode, so the assertion is made against the DACL that is
     /// really on disk: the ACE count, the SID each ACE names, its access mask, its
@@ -4838,7 +4884,14 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), b"rewritten");
         }
 
-        /// Property 2, repair on open, mirroring the Unix test's chmod-and-reopen.
+        /// Property 2, repair on open, mirroring the chmod-and-reopen of
+        /// `private_files_are_not_world_readable` over the same four paths: the
+        /// secrets and the revocation certificates, each directory and the file
+        /// in it. This loosened only the secrets until now, so nothing on
+        /// Windows checked that the revocations are repaired as well. The
+        /// directory above them is checked here only as the store first makes
+        /// it; its repair, and the lists in it, are
+        /// `the_directory_above_the_secrets_and_its_lists_are_owner_only`'s.
         ///
         /// Goes through `insert_secret` and `save_revocation` rather than calling
         /// `create_private` directly, so it also proves the real write paths use
@@ -4876,19 +4929,22 @@ mod tests {
 
             // A store written by an earlier version is already exposed, and the
             // user has no way to know it.
-            loosen(&secrets, true);
-            loosen(&key, false);
-            let (before_dir, before_key) = (read_dacl(&secrets), read_dacl(&key));
-            assert!(
-                before_dir.grants_everyone() && !before_dir.protected,
-                "the test's own setup did not take on the directory — {}",
-                before_dir.sddl,
-            );
-            assert!(
-                before_key.grants_everyone() && !before_key.protected,
-                "the test's own setup did not take on the key — {}",
-                before_key.sddl,
-            );
+            let revocation = store.revocation_path(&fingerprint);
+            for (path, inheritable) in [
+                (&secrets, true),
+                (&key, false),
+                (&store.revocations_dir, true),
+                (&revocation, false),
+            ] {
+                loosen(path, inheritable);
+                let before = read_dacl(path);
+                assert!(
+                    before.grants_everyone() && !before.protected,
+                    "the test's own setup did not take on {} — {}",
+                    path.display(),
+                    before.sddl,
+                );
+            }
 
             let reopened = Store::open(dir.path().join("certs.d"), &secrets).unwrap();
             read_dacl(&secrets).assert_only(&sid, INHERIT, "secrets directory after reopen");
@@ -4897,9 +4953,154 @@ mod tests {
                 0,
                 "secret key after reopen",
             );
+            read_dacl(&reopened.revocations_dir).assert_only(
+                &sid,
+                INHERIT,
+                "revocations directory after reopen",
+            );
+            read_dacl(&reopened.revocation_path(&fingerprint)).assert_only(
+                &sid,
+                0,
+                "revocation certificate after reopen",
+            );
             assert!(
                 !fs::read(&key).unwrap().is_empty(),
                 "the repaired key must still be readable by the user who owns it",
+            );
+        }
+
+        /// The directory above the secrets and the lists in it are owner-only
+        /// as the store writes them, and repaired to that on every open.
+        ///
+        /// Each list is checked as its writer first makes it, as its writer
+        /// leaves it after replacing an exposed copy, and after an open repairs
+        /// one an earlier build left exposed. Nothing on Windows checked any
+        /// of the three, although trust-roots decides whose certificate counts
+        /// as fully trusted, and the comment in
+        /// `every_file_the_store_keeps_is_replaced_rather_than_written_into`
+        /// said these tests did.
+        ///
+        /// The replacement is made over an exposed copy rather than a private
+        /// one. The rename that replaces a list is what decides its ACL, and a
+        /// replacement that kept the old file's ACL, as ReplaceFileW does,
+        /// would keep a private list private and pass regardless.
+        #[test]
+        fn the_directory_above_the_secrets_and_its_lists_are_owner_only() {
+            use crate::keygen::{KeyGenRequest, generate};
+
+            let dir = tempfile::tempdir().unwrap();
+            // Made by the store, as open_default's rpgp directory is.
+            let data = dir.path().join("rpgp");
+            let secrets = data.join("secrets");
+            let store = Store::open(dir.path().join("certs.d"), &secrets).unwrap();
+            let sid = current_user_sid().unwrap();
+            read_dacl(&data).assert_only(&sid, INHERIT, "the directory above the secrets");
+
+            // One entry on every list, through the store's own writers.
+            let write_lists = |fingerprint: &str, user_id: &str| {
+                store.set_trust_root(fingerprint, true).unwrap();
+                store.set_sha1_accepted(fingerprint, true).unwrap();
+                store
+                    .insert_imported_secret(&generate(&KeyGenRequest::new(user_id)).unwrap().cert)
+                    .unwrap();
+            };
+            // Named here rather than taken from the store's own list, so that a
+            // name dropped from that list is caught.
+            let lists = ["trust-roots", "imported-secrets", "sha1-accepted"];
+
+            write_lists(&"AB".repeat(20), "First <first@example.org>");
+            for list in lists {
+                let path = data.join(list);
+                read_dacl(&path).assert_only(&sid, 0, &format!("{list} as made"));
+                loosen(&path, false);
+                assert!(
+                    read_dacl(&path).grants_everyone(),
+                    "the test's own setup did not take on {list}",
+                );
+            }
+            write_lists(&"CD".repeat(20), "Second <second@example.org>");
+            for list in lists {
+                read_dacl(&data.join(list)).assert_only(
+                    &sid,
+                    0,
+                    &format!("{list} replaced over an exposed copy"),
+                );
+            }
+
+            // Whatever an earlier build left behind.
+            loosen(&data, true);
+            for list in lists {
+                loosen(&data.join(list), false);
+            }
+            for path in std::iter::once(data.clone()).chain(lists.map(|list| data.join(list))) {
+                let before = read_dacl(&path);
+                assert!(
+                    before.grants_everyone() && !before.protected,
+                    "the test's own setup did not take on {} — {}",
+                    path.display(),
+                    before.sddl,
+                );
+            }
+
+            Store::open(dir.path().join("certs.d"), &secrets).unwrap();
+            read_dacl(&data).assert_only(
+                &sid,
+                INHERIT,
+                "the directory above the secrets, reopened",
+            );
+            for list in lists {
+                read_dacl(&data.join(list)).assert_only(&sid, 0, &format!("{list}, reopened"));
+            }
+        }
+
+        /// A secrets directory reached through a junction is restricted as the
+        /// directory it is, with the inheritable ACE.
+        ///
+        /// Moving `rpgp\secrets` to another drive and leaving a junction in its
+        /// place is a common way to spare a small system drive. The policy was
+        /// chosen by looking at the junction itself, which std reports as a
+        /// symlink and not a directory, while the call that sets the ACL
+        /// followed it to the real directory. So that directory got the policy
+        /// for a file: owner-only, but with nothing for a file made inside it
+        /// to inherit.
+        ///
+        /// A junction rather than a directory symlink because making one needs
+        /// no privilege, and through `mklink` because std cannot make one.
+        #[test]
+        fn a_secrets_directory_behind_a_junction_is_restricted_as_a_directory() {
+            let dir = tempfile::tempdir().unwrap();
+            let real = dir.path().join("elsewhere");
+            fs::create_dir(&real).unwrap();
+            let data = dir.path().join("rpgp");
+            fs::create_dir(&data).unwrap();
+            let secrets = data.join("secrets");
+            let made = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(&secrets)
+                .arg(&real)
+                .output()
+                .unwrap();
+            assert!(
+                made.status.success(),
+                "making the junction: {}{}",
+                String::from_utf8_lossy(&made.stdout),
+                String::from_utf8_lossy(&made.stderr),
+            );
+            assert!(
+                fs::symlink_metadata(&secrets)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the test's own setup did not take: the secrets directory is not a junction",
+            );
+
+            Store::open(dir.path().join("certs.d"), &secrets).unwrap();
+            read_dacl(&real).assert_only(
+                &current_user_sid().unwrap(),
+                INHERIT,
+                "the directory behind the junction",
             );
         }
     }
