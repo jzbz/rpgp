@@ -147,6 +147,11 @@ pub struct CertSummary {
     pub authentication: crate::Authentication,
     /// Whether the user has designated this certificate a trust root.
     pub is_trust_root: bool,
+    /// Whether this certificate is a trust root whatever the user has
+    /// designated, because its secret key was generated here rather than
+    /// imported. Filled in by the caller from [`crate::Store::implicit_roots`],
+    /// like [`CertSummary::is_trust_root`] beside it.
+    pub implicit_root: bool,
     /// The certificate is unusable, and SHA-1 self-signatures are the reason —
     /// so offering the opt-in in [`crate::sha1`] would actually help. False for
     /// a certificate that is broken some other way, where the opt-in would
@@ -343,6 +348,7 @@ impl CertSummary {
             has_secret,
             authentication: crate::Authentication::Unknown,
             is_trust_root: false,
+            implicit_root: false,
             sha1_blocked,
             sha1_accepted: false,
             revocation: revoked.then(|| describe_revocation(cert)).flatten(),

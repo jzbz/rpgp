@@ -24,6 +24,10 @@ export struct CertRow {
     // internally sound.
     authentication: string,
     is-trust-root: bool,
+    // A trust root whatever `is-trust-root` says, because its secret key was
+    // generated here. A secret key that arrived by import is not one: it is a
+    // root only while `is-trust-root` makes it one.
+    implicit-root: bool,
     // The certificate is unusable *because* its self-signatures are hashed
     // with SHA-1, so the opt-in below would actually make it verifiable.
     // False for a certificate that is unusable some other way, where offering

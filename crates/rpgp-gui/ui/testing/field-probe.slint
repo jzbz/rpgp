@@ -1,10 +1,10 @@
 // Test-only harness: small windows built from the app's own widgets and
 // dialogs, so a Rust test can operate them and inspect what the accessibility
 // tree publishes. Not part of the application.
-import { Field, Btn, Check, Select, FieldRow, TextArea } from "../widgets.slint";
+import { Field, Btn, Check, Select, FieldRow, TextArea, TrustRootCheck } from "../widgets.slint";
 import { SignEncryptDialog, CertifyDialog, NotepadDialog, DeleteDialog } from "../dialogs.slint";
 import { KeygenDialog, DecryptVerifyDialog, RevokeDialog, LifecycleDialog } from "../dialogs.slint";
-import { RecipientRow, UserIdRow, SignatureRow } from "../types.slint";
+import { CertRow, RecipientRow, UserIdRow, SignatureRow } from "../types.slint";
 
 // One passphrase Field and one ordinary Field.
 export component FieldProbe inherits Window {
@@ -278,5 +278,24 @@ export component DeleteProbe inherits Window {
         confirm-word: "0123456789ABCDEF";
         busy: root.busy;
         run => { root.runs += 1; }
+    }
+}
+
+// The details pane's Trust root checkbox, given a certificate the way the
+// window gives it `detail`. The pane itself lives in the window, which has no
+// debug information to find it by, so this is the shipped component rather
+// than a copy of its markup.
+export component TrustRootProbe inherits Window {
+    in-out property <CertRow> cert;
+    in-out property <bool> busy: false;
+    in-out property <int> toggles: 0;
+
+    width: 360px;
+    height: 160px;
+
+    TrustRootCheck {
+        cert: root.cert;
+        busy: root.busy;
+        toggled => { root.toggles += 1; }
     }
 }

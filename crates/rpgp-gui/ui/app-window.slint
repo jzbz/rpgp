@@ -1,7 +1,8 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Theme, Icons, Icon } from "theme.slint";
 import {
-    Btn, Check, Divider, Field, FieldRow, Monogram, Pill, SectionLabel, Select, Tone, Variant,
+    Btn, Check, Divider, Field, FieldRow, Monogram, Pill, SectionLabel, Select, Tone,
+    TrustRootCheck, Variant,
 } from "widgets.slint";
 import { CertRow, CertificationRow, LookupRow, RecipientRow, SignatureRow, SubkeyRow, UserIdDetailRow, UserIdRow } from "types.slint";
 import { AboutDialog, CertifyDialog, DecryptVerifyDialog, DetailsDialog, KeygenDialog, LifecycleDialog, LookupDialog, NotepadDialog, DeleteDialog, RevokeDialog, SignEncryptDialog } from "dialogs.slint";
@@ -932,25 +933,10 @@ export component AppWindow inherits Window {
                             wrap: word-wrap;
                         }
 
-                        Check {
-                            // Kept short: the checkbox label does not wrap, and
-                            // the panel is narrow. The line below carries the
-                            // explanation.
-                            text: "Trust root";
-                            checked: root.detail.is-trust-root || root.detail.has-secret;
-                            // Own keys are roots implicitly and cannot be
-                            // un-rooted from here.
-                            enabled: !root.busy && !root.detail.has-secret;
+                        TrustRootCheck {
+                            cert: root.detail;
+                            busy: root.busy;
                             toggled => { root.toggle-trust-root(); }
-                        }
-
-                        Text {
-                            text: root.detail.has-secret
-                                ? "Your own keys are always trust roots."
-                                : "Certifications made by this key count as evidence.";
-                            color: Theme.text-faint;
-                            font-size: Theme.t-sm;
-                            wrap: word-wrap;
                         }
 
                         if root.detail-certifications.length == 0: Text {

@@ -1,5 +1,6 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme, Icons, Icon } from "theme.slint";
+import { CertRow } from "types.slint";
 
 export enum Tone { neutral, ok, warn, danger, accent }
 
@@ -310,8 +311,9 @@ export component Check inherits Rectangle {
     accessible-checkable: true;
     accessible-checked: root.checked;
     // Gated here and in the key handler for the reasons Btn gives. The Trust
-    // root box on a secret key is drawn ticked and is always disabled, so a
-    // toggle that got through would write a trust root the box cannot show.
+    // root box on a key generated here is drawn ticked and is always disabled,
+    // so a toggle that got through would write a trust root the box cannot
+    // show.
     accessible-action-default => {
         if (root.enabled) {
             root.toggled();
@@ -383,6 +385,45 @@ export component Check inherits Rectangle {
         y: -3px;
         width: root.width + 6px;
         height: root.height + 6px;
+    }
+}
+
+// The details pane's Trust root checkbox, and the line under it that says what
+// the tick means. Here rather than in app-window.slint so that
+// tests/accessibility.rs can reach it: the window is compiled without the
+// debug information the testing backend needs to find an element.
+export component TrustRootCheck inherits VerticalLayout {
+    in property <CertRow> cert;
+    in property <bool> busy: false;
+    callback toggled();
+
+    // The pane's own spacing, so the two sit where they would as its direct
+    // children.
+    spacing: Theme.s4;
+
+    Check {
+        // Kept short: the checkbox label does not wrap, and the panel is
+        // narrow. The line below carries the explanation.
+        text: "Trust root";
+        // The rule Store::effective_roots applies, not the secret half. A key
+        // generated here is a root whatever the explicit list says, so its box
+        // is ticked and cannot be cleared from here. A secret key that arrived
+        // by import is a root only once it is ticked, as any other certificate
+        // is, and can be unticked again.
+        checked: root.cert.is-trust-root || root.cert.implicit-root;
+        enabled: !root.busy && !root.cert.implicit-root;
+        toggled => { root.toggled(); }
+    }
+
+    Text {
+        text: root.cert.implicit-root
+            ? "Keys you generate here are always trust roots."
+            : root.cert.has-secret
+                ? "An imported key is a trust root only while this is ticked."
+                : "Certifications made by this key count as evidence.";
+        color: Theme.text-faint;
+        font-size: Theme.t-sm;
+        wrap: word-wrap;
     }
 }
 

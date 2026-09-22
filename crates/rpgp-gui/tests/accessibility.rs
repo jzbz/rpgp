@@ -832,3 +832,102 @@ fn every_passphrase_field_in_the_real_dialogs_suppresses_its_value() {
          through a probe — add a probe for the dialog holding the new one"
     );
 }
+
+/// The Trust root box is locked only for a key generated here. A secret key
+/// that arrived by import can be ticked, and unticked again.
+///
+/// The box used to follow the secret half: ticked and disabled for every key
+/// the store held one for. An imported key is not a trust root until the user
+/// makes it one, and this box is the only way to, so a restored backup could
+/// never vouch for anyone while the pane said it already did.
+#[test]
+fn only_a_key_generated_here_has_its_trust_root_box_locked() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+
+    let probe = TrustRootProbe::new().unwrap();
+    probe.show().unwrap();
+    let trust_root = || control(&probe, "Trust root", AccessibleRole::Checkbox);
+    // Ticked and enabled, as assistive technology is told them.
+    let shown = || {
+        let check = trust_root();
+        (check.accessible_checked(), check.accessible_enabled())
+    };
+    let says = |line: &str| {
+        ElementHandle::find_by_accessible_label(&probe, line)
+            .next()
+            .is_some()
+    };
+
+    // The four kinds of certificate the pane can be showing.
+    let generated = CertRow {
+        has_secret: true,
+        implicit_root: true,
+        ..Default::default()
+    };
+    let imported = CertRow {
+        has_secret: true,
+        ..Default::default()
+    };
+    let promoted = CertRow {
+        has_secret: true,
+        is_trust_root: true,
+        ..Default::default()
+    };
+    let foreign = CertRow::default();
+
+    // Generated here: ticked, and nothing to untick.
+    probe.set_cert(generated.clone());
+    assert_eq!(shown(), (Some(true), Some(false)));
+    assert!(says("Keys you generate here are always trust roots."));
+    trust_root().invoke_accessible_default_action();
+    assert_eq!(probe.get_toggles(), 0);
+
+    // Imported: held, not a root, and the box is how it becomes one.
+    probe.set_cert(imported.clone());
+    assert_eq!(
+        shown(),
+        (Some(false), Some(true)),
+        "an imported secret key was drawn as a trust root, with no way to make it one"
+    );
+    assert!(says(
+        "An imported key is a trust root only while this is ticked."
+    ));
+    trust_root().invoke_accessible_default_action();
+    assert_eq!(
+        probe.get_toggles(),
+        1,
+        "ticking the box should reach the toggle"
+    );
+
+    // Imported and made a root: ticked, and still free to be unticked.
+    probe.set_cert(promoted.clone());
+    assert_eq!(shown(), (Some(true), Some(true)));
+
+    // Someone else's certificate, as before.
+    probe.set_cert(foreign.clone());
+    assert_eq!(shown(), (Some(false), Some(true)));
+    assert!(says("Certifications made by this key count as evidence."));
+
+    // And none of them while an operation is in flight, each keeping its tick.
+    probe.set_busy(true);
+    for (kind, cert, ticked) in [
+        ("a key generated here", generated, true),
+        ("an imported key", imported, false),
+        ("an imported key made a root", promoted, true),
+        ("someone else's certificate", foreign, false),
+    ] {
+        probe.set_cert(cert);
+        assert_eq!(
+            shown(),
+            (Some(ticked), Some(false)),
+            "the box was left free while busy for {kind}"
+        );
+        trust_root().invoke_accessible_default_action();
+    }
+    assert_eq!(
+        probe.get_toggles(),
+        1,
+        "a box reached the toggle while busy"
+    );
+}

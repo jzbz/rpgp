@@ -1818,9 +1818,11 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
                 return;
             };
             // Of the two things that disable the checkbox, only `busy` is
-            // kept here. It is also disabled for any key with a secret half,
-            // but a secret key that arrived by import is not a trust root
-            // until it is made one, and making it one is this handler's job.
+            // kept here. It is also disabled for a key generated here, which
+            // is a trust root whatever the list says, so an entry written for
+            // one changes nothing the web of trust sees. A secret key that
+            // arrived by import is not a root until it is made one, and making
+            // it one is this handler's job.
             if refuse_while_busy(&ui) {
                 return;
             }
@@ -3451,8 +3453,9 @@ fn reload_after(ui: &AppWindow, state: &Shared, after: AfterReload) {
             if let Some(status) = after.status {
                 ui.set_status(status.into());
             } else if !loaded.degraded.is_empty() {
-                // Two reads name the same file, so dedupe rather than tell
-                // them about trust roots twice.
+                // Two reads can land under one name: the SHA-1 list is read
+                // twice, and the trust roots come from two files. So dedupe
+                // rather than name one part of the store twice.
                 let mut degraded = loaded.degraded;
                 degraded.sort_unstable();
                 degraded.dedup();
@@ -3479,13 +3482,14 @@ fn read_store(store: &Store) -> std::result::Result<Loaded, String> {
     let certs = store.certs().map_err(|e| e.to_string())?;
 
     // The bookkeeping reads below each fall back to an empty answer, and every
-    // one of those fallbacks errs in the safe direction: no trust roots means
-    // nothing authenticates, no SHA-1 entries means the strict policy, no secret
-    // fingerprints means no key claims to hold one. So a failure here cannot
-    // turn into a badge that overstates what is known — but it can make one
-    // quietly disappear, and an unexplained missing badge is exactly how "my key
-    // is gone" becomes a mystery. That is the reasoning behind the damaged-file
-    // survey elsewhere, and it applies here too: fall back, then say so.
+    // one of those fallbacks errs in the safe direction: fewer trust roots means
+    // fewer identities authenticate, no SHA-1 entries means the strict policy,
+    // no secret fingerprints means no key claims to hold one. So a failure here
+    // cannot turn into a badge that overstates what is known — but it can make
+    // one quietly disappear, and an unexplained missing badge is exactly how "my
+    // key is gone" becomes a mystery. That is the reasoning behind the
+    // damaged-file survey elsewhere, and it applies here too: fall back, then
+    // say so.
     let mut degraded: Vec<&'static str> = Vec::new();
 
     // Summarised under the store's policy rather than the standard one, so a
@@ -3503,19 +3507,29 @@ fn read_store(store: &Store) -> std::result::Result<Loaded, String> {
 
     // Authentication is a property of the whole graph, so it is computed once
     // for the store rather than per certificate. Trust roots are the explicit
-    // list plus every key whose secret half is here.
-    let roots: Vec<String> = store
-        .effective_roots()
-        .unwrap_or_else(|_| {
-            degraded.push("trust roots");
-            Default::default()
-        })
-        .into_iter()
-        .collect();
+    // list plus every key generated here, the union Store::effective_roots
+    // makes. It is built here from the two halves instead, because the details
+    // pane needs them apart: its Trust root box is ticked for a key in either
+    // and locked only for a key generated here. Built from the one reading,
+    // the box is ticked for exactly the keys the web of trust below starts
+    // from. If either half cannot be read, the web of trust starts from the
+    // other alone: fewer roots, never more, the safe direction the note above
+    // asks for.
     let explicit_roots = store.trust_roots().unwrap_or_else(|_| {
         degraded.push("trust roots");
         Default::default()
     });
+    // Asked of the store rather than read off the secret half: a secret key
+    // that arrived by import is held but is not a root until it is made one.
+    // If this read fails, every secret key's box is left free, a generated
+    // key's included. Ticking one then writes an entry that its box cannot
+    // remove once the store reads again, which is harmless: that key is a
+    // root either way.
+    let implicit_roots = store.implicit_roots().unwrap_or_else(|_| {
+        degraded.push("trust roots");
+        Default::default()
+    });
+    let roots: Vec<String> = explicit_roots.union(&implicit_roots).cloned().collect();
     let sha1_accepted = store.sha1_accepted().unwrap_or_else(|_| {
         degraded.push("SHA-1 acceptance");
         Default::default()
@@ -3534,6 +3548,7 @@ fn read_store(store: &Store) -> std::result::Result<Loaded, String> {
         let key = summary.fingerprint.to_uppercase();
         summary.has_secret = secrets.contains(&key);
         summary.is_trust_root = explicit_roots.contains(&key);
+        summary.implicit_root = implicit_roots.contains(&key);
         summary.sha1_accepted = sha1_accepted.contains(&key);
         // The verdict for the identity actually shown on the row, not the
         // best over every identity on the certificate.
@@ -3854,6 +3869,7 @@ pub fn to_row(summary: &CertSummary) -> CertRow {
         has_secret: summary.has_secret,
         authentication: summary.authentication.as_str().into(),
         is_trust_root: summary.is_trust_root,
+        implicit_root: summary.implicit_root,
         sha1_blocked: summary.sha1_blocked,
         sha1_accepted: summary.sha1_accepted,
         revocation: summary.revocation.clone().unwrap_or_default().into(),
@@ -4004,10 +4020,11 @@ mod tests {
     ///
     /// `read_store` is the whole of what a reload does before it touches the
     /// window, and the stitching at the end of it is the part that would fail
-    /// quietly: `has_secret`, `is_trust_root` and `sha1_accepted` each come
-    /// from a different file, are matched to a row by uppercased fingerprint,
-    /// and a mismatch produces a row with somebody else's badges rather than an
-    /// error. Nothing else asserts on that join.
+    /// quietly: `has_secret`, `is_trust_root`, `implicit_root` and
+    /// `sha1_accepted` each come from a different read of the store, are
+    /// matched to a row by uppercased fingerprint, and a mismatch produces a
+    /// row with somebody else's badges rather than an error. Nothing else
+    /// asserts on that join.
     #[test]
     fn read_store_puts_every_badge_on_the_right_row() {
         let dir = tempfile::tempdir().unwrap();
@@ -4019,11 +4036,18 @@ mod tests {
                 .cert
         };
         let mine = generate("Me <me@example.org>");
+        let imported = generate("Imported <imported@example.org>");
         let other = generate("Other <other@example.org>");
         store.insert_secret(&mine).unwrap();
+        // Stored the way Import stores a secret key that arrives in a file.
+        store.insert_imported_secret(&imported).unwrap();
         store.insert(&other).unwrap();
 
-        let (mine, other) = (mine.fingerprint().to_hex(), other.fingerprint().to_hex());
+        let (mine, imported, other) = (
+            mine.fingerprint().to_hex(),
+            imported.fingerprint().to_hex(),
+            other.fingerprint().to_hex(),
+        );
         store.set_trust_root(&mine, true).unwrap();
         store.set_sha1_accepted(&other, true).unwrap();
 
@@ -4033,7 +4057,7 @@ mod tests {
             "nothing was damaged, so nothing should be reported: {:?}",
             loaded.degraded
         );
-        assert_eq!(loaded.all.len(), 2);
+        assert_eq!(loaded.all.len(), 3);
 
         let row = |fingerprint: &str| {
             loaded
@@ -4042,15 +4066,117 @@ mod tests {
                 .find(|c| c.fingerprint == fingerprint)
                 .unwrap_or_else(|| panic!("{fingerprint} is missing from the list"))
         };
-        let (mine, other) = (row(&mine), row(&other));
+        let (mine, imported, other) = (row(&mine), row(&imported), row(&other));
 
         assert!(mine.has_secret, "the secret half is in the store");
         assert!(mine.is_trust_root, "it was just made one");
+        assert!(
+            mine.implicit_root,
+            "it was generated here, which makes it a root whatever the list says"
+        );
         assert!(!mine.sha1_accepted, "the other certificate was opted in");
+
+        assert!(imported.has_secret, "an imported secret key is still held");
+        assert!(!imported.is_trust_root);
+        assert!(
+            !imported.implicit_root,
+            "an imported secret key is not a trust root until it is made one"
+        );
 
         assert!(!other.has_secret);
         assert!(!other.is_trust_root);
+        assert!(!other.implicit_root);
         assert!(other.sha1_accepted);
+    }
+
+    /// A trust-root file that cannot be read leaves the web of trust fewer
+    /// roots, never more, and the reload says so.
+    ///
+    /// The roots are read in two halves, the explicit list and the keys
+    /// generated here, and each falls back to nothing on its own. An unreadable
+    /// list costs each listed key its root, and a key generated here keeps its
+    /// own. An unreadable imported-secrets file costs every secret key its
+    /// implicit root: nothing is left to tell a key generated here from an
+    /// imported one, and counting them all would make every imported key a
+    /// root nobody chose. The listed keys stay roots. Before the halves were
+    /// read apart, a failure of either left the web of trust no roots at all.
+    #[test]
+    fn an_unreadable_trust_root_file_leaves_fewer_roots_and_says_so() {
+        fn row<'a>(loaded: &'a Loaded, fingerprint: &str) -> &'a CertSummary {
+            loaded
+                .all
+                .iter()
+                .find(|c| c.fingerprint == fingerprint)
+                .unwrap_or_else(|| panic!("{fingerprint} is missing from the list"))
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        let store = Store::open(dir.path().join("certs.d"), &secrets).unwrap();
+        let mine = generated("Me <me@example.org>").cert;
+        let restored = generated("Restored <restored@example.org>").cert;
+        store.insert_secret(&mine).unwrap();
+        // Stored the way Import stores a secret key that arrives in a file,
+        // then made a root with the Trust root box.
+        store.insert_imported_secret(&restored).unwrap();
+        let (mine, restored) = (mine.fingerprint().to_hex(), restored.fingerprint().to_hex());
+        store.set_trust_root(&restored, true).unwrap();
+
+        // A reload with one of the store's files damaged, which is repaired
+        // again afterwards.
+        let read_damaged = |name: &str| {
+            let path = secrets.with_file_name(name);
+            let intact = std::fs::read(&path).unwrap();
+            // Bytes that are not UTF-8, so the read errors rather than
+            // returning empty.
+            std::fs::write(&path, b"\xff\xfe not utf-8 \xff").unwrap();
+            let loaded = read_store(&store).expect("only a bookkeeping file is damaged");
+            std::fs::write(&path, intact).unwrap();
+            assert!(
+                loaded.degraded.contains(&"trust roots"),
+                "the damaged {name} went unreported: {:?}",
+                loaded.degraded
+            );
+            loaded
+        };
+
+        // A root vouches for its own identity, and nothing else here certifies
+        // either key, so a row's own verdict says whether the web of trust
+        // started from that key.
+        let healthy = read_store(&store).expect("a healthy store reads");
+        assert!(healthy.degraded.is_empty(), "{:?}", healthy.degraded);
+        for key in [&mine, &restored] {
+            assert_eq!(
+                row(&healthy, key).authentication,
+                Authentication::Full,
+                "both keys are roots while nothing is damaged"
+            );
+        }
+
+        let loaded = read_damaged("imported-secrets");
+        let (mine_row, restored_row) = (row(&loaded, &mine), row(&loaded, &restored));
+        assert!(
+            !mine_row.implicit_root && !restored_row.implicit_root,
+            "no key may count as generated here while the imported list cannot be read"
+        );
+        assert_eq!(mine_row.authentication, Authentication::Unknown);
+        assert!(restored_row.is_trust_root);
+        assert_eq!(
+            restored_row.authentication,
+            Authentication::Full,
+            "the explicit list could still be read, so the key it names is still a root"
+        );
+
+        let loaded = read_damaged("trust-roots");
+        let (mine_row, restored_row) = (row(&loaded, &mine), row(&loaded, &restored));
+        assert!(mine_row.implicit_root);
+        assert_eq!(
+            mine_row.authentication,
+            Authentication::Full,
+            "a key generated here is a root whatever the list says, read or not"
+        );
+        assert!(!restored_row.is_trust_root);
+        assert_eq!(restored_row.authentication, Authentication::Unknown);
     }
 
     /// The list is a view of positions into `all`, so ordering it must still
@@ -5237,6 +5363,82 @@ mod tests {
         assert!(is_root());
         ui.invoke_toggle_sha1_accepted();
         assert!(accepted());
+    }
+
+    /// A secret key restored from a backup reaches the details pane as a key
+    /// that is not yet a trust root, and the pane's toggle makes it one and
+    /// takes it back.
+    ///
+    /// The pane used to read "trust root" off the secret half, so an imported
+    /// key was drawn ticked, with its box locked, while the web of trust left
+    /// it out. Nothing in the window could make it a root, which is what the
+    /// import's own status line tells the user to do. A key generated here is
+    /// the one whose box stays locked.
+    ///
+    /// A root vouches for its own identity, so each row's verdict shows which
+    /// keys the reload's web of trust started from, and those should be the
+    /// keys the pane draws ticked.
+    #[test]
+    fn a_restored_secret_key_can_be_made_a_trust_root_from_the_details_pane() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let mine = generated("Me <me@example.org>").cert;
+        let restored = generated("Restored <restored@example.org>").cert;
+        store.insert_secret(&mine).unwrap();
+        // Stored the way Import stores a secret key that arrives in a file.
+        store.insert_imported_secret(&restored).unwrap();
+        let (mine, restored) = (mine.fingerprint().to_hex(), restored.fingerprint().to_hex());
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let store = lock(&state).store.clone();
+        let is_root = |fingerprint: &str| {
+            store
+                .effective_roots()
+                .unwrap()
+                .contains(&fingerprint.to_uppercase())
+        };
+
+        click_row(&ui, &state, &mine);
+        let detail = ui.get_detail();
+        assert!(
+            detail.implicit_root,
+            "a key generated here is a root whatever the list says"
+        );
+        assert!(is_root(&mine));
+        assert_eq!(
+            detail.authentication, "verified",
+            "the reload's web of trust left out a key generated here"
+        );
+
+        click_row(&ui, &state, &restored);
+        let detail = ui.get_detail();
+        assert!(detail.has_secret);
+        assert!(
+            !detail.implicit_root && !detail.is_trust_root,
+            "the pane drew an imported key as a trust root the web of trust does not use"
+        );
+        assert!(!is_root(&restored));
+        assert_eq!(detail.authentication, "unverified");
+
+        ui.invoke_toggle_trust_root();
+        assert!(is_root(&restored), "ticking Trust root should make it one");
+
+        // The pane as the reload that toggle started would leave it: ticked
+        // by the list, and so still free to be unticked.
+        lock(&state).all = read_store(&store).expect("a healthy store reads").all;
+        apply_filter(&ui, &state);
+        click_row(&ui, &state, &restored);
+        let detail = ui.get_detail();
+        assert!(detail.is_trust_root && !detail.implicit_root);
+        assert_eq!(
+            detail.authentication, "verified",
+            "the reload's web of trust left out a key the pane draws ticked"
+        );
+
+        ui.invoke_toggle_trust_root();
+        assert!(!is_root(&restored), "unticking should take it back");
     }
 
     /// Run the event loop until `done`, or give up after a minute.

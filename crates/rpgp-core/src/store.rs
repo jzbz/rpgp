@@ -66,13 +66,14 @@ pub struct Store {
     cert_dir: PathBuf,
     secrets_dir: PathBuf,
     /// Fingerprints the user has explicitly designated as trust roots, one per
-    /// line. Own keys are roots implicitly — see [`Store::effective_roots`].
+    /// line. Keys generated here are roots implicitly — see
+    /// [`Store::implicit_roots`].
     roots_path: PathBuf,
     /// Revocation certificates made at key-generation time, kept against the
     /// day the secret key or its passphrase is gone.
     revocations_dir: PathBuf,
     /// Fingerprints of secret keys that arrived from outside, one per line.
-    /// These are *not* implicit trust roots — see [`Store::effective_roots`].
+    /// These are *not* implicit trust roots — see [`Store::implicit_roots`].
     imported_secrets_path: PathBuf,
     /// Fingerprints the user has allowed SHA-1 for, one per line. Kept apart
     /// from every other list here because it grants nothing: see
@@ -390,13 +391,29 @@ impl Store {
     /// be made a root deliberately, with the checkbox in its details pane.
     pub fn effective_roots(&self) -> Result<BTreeSet<String>> {
         let mut roots = self.trust_roots()?;
-        let imported = self.imported_secrets()?;
-        roots.extend(
-            self.secret_fingerprints()?
-                .into_iter()
-                .filter(|fp| !imported.contains(fp)),
-        );
+        roots.extend(self.implicit_roots()?);
         Ok(roots)
+    }
+
+    /// What [`Store::effective_roots`] adds to the explicit list: every secret
+    /// key held here that was not imported.
+    ///
+    /// Asked for on its own by the GUI's reload, which needs the two halves
+    /// apart and makes their union itself, so effective_roots has to stay
+    /// exactly that union for the two to agree. The halves are for the details
+    /// pane, whose Trust root checkbox has to tell a key that is a root
+    /// whatever the list says from one that is a root only while the list
+    /// names it. Ticking the first changes nothing; ticking the second is how
+    /// an imported key is made a root. The checkbox used to answer that from
+    /// the secret half alone, which drew every imported key as a root it was
+    /// not and left no way to make it one.
+    pub fn implicit_roots(&self) -> Result<BTreeSet<String>> {
+        let imported = self.imported_secrets()?;
+        Ok(self
+            .secret_fingerprints()?
+            .into_iter()
+            .filter(|fp| !imported.contains(fp))
+            .collect())
     }
 
     /// Fingerprints of secret keys that came from outside this installation.
@@ -1868,6 +1885,50 @@ mod tests {
         // The user can still promote it deliberately.
         store.set_trust_root(&theirs_fp, true).unwrap();
         assert!(store.effective_roots().unwrap().contains(&theirs_fp));
+    }
+
+    /// `implicit_roots` holds a key generated here, listed or not, and no other
+    /// key: not an imported one, and not one the explicit list alone makes a
+    /// root.
+    ///
+    /// These are the keys the web of trust starts from whatever the list says,
+    /// and the details pane locks the Trust root box for exactly them. A key
+    /// counted here that should not be would be a root nothing in the window
+    /// could take back; a key generated here and left out would be no root
+    /// until ticked, as if it had been imported.
+    #[test]
+    fn implicit_roots_are_the_keys_generated_here_and_no_others() {
+        use crate::keygen::{KeyGenRequest, generate};
+
+        let (_dir, store) = scratch();
+        let generate = |user_id: &str| generate(&KeyGenRequest::new(user_id)).unwrap().cert;
+        let mine = generate("Me <me@example.org>");
+        let imported = generate("Restored <restored@example.org>");
+        let promoted = generate("Promoted <promoted@example.org>");
+        let other = generate("Other <other@example.org>");
+        store.insert_secret(&mine).unwrap();
+        store.insert_imported_secret(&imported).unwrap();
+        store.insert_imported_secret(&promoted).unwrap();
+        store.insert(&other).unwrap();
+        let fingerprint = |cert: &Cert| cert.fingerprint().to_hex().to_uppercase();
+        // The key generated here is listed too, which must not take it out.
+        for listed in [&mine, &promoted, &other] {
+            store.set_trust_root(&fingerprint(listed), true).unwrap();
+        }
+
+        assert_eq!(
+            store.implicit_roots().unwrap(),
+            BTreeSet::from([fingerprint(&mine)]),
+        );
+        // And effective_roots is the explicit list plus exactly these.
+        assert_eq!(
+            store.effective_roots().unwrap(),
+            BTreeSet::from([
+                fingerprint(&mine),
+                fingerprint(&promoted),
+                fingerprint(&other)
+            ]),
+        );
     }
 
     /// Re-importing a backup of a key generated here must not demote it.
