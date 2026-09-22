@@ -7,7 +7,8 @@ use sequoia_openpgp::Profile;
 use sequoia_openpgp::cert::{CertBuilder, CipherSuite};
 use sequoia_openpgp::packet::Signature;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::store::Store;
 use zeroize::Zeroizing;
 
 /// Key types offered in the new-key dialog.
@@ -187,6 +188,78 @@ pub fn generate(request: &KeyGenRequest) -> Result<GeneratedKey> {
     Ok(GeneratedKey { cert, revocation })
 }
 
+/// What [`save`] kept of a key.
+#[derive(Debug)]
+pub enum Saved {
+    /// The key, both halves of it, and the revocation certificate made with
+    /// it.
+    Whole,
+    /// The key, both halves of it, and not its revocation certificate, which
+    /// could not be written for the reason given.
+    WithoutRevocation(Error),
+}
+
+/// Put a key [`generate`] made into the store, then the revocation
+/// certificate made with it.
+///
+/// The key comes first. An error means that nothing of it was kept, so that
+/// trying again makes one key rather than two, unless the error says that the
+/// new key's secret key could not be removed again; see below. The certificate
+/// follows the key because it is worth nothing without one, and because
+/// written first it would be left behind whenever the key failed to follow.
+/// Once the key is stored, a certificate that cannot be written is
+/// [`Saved::WithoutRevocation`] rather than an error. The GUI used to do both
+/// in one chain, which reported a certificate that failed after the key was
+/// stored as a key generation that had failed: the dialog stayed open with
+/// every field filled in, its button made a second key with the same user ID,
+/// and the first, held and unlisted until something else reloaded the list,
+/// never had a revocation certificate at all.
+///
+/// Where the secret key is written and cert-d then refuses its public half,
+/// the key is removed again. It would otherwise be held where nothing lists
+/// it, since the list is read from cert-d, and a key no one has seen yet is
+/// better gone than kept out of reach while the user tries again. Should the
+/// removal fail as well, the error says that the secret key could not be
+/// removed again, and that key stays in the secrets directory, unlisted.
+pub fn save(store: &Store, key: &GeneratedKey) -> Result<Saved> {
+    let fingerprint = key.cert.fingerprint().to_hex();
+    match store.insert_secret(&key.cert) {
+        Ok(()) => {}
+        Err(Error::PublicCertNotUpdated(refused)) => {
+            // Judged by whether the secret key is still there rather than by
+            // what the delete returns. Its last step unlinks the certificate
+            // in cert-d, which is not there to unlink, and on Unix that step
+            // fails outright when whatever refused the key was a file standing
+            // where cert-d wanted the certificate's directory.
+            let undo = store.delete(&fingerprint, true);
+            return Err(if !store.has_secret(&fingerprint) {
+                Error::invalid(format!(
+                    "the new key could not be added to the certificate store, \
+                     and was removed again: {refused}"
+                ))
+            } else {
+                Error::invalid(format!(
+                    "the new key could not be added to the certificate store \
+                     ({refused}), and its secret key could not be removed \
+                     again{}",
+                    undo.err().map(|e| format!(": {e}")).unwrap_or_default()
+                ))
+            });
+        }
+        Err(e) => return Err(e),
+    }
+
+    // Written once, now: a revocation certificate cannot be recreated later
+    // without the secret key, and this is the only moment it is certain to be
+    // unlocked.
+    match crate::revoke::armor(&key.revocation)
+        .and_then(|armored| store.save_revocation(&fingerprint, &armored))
+    {
+        Ok(()) => Ok(Saved::Whole),
+        Err(e) => Ok(Saved::WithoutRevocation(e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +299,67 @@ mod tests {
         let mut request = KeyGenRequest::new("");
         request.user_ids = vec!["   ".into()];
         assert!(generate(&request).is_err());
+    }
+
+    /// A key whose revocation certificate cannot be written is still stored,
+    /// and saving it says what is missing rather than failing.
+    ///
+    /// A failure here used to be a failed key generation, though the key was
+    /// already in the store, and the retry it invited made a second key with
+    /// the same user ID. A file sits where the revocations directory goes:
+    /// opening the store passes over it, and writing the certificate fails.
+    #[test]
+    fn a_key_whose_revocation_certificate_cannot_be_written_is_kept_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        let store = Store::open(dir.path().join("certs.d"), &secrets).unwrap();
+        std::fs::write(secrets.with_file_name("revocations"), b"").unwrap();
+        let key = generate(&KeyGenRequest::new("Alice <alice@example.org>")).unwrap();
+        let fingerprint = key.cert.fingerprint().to_hex();
+
+        match save(&store, &key) {
+            Ok(Saved::WithoutRevocation(_)) => {}
+            other => panic!("expected the key kept without its certificate: {other:?}"),
+        }
+        assert!(store.has_secret(&fingerprint));
+        assert!(
+            store.lookup(&fingerprint).is_ok(),
+            "the key should be listed, so that it is not made again"
+        );
+        assert!(!store.has_revocation(&fingerprint));
+
+        // And with nothing in the way, both are kept.
+        std::fs::remove_file(secrets.with_file_name("revocations")).unwrap();
+        let key = generate(&KeyGenRequest::new("Bob <bob@example.org>")).unwrap();
+        assert!(matches!(save(&store, &key), Ok(Saved::Whole)));
+        assert!(store.has_revocation(&key.cert.fingerprint().to_hex()));
+    }
+
+    /// A key cert-d will not take is removed again, so that nothing of a
+    /// generation reported as failed is left in the store.
+    ///
+    /// The secret half is written before cert-d is asked for the public one,
+    /// and a secret key with no certificate in cert-d is held where nothing
+    /// lists it: out of reach, while the retry the failure invites makes
+    /// another. Here cert-d fails because a file sits where it wants a
+    /// directory for the fingerprint.
+    #[test]
+    fn a_key_cert_d_refuses_is_removed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (certs, secrets) = (dir.path().join("certs.d"), dir.path().join("secrets"));
+        let store = Store::open(&certs, &secrets).unwrap();
+        let key = generate(&KeyGenRequest::new("Alice <alice@example.org>")).unwrap();
+        let fingerprint = key.cert.fingerprint().to_hex();
+        std::fs::write(certs.join(&fingerprint.to_lowercase()[..2]), b"").unwrap();
+
+        let refused = save(&store, &key).expect_err("cert-d took the key after all");
+        assert!(refused.to_string().contains("removed again"), "{refused}");
+        assert!(!store.has_secret(&fingerprint));
+        assert_eq!(
+            std::fs::read_dir(&secrets).unwrap().count(),
+            0,
+            "a failed generation left something of the key behind"
+        );
+        assert!(!store.has_revocation(&fingerprint));
     }
 }

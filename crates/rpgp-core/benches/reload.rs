@@ -127,9 +127,9 @@ fn main() {
         );
 
         // The cold pass: a fresh handle with an empty cache, which is what
-        // startup and every delete-then-reopen actually pay. Separate from
-        // store.certs() below, which measures the warm cache the rest of the
-        // session sees.
+        // startup actually pays. Separate from store.certs() below, which
+        // measures the warm cache the rest of the session sees, checked file
+        // by file against the disk.
         //
         // Added to settle a review claim that Store::open should call cert-d's
         // prefetch_all to parallelise this. Measured at n=1000 and n=3000 over

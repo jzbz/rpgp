@@ -224,7 +224,7 @@ signing — it simply does not vouch for anyone until you say so. Restoring your
 own backup is the same story: tick Trust root once, and it stays.
 
 The graph is rebuilt on every store reload rather than cached. At five thousand
-certificates that rebuild is about 62ms of a 118ms read — a caching layer would
+certificates that rebuild is about 53ms of a 127ms read — a caching layer would
 have to be invalidated by every certification, revocation and trust-root change,
 and taking the read off the event loop was the cheaper answer to the same
 complaint. A keyring well past that size will still want the cache.
@@ -310,7 +310,11 @@ A **revocation certificate** is now written at key generation, to
 the details pane. It is the way back if the secret key or its passphrase is
 lost: applying it needs neither, because it was signed while the key was in
 hand. It cannot be recreated afterwards, which is why it is written once, at
-the only moment the key is certainly available.
+the only moment the key is certainly available. If that write fails, on a full
+disk say, the key is kept all the same and the status line says it has no
+revocation certificate; the details pane then offers none to export, and the
+key can still be revoked from there for as long as you hold it and its
+passphrase.
 
 One timing wrinkle worth knowing. A revocation only supersedes a certification
 made *strictly earlier*, and OpenPGP timestamps have one-second granularity, so
@@ -446,6 +450,10 @@ That sharing is a property of a native build. The Flatpak keeps its store inside
 points into the sandbox there, and Flathub does not grant access to the real one
 without an exception. Point `RPGP_CERT_STORE` at a path both can reach if you
 want one store across both.
+
+Every time the list is read, at Refresh and after each change made here, each
+certificate in it is checked against its file, so a certificate that `sq` or a
+second rPGP window has changed or deleted there shows up as it now is.
 
 Secret keys do **not** go there — cert-d is a store of public certificates, and
 a transferable secret key in it would be readable by every tool that scans the

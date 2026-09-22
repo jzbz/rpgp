@@ -71,7 +71,7 @@ use crate::error::{Error, Result};
 
 pub struct Store {
     certs: CertStore<'static>,
-    /// Kept so the store can be reopened after a deletion; see [`Store::reopen`].
+    /// Kept for [`Store::reopen`] and for finding a certificate's file.
     cert_dir: PathBuf,
     secrets_dir: PathBuf,
     /// Fingerprints the user has explicitly designated as trust roots, one per
@@ -266,10 +266,17 @@ impl Store {
     /// Remove a certificate from the store.
     ///
     /// Neither cert-d nor `sequoia-cert-store` offers a removal call, so this
-    /// unlinks the file itself. The SQLite index beside it prunes entries whose
-    /// file has gone, but only during a scan, and scans are rate-limited — so
-    /// *this* store keeps reporting the certificate afterwards. Call
-    /// [`Store::reopen`] for a view that reflects the deletion.
+    /// unlinks the file itself. The copy cert-d parsed earlier stays in this
+    /// handle's cache until something looks the certificate up by fingerprint
+    /// and finds the file gone, which [`Store::certs`] does for every
+    /// certificate it lists, so the next listing from this same store leaves
+    /// it out. This used to say that the index pruned the entry on its next
+    /// scan and that scans were rate-limited, so a reopened store was needed
+    /// to see the deletion. Neither was so: a scan never removes the entry of
+    /// a file that has gone, the listing never consults the index, and waiting
+    /// never helped. The certificate's entries in the index do stay behind,
+    /// but they stay in a reopened store's index as well, which is read back
+    /// from the same SQLite file.
     ///
     /// The pre-made revocation certificate is deliberately left behind. If the
     /// key ever reached a keyserver, that file is the only way to retract it,
@@ -334,10 +341,11 @@ impl Store {
         remove_if_present(&self.cert_path(fingerprint))
     }
 
-    /// A second handle on the same directories, with a fresh index.
+    /// A second handle on the same directories, with caches of its own.
     ///
-    /// The only way to see a deletion, since a live store's index scan is
-    /// rate-limited. Cheap enough for an operation a user performs by hand.
+    /// Not needed to see a deletion, or anything else written to the store
+    /// since this handle was opened: [`Store::certs`] and the lookups check
+    /// what they hand out against the files.
     pub fn reopen(&self) -> Result<Store> {
         Store::open(&self.cert_dir, &self.secrets_dir)
     }
@@ -515,8 +523,9 @@ impl Store {
     }
 
     /// Store a secret key that arrived from outside, rather than one generated
-    /// here. Identical to [`Store::insert_secret`] except that the key does not
-    /// become an implicit trust root.
+    /// here. Identical to [`Store::insert_secret`], down to the error it
+    /// returns when cert-d refuses the public half, except that the key does
+    /// not become an implicit trust root.
     ///
     /// The lock is taken before looking for the key and held through the mark
     /// and the write. Looked for first, the key could be deleted by another
@@ -546,7 +555,7 @@ impl Store {
         }
         let merged = self.write_secret(&held, cert)?;
         drop(held);
-        self.insert(&merged)
+        self.insert_public_half(&merged)
     }
 
     /// The fingerprint of every secret key on disk, read from the filenames.
@@ -602,9 +611,46 @@ impl Store {
     /// this call, and a reload makes the call twice. Nothing downstream wants
     /// ownership: [`CertRef`] derefs to `&Cert`, so callers read exactly what
     /// they read before.
+    ///
+    /// Each certificate is checked against its file before it is handed out.
+    /// cert-d's own listing reads a file only the first time it meets it: after
+    /// that it hands back the copy it parsed then, and never looks at the file
+    /// again. So a certificate that another process changed — `sq`, which
+    /// shares this directory, or a second rPGP window adding a revocation or
+    /// withdrawing a certification — kept its old badges however often the
+    /// list was refreshed, and one that was deleted, by another process or by
+    /// [`Store::delete`] here, stayed in the list. Only a lookup of that one
+    /// certificate on its own, which selecting its row or verifying a message
+    /// it signed makes, brought it up to date; an introducer in the middle of
+    /// a trust path, or a row nobody selected, stayed as first read until the
+    /// app was restarted. Looking each one up again by fingerprint goes
+    /// through cert-d's load, which compares the file's modification time and
+    /// size with the copy it holds, reads the file again only when they
+    /// differ, and drops the copy when the file has gone. That costs an open
+    /// and a stat per certificate: on Linux, `benches/reload.rs` puts it at
+    /// about a microsecond and a half each, 7ms at five thousand certificates
+    /// against the 127ms the whole of a reload's core takes there. It is what
+    /// makes a reload a read of the disk rather than of this handle's memory,
+    /// without the full parse of every certificate that reopening the store
+    /// would cost.
     pub fn certs(&self) -> Result<Vec<CertRef>> {
         let mut out = Vec::new();
-        for lazy in self.certs.certs() {
+        for listed in self.certs.certs() {
+            let lazy = match self.certs.lookup_by_cert_fpr(&listed.fingerprint()) {
+                Ok(current) => current,
+                // Deleted since cert-d first read it, and now dropped from its
+                // cache as well.
+                Err(e) if is_not_found(&e) => continue,
+                // A file that is there and cannot be read now. This listing
+                // shows the copy last read. Where the file would not open,
+                // load has dropped that copy as well, and the next listing
+                // leaves the certificate out, since cert-d's listing passes
+                // over a file it cannot open, as a store opened afresh would.
+                // Where the file opens but no longer parses, load keeps the
+                // copy, and every listing shows it until the file parses
+                // again.
+                Err(_) => listed,
+            };
             // Resolved eagerly, so an unparseable certificate still fails the
             // whole call here rather than surfacing later as a panic in Deref.
             lazy.to_cert()?;
@@ -674,14 +720,7 @@ impl Store {
             Ok(found) => found,
             // Told apart from a store that could not be read, which is a real
             // failure and still propagates.
-            Err(e)
-                if matches!(
-                    e.downcast_ref::<StoreError>(),
-                    Some(StoreError::NotFound(_))
-                ) =>
-            {
-                return Ok(Vec::new());
-            }
+            Err(e) if is_not_found(&e) => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
         Ok(found
@@ -694,14 +733,69 @@ impl Store {
     ///
     /// Secret key material is stripped first: `update` writes to cert-d, which
     /// is world-readable by design.
+    ///
+    /// An error is returned only when cert-d does not hold what it was handed.
+    /// cert-d writes in two steps, the certificate's file and then an entry in
+    /// its SQLite index, and reports a failure of the second — a full disk is
+    /// enough — after the first has already put the certificate in place. That
+    /// used to come back as a failure, so a certification, a withdrawal or an
+    /// import that had been made was reported as one that had not, and the
+    /// obvious retry made a second certification beside the first. So a
+    /// failed write is followed by a read of the file, and if merging the
+    /// certificate into what is there would add nothing, the write is taken to
+    /// have landed. The index notices on its next scan that the directory has
+    /// changed since it last looked, and catches up by itself.
     pub fn insert(&self, cert: &Cert) -> Result<()> {
-        self.certs.update(Arc::new(LazyCert::from(
-            cert.clone().strip_secret_key_material(),
-        )))?;
-        Ok(())
+        self.insert_through(cert, |public| self.certs.update(public))
+    }
+
+    /// [`Store::insert`], with the write to cert-d handed in, so that a test
+    /// can fail it after it has written, as the index can.
+    fn insert_through(
+        &self,
+        cert: &Cert,
+        update: impl FnOnce(Arc<LazyCert<'static>>) -> anyhow::Result<()>,
+    ) -> Result<()> {
+        let public = || cert.clone().strip_secret_key_material();
+        let Err(e) = update(Arc::new(LazyCert::from(public()))) else {
+            return Ok(());
+        };
+        // Stripped a second time rather than kept from the first, so that a
+        // write that succeeds, as nearly all do, costs one copy of the
+        // certificate and not two: an import of thousands makes this call for
+        // each of them.
+        if self.holds_all_of(&public()) {
+            return Ok(());
+        }
+        Err(e.into())
+    }
+
+    /// Whether cert-d's copy of `cert` already carries everything `cert`
+    /// does.
+    ///
+    /// Read by fingerprint, which goes to the file rather than to the index,
+    /// and reads the file again whenever it has changed since this handle last
+    /// did. Anything short of a copy that merging `cert` into leaves exactly as
+    /// it was is a no, a copy that cannot be read included, so a doubt keeps
+    /// the error.
+    fn holds_all_of(&self, cert: &Cert) -> bool {
+        let Ok(stored) = self.certs.lookup_by_cert_fpr(&cert.fingerprint()) else {
+            return false;
+        };
+        let Ok(stored) = stored.to_cert() else {
+            return false;
+        };
+        stored
+            .clone()
+            .merge_public(cert.clone())
+            .is_ok_and(|merged| merged == *stored)
     }
 
     /// Store a transferable secret key, and its public half in cert-d.
+    ///
+    /// When the secret key is written and cert-d then refuses the public half,
+    /// the error is [`Error::PublicCertNotUpdated`], which says so, rather than
+    /// cert-d's own; see that variant.
     pub fn insert_secret(&self, cert: &Cert) -> Result<()> {
         let held = self.lock()?;
         let merged = self.write_secret(&held, cert)?;
@@ -714,7 +808,14 @@ impl Store {
         // finishing first would leave both or neither. That holds no secret
         // and makes nothing a trust root.
         drop(held);
-        self.insert(&merged)
+        self.insert_public_half(&merged)
+    }
+
+    /// The second write of [`Store::insert_secret`] and
+    /// [`Store::insert_imported_secret`], made once the secret key is written.
+    fn insert_public_half(&self, merged: &Cert) -> Result<()> {
+        self.insert(merged)
+            .map_err(|e| Error::PublicCertNotUpdated(Box::new(e)))
     }
 
     /// Merge `cert` into the secret key file and write it back, returning what
@@ -897,7 +998,9 @@ impl Store {
             let Ok(cert) = record.cert() else {
                 continue;
             };
-            self.insert(&cert)?;
+            // One that cannot be stored stops the import; see import_file.
+            self.insert(&cert)
+                .map_err(|e| stopped_after(&imported, e))?;
             imported.push(cert);
         }
 
@@ -915,6 +1018,13 @@ impl Store {
     /// Returns the certificates that were imported, secret keys included: a
     /// backup restore and a public keyring import land in the same code path,
     /// which is what a user dropping a file on the window expects.
+    ///
+    /// A certificate that will not parse is skipped, and one that cannot be
+    /// stored stops the import there: a write that fails, on a full disk or an
+    /// unwritable directory, would most likely fail again for every
+    /// certificate after it. What was stored before it stays, and the error is
+    /// [`Error::ImportStopped`], which counts it, so that the caller can tell
+    /// an import that wrote nothing from one that wrote some of the file.
     pub fn import_file(&self, path: impl AsRef<Path>) -> Result<Vec<Cert>> {
         let path = path.as_ref();
 
@@ -941,13 +1051,14 @@ impl Store {
                 skipped += 1;
                 continue;
             };
-            if cert.is_tsk() {
+            let stored = if cert.is_tsk() {
                 // insert_imported_secret, not insert_secret: a secret key that
                 // arrived in a file is not thereby one the user trusts.
-                self.insert_imported_secret(&cert)?;
+                self.insert_imported_secret(&cert)
             } else {
-                self.insert(&cert)?;
-            }
+                self.insert(&cert)
+            };
+            stored.map_err(|e| stopped_after(&imported, e))?;
             imported.push(cert);
         }
         if imported.is_empty() {
@@ -1081,6 +1192,24 @@ fn merge_secret(existing: Cert, incoming: &Cert) -> Result<Cert> {
     )?;
 
     Ok(existing.merge_public_and_secret(stripped)?)
+}
+
+/// What an import returns when it cannot store a certificate, having stored
+/// those in `imported` before it.
+fn stopped_after(imported: &[Cert], source: Error) -> Error {
+    Error::ImportStopped {
+        stored: imported.len(),
+        source: Box::new(source),
+    }
+}
+
+/// Whether a cert-d lookup failed for want of anything to find, rather than
+/// because the store could not be read.
+fn is_not_found(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<StoreError>(),
+        Some(StoreError::NotFound(_))
+    )
 }
 
 /// Keep only the hex digits of `fingerprint`.
@@ -3589,26 +3718,298 @@ mod tests {
         assert!(store.reopen().unwrap().certs().unwrap().is_empty());
     }
 
-    /// Deletion, and the reopen it requires to be visible.
+    /// The fingerprints `store` lists, in the form the files are named.
+    fn listed(store: &Store) -> BTreeSet<String> {
+        store
+            .certs()
+            .unwrap()
+            .iter()
+            .map(|cert| cert.fingerprint().to_hex())
+            .collect()
+    }
+
+    /// A deleted certificate is gone from the next listing of the store that
+    /// deleted it, with no need to open the store again.
+    ///
+    /// cert-d's listing hands back the copy it parsed when it first met a
+    /// file, and never looks at the file again, so the store listed a deleted
+    /// certificate for as long as it stayed open. The GUI swapped in a
+    /// reopened store after every delete to hide that, and where the reopen
+    /// failed the deleted certificate came back on every reload. A secret key
+    /// deleted with its certificate goes the same way.
     #[test]
-    fn deletes_a_public_certificate() {
+    fn a_deleted_certificate_is_gone_from_the_next_listing_of_the_same_store() {
         let (_dir, store) = scratch();
-        let cert = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
-            "Alice <alice@example.org>",
-        ))
-        .unwrap()
-        .cert;
-        store.insert(&cert).unwrap();
-        let fingerprint = cert.fingerprint().to_hex();
-        assert_eq!(store.certs().unwrap().len(), 1);
+        let generate = |user_id: &str| {
+            crate::keygen::generate(&crate::keygen::KeyGenRequest::new(user_id))
+                .unwrap()
+                .cert
+        };
+        let (alice, bob, mine) = (
+            generate("Alice <alice@example.org>"),
+            generate("Bob <bob@example.org>"),
+            generate("Me <me@example.org>"),
+        );
+        store.insert(&alice).unwrap();
+        store.insert(&bob).unwrap();
+        store.insert_secret(&mine).unwrap();
+        let (alice, bob, mine) = (
+            alice.fingerprint().to_hex(),
+            bob.fingerprint().to_hex(),
+            mine.fingerprint().to_hex(),
+        );
+        // Listed once before anything goes, as a reload would have listed
+        // them, which is what fills cert-d's cache.
+        assert_eq!(
+            listed(&store),
+            BTreeSet::from([alice.clone(), bob.clone(), mine.clone()])
+        );
 
-        store.delete(&fingerprint, false).unwrap();
+        store.delete(&alice, false).unwrap();
+        assert_eq!(
+            listed(&store),
+            BTreeSet::from([bob.clone(), mine.clone()]),
+            "the store that deleted the certificate still lists it"
+        );
+        assert!(store.lookup(&alice).is_err());
 
-        // The live store still reports it: its index scan is rate-limited, and
-        // that is exactly why `reopen` exists rather than being optional.
-        let refreshed = store.reopen().unwrap();
-        assert!(refreshed.certs().unwrap().is_empty());
-        assert!(refreshed.lookup(&fingerprint).is_err());
+        store.delete(&mine, true).unwrap();
+        assert_eq!(
+            listed(&store),
+            BTreeSet::from([bob]),
+            "the store that deleted the key still lists its certificate"
+        );
+    }
+
+    /// A listing shows what another handle on the same directories has
+    /// written or deleted since this one last read it.
+    ///
+    /// cert-d is shared, with `sq` and with a second rPGP window, and once its
+    /// listing had parsed a file it went on handing back that copy. A Refresh
+    /// then showed a certificate another program had revoked as valid, and
+    /// one it had deleted as still there, until the app was restarted or
+    /// something looked that one certificate up on its own. One it added did
+    /// appear, since the listing reads the directory for files it has not met,
+    /// which makes it the control here.
+    #[test]
+    fn a_listing_shows_what_another_handle_changed_since_this_one_read_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = || Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let (here, elsewhere) = (open(), open());
+        let generate = |user_id: &str| {
+            crate::keygen::generate(&crate::keygen::KeyGenRequest::new(user_id)).unwrap()
+        };
+        let alice = generate("Alice <alice@example.org>");
+        let bob = generate("Bob <bob@example.org>").cert;
+        let carol = generate("Carol <carol@example.org>").cert;
+        here.insert(&alice.cert).unwrap();
+        here.insert(&bob).unwrap();
+        let (alice_fp, bob_fp, carol_fp) = (
+            alice.cert.fingerprint().to_hex(),
+            bob.fingerprint().to_hex(),
+            carol.fingerprint().to_hex(),
+        );
+
+        let validity = |store: &Store, fingerprint: &str| {
+            store
+                .certs()
+                .unwrap()
+                .iter()
+                .find(|cert| cert.fingerprint().to_hex() == fingerprint)
+                .map(|cert| crate::CertSummary::from_cert(cert).validity)
+        };
+        assert_eq!(validity(&here, &alice_fp), Some(crate::Validity::Valid));
+        assert_eq!(
+            listed(&here),
+            BTreeSet::from([alice_fp.clone(), bob_fp.clone()])
+        );
+
+        let revoked = alice
+            .cert
+            .clone()
+            .insert_packets(alice.revocation.clone())
+            .unwrap()
+            .0;
+        elsewhere.insert(&revoked).unwrap();
+        elsewhere.delete(&bob_fp, false).unwrap();
+        elsewhere.insert(&carol).unwrap();
+
+        assert_eq!(
+            validity(&here, &alice_fp),
+            Some(crate::Validity::Revoked),
+            "a revocation another handle stored did not reach this one's listing"
+        );
+        assert_eq!(
+            listed(&here),
+            BTreeSet::from([alice_fp, carol_fp]),
+            "a certificate another handle deleted is still listed here"
+        );
+    }
+
+    /// A write to cert-d that fails after the certificate has reached its
+    /// file is reported as the success it was, and one that fails before
+    /// anything is written is still an error.
+    ///
+    /// cert-d writes the file and then its SQLite index, and passes on a
+    /// failure of the index, which a full disk between the two is enough for,
+    /// with the certificate already in place. A certification that had been
+    /// made was then reported as one that had not, and making it again put a
+    /// second beside the first. The write is failed here after the real one,
+    /// as the index would fail it.
+    #[test]
+    fn a_write_that_reached_cert_d_before_failing_is_reported_as_made() {
+        let (_dir, store) = scratch();
+        let bob =
+            crate::keygen::generate(&crate::keygen::KeyGenRequest::new("Bob <bob@example.org>"))
+                .unwrap()
+                .cert;
+        store.insert(&bob).unwrap();
+        let fingerprint = bob.fingerprint().to_hex();
+        let changed = with_user_id(&bob, "Bob <bob@work.example>");
+        let has_work_address = || {
+            crate::cert::user_ids(&store.lookup(&fingerprint).unwrap())
+                .iter()
+                .any(|uid| uid.text == "Bob <bob@work.example>")
+        };
+
+        let refused = store.insert_through(&changed, |_| {
+            Err(anyhow::anyhow!("simulated: nothing reached the file"))
+        });
+        assert!(
+            refused.is_err(),
+            "a write that stored nothing was reported as made"
+        );
+        assert!(!has_work_address(), "the premise: nothing was written");
+
+        store
+            .insert_through(&changed, |public| {
+                store.certs.update(public)?;
+                Err(anyhow::anyhow!("simulated: database or disk is full"))
+            })
+            .expect("the certificate reached cert-d, so the write was made");
+        assert!(has_work_address());
+        assert!(listed(&store).contains(&fingerprint));
+    }
+
+    /// A secret key written before cert-d refused its public half says that
+    /// it was kept, and the next write that cert-d takes brings the rest.
+    ///
+    /// The secret file is written first, so the key, or a change to it, is
+    /// there even though the certificate the list, exports and Publish read
+    /// did not take it. cert-d's own error came back instead, which read as a
+    /// change that had not been made. Here cert-d fails because a file sits
+    /// where it wants a directory for the fingerprint.
+    #[test]
+    fn a_secret_key_whose_certificate_cert_d_refused_says_it_was_kept() {
+        let (_dir, store) = scratch();
+        let generate = |user_id: &str| {
+            crate::keygen::generate(&crate::keygen::KeyGenRequest::new(user_id))
+                .unwrap()
+                .cert
+        };
+        let block = |cert: &Cert| {
+            let in_the_way = store
+                .cert_path(&cert.fingerprint().to_hex())
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            // Already there if an earlier key here shares the directory.
+            if !in_the_way.exists() {
+                fs::write(&in_the_way, b"").unwrap();
+            }
+            assert!(in_the_way.is_file());
+            in_the_way
+        };
+
+        let mine = generate("Me <me@example.org>");
+        let fingerprint = mine.fingerprint().to_hex();
+        let in_the_way = block(&mine);
+        match store.insert_secret(&mine) {
+            Err(Error::PublicCertNotUpdated(_)) => {}
+            other => panic!("cert-d's refusal was not reported as such: {other:?}"),
+        }
+        assert!(store.has_secret(&fingerprint), "the secret key was kept");
+        assert!(store.lookup(&fingerprint).is_err());
+
+        let imported = generate("Stranger <stranger@example.org>");
+        block(&imported);
+        match store.insert_imported_secret(&imported) {
+            Err(Error::PublicCertNotUpdated(_)) => {}
+            other => panic!("cert-d's refusal of an import was not reported as such: {other:?}"),
+        }
+
+        fs::remove_file(&in_the_way).unwrap();
+        store.insert_secret(&mine).unwrap();
+        assert!(listed(&store).contains(&fingerprint));
+    }
+
+    /// An import that stops at a certificate it cannot store says how many it
+    /// had stored, and those stay.
+    ///
+    /// It used to return the error of the certificate that failed, which the
+    /// GUI reported as an import that had failed, with the list left as it
+    /// was, though the certificates before that one were in the store.
+    #[test]
+    fn an_import_that_stops_partway_says_how_many_it_stored() {
+        let (dir, store) = scratch();
+        let generate = || {
+            crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+                "Someone <someone@example.org>",
+            ))
+            .unwrap()
+            .cert
+        };
+        // Two whose files go in different directories of cert-d, so that one
+        // can be blocked without the other.
+        let first = generate();
+        let second = std::iter::repeat_with(generate)
+            .find(|cert| {
+                store.cert_path(&cert.fingerprint().to_hex()).parent()
+                    != store.cert_path(&first.fingerprint().to_hex()).parent()
+            })
+            .unwrap();
+        let keyring = dir.path().join("keyring.pgp");
+        let mut file = fs::File::create(&keyring).unwrap();
+        first.serialize(&mut file).unwrap();
+        second.serialize(&mut file).unwrap();
+        drop(file);
+        let in_the_way = store
+            .cert_path(&second.fingerprint().to_hex())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        fs::write(&in_the_way, b"").unwrap();
+
+        match store.import_file(&keyring) {
+            Err(e @ Error::ImportStopped { stored: 1, .. }) => {
+                let message = e.to_string();
+                assert!(
+                    message.starts_with("1 certificate(s) were stored, and then: "),
+                    "{message}"
+                );
+            }
+            other => panic!("the import did not say it stopped after one: {other:?}"),
+        }
+        assert_eq!(
+            listed(&store),
+            BTreeSet::from([first.fingerprint().to_hex()]),
+            "what was stored before the import stopped should stay"
+        );
+
+        // Stopped at its first, it has no count to give.
+        let (_dir, store) = scratch();
+        let in_the_way = store
+            .cert_path(&first.fingerprint().to_hex())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        fs::write(&in_the_way, b"").unwrap();
+        match store.import_file(&keyring) {
+            Err(e @ Error::ImportStopped { stored: 0, .. }) => {
+                assert!(!e.to_string().contains("were stored"), "{e}");
+            }
+            other => panic!("the import did not say it stopped at once: {other:?}"),
+        }
     }
 
     /// Deleting a secret key is not something to do by accident.

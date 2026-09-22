@@ -62,8 +62,48 @@ pub enum Error {
     #[error("{name} has been revoked — {reason}")]
     Revoked { name: String, reason: String },
 
+    /// A secret key was written, and its public certificate then could not
+    /// be.
+    ///
+    /// The store keeps each of the user's keys twice: whole in the secrets
+    /// directory, and its public half in cert-d, which is what the list,
+    /// exports and Publish read. The secret file is written first, so a cert-d
+    /// write that fails after it leaves a change in the secret key and not in
+    /// the certificate. The change is not lost, because every later write of
+    /// that key merges the whole secret file into cert-d, and the next one that
+    /// succeeds brings it across. Passed on as it came, the cert-d error read
+    /// as a change that had not been made at all, which then surfaced with
+    /// some unrelated later one, or went out with the next Publish.
+    #[error("saved with the secret key, but its public certificate could not be updated: {0}")]
+    PublicCertNotUpdated(#[source] Box<Error>),
+
+    /// An import that stopped at a certificate it could not store.
+    ///
+    /// `stored` is how many it had stored before that one, and those stay
+    /// stored. An import used to return the failing certificate's own error,
+    /// which read as though nothing had been written: the GUI tried the file
+    /// as a revocation certificate next, reported the import as failed and did
+    /// not read the list again, so the certificates that had arrived did not
+    /// appear until something else reloaded it.
+    #[error("{}", import_stopped(.stored, .source))]
+    ImportStopped {
+        stored: usize,
+        #[source]
+        source: Box<Error>,
+    },
+
     #[error("{0}")]
     Invalid(String),
+}
+
+/// How [`Error::ImportStopped`] reads: with the count only where there is one
+/// to give, since saying that no certificates were stored adds nothing to the
+/// reason none were.
+fn import_stopped(stored: &usize, source: &Error) -> String {
+    match stored {
+        0 => source.to_string(),
+        stored => format!("{stored} certificate(s) were stored, and then: {source}"),
+    }
 }
 
 impl Error {

@@ -732,42 +732,12 @@ fn import_chosen_file(ui: &AppWindow, state: &Shared, path: PathBuf) {
         // lock protects — `all` is rebuilt by the reload in the completion
         // closure.
         let store = lock(&state).store.clone();
-        let outcome = {
-            // A revocation certificate is a bare signature, not a certificate,
-            // so CertParser rejects it. Same button, because a user handed a
-            // .rev file expects Import to take it.
-            match store.import_file(&path) {
-                Ok(certs) => {
-                    // Secret keys are called out rather than folded into the
-                    // count: one arriving is the difference between adding
-                    // someone's certificate and taking custody of their key,
-                    // and an imported key is deliberately not a trust root.
-                    let secrets = certs.iter().filter(|c| c.is_tsk()).count();
-                    Ok(if secrets == 0 {
-                        format!("Imported {} certificate(s)", certs.len())
-                    } else {
-                        format!(
-                            "Imported {} certificate(s), {secrets} with a secret \
-                             key. A secret key that arrives in a file is not made \
-                             a trust root; tick Trust root in its details pane if \
-                             you meant to trust it.",
-                            certs.len()
-                        )
-                    })
-                }
-                Err(import_error) => match revoke::apply_revocation_file(&store, &path) {
-                    Ok(cert) => Ok(format!(
-                        "Revoked {}",
-                        rpgp_core::CertSummary::from_cert(&cert).primary_user_id
-                    )),
-                    Err(_) => Err(import_error),
-                },
-            }
-        };
+        let outcome = import_into(&store, &path);
 
         // One refresh at the end rather than progressive updates: the list
         // stays as it was until the import is complete, which is what it did
-        // when this ran inline.
+        // when this ran inline. A failure refreshes it too, since an import
+        // that stops partway has stored what came before it.
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
@@ -782,10 +752,50 @@ fn import_chosen_file(ui: &AppWindow, state: &Shared, path: PathBuf) {
                         ..Default::default()
                     },
                 ),
-                Err(e) => ui.set_status(format!("Import failed: {e}").into()),
+                Err(e) => report_and_reload(&ui, &state, format!("Import failed: {e}")),
             }
         });
     });
+}
+
+/// The blocking half of Import: store what is in the file, and say what
+/// arrived.
+fn import_into(store: &Store, path: &Path) -> rpgp_core::Result<String> {
+    // A revocation certificate is a bare signature, not a certificate, so
+    // CertParser rejects it. Same button, because a user handed a .rev file
+    // expects Import to take it.
+    match store.import_file(path) {
+        Ok(certs) => {
+            // Secret keys are called out rather than folded into the count:
+            // one arriving is the difference between adding someone's
+            // certificate and taking custody of their key, and an imported
+            // key is deliberately not a trust root.
+            let secrets = certs.iter().filter(|c| c.is_tsk()).count();
+            Ok(if secrets == 0 {
+                format!("Imported {} certificate(s)", certs.len())
+            } else {
+                format!(
+                    "Imported {} certificate(s), {secrets} with a secret key. A \
+                     secret key that arrives in a file is not made a trust root; \
+                     tick Trust root in its details pane if you meant to trust it.",
+                    certs.len()
+                )
+            })
+        }
+        // The file held a certificate, so it is no revocation certificate, and
+        // what came before that one is stored. Handed to the fallback below as
+        // well, a keyring that had stored a revoked certificate before it
+        // stopped was reported as that certificate revoked, and the reason the
+        // import stopped went unsaid.
+        Err(stopped @ rpgp_core::Error::ImportStopped { .. }) => Err(stopped),
+        Err(import_error) => match revoke::apply_revocation_file(store, path) {
+            Ok(cert) => Ok(format!(
+                "Revoked {}",
+                rpgp_core::CertSummary::from_cert(&cert).primary_user_id
+            )),
+            Err(_) => Err(import_error),
+        },
+    }
 }
 
 // ------------------------------------------------------------- key generation
@@ -815,46 +825,72 @@ fn wire_keygen(ui: &AppWindow, state: &Shared) {
             ui.set_busy(true);
             ui.set_status("Generating key…".into());
 
-            // RSA-4096 takes seconds. Run it off the UI thread and hand the
-            // finished certificate back through the event loop.
+            // RSA-4096 takes seconds. Run it off the UI thread, store it there
+            // too, and hand the outcome back through the event loop. Storing
+            // it used to happen in the completion, on the event loop and with
+            // the state lock held across the key file's sync and cert-d's
+            // write, which waits on cert-d's lock for as long as another
+            // program holds it. The store is cloned out under a brief lock, as
+            // every other worker here does.
             let (ui_weak, state) = (ui_weak.clone(), state.clone());
             std::thread::spawn(move || {
                 let _busy = BusyGuard(ui_weak.clone());
-                let generated = keygen::generate(&request);
+                let store = lock(&state).store.clone();
+                let outcome = keygen::generate(&request).and_then(|key| {
+                    let fingerprint = key.cert.fingerprint().to_hex();
+                    keygen::save(&store, &key).map(|saved| (fingerprint, saved))
+                });
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(ui) = ui_weak.upgrade() else {
                         return;
                     };
-                    ui.set_busy(false);
-                    match generated.and_then(|key| {
-                        let guard = lock(&state);
-                        guard.store.insert_secret(&key.cert)?;
-                        // Written once, now: a revocation certificate cannot be
-                        // recreated later without the secret key, and this is
-                        // the only moment we are certain to have it unlocked.
-                        let fingerprint = key.cert.fingerprint().to_hex();
-                        guard
-                            .store
-                            .save_revocation(&fingerprint, &revoke::armor(&key.revocation)?)?;
-                        Ok(fingerprint)
-                    }) {
-                        Ok(fingerprint) => {
-                            ui.set_keygen_open(false);
-                            reload_after(
-                                &ui,
-                                &state,
-                                AfterReload {
-                                    status: Some(format!("Created {fingerprint}")),
-                                    ..Default::default()
-                                },
-                            );
-                        }
-                        Err(e) => ui.set_status(format!("Key generation failed: {e}").into()),
-                    }
+                    finish_keygen(&ui, &state, outcome);
                 });
             });
         }
     });
+}
+
+/// Show what became of a key generation, on the event loop.
+///
+/// A key that was stored closes the dialog and is listed, with or without the
+/// revocation certificate that should come with it. An error leaves the
+/// dialog open for another try, since [`keygen::save`] keeps nothing when it
+/// reports one, unless the error says that the new key's secret key could not
+/// be removed again: that key stays in the secrets directory, unlisted, and
+/// another try makes a second one beside it. A stored key used to be reported
+/// as a failure when its certificate could not be written, and the dialog's
+/// button, pressed again, made a second one.
+///
+/// Split out of the worker's completion, like [`show_decrypt_verify`], so a
+/// test can hand it an outcome without an event loop to deliver one.
+fn finish_keygen(
+    ui: &AppWindow,
+    state: &Shared,
+    outcome: rpgp_core::Result<(String, keygen::Saved)>,
+) {
+    ui.set_busy(false);
+    let status = match outcome {
+        Ok((fingerprint, keygen::Saved::Whole)) => format!("Created {fingerprint}"),
+        // What went wrong ahead of the fingerprint, since the status line
+        // elides its tail.
+        Ok((fingerprint, keygen::Saved::WithoutRevocation(e))) => format!(
+            "Key created, but its revocation certificate could not be saved ({e}): {fingerprint}"
+        ),
+        Err(e) => {
+            ui.set_status(format!("Key generation failed: {e}").into());
+            return;
+        }
+    };
+    ui.set_keygen_open(false);
+    reload_after(
+        ui,
+        state,
+        AfterReload {
+            status: Some(status),
+            ..Default::default()
+        },
+    );
 }
 
 fn expiry_from_index(index: i32) -> Option<Duration> {
@@ -2383,7 +2419,10 @@ fn wire_lifecycle(ui: &AppWindow, state: &Shared) {
                                 },
                             );
                         }
-                        Err(message) => ui.set_status(message.into()),
+                        // A change is two writes, the secret key's and then the
+                        // public certificate's, and a failure can come after
+                        // the first. The dialog stays open for another try.
+                        Err(message) => report_and_reload(&ui, &state, message),
                     }
                 });
             });
@@ -3033,7 +3072,10 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
                                 },
                             );
                         }
-                        Err(message) => ui.set_status(message.into()),
+                        // The certificate's trust-root and SHA-1 entries go
+                        // before anything is unlinked, so a delete that fails
+                        // can already have changed the badges on its row.
+                        Err(message) => report_and_reload(&ui, &state, message),
                     }
                 });
             });
@@ -3041,12 +3083,15 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
     });
 }
 
-/// Delete, then swap in a store that can actually see the deletion.
+/// Delete, off the event loop like every other worker here.
 ///
-/// A live `Store` keeps reporting a deleted certificate, because the index
-/// scan that prunes it is rate-limited. Reopening is the only way to get a
-/// current view, and it is I/O, so it happens off the lock like every other
-/// worker here.
+/// The store in `State` goes on being used afterwards, and its next listing
+/// leaves the certificate out; see [`Store::certs`]. This used to swap in a
+/// reopened store after every delete, believing a live one could never see
+/// the deletion, and a reopen that failed after the files were gone reported
+/// the delete as a failure and kept the old store, which then listed the
+/// deleted certificate on every reload until something looked that
+/// certificate up on its own.
 ///
 /// `fingerprint` is the certificate the dialog named and `confirmed_secret` is
 /// what it warned about, both recorded when it opened; the second is not what
@@ -3092,13 +3137,6 @@ fn run_delete(state: &Shared, fingerprint: &str, confirmed_secret: bool) -> Resu
             format!("Could not delete the certificate: {e}")
         }
     })?;
-
-    let refreshed =
-        Arc::new(store.reopen().map_err(|e| {
-            format!("Deleted, but the certificate list could not be refreshed: {e}")
-        })?);
-
-    lock(state).store = refreshed;
 
     Ok(if had_secret {
         "Key and secret key deleted. The revocation certificate was kept.".to_string()
@@ -3162,7 +3200,11 @@ fn wire_revoke(ui: &AppWindow, state: &Shared) {
                                 },
                             );
                         }
-                        Err(message) => ui.set_status(message.into()),
+                        // A revocation is written to the public certificate and
+                        // then to the secret key, and a withdrawal from several
+                        // keys stops at the first that fails, with those before
+                        // it made.
+                        Err(message) => report_and_reload(&ui, &state, message),
                     }
                 });
             });
@@ -3365,8 +3407,8 @@ struct Loaded {
 /// Everything here is local — cert-d, the trust graph, the secret-key
 /// directory — and all of it now happens on a worker, because it does not fit
 /// in a frame. Measured by `benches/reload.rs`, the read is 18ms at a thousand
-/// certificates and 118ms at five thousand, against a 16ms budget; the web of
-/// trust alone is 62ms of that second figure. It ran on the event loop because
+/// certificates and 127ms at five thousand, against a 16ms budget; the web of
+/// trust alone is 53ms of that second figure. It ran on the event loop because
 /// the list had to exist before the call returned, several callers following it
 /// straight away with `reselect` — [`AfterReload`] carries that intent across
 /// the gap instead.
@@ -3471,6 +3513,32 @@ fn reload_after(ui: &AppWindow, state: &Shared, after: AfterReload) {
             survey_agent_and_secrets(&ui, &state, store);
         });
     });
+}
+
+/// Report a failure, and read the store again behind the message.
+///
+/// For the operations that make more than one write, where a failure can
+/// come after some of them have landed: an import that stops partway, a key
+/// change whose secret half was written, a revocation, a withdrawal from
+/// several keys, a delete past its list entries. Their failures used to set
+/// the status line and leave the list as it was, so what had been written did
+/// not show until something else reloaded, and the user acted on a picture
+/// that was no longer the store. The message goes up at once, rather than
+/// waiting for the reload to land, and again when it does, since landing
+/// writes over the status line. A reload that cannot read the store puts its
+/// own "Cannot read the certificate store" in place of the message instead:
+/// the list then still shows the old picture, and that is the more pressing
+/// thing to know.
+fn report_and_reload(ui: &AppWindow, state: &Shared, message: String) {
+    ui.set_status(message.clone().into());
+    reload_after(
+        ui,
+        state,
+        AfterReload {
+            status: Some(message),
+            ..Default::default()
+        },
+    );
 }
 
 /// The blocking half of a reload: every read of the store, and no window.
@@ -4749,10 +4817,11 @@ mod tests {
         assert_eq!(ui.get_delete_target(), "Bob <bob@example.org>");
 
         ui.set_detail(row_for(&state, &alice));
-        let before = lock(&state).store.clone();
         ui.invoke_delete_run();
-        // run_delete swaps in a reopened store once the delete has gone through.
-        wait_for("the delete", || !Arc::ptr_eq(&lock(&state).store, &before));
+        // Seen by the store the window goes on using, which the delete no
+        // longer replaces.
+        let store = lock(&state).store.clone();
+        wait_for("the delete", || store.certs().unwrap().len() == 1);
 
         let after = Store::open(&certs, &secrets).unwrap();
         assert!(
@@ -4763,6 +4832,165 @@ mod tests {
             after.lookup(&alice).is_ok(),
             "the one the pane moved to should not have been touched"
         );
+    }
+
+    /// A delete that has gone through is reported as done, and the list
+    /// leaves the certificate out, even where the store could not have been
+    /// opened a second time.
+    ///
+    /// The delete used to reopen the store in order to see its own deletion,
+    /// and a reopen that failed after the files were gone reported the delete
+    /// as a failure and kept the old store, which went on listing the deleted
+    /// certificate on every reload. Opening fails here because a directory
+    /// stands where cert-d's index goes, while the store already open keeps
+    /// the index it has. Unix only, since Windows refuses to rename a file
+    /// that is open, as that index is.
+    #[cfg(unix)]
+    #[test]
+    fn a_delete_is_seen_by_the_store_in_use_even_where_opening_another_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (certs, secrets) = (dir.path().join("certs.d"), dir.path().join("secrets"));
+        let store = Store::open(&certs, &secrets).unwrap();
+        let bob = generated("Bob <bob@example.org>").cert;
+        store.insert(&bob).unwrap();
+        let fingerprint = bob.fingerprint().to_hex();
+        let state = state_for(store);
+        let listed = || {
+            let store = lock(&state).store.clone();
+            read_store(&store)
+                .expect("the store in use reads")
+                .all
+                .iter()
+                .any(|c| c.fingerprint == fingerprint)
+        };
+        assert!(listed());
+
+        let index = std::fs::read_dir(&certs)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("_sequoia_cert_store_index") && name.ends_with(".sqlite")
+                    })
+            })
+            .expect("cert-d keeps an index");
+        std::fs::rename(&index, index.with_extension("moved")).unwrap();
+        std::fs::create_dir(&index).unwrap();
+        assert!(
+            Store::open(&certs, &secrets).is_err(),
+            "the store still opens a second time, so this proves nothing"
+        );
+
+        let message =
+            run_delete(&state, &fingerprint, false).expect("the files are gone, so it was done");
+        assert_eq!(message, "Certificate deleted.");
+        assert!(!listed(), "the deleted certificate is still listed");
+    }
+
+    /// A key stored without its revocation certificate closes the dialog, as
+    /// one stored with it does, and a generation that kept nothing leaves the
+    /// dialog open for another try.
+    ///
+    /// The first used to be reported as a failed generation, with the dialog
+    /// left open and every field still filled in, and its button, pressed
+    /// again, made a second key with the same user ID. The outcomes are handed
+    /// over directly, since only an event loop delivers a worker's; which one
+    /// `keygen::save` returns when is rpgp-core's to test.
+    #[test]
+    fn a_key_kept_without_its_revocation_certificate_closes_the_dialog() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let full = || rpgp_core::Error::invalid("no space left on device");
+
+        ui.set_keygen_open(true);
+        ui.set_busy(true);
+        finish_keygen(&ui, &state, Err(full()));
+        assert!(
+            ui.get_keygen_open(),
+            "a generation that kept nothing closed its dialog"
+        );
+        assert!(!ui.get_busy());
+        assert_eq!(
+            ui.get_status(),
+            "Key generation failed: no space left on device"
+        );
+
+        ui.set_busy(true);
+        let asked = lock(&state).reload_generation;
+        finish_keygen(
+            &ui,
+            &state,
+            Ok(("AB".repeat(20), keygen::Saved::WithoutRevocation(full()))),
+        );
+        assert!(
+            !ui.get_keygen_open(),
+            "a key that was kept left the dialog open to make another"
+        );
+        assert!(!ui.get_busy());
+        assert!(
+            lock(&state).reload_generation > asked,
+            "the list was not read again to show the key"
+        );
+    }
+
+    /// A keyring whose import stops partway is reported as that, and not
+    /// taken for a revocation certificate.
+    ///
+    /// A failed import falls back to reading the file as a revocation
+    /// certificate, which is for a file with no certificate in it. A keyring
+    /// that had stored a revoked certificate before it stopped was taken for
+    /// one, and the status line said that certificate had been revoked and
+    /// nothing about the import. Here the second certificate cannot be stored
+    /// because a file stands where cert-d wants a directory for it.
+    #[test]
+    fn a_keyring_that_stops_partway_is_not_taken_for_a_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = Store::open(
+            dir.path().join("elsewhere"),
+            dir.path().join("elsewhere-secrets"),
+        )
+        .unwrap();
+        let retired = generated("Retired <retired@example.org>").cert;
+        let retired_fp = retired.fingerprint().to_hex();
+        elsewhere.insert_secret(&retired).unwrap();
+        revoke::revoke_cert(&elsewhere, &RevokeRequest::new(&retired_fp)).unwrap();
+        // One whose file goes in another of cert-d's directories.
+        let prefix = |fingerprint: &str| fingerprint.to_lowercase()[..2].to_string();
+        let other_fp = std::iter::repeat_with(|| generated("Other <other@example.org>").cert)
+            .find(|cert| prefix(&cert.fingerprint().to_hex()) != prefix(&retired_fp))
+            .map(|cert| {
+                elsewhere.insert(&cert).unwrap();
+                cert.fingerprint().to_hex()
+            })
+            .unwrap();
+        let keyring = dir.path().join("keyring.asc");
+        elsewhere
+            .export_file(&[retired_fp.clone(), other_fp.clone()], &keyring)
+            .unwrap();
+
+        let certs = dir.path().join("certs.d");
+        let store = Store::open(&certs, dir.path().join("secrets")).unwrap();
+        std::fs::write(certs.join(prefix(&other_fp)), b"").unwrap();
+
+        match import_into(&store, &keyring) {
+            Err(e @ rpgp_core::Error::ImportStopped { stored: 1, .. }) => assert!(
+                e.to_string().starts_with("1 certificate(s) were stored"),
+                "{e}"
+            ),
+            other => panic!("expected the import to stop after one certificate: {other:?}"),
+        }
+        let listed: Vec<String> = read_store(&store)
+            .expect("the store reads")
+            .all
+            .into_iter()
+            .map(|c| c.fingerprint)
+            .collect();
+        assert_eq!(listed, [retired_fp], "what was stored should be listed");
     }
 
     /// A lifecycle action changes the key its dialog was opened for, not
