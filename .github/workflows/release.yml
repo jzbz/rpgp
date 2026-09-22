@@ -491,6 +491,44 @@ jobs:
               --generate-notes
           fi
 
+          # Only ever onto a draft, and never under a signature. A re-run, or a
+          # dispatch naming a tag released long ago, would otherwise --clobber
+          # files that people have downloaded and that SHA256SUMS.asc and the
+          # winget manifest already vouch for — leaving a signature that fails
+          # against the file beside it, which reads as tampering rather than as
+          # a rebuild. The same refusal checksums.yml makes, for the same
+          # reason: the operator decides, not the workflow.
+          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft --jq .isDraft)
+          if [ "$draft" != true ]; then
+            echo "::error::$TAG is already published. Its assets are not replaced"
+            echo "::error::after the fact; a changed build needs a new tag."
+            exit 1
+          fi
+          assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name')
+          if grep -qx 'SHA256SUMS.asc' <<<"$assets"; then
+            echo "::error::$TAG already has SHA256SUMS.asc. Replacing assets would"
+            echo "::error::invalidate it. Delete the signature first if the"
+            echo "::error::artifacts genuinely need rebuilding:"
+            echo "::error::  gh release delete-asset $TAG SHA256SUMS.asc"
+            exit 1
+          fi
+          # An unsigned SHA256SUMS from an earlier run describes the builds
+          # this upload is about to replace, and neither the .exe nor the
+          # .flatpak is reproducible, so its lines for them are about to be
+          # wrong. Left in place it is the file the earlier checksums.yml
+          # summary tells the maintainer to download and sign, and a warning in
+          # a green run's log would not stop that. Deleted, there is nothing
+          # stale to sign: checksums.yml writes it again over what is attached.
+          if grep -qx 'SHA256SUMS' <<<"$assets"; then
+            gh release delete-asset "$TAG" SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" --yes
+            echo "::warning::$TAG had an unsigned SHA256SUMS from an earlier run,"
+            echo "::warning::which would not have matched these builds, so it was"
+            echo "::warning::deleted. Run checksums.yml again once every asset is attached."
+          fi
+
           gh release upload "$TAG" \
             "${files[@]}" \
             --repo "$GITHUB_REPOSITORY" --clobber
