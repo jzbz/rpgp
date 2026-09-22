@@ -967,12 +967,29 @@ impl Store {
     ///
     /// Only public halves are written; exporting a secret key is a separate,
     /// deliberately louder operation.
+    ///
+    /// The export is armored in memory and written to `path` only once every
+    /// certificate has been found. The file used to be opened, and truncated,
+    /// first, so a fingerprint that failed to resolve left an existing file
+    /// empty or holding an armor block with no end. The write is checked
+    /// too: it used to happen in a `BufWriter`'s drop, which discards a
+    /// failed write, and a certificate usually fits in its buffer whole, so
+    /// an export to a full disk or over quota left an empty file and reported
+    /// success.
+    ///
+    /// The file at `path` is written into, as it always has been, rather than
+    /// replaced by a staged file renamed onto it as `ops` replaces its
+    /// outputs. Those stage because the operation itself can fail part-way;
+    /// here nothing is left to fail by then but the write, so a rename would
+    /// buy little, and it would cost the file the user chose to export to: it
+    /// puts a new file in place of a symlink at the path rather than writing
+    /// where the link points, and the new file has the owner, permissions and
+    /// ACL of any new file rather than the old one's. A failed write is
+    /// reported, but it can leave the file cut short.
     pub fn export_file(&self, fingerprints: &[String], path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        let file = fs::File::create(path)
-            .map_err(|e| Error::io(format!("writing {}", path.display()), e))?;
         let mut writer = sequoia_openpgp::armor::Writer::new(
-            io::BufWriter::new(file),
+            Vec::new(),
             sequoia_openpgp::armor::Kind::PublicKey,
         )?;
         for fpr in fingerprints {
@@ -985,8 +1002,8 @@ impl Store {
             // publishable/local distinction promising it would not.
             cert.strip_secret_key_material().export(&mut writer)?;
         }
-        writer.finalize()?;
-        Ok(())
+        let armored = writer.finalize()?;
+        fs::write(path, armored).map_err(|e| Error::io(format!("writing {}", path.display()), e))
     }
 
     fn secret_path(&self, fingerprint: &str) -> PathBuf {
@@ -3461,6 +3478,66 @@ mod tests {
             1,
             "the publishable one should be there"
         );
+    }
+
+    /// An export that cannot be written is an error, not a success over an
+    /// empty file.
+    ///
+    /// The armor used to reach the file only in a `BufWriter`'s drop, which
+    /// discards a failed write, and a certificate usually fits in its buffer
+    /// whole.
+    ///
+    /// `/dev/full` opens like a file on a full disk and fails every write the
+    /// same way.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_export_that_cannot_be_written_is_an_error() {
+        let (_dir, store) = scratch();
+        let alice = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        store.insert(&alice).unwrap();
+        let error = store
+            .export_file(&[alice.fingerprint().to_hex()], "/dev/full")
+            .expect_err("an export that was never written must not succeed");
+        assert!(
+            error.to_string().starts_with("writing /dev/full:"),
+            "{error}"
+        );
+    }
+
+    /// An export naming a certificate that is not held leaves the file at its
+    /// path as it was.
+    ///
+    /// The file used to be opened and truncated before any certificate was
+    /// looked up, so one that failed to resolve left an earlier file empty,
+    /// or holding an armor block with no end.
+    #[test]
+    fn an_export_naming_a_certificate_not_held_leaves_the_file_there_as_it_was() {
+        let (dir, store) = scratch();
+        let alice = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        store.insert(&alice).unwrap();
+        let out = dir.path().join("keys.asc");
+        fs::write(&out, b"AN EARLIER EXPORT").unwrap();
+        let absent = "0123456789ABCDEF0123456789ABCDEF01234567".to_string();
+
+        for fingerprints in [
+            vec![absent.clone()],
+            vec![alice.fingerprint().to_hex(), absent],
+        ] {
+            assert!(store.export_file(&fingerprints, &out).is_err());
+            assert_eq!(
+                fs::read(&out).unwrap(),
+                b"AN EARLIER EXPORT",
+                "exporting {fingerprints:?}"
+            );
+        }
     }
 
     /// Fingerprints arrive in whatever case the caller had. The files are

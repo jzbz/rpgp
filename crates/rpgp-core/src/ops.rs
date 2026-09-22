@@ -1,7 +1,7 @@
 //! Message operations: encrypt, decrypt, sign, verify.
 
 use std::fs;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use sequoia_openpgp::cert::ValidCert;
@@ -1098,10 +1098,13 @@ pub fn encrypted_name(input: &Path) -> PathBuf {
 /// Best-effort, and deliberately so: it picks a pleasant name, it does not
 /// enforce the rule. The name can be taken between the check and the write,
 /// and after 999 collisions the series is exhausted and the original path
-/// comes back — which is why the three places that actually destroy data
-/// (`File::create_new` for the staging file, and the `output.exists()` guards
-/// before the renames and the detached-signature write) refuse rather than
-/// trust the name they were handed.
+/// comes back — which is why the places that actually destroy data refuse
+/// rather than trust the name they were handed. `create_new` makes each
+/// staging file and a detached signature written straight to its name, and
+/// refuses any entry already there, a dangling symlink included, in the same
+/// call that creates the file. Before a rename, the `output.exists()` check
+/// only narrows the window, since the rename replaces whatever is at the name
+/// by then; see [`write_staged`].
 ///
 /// Only a derived name comes through here. Inside a Flatpak the user chooses
 /// each output in a save dialog instead, and that path is written as chosen,
@@ -1175,6 +1178,183 @@ pub enum Existing {
     Replace,
 }
 
+/// Who may read a file an operation writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Readers {
+    /// Its owner alone: 0600 on Unix, whatever the umask.
+    ///
+    /// For plaintext. A decrypted file was protected until the moment it was
+    /// written, and under the usual umask it came out 0644, readable by every
+    /// local account that can reach the directory it lands in, such as /tmp
+    /// or a group-shared folder. The mode is set by the call that creates the
+    /// staging file rather than by a chmod after it, which would leave a
+    /// window in which another user could open the file while it was still
+    /// empty and read everything written to it afterwards through that
+    /// descriptor. A file replacing a chosen one takes this mode too, whatever
+    /// that one had.
+    ///
+    /// Windows has no mode, and the file takes the ACL its directory passes
+    /// down, as it always has; under the user's profile that already keeps
+    /// other users out. The store's owner-only ACL is not borrowed for it,
+    /// because that would cut the file off from whatever a shared or synced
+    /// folder the user chose passes down.
+    Owner,
+    /// Whoever the umask and the directory allow, as for any other new file
+    /// the user makes. For ciphertext and signatures, which exist to be handed
+    /// on.
+    Usual,
+}
+
+impl Readers {
+    /// Options that create a new file for these readers, and refuse any entry
+    /// already at the name, a symlink included, rather than open it.
+    fn options(self) -> fs::OpenOptions {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if self == Readers::Owner {
+                options.mode(0o600);
+            }
+        }
+        options
+    }
+}
+
+/// A file an operation created and has not finished with, removed when this
+/// is dropped unless [`Unfinished::keep`] or [`Unfinished::rename_onto`] says
+/// otherwise.
+///
+/// Every way out of an operation passes through the drop: an error from any
+/// step, one added later included, and a panic unwinding out of Sequoia on the
+/// GUI's worker thread. Removing the file by hand in each error arm missed
+/// some of them. A decrypt whose last buffered write failed on a full disk
+/// returned its error and left all of the plaintext but that last buffer at
+/// `<output>.part`, where a retry stepped around it to `<output> (1).part`,
+/// and a rename that failed left the whole of it. A process that ends without
+/// unwinding, in a crash or with the window closed while a worker is still
+/// writing, still leaves the file behind.
+///
+/// Only [`create_new`] makes one, and only once the file exists, so a name
+/// that was already taken is refused and left alone rather than removed.
+/// Whoever holds the file closes it first, so that nothing is renamed or
+/// removed while a handle to it is still open.
+struct Unfinished {
+    path: PathBuf,
+    kept: bool,
+}
+
+impl Unfinished {
+    /// Leave the file where it is.
+    fn keep(mut self) {
+        self.kept = true;
+    }
+
+    /// Rename the file onto `output`, and leave it there once it is.
+    fn rename_onto(self, output: &Path) -> Result<()> {
+        fs::rename(&self.path, output)
+            .map_err(|e| Error::io(format!("writing {}", output.display()), e))?;
+        self.keep();
+        Ok(())
+    }
+}
+
+impl Drop for Unfinished {
+    fn drop(&mut self) {
+        if !self.kept {
+            // Best effort: the error on its way back is the one that matters.
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Create a new file at `path` for `readers`, with the [`Unfinished`] that
+/// removes it again unless the operation succeeds.
+fn create_new(path: PathBuf, readers: Readers) -> Result<(Unfinished, fs::File)> {
+    let file = readers
+        .options()
+        .open(&path)
+        .map_err(|e| Error::io(format!("writing {}", path.display()), e))?;
+    Ok((Unfinished { path, kept: false }, file))
+}
+
+fn already_exists(output: &Path) -> Error {
+    Error::invalid(format!("{} already exists", output.display()))
+}
+
+/// How much of a streamed output is gathered before it is written.
+///
+/// Sequoia's armor writer hands its sink one 64-column line at a time, and a
+/// decrypt copies 8 KiB at a time, so behind `BufWriter`'s default of 8 KiB a
+/// gigabyte of output took between 130,000 and 180,000 writes. Each of them
+/// appends to a new file, which is dear on a copy-on-write filesystem:
+/// measured on btrfs, an encrypt ran a sixth to a quarter faster with this
+/// buffer, and a decrypt a few percent. A mebibyte is small beside what
+/// Sequoia buffers for itself, 4 MiB per packet it writes and 25 MiB held
+/// back while it decrypts.
+const OUTPUT_BUFFER: usize = 1 << 20;
+
+/// Write an output to a new file beside it, and rename that onto `output`
+/// once `fill` and the last buffered write have both succeeded.
+///
+/// So an operation that fails at any step leaves `output` as it was and
+/// nothing beside it: a wrong passphrase, a message that does not decrypt, a
+/// full disk at the last write and a refused rename all end the same way. A
+/// file already at `output` is refused or replaced by the rename, never
+/// written into; see [`Existing`].
+///
+/// The staging name is the output's with `.part` appended rather than
+/// substituted: `output.with_extension("part")` turned `notes.txt.asc` into
+/// `notes.part`, a name the user may well own. It goes through `free_name`,
+/// so it steps around a `.part` file already there, and [`create_new`] refuses
+/// it if it is taken all the same, so the file written and renamed is always
+/// one this call made.
+///
+/// With [`Existing::Refuse`], a file that has appeared at `output` by the time
+/// the output is finished is refused. That narrows the window between
+/// `free_name` and the rename to a check just before it, and does not close
+/// it: `fs::rename` replaces whatever is at the name, and a rename that
+/// refuses to is not portable.
+///
+/// Nothing is synced before the rename, unlike the store's writes, whose
+/// files stay in the store's own directory. On macOS `sync_all` is
+/// `fcntl(F_FULLFSYNC)` with no fallback to `fsync`, and that fails on some
+/// volumes an output may well be written to, such as SMB shares and FAT or
+/// exFAT drives, so it would turn a good output there into a reported
+/// failure. The last buffered write still catches a full disk or an
+/// exhausted quota on a local filesystem; an error that a network filesystem
+/// reports only at close is lost.
+fn write_staged<T>(
+    output: &Path,
+    existing: Existing,
+    readers: Readers,
+    fill: impl FnOnce(&mut BufWriter<fs::File>) -> Result<T>,
+) -> Result<T> {
+    let (staging, file) = create_new(free_name(append_extension(output, "part")), readers)?;
+    // Declared after `staging`, so that on every way out, a panic included,
+    // the file is closed before its name is removed.
+    let mut sink = BufWriter::with_capacity(OUTPUT_BUFFER, file);
+    let value = fill(&mut sink)?;
+    // Flushed by into_inner rather than by the drop, which discards a failed
+    // write: up to a whole buffer, and so all of a small output, is written
+    // only here.
+    let file = sink.into_inner().map_err(|e| {
+        Error::io(
+            format!("writing {}", staging.path.display()),
+            e.into_error(),
+        )
+    })?;
+    // Closed before it is renamed, so that no handle to it outlives the
+    // operation.
+    drop(file);
+    if existing == Existing::Refuse && output.exists() {
+        return Err(already_exists(output));
+    }
+    staging.rename_onto(output)?;
+    Ok(value)
+}
+
 pub fn encrypt_file(
     recipients: &[Cert],
     passwords: &[Zeroizing<String>],
@@ -1193,37 +1373,12 @@ pub fn encrypt_file(
     // file the user picked — a multi-gigabyte archive was an out-of-memory
     // kill rather than a slow encrypt.
     //
-    // Staged exactly as decrypt_file stages, free_name included: the naive
-    // `output.with_extension("part")` turned notes.txt.asc into notes.part and
-    // truncated a file the user may well own, which is what free_name and
-    // append_extension exist to prevent.
+    // Staged through write_staged, as decrypt_file is.
     let mut source =
         fs::File::open(input).map_err(|e| Error::io(format!("reading {}", input.display()), e))?;
-    let staging = free_name(append_extension(output, "part"));
-    {
-        let file = fs::File::create_new(&staging)
-            .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
-        let mut sink = BufWriter::new(file);
-        match encrypt_stream(recipients, passwords, signer, &mut source, &mut sink) {
-            Ok(()) => sink
-                .flush()
-                .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?,
-            Err(e) => {
-                let _ = fs::remove_file(&staging);
-                return Err(e);
-            }
-        }
-    }
-    if existing == Existing::Refuse && output.exists() {
-        let _ = fs::remove_file(&staging);
-        return Err(Error::invalid(format!(
-            "{} already exists",
-            output.display()
-        )));
-    }
-    fs::rename(&staging, output)
-        .map_err(|e| Error::io(format!("writing {}", output.display()), e))?;
-    Ok(())
+    write_staged(output, existing, Readers::Usual, |sink| {
+        encrypt_stream(recipients, passwords, signer, &mut source, sink)
+    })
 }
 
 pub fn sign_detached_file(
@@ -1240,33 +1395,35 @@ pub fn sign_detached_file(
     let mut signature = Vec::new();
     sign_detached_stream(signer, password, &mut source, &mut signature)?;
     match existing {
+        // Written straight to its name, since nothing there is being
+        // replaced, into a file create_new makes. The name used to be checked
+        // with exists() and then written with fs::write, which truncated a
+        // file that appeared in between, and followed a dangling symlink
+        // planted at the name, which exists() reports as absent, to create the
+        // signature wherever the link pointed. A signature cut short by a
+        // failed write is removed, since the file is known to be this call's.
         Existing::Refuse => {
-            if output.exists() {
-                return Err(Error::invalid(format!(
-                    "{} already exists",
-                    output.display()
-                )));
-            }
-            write(output, &signature)
+            let (unfinished, mut file) = match create_new(output.to_path_buf(), Readers::Usual) {
+                Err(Error::Io { source, .. }) if source.kind() == ErrorKind::AlreadyExists => {
+                    return Err(already_exists(output));
+                }
+                created => created?,
+            };
+            let written = file.write_all(&signature);
+            drop(file);
+            written.map_err(|e| Error::io(format!("writing {}", output.display()), e))?;
+            unfinished.keep();
+            Ok(())
         }
         // Staged and renamed onto the chosen file, as encrypt_file and
         // decrypt_file stage, rather than written straight into it. A write
         // truncates its file first, so one that failed part-way, on a full
         // disk or over quota, would leave the file the user agreed to replace
         // neither what it was nor a signature.
-        Existing::Replace => {
-            let staging = free_name(append_extension(output, "part"));
-            let mut file = fs::File::create_new(&staging)
-                .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
-            if let Err(e) = file.write_all(&signature) {
-                drop(file);
-                let _ = fs::remove_file(&staging);
-                return Err(Error::io(format!("writing {}", staging.display()), e));
-            }
-            drop(file);
-            fs::rename(&staging, output)
+        Existing::Replace => write_staged(output, existing, Readers::Usual, |sink| {
+            sink.write_all(&signature)
                 .map_err(|e| Error::io(format!("writing {}", output.display()), e))
-        }
+        }),
     }
 }
 
@@ -1293,40 +1450,12 @@ pub fn decrypt_file(
     // the bytes they expand to. Anyone can encrypt a highly compressible
     // message to a published key, so buffering the plaintext made the size of
     // an allocation the sender's choice. On disk it is the filesystem's
-    // problem, and a partial temp file is removed.
-    // Appended rather than substituted, and routed through free_name: the old
-    // `output.with_extension("part")` turned notes.txt into notes.part — a name
-    // a user may well own — and this path truncates that file on create, then
-    // renames it away on success or unlinks it on failure. free_name is the
-    // same rule decrypted_name already applies to the output; the staging file
-    // had simply been left out of it.
-    let staging = free_name(append_extension(output, "part"));
-    let result = {
-        let file = fs::File::create_new(&staging)
-            .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
-        let mut sink = BufWriter::new(file);
-        match decrypt_stream(store, source, passwords, &mut sink) {
-            Ok(result) => {
-                sink.flush()
-                    .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
-                result
-            }
-            Err(e) => {
-                let _ = fs::remove_file(&staging);
-                return Err(e);
-            }
-        }
-    };
-    if existing == Existing::Refuse && output.exists() {
-        let _ = fs::remove_file(&staging);
-        return Err(Error::invalid(format!(
-            "{} already exists",
-            output.display()
-        )));
-    }
-    fs::rename(&staging, output)
-        .map_err(|e| Error::io(format!("writing {}", output.display()), e))?;
-    Ok(result)
+    // problem, and write_staged removes the partial file however the
+    // decryption ends. It is readable by its owner alone from the moment it
+    // exists; see Readers::Owner.
+    write_staged(output, existing, Readers::Owner, |sink| {
+        decrypt_stream(store, source, passwords, sink)
+    })
 }
 
 /// Verify an armored or binary detached signature against the file it signs.
@@ -1338,8 +1467,16 @@ pub fn verify_detached_files(
     let signature = read(signature_path)?;
     // The signed file is streamed rather than read whole: it is unbounded and
     // caller-supplied, while the signature beside it is a few hundred bytes.
-    // verify_file reaches the same verdict as verify_bytes; this writes
-    // nothing, so there is no output to keep intact.
+    //
+    // It is read through a file handle rather than handed to verify_file,
+    // which on Unix maps a file of 64 KiB or more into memory. A mapped file
+    // that shrinks while it is being hashed, or whose disk or network share
+    // goes away meanwhile, raises SIGBUS, and that kills the whole window,
+    // where a read ends early at a bad signature or returns an error. On a
+    // file that does not change, the verdict is the one verify_bytes reaches.
+    // This writes nothing, so there is no output to keep intact.
+    let data = fs::File::open(data_path)
+        .map_err(|e| Error::io(format!("reading {}", data_path.display()), e))?;
     let policy = sha1_policy_or_strict(store);
     let helper = Helper::new(store, &[], &policy);
     let mut verifier = DetachedVerifierBuilder::from_bytes(&signature)?.with_policy(
@@ -1347,7 +1484,7 @@ pub fn verify_detached_files(
         None,
         helper,
     )?;
-    verifier.verify_file(data_path)?;
+    verifier.verify_reader(data)?;
 
     let helper = verifier.into_helper();
     Ok(VerifyResult {
@@ -1359,10 +1496,6 @@ pub fn verify_detached_files(
 
 fn read(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).map_err(|e| Error::io(format!("reading {}", path.display()), e))
-}
-
-fn write(path: &Path, bytes: &[u8]) -> Result<()> {
-    fs::write(path, bytes).map_err(|e| Error::io(format!("writing {}", path.display()), e))
 }
 
 #[cfg(test)]
@@ -2288,6 +2421,12 @@ mod tests {
         );
 
         // And a failure leaves neither a staging file nor a damaged output.
+        // Alice's key has no passphrase, so offering one fails the signing
+        // step, as "this key has no passphrase", once the staging file has
+        // been made. That is not the refusal of the taken output name, which
+        // is never reached here;
+        // a_chosen_output_replaces_the_file_there_and_a_derived_one_does_not
+        // tests that.
         std::fs::write(&output, b"PRECIOUS").unwrap();
         assert!(
             encrypt_file(
@@ -2673,6 +2812,457 @@ mod tests {
         assert!(
             !output.exists(),
             "a failed decryption must not create the output file"
+        );
+    }
+
+    /// A staged output leaves nothing behind however it fails.
+    ///
+    /// Each error arm used to remove the staging file by hand, and the last
+    /// write was not one of them: a decrypt whose final flush failed, on a
+    /// full disk or over quota, returned its error and left all of the
+    /// plaintext but that last buffer at `<output>.part`. Here the file under
+    /// the buffer is swapped for a handle that cannot write, which fails that
+    /// flush the same way. A panic, which no error arm sees, goes through the
+    /// same drop.
+    #[test]
+    fn a_staged_output_leaves_nothing_behind_however_it_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.txt");
+        let staging = append_extension(&output, "part");
+        let nothing_left = |how: &str| {
+            assert!(!output.exists(), "{how} left an output");
+            assert!(!staging.exists(), "{how} left its staging file behind");
+        };
+
+        let failed = write_staged::<()>(&output, Existing::Refuse, Readers::Owner, |sink| {
+            sink.write_all(b"half a plaintext").unwrap();
+            Err(Error::invalid("the rest did not decrypt"))
+        });
+        assert!(failed.is_err());
+        nothing_left("a failed operation");
+
+        let error = write_staged(&output, Existing::Refuse, Readers::Owner, |sink| {
+            sink.write_all(b"a plaintext the last write never lands")
+                .unwrap();
+            *sink.get_mut() = fs::File::open(&staging).unwrap();
+            Ok(())
+        })
+        .expect_err("an operation whose last write fails has failed");
+        assert!(
+            error.to_string().contains(".part"),
+            "the error should name the file it could not write: {error}"
+        );
+        nothing_left("a failed last write");
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_staged::<()>(&output, Existing::Refuse, Readers::Owner, |sink| {
+                sink.write_all(b"some of a plaintext").unwrap();
+                panic!("a bug part-way through an operation");
+            })
+        }));
+        assert!(panicked.is_err());
+        nothing_left("a panic");
+
+        // The control: one that succeeds leaves its output and nothing else.
+        write_staged(&output, Existing::Refuse, Readers::Owner, |sink| {
+            sink.write_all(b"a plaintext").map_err(Error::from)
+        })
+        .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"a plaintext");
+        assert!(!staging.exists(), "a finished output left its staging file");
+    }
+
+    /// A rename that fails leaves no staging file behind either.
+    ///
+    /// It used to leave the whole output under its `.part` name: for a
+    /// decrypt, all of the plaintext, in a file the user was told had not been
+    /// written. A directory at each chosen path is what fails the rename here.
+    #[test]
+    fn a_failed_rename_leaves_no_staging_file_behind() {
+        let (dir, store) = scratch_store();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+        let input = dir.path().join("notes.txt");
+        std::fs::write(&input, b"the plaintext").unwrap();
+        let encrypted = dir.path().join("notes.txt.asc");
+        let mut ciphertext = Vec::new();
+        encrypt(
+            std::slice::from_ref(&alice),
+            &[],
+            None,
+            b"the plaintext",
+            &mut ciphertext,
+        )
+        .unwrap();
+        std::fs::write(&encrypted, &ciphertext).unwrap();
+
+        let outputs = dir.path().join("outputs");
+        std::fs::create_dir(&outputs).unwrap();
+        let in_the_way = |name: &str| {
+            let path = outputs.join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("inside"), b"kept").unwrap();
+            path
+        };
+        let rename_failed = |result: Result<()>, output: &Path| {
+            let error = result.expect_err("a rename onto a directory must fail");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("writing {}:", output.display())),
+                "the operation should have got as far as the rename: {error}"
+            );
+        };
+
+        let output = in_the_way("chosen.asc");
+        let recipients = std::slice::from_ref(&alice);
+        let encrypted_to = encrypt_file(recipients, &[], None, &input, &output, Existing::Replace);
+        rename_failed(encrypted_to, &output);
+        let output = in_the_way("chosen.sig");
+        let signed = sign_detached_file(&alice, None, &input, &output, Existing::Replace);
+        rename_failed(signed, &output);
+        let output = in_the_way("chosen.txt");
+        let decrypted = decrypt_file(&store, &encrypted, &[], &output, Existing::Replace);
+        rename_failed(decrypted.map(|_| ()), &output);
+
+        let mut names: Vec<String> = std::fs::read_dir(&outputs)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["chosen.asc", "chosen.sig", "chosen.txt"]);
+        for name in names {
+            assert_eq!(
+                std::fs::read(outputs.join(name).join("inside")).unwrap(),
+                b"kept"
+            );
+        }
+    }
+
+    /// A staging name that is already taken is refused, and the file there is
+    /// left as it was.
+    ///
+    /// free_name hands back a taken name once its series is used up, or when
+    /// another file takes the name first, and then only `create_new` stands
+    /// between that file and the operation. It is also the one failure that
+    /// must not remove the file it failed on, which is somebody else's.
+    #[test]
+    fn a_taken_staging_name_is_refused_and_left_as_it_was() {
+        let (dir, store) = scratch_store();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+        let input = dir.path().join("notes.txt");
+        std::fs::write(&input, b"the plaintext").unwrap();
+        let encrypted = dir.path().join("notes.txt.asc");
+        encrypt_file(
+            std::slice::from_ref(&alice),
+            &[],
+            None,
+            &input,
+            &encrypted,
+            Existing::Refuse,
+        )
+        .unwrap();
+
+        let output = dir.path().join("out.txt");
+        let staging = append_extension(&output, "part");
+        let taken: Vec<PathBuf> = std::iter::once(staging.clone())
+            .chain((1..1000).map(|n| dir.path().join(format!("out.txt ({n}).part"))))
+            .collect();
+        for path in &taken {
+            std::fs::write(path, b"somebody else's").unwrap();
+        }
+        assert_eq!(free_name(staging.clone()), staging, "the series is used up");
+
+        // Replace, so that the signature is staged as well.
+        let recipients = std::slice::from_ref(&alice);
+        let refused = [
+            encrypt_file(recipients, &[], None, &input, &output, Existing::Replace),
+            sign_detached_file(&alice, None, &input, &output, Existing::Replace),
+            decrypt_file(&store, &encrypted, &[], &output, Existing::Replace).map(|_| ()),
+        ];
+        for result in refused {
+            let error = result.expect_err("a taken staging name must be refused");
+            assert!(error.to_string().contains("exists"), "{error}");
+        }
+        assert!(!output.exists());
+        for path in &taken {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                b"somebody else's",
+                "{} was not left as it was",
+                path.display()
+            );
+        }
+    }
+
+    /// A derived output name that comes back taken is refused rather than
+    /// written over.
+    ///
+    /// Once `name (1)` to `name (999)` are all taken, free_name hands back the
+    /// name itself, and only each operation's own refusal stands between its
+    /// output and the file there. This is the way the GUI reaches it: outside
+    /// a Flatpak it derives every output name through these three functions.
+    #[test]
+    fn a_derived_name_that_comes_back_taken_is_refused() {
+        let (dir, store) = scratch_store();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+        let input = dir.path().join("notes.txt");
+        std::fs::write(&input, b"the plaintext").unwrap();
+        let letter = dir.path().join("letter.txt.gpg");
+        let mut ciphertext = Vec::new();
+        encrypt(
+            std::slice::from_ref(&alice),
+            &[],
+            None,
+            b"the plaintext",
+            &mut ciphertext,
+        )
+        .unwrap();
+        std::fs::write(&letter, &ciphertext).unwrap();
+
+        let earlier: &[u8] = b"AN EARLIER FILE";
+        let take_series = |base: &str, extension: &str| -> Vec<PathBuf> {
+            let series: Vec<PathBuf> = std::iter::once(format!("{base}{extension}"))
+                .chain((1..1000).map(|n| format!("{base} ({n}){extension}")))
+                .map(|name| dir.path().join(name))
+                .collect();
+            for path in &series {
+                std::fs::write(path, earlier).unwrap();
+            }
+            series
+        };
+        let refused = |result: Result<()>, series: &[PathBuf]| {
+            let error = result.expect_err("a taken derived name must be refused");
+            assert!(error.to_string().contains("already exists"), "{error}");
+            for path in series {
+                assert_eq!(std::fs::read(path).unwrap(), earlier, "{}", path.display());
+            }
+        };
+
+        let series = take_series("notes.txt", ".asc");
+        let output = encrypted_name(&input);
+        assert_eq!(output, series[0]);
+        let recipients = std::slice::from_ref(&alice);
+        let encrypted = encrypt_file(recipients, &[], None, &input, &output, Existing::Refuse);
+        refused(encrypted, &series);
+
+        let series = take_series("notes.txt", ".sig");
+        let output = signature_name(&input);
+        assert_eq!(output, series[0]);
+        refused(
+            sign_detached_file(&alice, None, &input, &output, Existing::Refuse),
+            &series,
+        );
+
+        let series = take_series("letter", ".txt");
+        let output = decrypted_name(&letter);
+        assert_eq!(output, series[0]);
+        let decrypted = decrypt_file(&store, &letter, &[], &output, Existing::Refuse);
+        refused(decrypted.map(|_| ()), &series);
+
+        let staged = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".part"))
+            .collect::<Vec<_>>();
+        assert!(staged.is_empty(), "{staged:?}");
+    }
+
+    /// A detached signature is not written through a dangling symlink at its
+    /// name.
+    ///
+    /// The name was checked with `exists()`, which follows the link and finds
+    /// nothing, and then written with `fs::write`, which follows it too and
+    /// creates the file it points at: an extracted archive or a cloned
+    /// repository carrying `release.tar.gz.sig -> ../elsewhere` had the
+    /// signature created outside the directory. `create_new` refuses the link
+    /// itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_signature_is_not_written_through_a_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        let project = dir.path().join("project");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&elsewhere).unwrap();
+        let input = project.join("release.tar.gz");
+        std::fs::write(&input, b"a release").unwrap();
+        let planted = elsewhere.join("planted");
+        let link = project.join("release.tar.gz.sig");
+        std::os::unix::fs::symlink(&planted, &link).unwrap();
+
+        // free_name follows the link and finds nothing either, so the name
+        // the GUI would use is the link's.
+        let output = signature_name(&input);
+        assert_eq!(output, link);
+        let error = sign_detached_file(&alice, None, &input, &output, Existing::Refuse)
+            .expect_err("a symlink at the name must be refused");
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert!(
+            !planted.exists(),
+            "the signature was written through the link"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// A decrypted file is readable by its owner alone, and so is its staging
+    /// file from the moment it exists; ciphertext and signatures keep the
+    /// mode any new file gets.
+    ///
+    /// The plaintext used to be created 0666 less the umask, usually 0644:
+    /// readable by every local account that can reach the directory, while it
+    /// streamed and after. Under a umask of 077 every new file is private
+    /// already, and this cannot tell the difference.
+    #[cfg(unix)]
+    #[test]
+    fn a_decrypted_file_is_readable_by_its_owner_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        let (dir, store) = scratch_store();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+        let input = dir.path().join("payroll.csv");
+        std::fs::write(&input, b"name,salary").unwrap();
+        // What any new file gets here, under whatever umask this runs with.
+        let usual = mode(&input);
+
+        let encrypted = encrypted_name(&input);
+        let recipients = std::slice::from_ref(&alice);
+        encrypt_file(recipients, &[], None, &input, &encrypted, Existing::Refuse).unwrap();
+        let signature = signature_name(&input);
+        sign_detached_file(&alice, None, &input, &signature, Existing::Refuse).unwrap();
+        assert_eq!(mode(&encrypted), usual, "the ciphertext");
+        assert_eq!(mode(&signature), usual, "the signature");
+
+        std::fs::remove_file(&input).unwrap();
+        let decrypted = decrypted_name(&encrypted);
+        decrypt_file(&store, &encrypted, &[], &decrypted, Existing::Refuse).unwrap();
+        assert_eq!(std::fs::read(&decrypted).unwrap(), b"name,salary");
+        assert_eq!(mode(&decrypted), 0o600, "the plaintext");
+
+        // A chosen file the plaintext replaces is replaced by a private one.
+        let chosen = dir.path().join("chosen.csv");
+        std::fs::write(&chosen, b"an earlier file").unwrap();
+        std::fs::set_permissions(&chosen, std::fs::Permissions::from_mode(0o644)).unwrap();
+        decrypt_file(&store, &encrypted, &[], &chosen, Existing::Replace).unwrap();
+        assert_eq!(mode(&chosen), 0o600, "the plaintext over a chosen file");
+
+        // Before a byte of plaintext is in it, not after.
+        let output = dir.path().join("early.csv");
+        write_staged(&output, Existing::Refuse, Readers::Owner, |sink| {
+            let staging = sink.get_ref().metadata().unwrap();
+            assert_eq!(staging.len(), 0);
+            assert_eq!(
+                staging.permissions().mode() & 0o777,
+                0o600,
+                "the staging file"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// One of the counters in `/proc/thread-self/io` for the calling thread.
+    #[cfg(target_os = "linux")]
+    fn thread_io(counter: &str) -> u64 {
+        let text = std::fs::read_to_string("/proc/thread-self/io").unwrap();
+        text.lines()
+            .find_map(|line| line.strip_prefix(counter)?.strip_prefix(": ")?.parse().ok())
+            .unwrap_or_else(|| panic!("no {counter} in {text}"))
+    }
+
+    /// The file a detached signature covers is read rather than mapped into
+    /// memory.
+    ///
+    /// `verify_file` maps a file of 64 KiB or more on Unix, and a mapped file
+    /// that shrinks while it is being hashed, or whose device goes away,
+    /// raises SIGBUS and takes the whole window with it. A test that provoked
+    /// that would race the hash, so this looks at how the bytes arrive
+    /// instead: a read counts them in this thread's `rchar`, and a page fault
+    /// on a mapping does not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_signed_file_is_read_rather_than_mapped_into_memory() {
+        let (dir, store) = scratch_store();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+        // Sixteen times the size at which buffered-reader starts to map.
+        let size = 1024 * 1024;
+        let data = dir.path().join("image.iso");
+        std::fs::write(&data, vec![0x5a; size]).unwrap();
+        let signature = signature_name(&data);
+        sign_detached_file(&alice, None, &data, &signature, Existing::Refuse).unwrap();
+
+        let before = thread_io("rchar");
+        let result = verify_detached_files(&store, &signature, &data).unwrap();
+        let read = thread_io("rchar") - before;
+        assert!(result.all_good(), "signatures: {:?}", result.signatures);
+        assert!(
+            read >= size as u64,
+            "{read} bytes were read to verify a file of {size}, so it was mapped"
+        );
+    }
+
+    /// A streamed output reaches its file in large writes rather than a write
+    /// for every 8 KiB; see [`OUTPUT_BUFFER`].
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_streamed_output_is_written_in_large_pieces() {
+        let (dir, store) = scratch_store();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+        let input = dir.path().join("archive.tar");
+        std::fs::write(&input, vec![0x5a; 2 * 1024 * 1024]).unwrap();
+        let average_write = |run: &dyn Fn()| {
+            let (calls, bytes) = (thread_io("syscw"), thread_io("wchar"));
+            run();
+            let (calls, bytes) = (thread_io("syscw") - calls, thread_io("wchar") - bytes);
+            assert!(calls > 0);
+            bytes / calls
+        };
+
+        let encrypted = dir.path().join("archive.tar.asc");
+        let encrypt = || {
+            let recipients = std::slice::from_ref(&alice);
+            encrypt_file(recipients, &[], None, &input, &encrypted, Existing::Refuse).unwrap();
+        };
+        let average = average_write(&encrypt);
+        assert!(
+            average >= 256 * 1024,
+            "an encrypt wrote {average} bytes a write"
+        );
+
+        let decrypted = dir.path().join("out.tar");
+        let decrypt = || {
+            decrypt_file(&store, &encrypted, &[], &decrypted, Existing::Refuse).unwrap();
+        };
+        let average = average_write(&decrypt);
+        assert!(
+            average >= 256 * 1024,
+            "a decrypt wrote {average} bytes a write"
         );
     }
 

@@ -421,6 +421,18 @@ your files keeps anything else written beside one of them to itself: it reaches
 your disk only as a hidden `.xdp-` file, never under the name you would look
 for.
 
+While an encrypt or decrypt runs, its output is written to a `.part` file
+beside it and renamed into place only once it is complete, so one that fails
+leaves nothing behind, and a file you chose to replace stays as it was. One cut
+off before it can clear up, by a crash or by closing the window while it runs,
+can leave its `.part` file behind, as a hidden `.xdp-` file in the Flatpak;
+after a decrypt that file holds the plaintext written so far, and it can be
+deleted. On Linux and macOS a decrypted file can be read by you alone: it is
+`0600` from the moment it is created, whatever your umask. On Windows it takes
+the permissions of the folder it lands in, as any new file does. Encrypted
+files and signatures are meant to be passed on, so they get the permissions any
+new file of yours gets.
+
 ## Where certificates live
 
 Public certificates go in a [pgp-cert-d][certd] directory, the same layout `sq`
