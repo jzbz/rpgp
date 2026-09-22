@@ -1604,9 +1604,13 @@ impl Drop for StoreLock {
 /// Restrict a path to the current user.
 ///
 /// Windows has no mode, so `mode` is ignored there and the equivalent ACL is
-/// derived from what the path is; see [`windows_acl`]. On a platform that is
-/// neither, this is a no-op, because inventing a mapping would be worse than
-/// being explicit about not having one.
+/// derived from what the path leads to; see [`windows_acl`]. On a platform
+/// that is neither, this is a no-op, because inventing a mapping would be
+/// worse than being explicit about not having one.
+///
+/// A link at the end of the path is followed on Unix and Windows alike, so
+/// what is restricted is what the link leads to: chmod follows a symlink, and
+/// on Windows the ACL is set through a handle opened on that object.
 #[cfg(unix)]
 fn restrict(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -1634,8 +1638,7 @@ fn restrict(_path: &Path, _mode: u32) -> Result<()> {
 ///
 /// For the files the repair on open lists first and restricts after: one that
 /// is gone by then exposes nothing. Both platforms report that as `NotFound`,
-/// whether Unix's chmod finds nothing or Windows fails to inspect the path or
-/// to set its ACL.
+/// whether Unix's chmod finds nothing or Windows finds nothing to open.
 fn restrict_if_present(path: &Path, mode: u32) -> Result<()> {
     match restrict(path, mode) {
         Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1681,7 +1684,7 @@ mod windows_acl {
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
     };
     use windows_sys::Win32::Security::{
         ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
@@ -1689,8 +1692,9 @@ mod windows_acl {
         TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        READ_CONTROL, WRITE_DAC,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -1729,43 +1733,115 @@ mod windows_acl {
         Ok(format!("D:P(A;{flags};FA;;;{sid})"))
     }
 
-    /// Restrict `path` to the current user, replacing whatever DACL it has.
+    /// Restrict what `path` names to the current user, replacing whatever
+    /// DACL it has.
     ///
     /// The repair half. Used for directories, which `fs::create_dir_all` has
     /// already made by the time we are called, and for files a previous build
     /// left behind.
+    ///
+    /// A link at the end of `path` is followed and the ACL goes on what it
+    /// leads to, as chmod follows a symlink on Unix. This used to call
+    /// SetNamedSecurityInfoW, which does not follow one: given the path of a
+    /// junction, it set the ACL of the junction itself, as the windows-core CI
+    /// job showed. A symlink goes through the same reparse-point handling,
+    /// though that case was not observed. So a secrets directory moved to
+    /// another drive with a junction left in its place kept whatever ACL its
+    /// new location handed down, through every open. Each key file in it was
+    /// still owner-only, as [`create_private`] made it, but the directory let
+    /// in anyone its parents let in: to list the keys, and where those parents
+    /// granted full control, to delete them or put others in their place. The
+    /// object is opened here instead, by CreateFileW, which follows links as it
+    /// opens, and the policy is both chosen from and set through that one
+    /// handle.
+    ///
+    /// Following the link takes rights away from everyone but this user and
+    /// grants this user nothing it could not grant itself: the policy names
+    /// nobody else, and the open succeeds only where this user may already
+    /// rewrite the ACL.
     pub(super) fn restrict(path: &Path) -> Result<()> {
-        // Which form of the policy applies is decided by what the path *is*,
-        // not by the `mode` the caller passed: see the wrapper's doc comment.
-        // It is judged with any link at its end followed, because
-        // SetNamedSecurityInfoW follows that link and puts the ACL on what it
-        // leads to, as chmod does on Unix. Judged without following it, a
-        // secrets directory moved to another drive with a junction left in its
-        // place looked like a file, since std reports a junction as a symlink
-        // and not a directory, and the real directory got the policy for a
-        // file, with nothing for what is made inside it to inherit.
-        let container = fs::metadata(path)
+        let wide = wide_path(path)?;
+
+        // WRITE_DAC is what setting the DACL needs. READ_CONTROL too, because
+        // SetSecurityInfo does not document all it needs and may read the
+        // descriptor already there, and an object's owner is normally granted
+        // both whatever its DACL says. FILE_READ_ATTRIBUTES is for the
+        // metadata read below, which chooses the policy as fs::metadata on
+        // the path used to. Named rights, not MAXIMUM_ALLOWED, with which
+        // SetSecurityInfo documents that it propagates nothing to what is
+        // inside a directory. Every share flag, for create_private's reason:
+        // sharing is a concurrency setting, not an access-control boundary.
+        //
+        // No FILE_FLAG_OPEN_REPARSE_POINT, which would open a link at the end
+        // of the path rather than what it leads to, as SetNamedSecurityInfoW
+        // did. FILE_FLAG_BACKUP_SEMANTICS because CreateFileW opens no
+        // directory without it. It overrides access checks only for a process
+        // that has enabled the backup and restore privileges, which this one
+        // never does.
+        //
+        // SAFETY: `wide` is a NUL-terminated UTF-16 buffer alive for the call.
+        // The security attributes and the template handle are optional and
+        // null. The return value is validated below before being treated as
+        // a handle.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                ptr::null_mut(),
+            )
+        };
+        // Read before anything else can clobber it. Nothing at the path, or
+        // a link that leads nowhere, is ERROR_FILE_NOT_FOUND or
+        // ERROR_PATH_NOT_FOUND, which io::Error reports as NotFound, and
+        // `restrict_if_present` depends on that.
+        //
+        // SAFETY: GetLastError takes no arguments and touches no memory.
+        let code = unsafe { GetLastError() };
+        // SAFETY: on success this is an owned, open handle for which
+        // CloseHandle is the correct destructor, and it is not closed
+        // anywhere else here. On failure it is the sentinel, which
+        // `HandleOrInvalid` recognises and does not close.
+        let handle = unsafe { HandleOrInvalid::from_raw_handle(raw) };
+        // A File from here on, so every return below closes the handle.
+        let object = fs::File::from(
+            OwnedHandle::try_from(handle)
+                .map_err(|_| win32(code, format!("restricting {}", path.display())))?,
+        );
+
+        // Which form of the policy applies is decided by what the object
+        // *is*, not by the `mode` the caller passed: see the wrapper's doc
+        // comment. Judged through the handle, so that it describes the object
+        // the ACL is about to land on. A second look at the path could meet a
+        // link retargeted in between and pair one object's policy with
+        // another object.
+        let container = object
+            .metadata()
             .map_err(|e| Error::io(format!("inspecting {}", path.display()), e))?
             .is_dir();
 
         let descriptor = SecurityDescriptor::from_sddl(&sddl(container)?)?;
         let dacl = descriptor.dacl()?;
-        let wide = wide_path(path)?;
 
-        // SAFETY: `wide` is a NUL-terminated UTF-16 buffer alive for the call.
-        // The ACL pointer is taken in the argument list itself, from a `dacl`
-        // that borrows `descriptor`, and `descriptor` is not dropped until the
-        // call has returned, so the allocation it points into outlives the
-        // call. The borrow alone would not ensure that: the raw pointer carries
-        // no lifetime, which is why it is never kept in a local of its own. The
-        // owner, group and SACL parameters are null, which the API documents
-        // as "leave this component alone", and the matching bits are absent
-        // from `securityinfo`. PROTECTED_DACL_SECURITY_INFORMATION is what
-        // strips inherited ACEs already on the object; DACL alone would add
-        // ours and keep theirs.
+        // SAFETY: `object` owns an open handle with WRITE_DAC and is not
+        // dropped until this function returns, after the call. The ACL
+        // pointer is taken in the argument list itself, from a `dacl` that
+        // borrows `descriptor`, and `descriptor` is not dropped until the call
+        // has returned, so the allocation it points into outlives the call.
+        // The borrow alone would not ensure that: the raw pointer carries no
+        // lifetime, which is why it is never kept in a local of its own. Nor
+        // is it ever null, which would grant everyone everything. The owner,
+        // group and SACL parameters are null, which the API accepts for a
+        // component it is not setting, and the matching bits are absent from
+        // `securityinfo`. PROTECTED_DACL_SECURITY_INFORMATION is what strips
+        // inherited ACEs already on the object; DACL alone would add ours and
+        // keep theirs.
         let status = unsafe {
-            SetNamedSecurityInfoW(
-                wide.as_ptr(),
+            SetSecurityInfo(
+                object.as_raw_handle(),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 ptr::null_mut(),
@@ -1915,12 +1991,12 @@ mod windows_acl {
     /// `dacl()` used to return a bare `*const ACL`, which carries no
     /// lifetime, so `SecurityDescriptor::from_sddl(..)?.dacl()?` would have
     /// compiled, freed the descriptor at the end of that statement, and left
-    /// the pointer for SetNamedSecurityInfoW to read the freed ACL through.
-    /// The borrow makes that a compile error. Not a `&ACL`, though: `ACL` is
-    /// only the header of a variable-length structure whose ACEs follow it,
-    /// and under Stacked Borrows, one model of Rust's aliasing rules, a
-    /// pointer made from a reference to the header may read the header alone,
-    /// where Windows reads the whole ACL through it.
+    /// the pointer for the call that sets the ACL to read the freed ACL
+    /// through. The borrow makes that a compile error. Not a `&ACL`, though:
+    /// `ACL` is only the header of a variable-length structure whose ACEs
+    /// follow it, and under Stacked Borrows, one model of Rust's aliasing
+    /// rules, a pointer made from a reference to the header may read the
+    /// header alone, where Windows reads the whole ACL through it.
     struct BorrowedDacl<'a>(NonNull<ACL>, PhantomData<&'a SecurityDescriptor>);
 
     impl BorrowedDacl<'_> {
@@ -2039,9 +2115,10 @@ mod windows_acl {
     ///
     /// Through `encode_wide`, never `to_string_lossy`: a Windows path can be
     /// ill-formed UTF-16, and a lossy round-trip would silently name a
-    /// different file. The path is passed as the caller built it — no
-    /// `canonicalize`, whose `\\?\` prefix the aclapi name-parsing layer is not
-    /// reliably prepared for.
+    /// different file. The path is passed as the caller built it, with no
+    /// `canonicalize`: CreateFileW resolves any link in it as it opens, and
+    /// resolving it beforehand as well would only open a gap in which the
+    /// two resolutions could reach different objects.
     fn wide_path(path: &Path) -> Result<Vec<u16>> {
         let mut units: Vec<u16> = path.as_os_str().encode_wide().collect();
         // An interior NUL would truncate the name at the FFI boundary and open
@@ -5057,12 +5134,16 @@ mod tests {
         /// directory it is, with the inheritable ACE.
         ///
         /// Moving `rpgp\secrets` to another drive and leaving a junction in its
-        /// place is a common way to spare a small system drive. The policy was
-        /// chosen by looking at the junction itself, which std reports as a
-        /// symlink and not a directory, while the call that sets the ACL
-        /// followed it to the real directory. So that directory got the policy
-        /// for a file: owner-only, but with nothing for a file made inside it
-        /// to inherit.
+        /// place is a common way to spare a small system drive. The ACL used to
+        /// be set with SetNamedSecurityInfoW, which, given the junction's path,
+        /// sets the ACL of the junction itself and never reaches the directory
+        /// behind it. That directory kept whatever its new location handed
+        /// down, through every open. This test was written believing the
+        /// opposite, that the call followed the junction, and on its first run
+        /// in CI it found the directory with nothing but the ACEs it had
+        /// inherited, not even the protection. It passes only if the ACL lands
+        /// on the directory the junction leads to, and as a directory's, with
+        /// the inheritable ACE.
         ///
         /// A junction rather than a directory symlink because making one needs
         /// no privilege, and through `mklink` because std cannot make one.
