@@ -142,25 +142,53 @@ jobs:
       #
       # `git rev-parse HEAD`, not GITHUB_SHA. On a manual run GITHUB_SHA is the
       # tip of the ref the workflow was *dispatched on* — master — while the
-      # checkout above honours inputs.ref and sits on the tag. Rewriting the
-      # pin to master while `tag:` still named the release left the two
-      # contradicting each other, and flatpak-builder refused the source with
-      # "Git commit for branch (null) is <tag>, but expected <master>". HEAD is
-      # the commit being built by construction, on a tag push and a manual run
+      # checkout above honours inputs.ref and sits on the tag. HEAD is the
+      # commit being built by construction, on a tag push and a manual run
       # alike.
+      #
+      # `tag:` is rewritten with it, because flatpak-builder checks the two
+      # against each other and refuses a source where they disagree ("Git
+      # commit for branch (null) is <tag>, but expected <commit>"). On a tag
+      # build it becomes the tag being built. On anything else — a dispatch
+      # naming a commit or a branch, which is how this workflow is tested — the
+      # line is removed, since no tag names that commit and leaving the
+      # manifest's old one would contradict it. Rewriting only the pin was
+      # right for a tag build and failed every other: a dispatch on an untagged
+      # commit went on fetching v0.1.3 and was refused for it.
+      #
+      # Whether this is a tag build is read from the checkout rather than from
+      # the name: actions/checkout fetches the tag's ref when it was given a
+      # tag, and only then.
       - name: Point the manifest at this commit
         run: |
           set -euo pipefail
-          python3 - "$(git rev-parse HEAD)" <<'PY'
+          head=$(git rev-parse HEAD)
+          tag=
+          if tagged=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
+            if [ "$tagged" != "$head" ]; then
+              echo "::error::$TAG names $tagged, but the checkout is $head"
+              exit 1
+            fi
+            tag=$TAG
+          fi
+          python3 - "$head" "$tag" <<'PY'
           import pathlib, re, sys
-          sha = sys.argv[1]
+          sha, tag = sys.argv[1], sys.argv[2]
           p = pathlib.Path("packaging/app.rpgp.rpgp.yml")
           s = p.read_text()
-          s2 = re.sub(r"^        commit: [0-9a-f]{40}$",
-                      f"        commit: {sha}", s, count=1, flags=re.M)
-          assert s2 != s, "no commit: line to rewrite in the manifest"
-          p.write_text(s2)
-          print(f"building {sha}")
+          # Counted, so that each is found exactly once: a manifest that grew a
+          # second git source, or lost its pin or its tag, stops here instead of
+          # building from whichever line happened to match first.
+          s, n = re.subn(r"^        commit: [0-9a-f]{40}$",
+                         f"        commit: {sha}", s, flags=re.M)
+          assert n == 1, f"expected one commit: line in the manifest, found {n}"
+          if tag:
+              s, n = re.subn(r"^        tag: \S+$", f"        tag: {tag}", s, flags=re.M)
+          else:
+              s, n = re.subn(r"^        tag: \S+\n", "", s, flags=re.M)
+          assert n == 1, f"expected one tag: line in the manifest, found {n}"
+          p.write_text(s)
+          print(f"building {sha} as {tag}" if tag else f"building {sha}, untagged")
           PY
 
       - name: Build
