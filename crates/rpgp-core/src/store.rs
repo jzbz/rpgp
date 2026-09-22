@@ -15,7 +15,14 @@
 //! Those files are `0600` inside a `0700` directory, tightened on every open
 //! rather than only on create. A key generated with a passphrase is encrypted
 //! with it; a key generated without one is not, and then the permissions are
-//! the only thing protecting it — the same trade GnuPG makes.
+//! the only thing protecting it — the same trade GnuPG makes. The `rpgp`
+//! directory above them, which holds the revocation certificates and the
+//! bookkeeping lists, is `0700` too.
+//!
+//! Two rPGP windows can share one store, and most of what the store writes
+//! for itself is read, merged and written back. Every such write takes an
+//! advisory lock beside the secrets directory first, as cert-d does for the
+//! public certificates with a lock of its own; see [`StoreLock`].
 //!
 //! On Windows the same two properties are enforced with a DACL naming only the
 //! current user, applied by the call that creates the file; see [`windows_acl`].
@@ -51,6 +58,8 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use sequoia_cert_store::store::StoreError;
 use sequoia_cert_store::{CertStore, LazyCert, Store as _, StoreUpdate as _};
@@ -79,6 +88,10 @@ pub struct Store {
     /// from every other list here because it grants nothing: see
     /// [`Store::sha1_policy`] and the [`crate::sha1`] module.
     sha1_path: PathBuf,
+    /// The file [`StoreLock`] locks. Beside the lists, so that two stores
+    /// sharing those — which two secrets directories in one parent do — share
+    /// the lock too.
+    lock_path: PathBuf,
 }
 
 /// A certificate in the store, borrowed rather than copied.
@@ -135,6 +148,14 @@ impl Store {
         Self::open(cert_dir, secrets_dir)
     }
 
+    /// Open a store, creating both directories if they are missing.
+    ///
+    /// The directory holding `secrets_dir` is the store's as well: the
+    /// revocation certificates, the bookkeeping lists and the lock live there,
+    /// and it is restricted to the current user like `secrets_dir` itself. So
+    /// `secrets_dir` wants a parent of its own, as [`Store::open_default`]
+    /// gives it with `rpgp/secrets`, never one shared with anything else such
+    /// as the home directory.
     pub fn open(cert_dir: impl AsRef<Path>, secrets_dir: impl AsRef<Path>) -> Result<Self> {
         let cert_dir = cert_dir.as_ref();
         let secrets_dir = secrets_dir.as_ref();
@@ -143,42 +164,87 @@ impl Store {
             .map_err(|e| Error::io(format!("creating {}", cert_dir.display()), e))?;
         fs::create_dir_all(secrets_dir)
             .map_err(|e| Error::io(format!("creating {}", secrets_dir.display()), e))?;
+
+        // Held for the sweep and the repair below, so that neither meets a
+        // file that a writer taking the lock is still making.
+        let lock_path = secrets_dir.with_file_name("write.lock");
+        let held = StoreLock::acquire(&lock_path)?;
+
+        // The directory above the secrets. create_dir_all made it with the
+        // default mode, and on a group-writable umask anyone in the group could
+        // then rename a list of their own over trust-roots, or unlink
+        // imported-secrets and with it the record that a stranger's key is no
+        // trust root, whatever mode the files themselves had. Restricted under
+        // the lock like the rest of the repair, because on Windows restricting
+        // a directory carries the new ACL down to everything in it, a list
+        // another window is replacing included. Of what the store keeps in it,
+        // only the secrets directory, restricted below, and the lock file are
+        // made before this, and the lock file holds nothing: on Unix it is
+        // private from the start, and on Windows it takes the directory's ACL.
+        // A bare relative name has no parent to speak of, and the current
+        // directory is not this function's to lock down.
+        let data_dir = secrets_dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        if let Some(data_dir) = data_dir {
+            restrict(data_dir, 0o700)?;
+        }
+
+        // Staging files a crash left behind. Swept before the repair, so that
+        // one this cannot remove is still tightened with the rest.
+        let revocations_dir = secrets_dir.with_file_name("revocations");
+        remove_leftover_staging(&held, secrets_dir, |name| {
+            name.contains(".pgp.") && name.ends_with(".tmp")
+        });
+        remove_leftover_staging(&held, &revocations_dir, |name| {
+            name.contains(".rev.") && name.ends_with(".tmp")
+        });
+        if let Some(data_dir) = data_dir {
+            // Matched by name, list by list: this directory is whatever the
+            // caller chose, and what else is in it is not the store's.
+            remove_leftover_staging(&held, data_dir, |name| {
+                BOOKKEEPING.iter().any(|list| is_staging_for(name, list))
+            });
+        }
+
         // Secret key material, and the revocation certificates that could
         // retire a key, must not be world-readable. Tighten on every open, not
         // only on create: a store made by an earlier version is already
         // exposed, and the user has no way to know it.
+        //
+        // A file listed here can be gone by the time it is reached. Every
+        // write of this store holds the lock, but an older build or a file
+        // manager does not, and a file that no longer exists exposes nothing,
+        // so that is no reason to refuse to open. The directories themselves
+        // still have to be restricted, or the open fails.
         restrict(secrets_dir, 0o700)?;
         for path in existing_files(secrets_dir) {
-            restrict(&path, 0o600)?;
+            restrict_if_present(&path, 0o600)?;
         }
         // The revocations directory too, when there is one. Anyone holding a
         // revocation certificate can retire the key it belongs to, and the
         // module doc has always claimed these are tightened on open — until
         // now it was only the secrets that were.
-        let revocations_dir = secrets_dir.with_file_name("revocations");
         if revocations_dir.is_dir() {
             restrict(&revocations_dir, 0o700)?;
             for path in existing_files(&revocations_dir) {
-                restrict(&path, 0o600)?;
+                restrict_if_present(&path, 0o600)?;
             }
         }
 
-        // The two bookkeeping files beside the secrets directory. Neither holds
-        // key material, but trust-roots is the list of keys this user has
-        // decided to trust — anyone able to write it can make a stranger's
-        // certificate authenticate as fully trusted — and both were created
-        // with the default mode in a parent directory this function does not
-        // restrict, so they landed world-readable and group-writable on a
-        // typical umask.
-        for path in [
-            secrets_dir.with_file_name("trust-roots"),
-            secrets_dir.with_file_name("imported-secrets"),
-            secrets_dir.with_file_name("sha1-accepted"),
-        ] {
+        // The bookkeeping files beside the secrets directory. None holds key
+        // material, but trust-roots is the list of keys this user has decided
+        // to trust — anyone able to write it can make a stranger's certificate
+        // authenticate as fully trusted — and earlier builds created them with
+        // the default mode, in a directory nothing restricted, so they landed
+        // world-readable and group-writable on a typical umask.
+        for list in BOOKKEEPING {
+            let path = secrets_dir.with_file_name(list);
             if path.is_file() {
-                restrict(&path, 0o600)?;
+                restrict_if_present(&path, 0o600)?;
             }
         }
+        drop(held);
 
         Ok(Store {
             certs: CertStore::open(cert_dir)?,
@@ -187,8 +253,14 @@ impl Store {
             roots_path: secrets_dir.with_file_name("trust-roots"),
             imported_secrets_path: secrets_dir.with_file_name("imported-secrets"),
             sha1_path: secrets_dir.with_file_name("sha1-accepted"),
-            revocations_dir: secrets_dir.with_file_name("revocations"),
+            revocations_dir,
+            lock_path,
         })
+    }
+
+    /// Take the store's write lock; see [`StoreLock`].
+    fn lock(&self) -> Result<StoreLock> {
+        StoreLock::acquire(&self.lock_path)
     }
 
     /// Remove a certificate from the store.
@@ -205,6 +277,9 @@ impl Store {
     /// the key is deleted is exactly when it stops being redundant. Ask for it
     /// with [`Store::revocation_path`] before deleting if it should go too.
     pub fn delete(&self, fingerprint: &str, secret_too: bool) -> Result<()> {
+        // Held throughout, so that no secret key can arrive from another
+        // writer between the guard looking for one and the unlinks below.
+        let held = self.lock()?;
         if self.has_secret(fingerprint) && !secret_too {
             return Err(Error::invalid(
                 "this certificate has a secret key; deleting it needs to be confirmed",
@@ -214,10 +289,28 @@ impl Store {
         // The secret first. If this fails halfway, a store still holding the
         // public certificate is the recoverable direction to fail in.
         if secret_too {
-            remove_if_present(&self.secret_path(fingerprint))?;
+            let path = self.secret_path(fingerprint);
+            remove_if_present(&path)?;
+            // And whatever a crashed write of this key left beside it, which
+            // can be a whole copy of the key. With the lock held no write that
+            // takes it is in progress, so every staging file of this key is a
+            // leftover, or an older build's, which takes no lock: a write of a
+            // key being deleted is better failed than completed. A leftover
+            // that cannot be removed fails the delete, though the sweep on
+            // open lets one be: the user asked for this key to be gone, and a
+            // copy of it still on disk is what they need to hear about. The
+            // public certificate then stays, as above, and the next open tries
+            // the leftover again.
+            if let Some(target) = path.file_name().and_then(|name| name.to_str()) {
+                for leftover in
+                    staging_files(&self.secrets_dir, |name| is_staging_for(name, target))
+                {
+                    remove_if_present(&leftover)?;
+                }
+            }
         }
         remove_if_present(&self.cert_path(fingerprint))?;
-        self.set_trust_root(fingerprint, false)?;
+        self.write_trust_root(&held, fingerprint, false)?;
         Ok(())
     }
 
@@ -252,16 +345,23 @@ impl Store {
     }
 
     /// Keep a revocation certificate. Written once, at key generation.
+    ///
+    /// Staged and renamed into place like everything else the store writes.
+    /// It used to be written straight to its path, so a write that failed
+    /// part-way — a full disk, a quota — or a crash before the data reached
+    /// the disk left an empty or truncated file there. `has_revocation` takes
+    /// any file for a certificate, so the details pane offered that one for
+    /// export and the delete dialog promised it would retract the key, which
+    /// is found out only on the day it is needed. A write that fails now
+    /// leaves no file, and the delete dialog says there is no certificate.
     pub fn save_revocation(&self, fingerprint: &str, armored: &[u8]) -> Result<()> {
+        let held = self.lock()?;
         fs::create_dir_all(&self.revocations_dir)
             .map_err(|e| Error::io(format!("creating {}", self.revocations_dir.display()), e))?;
         restrict(&self.revocations_dir, 0o700)?;
 
         // Anyone holding this file can retire the key it belongs to.
-        let path = self.revocation_path(fingerprint);
-        let mut file = create_private(&path)?;
-        file.write_all(armored)
-            .map_err(|e| Error::io(format!("writing {}", path.display()), e))
+        write_private_atomic(&held, &self.revocation_path(fingerprint), armored)
     }
 
     /// Fingerprints the user has explicitly marked as trust roots.
@@ -282,6 +382,12 @@ impl Store {
     }
 
     pub fn set_trust_root(&self, fingerprint: &str, root: bool) -> Result<()> {
+        let held = self.lock()?;
+        self.write_trust_root(&held, fingerprint, root)
+    }
+
+    /// [`Store::set_trust_root`], for a caller already holding the lock.
+    fn write_trust_root(&self, held: &StoreLock, fingerprint: &str, root: bool) -> Result<()> {
         let mut roots = self.trust_roots()?;
         if root {
             roots.insert(fingerprint.to_uppercase());
@@ -291,7 +397,7 @@ impl Store {
 
         let mut text = roots.into_iter().collect::<Vec<_>>().join("\n");
         text.push('\n');
-        write_private_atomic(&self.roots_path, &text)
+        write_private_atomic(held, &self.roots_path, text.as_bytes())
     }
 
     /// Fingerprints the user has allowed SHA-1 signatures from.
@@ -316,6 +422,7 @@ impl Store {
     }
 
     pub fn set_sha1_accepted(&self, fingerprint: &str, accepted: bool) -> Result<()> {
+        let held = self.lock()?;
         let mut list = self.sha1_accepted()?;
         let key = hex_only(fingerprint).to_uppercase();
         if accepted {
@@ -326,7 +433,7 @@ impl Store {
 
         let mut text = list.into_iter().collect::<Vec<_>>().join("\n");
         text.push('\n');
-        write_private_atomic(&self.sha1_path, &text)
+        write_private_atomic(&held, &self.sha1_path, text.as_bytes())
     }
 
     /// The user's SHA-1 opt-in, resolved against the store.
@@ -442,7 +549,7 @@ impl Store {
     /// Only marks a key we do not already hold: re-importing a backup of a key
     /// you generated here must not demote it, and applying a revocation or an
     /// expiry edit rewrites the same file without changing where it came from.
-    fn mark_imported_secret(&self, fingerprint: &str) -> Result<()> {
+    fn mark_imported_secret(&self, held: &StoreLock, fingerprint: &str) -> Result<()> {
         let key = hex_only(fingerprint).to_uppercase();
         let mut imported = self.imported_secrets()?;
         if !imported.insert(key) {
@@ -450,20 +557,30 @@ impl Store {
         }
         let mut text = imported.into_iter().collect::<Vec<_>>().join("\n");
         text.push('\n');
-        write_private_atomic(&self.imported_secrets_path, &text)
+        write_private_atomic(held, &self.imported_secrets_path, text.as_bytes())
     }
 
     /// Store a secret key that arrived from outside, rather than one generated
     /// here. Identical to [`Store::insert_secret`] except that the key does not
     /// become an implicit trust root.
+    ///
+    /// The lock is taken before looking for the key and held through the write
+    /// and the mark. Looked for first, the key could be deleted by another
+    /// writer while this one waited for the lock, and then written back
+    /// unmarked though it came from outside — and an imported key with no mark
+    /// is a trust root. The public half goes to cert-d afterwards, as in
+    /// `insert_secret`, so the mark comes before it: a cert-d insert that fails
+    /// leaves the key marked rather than a root.
     pub fn insert_imported_secret(&self, cert: &Cert) -> Result<()> {
+        let held = self.lock()?;
         let fingerprint = cert.fingerprint().to_hex();
         let already_held = self.has_secret(&fingerprint);
-        self.insert_secret(cert)?;
+        let merged = self.write_secret(&held, cert)?;
         if !already_held {
-            self.mark_imported_secret(&fingerprint)?;
+            self.mark_imported_secret(&held, &fingerprint)?;
         }
-        Ok(())
+        drop(held);
+        self.insert(&merged)
     }
 
     /// The fingerprint of every secret key on disk, read from the filenames.
@@ -620,6 +737,24 @@ impl Store {
 
     /// Store a transferable secret key, and its public half in cert-d.
     pub fn insert_secret(&self, cert: &Cert) -> Result<()> {
+        let held = self.lock()?;
+        let merged = self.write_secret(&held, cert)?;
+        // The public half goes to cert-d once the lock is released. cert-d
+        // takes a lock of its own and merges against its own copy, so it needs
+        // nothing from this one, and waiting on it with this one held is the
+        // only way this lock could come to wait on anything but the disk. The
+        // cost: a delete of this key from another window can land between the
+        // two and leave the public half without the secret, where either one
+        // finishing first would leave both or neither. That holds no secret
+        // and makes nothing a trust root.
+        drop(held);
+        self.insert(&merged)
+    }
+
+    /// Merge `cert` into the secret key file and write it back, returning what
+    /// was written. The read and the write both happen under `held`, so no
+    /// other writer's merge can land between them and be lost.
+    fn write_secret(&self, held: &StoreLock, cert: &Cert) -> Result<Cert> {
         if !cert.is_tsk() {
             return Err(Error::invalid("certificate carries no secret key material"));
         }
@@ -660,20 +795,11 @@ impl Store {
             Err(_) => cert.clone(),
         };
 
-        // Written beside the target and renamed into place, so a crash while
-        // serialising leaves a stray .tmp rather than a truncated .pgp. The
-        // rename keeps the private mode/ACL the file was created with, and the
-        // extension keeps secret_certs from ever seeing a half-written key.
-        let staging = path.with_extension("pgp.tmp");
-        {
-            let mut file = create_private(&staging)?;
-            cert.as_tsk().serialize(&mut file)?;
-            file.sync_all()
-                .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
-        }
-        fs::rename(&staging, &path)
-            .map_err(|e| Error::io(format!("writing {}", path.display()), e))?;
-        self.insert(&cert)
+        // Staged beside the target and renamed into place, so a crash while
+        // serialising leaves the previous file rather than a truncated one;
+        // see `replace_private`.
+        replace_private(held, &path, |file| Ok(cert.as_tsk().serialize(file)?))?;
+        Ok(cert)
     }
 
     /// Every transferable secret key on disk.
@@ -1010,16 +1136,65 @@ fn existing_files(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Create a file only the current user can read, with the mode set at the
+/// Files directly inside `dir` whose names `is_staging` accepts.
+fn staging_files(dir: &Path, is_staging: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    existing_files(dir)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(&is_staging)
+        })
+        .collect()
+}
+
+/// Whether `name` is a staging file for the file named `target`: the target's
+/// name, then anything that starts with a dot and ends in `.tmp`.
+///
+/// That covers the names [`create_staging`] makes and the fixed
+/// `<target>.tmp` earlier builds staged under.
+fn is_staging_for(name: &str, target: &str) -> bool {
+    name.strip_prefix(target)
+        .is_some_and(|rest| rest.starts_with('.') && rest.ends_with(".tmp"))
+}
+
+/// The bookkeeping lists kept beside the secrets directory.
+const BOOKKEEPING: [&str; 3] = ["trust-roots", "imported-secrets", "sha1-accepted"];
+
+/// Remove the staging files a crashed write left in `dir`.
+///
+/// Only a crash leaves one, since a write that fails removes its own, and no
+/// write opens a staging file that is already there, so nothing will ever reuse
+/// one: without this they would pile up for good, and in the secrets directory
+/// each can be a whole copy of a secret key. Only with the lock held, so none
+/// of them can be a write still in progress, as long as the writer takes the
+/// lock. An older build takes none and stages under the fixed names this also
+/// removes, so one writing meanwhile can lose its staging file: its rename then
+/// fails, and the file it meant to replace stays as it was. Best effort, like a
+/// failed write's own clean-up: a leftover that cannot be removed is private
+/// and in nobody's way, and no reason to refuse to open the store.
+fn remove_leftover_staging(_held: &StoreLock, dir: &Path, is_staging: impl Fn(&str) -> bool) {
+    for path in staging_files(dir, is_staging) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Create a new file only the current user can read, with the mode set at the
 /// moment of creation.
 ///
 /// Creating it and then relaxing to `chmod` would leave a window in which
 /// another user could open the file and keep that descriptor across every
 /// later write.
+///
+/// A file that already exists is refused rather than opened, so this never
+/// writes into anything it did not make: not another writer's staging file,
+/// not a leftover, and not a symlink or hard link planted at the name, which
+/// `O_EXCL` does not follow. Every caller stages a new file and renames it
+/// into place, so nothing needs to open an existing one.
 #[cfg(not(windows))]
 fn create_private(path: &Path) -> Result<fs::File> {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1030,28 +1205,207 @@ fn create_private(path: &Path) -> Result<fs::File> {
         .map_err(|e| Error::io(format!("writing {}", path.display()), e))
 }
 
-/// Replace a bookkeeping file atomically and privately.
+/// Create a private staging file beside `path`, under a name no other write
+/// is using.
 ///
-/// The same stage-and-rename `insert_secret` uses, for the same reason: a
-/// crash or a full disk between the truncate and the writeback leaves the
-/// previous list intact rather than a zero-length one. That matters more here
-/// than the size of the file suggests — a truncated imported-secrets list does
-/// not fail closed. Every stranger keypair it used to name silently becomes a
-/// trust root again, all at once, which is the door the list exists to shut.
+/// Two writers used to share one: every write of a key or a list staged
+/// under one fixed name, the second writer truncated the file the first was
+/// still writing, and the first rename installed bytes from both. Now none
+/// can. [`create_private`] makes a new file or fails, so no two writes ever
+/// hold the same staging file, whatever it is called, and a writer that
+/// takes the store's lock makes its staging files only while it holds it.
+///
+/// The name only makes a clash unlikely. It is the target's with
+/// `.<process ID>-<counter>.tmp` after it: the counter tells writes in one
+/// process apart, and the process ID tells processes apart only where they
+/// share a PID namespace. A crash can leave a file under a process ID since
+/// reused, and each `flatpak run` starts a sandbox with a PID namespace of
+/// its own, so two rPGP windows in the Flatpak share a store and can share a
+/// process ID too. A clash costs a retry under the next counter, up to
+/// sixteen attempts, rather than a write into somebody else's file.
+///
+/// The target's name stays at the front and `.tmp` ends it, so nothing that
+/// lists keys or certificates by extension ever sees a half-written one, and
+/// the sweep in [`Store::open`] knows what it may remove.
+fn create_staging(path: &Path) -> Result<(PathBuf, fs::File)> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    create_staging_from(path, &NEXT)
+}
+
+/// [`create_staging`], numbering from `next`, which a test can start where it
+/// likes.
+fn create_staging_from(path: &Path, next: &AtomicU64) -> Result<(PathBuf, fs::File)> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let mut staging = path.to_path_buf();
+        staging.as_mut_os_string().push(format!(
+            ".{}-{}.tmp",
+            std::process::id(),
+            next.fetch_add(1, Ordering::Relaxed)
+        ));
+        match create_private(&staging) {
+            Err(Error::Io { source, .. })
+                if source.kind() == io::ErrorKind::AlreadyExists && attempts < 16 => {}
+            created => return created.map(|file| (staging, file)),
+        }
+    }
+}
+
+/// Replace `path` with what `write` puts in a new private file beside it.
+///
+/// Staged, synced and renamed into place, so a crash or a full disk part-way
+/// through leaves the previous file intact rather than a truncated or
+/// zero-length one, and the rename keeps the private mode or ACL the staging
+/// file was created with. When anything fails the staging file is removed
+/// before the error goes back: it can hold a whole secret key, and it used to
+/// be left where it was, still there after the key was deleted.
+///
+/// Takes the store's lock as proof that it is held, because the sweep in
+/// [`Store::open`] removes staging files and may do so only because every
+/// write that makes one holds the lock until it is gone.
+fn replace_private(
+    _held: &StoreLock,
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> Result<()>,
+) -> Result<()> {
+    let (staging, mut file) = create_staging(path)?;
+    let written = write(&mut file).and_then(|()| {
+        file.sync_all()
+            .map_err(|e| Error::io(format!("writing {}", path.display()), e))
+    });
+    // Closed before it is renamed or removed, so no handle to it outlives
+    // the write.
+    drop(file);
+    let replaced = written.and_then(|()| {
+        fs::rename(&staging, path).map_err(|e| Error::io(format!("writing {}", path.display()), e))
+    });
+    if replaced.is_err() {
+        // Best effort: the error going back is the one that matters, and a
+        // file this cannot remove is swept by the next open.
+        let _ = fs::remove_file(&staging);
+    }
+    replaced
+}
+
+/// Replace a file the store keeps for itself with `bytes`, atomically and
+/// privately.
+///
+/// That matters more for the bookkeeping lists than their size suggests — a
+/// truncated imported-secrets list does not fail closed. Every stranger
+/// keypair it used to name silently becomes a trust root again, all at once,
+/// which is the door the list exists to shut.
 ///
 /// The staging file is created private, so the result is 0o600 from the moment
 /// it exists rather than 0o666 & ~umask until the next `Store::open` repairs
 /// it — a whole session, in an app the user leaves running.
-fn write_private_atomic(path: &Path, text: &str) -> Result<()> {
-    let staging = path.with_extension("tmp");
-    {
-        let mut file = create_private(&staging)?;
-        file.write_all(text.as_bytes())
-            .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
-        file.sync_all()
-            .map_err(|e| Error::io(format!("writing {}", staging.display()), e))?;
+fn write_private_atomic(held: &StoreLock, path: &Path, bytes: &[u8]) -> Result<()> {
+    replace_private(held, path, |file| {
+        file.write_all(bytes)
+            .map_err(|e| Error::io(format!("writing {}", path.display()), e))
+    })
+}
+
+/// How long a writer waits for another to finish before it gives up.
+///
+/// Every hold is one read-merge-write, milliseconds long, so a wait this long
+/// means the holder is stuck — a process stopped part-way through a write —
+/// and an error that says so is better than a window that hangs, since some
+/// writes run on the GUI's event loop.
+const LOCK_PATIENCE: Duration = Duration::from_secs(10);
+
+/// The store's write lock, held for one read-merge-write and released when
+/// dropped.
+///
+/// The secret keys and the bookkeeping lists are each read, merged and written
+/// back, and nothing used to stop two writers doing that at once: two worker
+/// threads, two rPGP windows, or rPGP and another program. The second writer's
+/// merge started from what the first was about to replace, so one of the two
+/// changes was lost, and a lost entry in imported-secrets makes a stranger's
+/// key a trust root. Every write to the files this module keeps for itself
+/// takes this lock first, and so does [`Store::open`] while it sweeps and
+/// repairs them. Readers do not: a rename replaces a whole file at once, so a
+/// reader sees the old one or the new one.
+///
+/// One lock for the whole store rather than one per file, because some writes
+/// span files — an import writes a key and marks it in imported-secrets, and
+/// a delete removes a key and its trust-root entry — and one lock has no
+/// order to take locks in and get wrong. Writes are rare and short, so
+/// nothing is lost to a coarser lock.
+///
+/// It cannot deadlock. It is never held while waiting on anything else — the
+/// public half goes to cert-d after it is released — and no function that
+/// holds it calls one that takes it; the functions that take it pass it on to
+/// those that need it instead. That rule matters, because a second hold in
+/// one thread would wait on the first until it gave up: the lock belongs to
+/// the open file, not to the process.
+///
+/// Advisory, through `File::try_lock`: `flock` on Unix, `LockFileEx` on
+/// Windows. A writer that does not take it, such as an older build, is not
+/// kept out, but neither can tear a file the other is making: an older build
+/// stages under a fixed name this one never uses, and [`create_private`]
+/// never opens a file that is already there. The lock file is never written
+/// to; on Windows that is what makes locking it harmless, since a lock there
+/// is mandatory for the bytes it covers.
+///
+/// On a filesystem that refuses to lock at all, every write fails with an
+/// error naming the lock file, and so does [`Store::open`], whose repair takes
+/// the lock too; the store used to open there. That fails closed rather than
+/// write unguarded, which is what cert-d's own inserts do there as well.
+struct StoreLock(fs::File);
+
+impl StoreLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        Self::acquire_within(path, LOCK_PATIENCE)
     }
-    fs::rename(&staging, path).map_err(|e| Error::io(format!("writing {}", path.display()), e))
+
+    fn acquire_within(path: &Path, patience: Duration) -> Result<Self> {
+        let mut options = fs::OpenOptions::new();
+        // Opened for writing because creating the file needs write access, and
+        // because std leaves it unspecified whether a file not open for
+        // writing can be locked. Never truncated or written: the lock is all
+        // it is for.
+        options.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(path)
+            .map_err(|e| Error::io(format!("opening {}", path.display()), e))?;
+
+        // Polled rather than blocked on, so that the wait can end.
+        let deadline = Instant::now() + patience;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(StoreLock(file)),
+                Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(Error::io(
+                        format!("locking {}", path.display()),
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "another writer held it for too long",
+                        ),
+                    ));
+                }
+                Err(fs::TryLockError::Error(e)) => {
+                    return Err(Error::io(format!("locking {}", path.display()), e));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        // Closing the file would release the lock as well, but Windows only
+        // promises to do that eventually and asks for an explicit unlock.
+        let _ = self.0.unlock();
+    }
 }
 
 /// Restrict a path to the current user.
@@ -1081,6 +1435,19 @@ fn create_private(path: &Path) -> Result<fs::File> {
 #[cfg(all(not(unix), not(windows)))]
 fn restrict(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
+}
+
+/// [`restrict`], treating "it was not there" as success.
+///
+/// For the files the repair on open lists first and restricts after: one that
+/// is gone by then exposes nothing. Both platforms report that as `NotFound`,
+/// whether Unix's chmod finds nothing or Windows fails to inspect the path or
+/// to set its ACL.
+fn restrict_if_present(path: &Path, mode: u32) -> Result<()> {
+    match restrict(path, mode) {
+        Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        restricted => restricted,
+    }
 }
 
 // ===========================================================================
@@ -1116,12 +1483,11 @@ mod windows_acl {
     use std::ptr;
 
     use windows_sys::Win32::Foundation::{
-        ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_WRITE,
-        GetLastError, LocalFree,
+        ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_WRITE, GetLastError, LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW, SetSecurityInfo,
+        SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::{
         ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
@@ -1129,8 +1495,8 @@ mod windows_acl {
         TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, WRITE_DAC,
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -1213,6 +1579,12 @@ mod windows_acl {
 
     /// Create `path` accessible only to the current user, with the ACL applied
     /// by the same call that creates the file.
+    ///
+    /// A new file or nothing: CREATE_NEW fails with ERROR_FILE_EXISTS where
+    /// something is already there, as `create_new` does on Unix. So the ACL
+    /// passed in always applies. CreateFileW ignores it only when it opens a
+    /// file that exists, which this used to do, and then had to put the
+    /// policy on the handle itself or the old file's ACL survived.
     pub(super) fn create_private(path: &Path) -> Result<fs::File> {
         let descriptor = SecurityDescriptor::from_sddl(&sddl(false)?)?;
         let attributes = SECURITY_ATTRIBUTES {
@@ -1224,12 +1596,11 @@ mod windows_acl {
         };
         let wide = wide_path(path)?;
 
-        // WRITE_DAC is only for the pre-existing-file branch below;
-        // GENERIC_WRITE is what the caller actually wants. The share mode
-        // matches what `fs::OpenOptions` uses, because share mode is a
-        // concurrency setting and not an access-control boundary — the ACL is
-        // the boundary, and an exclusive open would only add spurious sharing
-        // violations when an indexer or scanner holds a transient handle.
+        // GENERIC_WRITE is what the caller wants. The share mode matches what
+        // `fs::OpenOptions` uses, because share mode is a concurrency setting
+        // and not an access-control boundary — the ACL is the boundary, and an
+        // exclusive open would only add spurious sharing violations when an
+        // indexer or scanner holds a transient handle.
         //
         // SAFETY: `wide` is a NUL-terminated UTF-16 buffer and `attributes`
         // (with the descriptor it points at) is alive across the call. The
@@ -1237,17 +1608,17 @@ mod windows_acl {
         let raw = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                GENERIC_WRITE | WRITE_DAC,
+                GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 &attributes,
-                CREATE_ALWAYS,
+                CREATE_NEW,
                 FILE_ATTRIBUTE_NORMAL,
                 ptr::null_mut(),
             )
         };
         // Read the thread's last-error code before anything else can clobber
-        // it. On success it is ERROR_ALREADY_EXISTS exactly when the file was
-        // already there; on failure it is the reason.
+        // it. On failure it is the reason, ERROR_FILE_EXISTS among them, which
+        // io::Error reports as AlreadyExists.
         //
         // SAFETY: GetLastError takes no arguments and touches no memory.
         let code = unsafe { GetLastError() };
@@ -1263,38 +1634,6 @@ mod windows_acl {
         let handle = unsafe { HandleOrInvalid::from_raw_handle(raw) };
         let handle = OwnedHandle::try_from(handle)
             .map_err(|_| win32(code, format!("creating {}", path.display())))?;
-
-        if code == ERROR_ALREADY_EXISTS {
-            // CreateFileW applies lpSecurityDescriptor only when it creates the
-            // file; over an existing one the member is documented to be
-            // ignored, so the old ACL survived the truncation. That is the same
-            // semantics as `open(O_CREAT|O_TRUNC, 0600)` on Unix, where the
-            // mode likewise applies only at creation.
-            //
-            // This is repair, not create-then-tighten. The permissive window
-            // predates this call and is not opened by it: on the path where the
-            // file is new, the ACL arrives with the file and nothing runs in
-            // between. Doing it on the handle rather than the path also leaves
-            // no second name lookup to race.
-            let dacl = descriptor.dacl()?;
-            // SAFETY: `handle` is open and was requested with WRITE_DAC, which
-            // this call requires. `dacl` points into `descriptor`, a live
-            // local, so it outlives the call.
-            let status = unsafe {
-                SetSecurityInfo(
-                    handle.as_raw_handle(),
-                    SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    dacl,
-                    ptr::null(),
-                )
-            };
-            if status != ERROR_SUCCESS {
-                return Err(win32(status, format!("restricting {}", path.display())));
-            }
-        }
 
         drop(descriptor);
         Ok(fs::File::from(handle))
@@ -2116,60 +2455,810 @@ mod tests {
         );
     }
 
-    /// The two bookkeeping lists are small enough to look harmless, but a
-    /// truncated imported-secrets list does not fail closed: every stranger
-    /// keypair it named silently becomes a trust root again, all at once, and
-    /// certifications those keys issued start rendering as verified. A bare
-    /// `fs::write` truncates first and can then fail — a full disk is enough —
-    /// so the list is staged and renamed like the secret keys are.
+    /// Every file the store keeps for itself is replaced whole, never written
+    /// into, and comes out private whatever the file it replaced was.
     ///
-    /// They also used to be created 0o666 & ~umask and only repaired by the
-    /// next `Store::open`, which in an app the user leaves running is the rest
-    /// of the session.
+    /// The lists are small enough to look harmless, but a truncated
+    /// imported-secrets list does not fail closed: every stranger keypair it
+    /// named silently becomes a trust root again, all at once, and
+    /// certifications those keys issued start rendering as verified. A write
+    /// in place truncates first and can then fail — a full disk is enough — so
+    /// every one of these is staged and renamed. The revocation certificate
+    /// was the one written in place until now.
+    ///
+    /// A second hard link to each file tells the two apart, whatever the
+    /// umask: a rename replaces the name and leaves the old file, still at the
+    /// link, as it was, while a write in place changes what the link reads. So
+    /// does a file loosened to 0o644 first, which a write in place leaves at
+    /// 0o644 and a rename replaces with a new 0o600 one.
     #[test]
-    fn the_bookkeeping_lists_are_written_privately_and_all_at_once() {
-        let (dir, store) = scratch();
-        let request = crate::keygen::KeyGenRequest::new("Alice <alice@example.org>");
-        let generated = crate::keygen::generate(&request).unwrap();
-        let fingerprint = generated.cert.fingerprint().to_hex();
-        store.insert(&generated.cert).unwrap();
-        store.set_trust_root(&fingerprint, true).unwrap();
+    fn every_file_the_store_keeps_is_replaced_rather_than_written_into() {
+        use crate::keygen::{KeyGenRequest, generate};
 
-        // Windows carries the same property through an ACL rather than a mode;
-        // the acl tests below cover that side.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&store.roots_path)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600, "trust-roots as created");
-        }
+        let (dir, store) = scratch();
+        let generate = |user_id: &str| generate(&KeyGenRequest::new(user_id)).unwrap().cert;
+        let alice = generate("Alice <alice@example.org>");
+        let (first, second) = (
+            generate("First <first@example.org>"),
+            generate("Second <second@example.org>"),
+        );
+        let alice_fp = alice.fingerprint().to_hex();
+
+        let replaced = |path: &Path, write_first: &dyn Fn(), write_second: &dyn Fn()| {
+            write_first();
+            let before = fs::read(path).unwrap();
+            let mut link = path.to_path_buf();
+            link.as_mut_os_string().push(".old");
+            fs::hard_link(path, &link).unwrap();
+            // Windows carries the same property through an ACL rather than a
+            // mode; the acl tests below cover that side.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+
+            write_second();
+            assert_ne!(
+                fs::read(path).unwrap(),
+                before,
+                "{}: the second write has to change the file, or this proves nothing",
+                path.display()
+            );
+            assert_eq!(
+                fs::read(&link).unwrap(),
+                before,
+                "{} was written into rather than replaced",
+                path.display()
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{} after it was replaced", path.display());
+            }
+        };
+
+        replaced(
+            &store.roots_path,
+            &|| store.set_trust_root(&"AB".repeat(20), true).unwrap(),
+            &|| store.set_trust_root(&"CD".repeat(20), true).unwrap(),
+        );
+        replaced(
+            &store.sha1_path,
+            &|| store.set_sha1_accepted(&"AB".repeat(20), true).unwrap(),
+            &|| store.set_sha1_accepted(&"CD".repeat(20), true).unwrap(),
+        );
+        replaced(
+            &store.imported_secrets_path,
+            &|| store.insert_imported_secret(&first).unwrap(),
+            &|| store.insert_imported_secret(&second).unwrap(),
+        );
+        replaced(
+            &store.secret_path(&alice_fp),
+            &|| store.insert_secret(&alice).unwrap(),
+            &|| {
+                store
+                    .insert_secret(&with_user_id(&alice, "Alice <alice@example.net>"))
+                    .unwrap()
+            },
+        );
+        // Only replaced here, never read, so any bytes will do.
+        replaced(
+            &store.revocation_path(&alice_fp),
+            &|| store.save_revocation(&alice_fp, b"the first").unwrap(),
+            &|| store.save_revocation(&alice_fp, b"the second").unwrap(),
+        );
 
         // Nothing is left behind for the next open to trip over.
+        for directory in [
+            dir.path(),
+            store.secrets_dir.as_path(),
+            store.revocations_dir.as_path(),
+        ] {
+            let staging = staging_files(directory, |name| name.ends_with(".tmp"));
+            assert!(staging.is_empty(), "left behind: {staging:?}");
+        }
+        let reopened = store.reopen().unwrap();
         assert!(
-            !store.roots_path.with_extension("tmp").exists(),
-            "the staging file must be renamed away, not left in the store"
-        );
-
-        // The rename is what makes it all-or-nothing: replacing the directory
-        // entry cannot leave a half-written list, whatever happens mid-write.
-        assert!(
-            store
-                .trust_roots()
-                .unwrap()
-                .contains(&fingerprint.to_uppercase())
-        );
-        let reopened = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
-        assert!(
-            reopened
-                .trust_roots()
-                .unwrap()
-                .contains(&fingerprint.to_uppercase()),
+            reopened.trust_roots().unwrap().contains(&"CD".repeat(20)),
             "the list must survive a reopen"
         );
+    }
+
+    /// `cert` with one more user ID, bound by its own primary key.
+    fn with_user_id(cert: &Cert, user_id: &str) -> Cert {
+        use sequoia_openpgp::packet::UserID;
+        use sequoia_openpgp::packet::signature::SignatureBuilder;
+        use sequoia_openpgp::types::SignatureType;
+
+        let mut signer = cert
+            .primary_key()
+            .key()
+            .clone()
+            .parts_into_secret()
+            .unwrap()
+            .into_keypair()
+            .unwrap();
+        let user_id = UserID::from(user_id);
+        let binding = SignatureBuilder::new(SignatureType::PositiveCertification)
+            .sign_userid_binding(&mut signer, cert.primary_key().key(), &user_id)
+            .unwrap();
+        cert.clone()
+            .insert_packets(vec![Packet::from(user_id), Packet::from(binding)])
+            .unwrap()
+            .0
+    }
+
+    /// While the lock is held elsewhere, no write to the store's own files
+    /// lands, and each goes through once it is released.
+    ///
+    /// Held the way another process would hold it: its own open of the lock
+    /// file, locked with std's call rather than the store's. None of these
+    /// writes took a lock before, so each landed at once, whatever else was
+    /// writing.
+    #[test]
+    fn every_write_waits_while_the_lock_is_held_elsewhere() {
+        use crate::keygen::{KeyGenRequest, generate};
+
+        let (_dir, store) = scratch();
+        let generated = generate(&KeyGenRequest::new("Alice <alice@example.org>")).unwrap();
+        let alice = generated.cert.clone();
+        let armored = crate::revoke::armor(&generated.revocation).unwrap();
+        let imported = generate(&KeyGenRequest::new("Imported <imported@example.org>"))
+            .unwrap()
+            .cert;
+        let public = generate(&KeyGenRequest::new("Bob <bob@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert(&public).unwrap();
+        let fingerprint = |cert: &Cert| cert.fingerprint().to_hex();
+        let listed = "AB".repeat(20);
+        // What a crash leaves behind, which only an open removes.
+        let leftover = store.roots_path.with_file_name("trust-roots.tmp");
+        fs::write(&leftover, b"half a list").unwrap();
+
+        let elsewhere = fs::OpenOptions::new()
+            .write(true)
+            .open(&store.lock_path)
+            .unwrap();
+        elsewhere.lock().unwrap();
+
+        let landed = || {
+            [
+                store.trust_roots().unwrap().contains(&listed),
+                store.sha1_accepted().unwrap().contains(&listed),
+                store.has_secret(&fingerprint(&alice)),
+                store.has_secret(&fingerprint(&imported)),
+                store.has_revocation(&fingerprint(&alice)),
+                !store.cert_path(&fingerprint(&public)).exists(),
+                !leftover.exists(),
+            ]
+        };
+        std::thread::scope(|scope| {
+            let writes = [
+                scope.spawn(|| store.set_trust_root(&listed, true)),
+                scope.spawn(|| store.set_sha1_accepted(&listed, true)),
+                scope.spawn(|| store.insert_secret(&alice)),
+                scope.spawn(|| store.insert_imported_secret(&imported)),
+                scope.spawn(|| store.save_revocation(&fingerprint(&alice), &armored)),
+                scope.spawn(|| store.delete(&fingerprint(&public), false)),
+                scope.spawn(|| store.reopen().map(drop)),
+            ];
+
+            std::thread::sleep(Duration::from_millis(500));
+            assert_eq!(
+                landed(),
+                [false; 7],
+                "a write landed while the lock was held elsewhere"
+            );
+
+            elsewhere.unlock().unwrap();
+            for write in writes {
+                write.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(
+            landed(),
+            [true; 7],
+            "every write lands once the lock is free"
+        );
+    }
+
+    /// An import that had to wait for the lock looks for the key only once it
+    /// holds it.
+    ///
+    /// Here another writer holds the lock and deletes a key generated here
+    /// while an import of the same key waits. The key the import then writes
+    /// came from outside, so it has to be marked imported, as it would be had
+    /// the import come second. One that looked before it waited would find
+    /// the key still held and write it back unmarked, and an imported key
+    /// with no mark is a trust root.
+    #[test]
+    fn an_import_marks_a_key_that_was_deleted_while_it_waited() {
+        let (_dir, store) = scratch();
+        let key = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        store.insert_secret(&key).unwrap();
+        let fingerprint = key.fingerprint().to_hex().to_uppercase();
+
+        let elsewhere = fs::OpenOptions::new()
+            .write(true)
+            .open(&store.lock_path)
+            .unwrap();
+        elsewhere.lock().unwrap();
+        std::thread::scope(|scope| {
+            let import = scope.spawn(|| store.insert_imported_secret(&key));
+            std::thread::sleep(Duration::from_millis(500));
+            // The other writer's delete, made while it holds the lock.
+            fs::remove_file(store.secret_path(&fingerprint)).unwrap();
+            elsewhere.unlock().unwrap();
+            import.join().unwrap().unwrap();
+        });
+
+        assert!(store.has_secret(&fingerprint));
+        assert!(
+            store.imported_secrets().unwrap().contains(&fingerprint),
+            "a key imported after its delete was not marked imported"
+        );
+        assert!(!store.effective_roots().unwrap().contains(&fingerprint));
+    }
+
+    /// An import whose public half cert-d refuses still leaves its secret key
+    /// marked imported.
+    ///
+    /// The secret key is on disk before the public half goes to cert-d, which
+    /// happens once the lock is released. The mark used to come after cert-d,
+    /// so an insert that failed there left an imported key held and unmarked,
+    /// and an imported key with no mark is a trust root. Here cert-d fails
+    /// because a file sits where it wants a directory for this fingerprint.
+    #[test]
+    fn an_import_that_cert_d_refuses_is_still_marked_imported() {
+        let (_dir, store) = scratch();
+        let key = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Stranger <stranger@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        let fingerprint = key.fingerprint().to_hex().to_uppercase();
+        let in_the_way = store
+            .cert_path(&fingerprint)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(!in_the_way.exists());
+        fs::write(&in_the_way, b"").unwrap();
+
+        assert!(
+            store.insert_imported_secret(&key).is_err(),
+            "cert-d took the public half after all, so this proves nothing"
+        );
+        assert!(store.has_secret(&fingerprint));
+        assert!(
+            store.imported_secrets().unwrap().contains(&fingerprint),
+            "an import cert-d refused left its secret key unmarked"
+        );
+        assert!(!store.effective_roots().unwrap().contains(&fingerprint));
+    }
+
+    /// A delete that had to wait for the lock looks for a secret key only once
+    /// it holds it.
+    ///
+    /// Here another writer holds the lock and saves a secret key for a
+    /// certificate that had none, while a delete of that certificate, not
+    /// confirmed for a secret key, waits. The delete has to refuse, as it
+    /// would had it come second. One that looked before it waited would find
+    /// no secret key and delete the certificate unconfirmed.
+    #[test]
+    fn a_delete_refuses_a_secret_key_that_arrived_while_it_waited() {
+        use sequoia_openpgp::serialize::Serialize;
+
+        let (_dir, store) = scratch();
+        let key = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        store.insert(&key).unwrap();
+        let fingerprint = key.fingerprint().to_hex();
+
+        let elsewhere = fs::OpenOptions::new()
+            .write(true)
+            .open(&store.lock_path)
+            .unwrap();
+        elsewhere.lock().unwrap();
+        let deleted = std::thread::scope(|scope| {
+            let delete = scope.spawn(|| store.delete(&fingerprint, false));
+            std::thread::sleep(Duration::from_millis(500));
+            // The other writer's save, made while it holds the lock.
+            let mut bytes = Vec::new();
+            key.as_tsk().serialize(&mut bytes).unwrap();
+            fs::write(store.secret_path(&fingerprint), bytes).unwrap();
+            elsewhere.unlock().unwrap();
+            delete.join().unwrap()
+        });
+
+        assert!(
+            deleted.is_err(),
+            "a certificate whose secret key arrived was deleted unconfirmed"
+        );
+        assert!(store.cert_path(&fingerprint).exists());
+        assert!(store.has_secret(&fingerprint));
+    }
+
+    /// Writers on separate handles to one store, as two rPGP windows are, lose
+    /// none of each other's changes.
+    ///
+    /// Each thread opens the store for itself, so only the files and the lock
+    /// stand between them. Every write used to read a list, change it, and
+    /// stage it under one fixed name: a writer whose read came before another's
+    /// rename put back a list without the other's entry, and a writer whose
+    /// staging file another had already renamed into place failed.
+    #[test]
+    fn writers_on_separate_handles_lose_none_of_each_others_changes() {
+        const WRITERS: usize = 8;
+        const EACH: usize = 5;
+
+        let dir = tempfile::tempdir().unwrap();
+        let open = || Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let fingerprint = |writer: usize, n: usize| format!("{:040X}", writer * 1000 + n);
+        let stores: Vec<Store> = (0..WRITERS).map(|_| open()).collect();
+
+        // One list at a time, every writer starting together, so that all of
+        // them read at once: that is when a read the lock does not cover goes
+        // stale. Errors are collected rather than unwrapped, because a writer
+        // that panicked would leave the others waiting at the barrier.
+        let start = std::sync::Barrier::new(WRITERS);
+        let failures: Vec<String> = std::thread::scope(|scope| {
+            let writers: Vec<_> = stores
+                .iter()
+                .enumerate()
+                .map(|(writer, store)| {
+                    let start = &start;
+                    scope.spawn(move || {
+                        let mut failures = Vec::new();
+                        start.wait();
+                        for n in 0..EACH {
+                            if let Err(e) = store.set_trust_root(&fingerprint(writer, n), true) {
+                                failures.push(e.to_string());
+                            }
+                        }
+                        start.wait();
+                        for n in 0..EACH {
+                            if let Err(e) = store.set_sha1_accepted(&fingerprint(writer, n), true) {
+                                failures.push(e.to_string());
+                            }
+                        }
+                        failures
+                    })
+                })
+                .collect();
+            writers
+                .into_iter()
+                .flat_map(|writer| writer.join().unwrap())
+                .collect()
+        });
+        assert!(failures.is_empty(), "{failures:#?}");
+
+        let everything: BTreeSet<String> = (0..WRITERS)
+            .flat_map(|writer| (0..EACH).map(move |n| fingerprint(writer, n)))
+            .collect();
+        let store = open();
+        assert_eq!(store.trust_roots().unwrap(), everything);
+        assert_eq!(store.sha1_accepted().unwrap(), everything);
+    }
+
+    /// Two saves of one secret key on separate handles both land, merged.
+    ///
+    /// Each adds a user ID, the way two windows each editing the key would.
+    /// Both used to read the file before either wrote it and stage under the
+    /// same fixed name, so one save failed, one user ID was lost, or the file
+    /// was left holding bytes from both.
+    #[test]
+    fn two_saves_of_one_key_on_separate_handles_both_land() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = || Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let (one, other) = (open(), open());
+        let key = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        let fingerprint = key.fingerprint().to_hex();
+        one.insert_secret(&key).unwrap();
+
+        // Several rounds, because two writers with no lock between them lose
+        // an update only when their reads and writes interleave.
+        for round in 0..8 {
+            let first = format!("First {round} <first@example.org>");
+            let second = format!("Second {round} <second@example.org>");
+            let (with_first, with_second) =
+                (with_user_id(&key, &first), with_user_id(&key, &second));
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let saves = [
+                    scope.spawn(|| {
+                        start.wait();
+                        one.insert_secret(&with_first)
+                    }),
+                    scope.spawn(|| {
+                        start.wait();
+                        other.insert_secret(&with_second)
+                    }),
+                ];
+                for save in saves {
+                    save.join().unwrap().unwrap();
+                }
+            });
+
+            let stored = one.secret_cert(&fingerprint).unwrap();
+            assert!(stored.is_tsk());
+            for user_id in [&first, &second] {
+                assert!(
+                    stored
+                        .userids()
+                        .any(|ua| ua.userid().value() == user_id.as_bytes()),
+                    "round {round}: {user_id} was lost"
+                );
+            }
+        }
+    }
+
+    /// A writer gives up on a lock that is never released, rather than hang.
+    ///
+    /// The lock here is released after two seconds, so a writer that waited
+    /// without limit would still return — with the lock, which is the failure
+    /// this looks for.
+    #[test]
+    fn a_lock_held_too_long_is_an_error_rather_than_a_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("write.lock");
+        let elsewhere = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        elsewhere.lock().unwrap();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_secs(2));
+                elsewhere.unlock().unwrap();
+            });
+            let started = Instant::now();
+            let waited = StoreLock::acquire_within(&path, Duration::from_millis(200)).map(drop);
+            assert!(
+                matches!(&waited, Err(Error::Io { source, .. })
+                    if source.kind() == io::ErrorKind::TimedOut),
+                "{waited:?}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+        });
+    }
+
+    /// A write that fails leaves nothing beside its target, and the target as
+    /// it was.
+    ///
+    /// The staging file can hold a whole secret key. It used to stay wherever
+    /// a write failed, and nothing ever removed it, not even deleting the key.
+    /// Two failures here: the writing itself, as a full disk fails it part-way,
+    /// and the rename, onto a directory it cannot replace.
+    #[test]
+    fn a_failed_write_leaves_no_staging_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = StoreLock::acquire(&dir.path().join("write.lock")).unwrap();
+
+        let path = dir.path().join("trust-roots");
+        fs::write(&path, b"as it was").unwrap();
+        let failed = replace_private(&held, &path, |file| {
+            file.write_all(b"half of it").unwrap();
+            Err(Error::invalid("the disk is full"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"as it was");
+
+        let in_the_way = dir.path().join("sha1-accepted");
+        fs::create_dir(&in_the_way).unwrap();
+        fs::write(in_the_way.join("inside"), b"").unwrap();
+        assert!(write_private_atomic(&held, &in_the_way, b"never lands").is_err());
+
+        let staging = staging_files(dir.path(), |name| name.ends_with(".tmp"));
+        assert!(staging.is_empty(), "left behind: {staging:?}");
+    }
+
+    /// Deleting a secret key removes what a crashed write of it left behind,
+    /// and nothing of any other key's.
+    ///
+    /// A staging file a crash leaves can be a whole copy of the key, and the
+    /// delete used to leave it where it was while telling the user the key
+    /// was gone.
+    #[test]
+    fn deleting_a_secret_key_removes_the_staging_files_a_crash_left_of_it() {
+        let (_dir, store) = scratch();
+        let key = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        store.insert_secret(&key).unwrap();
+        let fingerprint = key.fingerprint().to_hex();
+
+        let beside = |suffix: &str| {
+            let mut path = store.secret_path(&fingerprint);
+            path.as_mut_os_string().push(suffix);
+            path
+        };
+        // The fixed name earlier builds staged under, and a unique one.
+        let leftovers = [beside(".tmp"), beside(".4242-7.tmp")];
+        let another = store
+            .secret_path(&"AB".repeat(20))
+            .with_extension("pgp.4242-8.tmp");
+        for file in leftovers.iter().chain([&another]) {
+            fs::write(file, b"a whole key, once").unwrap();
+        }
+
+        store.delete(&fingerprint, true).unwrap();
+        for leftover in &leftovers {
+            assert!(
+                !leftover.exists(),
+                "{} outlived the delete",
+                leftover.display()
+            );
+        }
+        assert!(
+            another.exists(),
+            "another key's staging file is not this delete's to remove"
+        );
+    }
+
+    /// Opening the store removes the staging files a crash left behind, and
+    /// nothing else.
+    ///
+    /// The unique names mean no later write reuses one, so without this they
+    /// would pile up for good. The directory above the secrets is whatever the
+    /// caller chose, so only names the store stages under go from there.
+    #[test]
+    fn opening_removes_the_staging_files_a_crash_left_behind() {
+        let (dir, store) = scratch();
+        fs::create_dir_all(&store.revocations_dir).unwrap();
+        let fingerprint = "AB".repeat(20);
+        let secrets = &store.secrets_dir;
+        let leftovers = [
+            secrets.join(format!("{fingerprint}.pgp.tmp")),
+            secrets.join(format!("{fingerprint}.pgp.4242-7.tmp")),
+            store
+                .revocations_dir
+                .join(format!("{fingerprint}.rev.4242-8.tmp")),
+            dir.path().join("trust-roots.tmp"),
+            dir.path().join("imported-secrets.4242-9.tmp"),
+            dir.path().join("sha1-accepted.tmp"),
+        ];
+        let kept = [
+            // Set aside by insert_secret, which is not a staging file.
+            secrets.join(format!("{fingerprint}.pgp.unreadable")),
+            dir.path().join("notes.tmp"),
+            dir.path().join("trust-roots"),
+        ];
+        for file in leftovers.iter().chain(&kept) {
+            fs::write(file, b"").unwrap();
+        }
+
+        store.reopen().unwrap();
+        for leftover in &leftovers {
+            assert!(
+                !leftover.exists(),
+                "{} outlived the open",
+                leftover.display()
+            );
+        }
+        for file in &kept {
+            assert!(file.exists(), "{} is not a staging file", file.display());
+        }
+    }
+
+    /// `create_private` makes a new file or nothing.
+    ///
+    /// It used to open whatever was at the name and truncate it: another
+    /// writer's staging file, or, on Unix, a symlink planted there by anyone
+    /// able to write the directory, which it then wrote through.
+    #[test]
+    fn create_private_never_opens_a_file_that_is_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust-roots.tmp");
+        fs::write(&path, b"somebody else's").unwrap();
+        let refused = create_private(&path);
+        assert!(
+            matches!(&refused, Err(Error::Io { source, .. })
+                if source.kind() == io::ErrorKind::AlreadyExists),
+            "{refused:?}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"somebody else's");
+
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("somewhere-else");
+            let planted = dir.path().join("planted.tmp");
+            std::os::unix::fs::symlink(&target, &planted).unwrap();
+            assert!(create_private(&planted).is_err());
+            assert!(!target.exists(), "a planted symlink was followed");
+        }
+    }
+
+    /// A staging name that is already taken is passed over for the next one,
+    /// for up to sixteen attempts.
+    ///
+    /// The process ID in the name tells processes apart only within one PID
+    /// namespace. Two rPGP windows in the Flatpak can share a store and a
+    /// process ID, and a crash can leave a file under a process ID since
+    /// reused, so a name can be taken. That has to cost a retry, not the
+    /// write, and not what is in the file there. A counter of the test's own
+    /// says which names the attempts will take. Past sixteen the write gives
+    /// up: a directory that answers every name that way will go on doing so,
+    /// and the store's lock is held meanwhile.
+    #[test]
+    fn a_staging_name_already_taken_is_passed_over_for_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust-roots");
+        let name = |n: u64| {
+            dir.path()
+                .join(format!("trust-roots.{}-{n}.tmp", std::process::id()))
+        };
+        for n in 0..3 {
+            fs::write(name(n), b"somebody else's").unwrap();
+        }
+
+        let (staging, file) = create_staging_from(&path, &AtomicU64::new(0))
+            .unwrap_or_else(|e| panic!("a taken staging name failed the write: {e:?}"));
+        drop(file);
+        assert_eq!(staging, name(3));
+        for n in 0..3 {
+            assert_eq!(fs::read(name(n)).unwrap(), b"somebody else's");
+        }
+
+        for n in 100..116 {
+            fs::write(name(n), b"").unwrap();
+        }
+        let next = AtomicU64::new(100);
+        let refused = create_staging_from(&path, &next).map(|(staging, _)| staging);
+        assert!(
+            matches!(&refused, Err(Error::Io { source, .. })
+                if source.kind() == io::ErrorKind::AlreadyExists),
+            "{refused:?}"
+        );
+        assert_eq!(next.load(Ordering::Relaxed), 116, "attempts made");
+    }
+
+    /// A symlink planted where trust-roots used to be staged is neither written
+    /// through nor renamed into place.
+    ///
+    /// Every write of the list staged at `trust-roots.tmp`, opened it following
+    /// symlinks and renamed it over the list, so anyone able to write the
+    /// directory could point that name at a file of their own and, after the
+    /// user's next change, own the list of trust roots.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_old_staging_name_is_not_written_through() {
+        let (dir, store) = scratch();
+        let theirs = dir.path().join("somebody-elses-roots");
+        std::os::unix::fs::symlink(&theirs, dir.path().join("trust-roots.tmp")).unwrap();
+
+        let fingerprint = "AB".repeat(20);
+        store.set_trust_root(&fingerprint, true).unwrap();
+        assert!(!theirs.exists(), "the list was written through the link");
+        assert!(
+            fs::symlink_metadata(&store.roots_path)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "trust-roots must be a file of its own"
+        );
+        assert!(store.trust_roots().unwrap().contains(&fingerprint));
+    }
+
+    /// The directory above the secrets and the lists in it are private as
+    /// created, and repaired to that on every open.
+    ///
+    /// Only the files used to be. With the directory left group-writable, as a
+    /// group-writable umask makes it, anyone in the group could rename a list
+    /// of their own over trust-roots or unlink imported-secrets, whatever the
+    /// files' own modes. Every list is repaired here, not only sha1-accepted,
+    /// whose test in `tests/sha1_optin.rs` was the only one.
+    #[cfg(unix)]
+    #[test]
+    fn the_directory_above_the_secrets_and_its_lists_are_kept_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        // Made by the store, as open_default's rpgp directory is.
+        let data = dir.path().join("rpgp");
+        let secrets = data.join("secrets");
+        let store = Store::open(dir.path().join("certs.d"), &secrets).unwrap();
+        assert_eq!(mode(&data), 0o700, "the directory above the secrets");
+
+        let fingerprint = "AB".repeat(20);
+        store.set_trust_root(&fingerprint, true).unwrap();
+        store.set_sha1_accepted(&fingerprint, true).unwrap();
+        store
+            .insert_imported_secret(
+                &crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+                    "Imported <imported@example.org>",
+                ))
+                .unwrap()
+                .cert,
+            )
+            .unwrap();
+
+        // Whatever an earlier build left behind. Named here rather than taken
+        // from the store's own list, so that a name dropped from that list is
+        // caught.
+        let lists = ["trust-roots", "imported-secrets", "sha1-accepted"];
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o755)).unwrap();
+        for list in lists {
+            fs::set_permissions(data.join(list), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        Store::open(dir.path().join("certs.d"), &secrets).unwrap();
+        assert_eq!(
+            mode(&data),
+            0o700,
+            "the directory above the secrets, reopened"
+        );
+        for list in lists {
+            assert_eq!(mode(&data.join(list)), 0o600, "{list}, reopened");
+        }
+    }
+
+    /// Opening the store is not failed by a file that vanishes while it opens.
+    ///
+    /// The repair finds each file first and restricts it after, and a file
+    /// renamed or removed in between — by a build of rPGP that takes no lock,
+    /// or by a file manager — used to fail the whole open: "rPGP could not
+    /// start" at launch, or a stale list after a delete. The churn here is
+    /// that other writer, as fast as it can go, in each place the repair
+    /// looks: the secrets, the revocation certificates and the lists.
+    ///
+    /// Unix only: on Windows a file in the middle of being deleted answers
+    /// "access denied" for a moment rather than "not found", which is not what
+    /// this is about.
+    #[cfg(unix)]
+    #[test]
+    fn opening_is_not_failed_by_a_file_that_vanishes_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        let revocations = dir.path().join("revocations");
+        let open = || Store::open(dir.path().join("certs.d"), &secrets).map(drop);
+        open().unwrap();
+        fs::create_dir(&revocations).unwrap();
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let churn = |path: &dyn Fn(u64) -> PathBuf| {
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let path = path(n);
+                let _ = fs::write(&path, b"");
+                let _ = fs::remove_file(&path);
+                n += 1;
+            }
+        };
+        let lists = ["trust-roots", "imported-secrets", "sha1-accepted"];
+        let failed = std::thread::scope(|scope| {
+            scope.spawn(|| churn(&|n| secrets.join(format!("{n:040X}.pgp"))));
+            scope.spawn(|| churn(&|n| revocations.join(format!("{n:040X}.rev"))));
+            scope.spawn(|| churn(&|n| dir.path().join(lists[n as usize % lists.len()])));
+            let started = Instant::now();
+            let failed = (0..200)
+                .take_while(|_| started.elapsed() < Duration::from_secs(10))
+                .map(|_| open())
+                .find(Result::is_err);
+            stop.store(true, Ordering::Relaxed);
+            failed
+        });
+        assert!(failed.is_none(), "{failed:?}");
     }
 
     /// One file that will not parse used to take every secret key with it —
@@ -2899,12 +3988,15 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), b"pretend transferable secret key");
         }
 
-        /// The branch that is easy to miss: `CreateFileW` ignores
-        /// `lpSecurityDescriptor` when the file already exists, so overwriting an
-        /// exposed key keeps its old ACL unless `create_private` notices
-        /// ERROR_ALREADY_EXISTS and re-applies the DACL to the handle it holds.
+        /// The case that is easy to miss: `CreateFileW` ignores
+        /// `lpSecurityDescriptor` when the file already exists, so a key written
+        /// into an exposed file kept that file's ACL. Nothing writes into an
+        /// existing file any more — every write stages a new one, whose ACL
+        /// arrives with it, and renames it over the old — so what has to hold
+        /// is that the rename carries the staging file's ACL across rather than
+        /// the destination keeping its own.
         #[test]
-        fn overwriting_an_exposed_key_replaces_its_acl() {
+        fn a_file_written_over_an_exposed_one_is_owner_only() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("DEADBEEF.pgp");
             fs::write(&path, b"left behind by an older build").unwrap();
@@ -2914,9 +4006,8 @@ mod tests {
                 "the test's own setup did not take: the file has no Everyone ACE",
             );
 
-            let mut file = create_private(&path).unwrap();
-            file.write_all(b"rewritten").unwrap();
-            drop(file);
+            let held = StoreLock::acquire(&dir.path().join("write.lock")).unwrap();
+            write_private_atomic(&held, &path, b"rewritten").unwrap();
 
             read_dacl(&path).assert_only(
                 &current_user_sid().unwrap(),
@@ -2952,6 +4043,7 @@ mod tests {
 
             let sid = current_user_sid().unwrap();
             let key = store.secret_path(&fingerprint);
+            read_dacl(dir.path()).assert_only(&sid, INHERIT, "the directory above the secrets");
             read_dacl(&secrets).assert_only(&sid, INHERIT, "secrets directory");
             read_dacl(&key).assert_only(&sid, 0, "secret key");
             read_dacl(&store.revocations_dir).assert_only(&sid, INHERIT, "revocations directory");

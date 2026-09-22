@@ -443,9 +443,16 @@ directory. They live in their own directory, one binary TSK per file:
 
 Those files are `0600` in a `0700` directory, tightened every time the store is
 opened rather than only when a key is written, so a store created by an earlier
-build is repaired rather than left exposed. A key generated with a passphrase is
-encrypted with it. A key generated **without** one is not, and then the file
-permissions are all that protects it.
+build is repaired rather than left exposed. The `rpgp` directory above it, which
+holds the revocation certificates and the lists of trust roots, of imported keys
+and of certificates you accept SHA-1 from, is `0700` too. A key generated with a
+passphrase is encrypted with it. A key generated **without** one is not, and
+then the file permissions are all that protects it.
+
+Two rPGP windows can share one store. Each change to a key or a list is made
+under a lock file in the `rpgp` directory, so the two take turns rather than
+undo each other's changes, and each file is replaced whole, so a crash or a full
+disk part-way through leaves the previous version rather than a damaged one.
 
 [certd]: https://www.ietf.org/archive/id/draft-nwjw-openpgp-cert-d-02.html
 
