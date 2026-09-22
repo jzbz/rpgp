@@ -3081,8 +3081,8 @@ fn run_delete(state: &Shared, fingerprint: &str, confirmed_secret: bool) -> Resu
     // are on screen, since a failed delete leaves the dialog open and
     // dismissing it is what makes reopening re-read the store and put the
     // warning back. The state is read here rather than before the call so that
-    // a failure past the guard, with the certificate already unlinked, is not
-    // reported as having deleted nothing.
+    // a failure past the guard, with the certificate's trust-root and SHA-1
+    // entries already removed, is not reported as having deleted nothing.
     store.delete(fingerprint, confirmed_secret).map_err(|e| {
         if !confirmed_secret && store.has_secret(fingerprint) {
             "Cancel, then open Delete again: nothing was deleted, because this \

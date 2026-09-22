@@ -276,6 +276,23 @@ impl Store {
     /// and it cannot be regenerated once the secret key is gone — so the moment
     /// the key is deleted is exactly when it stops being redundant. Ask for it
     /// with [`Store::revocation_path`] before deleting if it should go too.
+    ///
+    /// The certificate's entries in trust-roots and sha1-accepted are removed
+    /// with it, and before anything is unlinked. Both lists are keyed by
+    /// fingerprint alone, so an entry left behind applies again when the same
+    /// certificate is next imported: a trust root once more, with everything
+    /// it certified authenticated, while the import reports it unverified. The
+    /// SHA-1 entry used to be left for good, and the trust-root entry was
+    /// removed last, so a delete that failed there had already unlinked the
+    /// certificate, and once the list stopped showing it there was nothing to
+    /// retry the delete from. Removed first, a delete that fails after them
+    /// leaves a certificate trusted less rather than more, and ticking the
+    /// boxes again puts them back.
+    ///
+    /// Its entry in imported-secrets is kept. That entry only ever withholds
+    /// trust-root status, so keeping it is the safe direction; removed before
+    /// the secret key, it would let a failed unlink leave an imported key a
+    /// trust root.
     pub fn delete(&self, fingerprint: &str, secret_too: bool) -> Result<()> {
         // Held throughout, so that no secret key can arrive from another
         // writer between the guard looking for one and the unlinks below.
@@ -286,7 +303,12 @@ impl Store {
             ));
         }
 
-        // The secret first. If this fails halfway, a store still holding the
+        // The entries first; see above. A list the certificate is not on is
+        // left as it was rather than written again.
+        update_list(&held, &self.roots_path, fingerprint, false)?;
+        update_list(&held, &self.sha1_path, fingerprint, false)?;
+
+        // Then the secret. If this fails halfway, a store still holding the
         // public certificate is the recoverable direction to fail in.
         if secret_too {
             let path = self.secret_path(fingerprint);
@@ -309,9 +331,7 @@ impl Store {
                 }
             }
         }
-        remove_if_present(&self.cert_path(fingerprint))?;
-        self.write_trust_root(&held, fingerprint, false)?;
-        Ok(())
+        remove_if_present(&self.cert_path(fingerprint))
     }
 
     /// A second handle on the same directories, with a fresh index.
@@ -366,38 +386,12 @@ impl Store {
 
     /// Fingerprints the user has explicitly marked as trust roots.
     pub fn trust_roots(&self) -> Result<BTreeSet<String>> {
-        match fs::read_to_string(&self.roots_path) {
-            Ok(text) => Ok(text
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_uppercase)
-                .collect()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
-            Err(e) => Err(Error::io(
-                format!("reading {}", self.roots_path.display()),
-                e,
-            )),
-        }
+        read_list(&self.roots_path)
     }
 
     pub fn set_trust_root(&self, fingerprint: &str, root: bool) -> Result<()> {
         let held = self.lock()?;
-        self.write_trust_root(&held, fingerprint, root)
-    }
-
-    /// [`Store::set_trust_root`], for a caller already holding the lock.
-    fn write_trust_root(&self, held: &StoreLock, fingerprint: &str, root: bool) -> Result<()> {
-        let mut roots = self.trust_roots()?;
-        if root {
-            roots.insert(fingerprint.to_uppercase());
-        } else {
-            roots.remove(&fingerprint.to_uppercase());
-        }
-
-        let mut text = roots.into_iter().collect::<Vec<_>>().join("\n");
-        text.push('\n');
-        write_private_atomic(held, &self.roots_path, text.as_bytes())
+        update_list(&held, &self.roots_path, fingerprint, root)
     }
 
     /// Fingerprints the user has allowed SHA-1 signatures from.
@@ -406,34 +400,12 @@ impl Store {
     /// what *verifies*, and must never widen what is *trusted*. It is not a
     /// weaker cousin of [`Store::trust_roots`] and the two are never combined.
     pub fn sha1_accepted(&self) -> Result<BTreeSet<String>> {
-        match fs::read_to_string(&self.sha1_path) {
-            Ok(text) => Ok(text
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_uppercase)
-                .collect()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
-            Err(e) => Err(Error::io(
-                format!("reading {}", self.sha1_path.display()),
-                e,
-            )),
-        }
+        read_list(&self.sha1_path)
     }
 
     pub fn set_sha1_accepted(&self, fingerprint: &str, accepted: bool) -> Result<()> {
         let held = self.lock()?;
-        let mut list = self.sha1_accepted()?;
-        let key = hex_only(fingerprint).to_uppercase();
-        if accepted {
-            list.insert(key);
-        } else {
-            list.remove(&key);
-        }
-
-        let mut text = list.into_iter().collect::<Vec<_>>().join("\n");
-        text.push('\n');
-        write_private_atomic(&held, &self.sha1_path, text.as_bytes())
+        update_list(&held, &self.sha1_path, fingerprint, accepted)
     }
 
     /// The user's SHA-1 opt-in, resolved against the store.
@@ -444,9 +416,10 @@ impl Store {
     /// is the default and stays the default until someone acts.
     ///
     /// An opted-in fingerprint that no longer resolves to a certificate is
-    /// skipped rather than treated as an error: the user may have deleted the
-    /// key and left the line behind, and a stale entry should cost them a
-    /// silently strict verification, not a failed one.
+    /// skipped rather than treated as an error: [`Store::delete`] takes the
+    /// line out, but cert-d is shared, and a certificate deleted with another
+    /// tool leaves it behind. A stale entry should cost the user a silently
+    /// strict verification, not a failed one.
     ///
     /// What comes back is then checked against the line that asked for it,
     /// because [`Store::lookup`] answers a broader question than this one is
@@ -529,19 +502,7 @@ impl Store {
     /// distinction existed keeps every root it had; only keys imported from
     /// now on are held back.
     pub fn imported_secrets(&self) -> Result<BTreeSet<String>> {
-        match fs::read_to_string(&self.imported_secrets_path) {
-            Ok(text) => Ok(text
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_uppercase)
-                .collect()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
-            Err(e) => Err(Error::io(
-                format!("reading {}", self.imported_secrets_path.display()),
-                e,
-            )),
-        }
+        read_list(&self.imported_secrets_path)
     }
 
     /// Record a secret key as having arrived from outside.
@@ -550,35 +511,40 @@ impl Store {
     /// you generated here must not demote it, and applying a revocation or an
     /// expiry edit rewrites the same file without changing where it came from.
     fn mark_imported_secret(&self, held: &StoreLock, fingerprint: &str) -> Result<()> {
-        let key = hex_only(fingerprint).to_uppercase();
-        let mut imported = self.imported_secrets()?;
-        if !imported.insert(key) {
-            return Ok(());
-        }
-        let mut text = imported.into_iter().collect::<Vec<_>>().join("\n");
-        text.push('\n');
-        write_private_atomic(held, &self.imported_secrets_path, text.as_bytes())
+        update_list(held, &self.imported_secrets_path, fingerprint, true)
     }
 
     /// Store a secret key that arrived from outside, rather than one generated
     /// here. Identical to [`Store::insert_secret`] except that the key does not
     /// become an implicit trust root.
     ///
-    /// The lock is taken before looking for the key and held through the write
-    /// and the mark. Looked for first, the key could be deleted by another
+    /// The lock is taken before looking for the key and held through the mark
+    /// and the write. Looked for first, the key could be deleted by another
     /// writer while this one waited for the lock, and then written back
     /// unmarked though it came from outside — and an imported key with no mark
-    /// is a trust root. The public half goes to cert-d afterwards, as in
-    /// `insert_secret`, so the mark comes before it: a cert-d insert that fails
-    /// leaves the key marked rather than a root.
+    /// is a trust root.
+    ///
+    /// The mark comes first for the same reason: before the secret key is
+    /// written, and so before the public half goes to cert-d once the lock is
+    /// released. It used to follow the write, so a mark that failed — a full
+    /// disk is enough — or a crash between the two left the key held and
+    /// unmarked: a trust root, and one a retry would find already held and so
+    /// never mark. A mark whose key then fails to arrive costs nothing. It
+    /// only ever withholds root status, and this store holds no secret key for
+    /// it to withhold it from. Even so, a certificate with no secret key in it,
+    /// which write_secret refuses, is turned away before the mark, so that an
+    /// import refused for that leaves nothing behind.
     pub fn insert_imported_secret(&self, cert: &Cert) -> Result<()> {
+        // write_secret refuses this too, but only after the mark; see above.
+        if !cert.is_tsk() {
+            return Err(Error::invalid("certificate carries no secret key material"));
+        }
         let held = self.lock()?;
         let fingerprint = cert.fingerprint().to_hex();
-        let already_held = self.has_secret(&fingerprint);
-        let merged = self.write_secret(&held, cert)?;
-        if !already_held {
+        if !self.has_secret(&fingerprint) {
             self.mark_imported_secret(&held, &fingerprint)?;
         }
+        let merged = self.write_secret(&held, cert)?;
         drop(held);
         self.insert(&merged)
     }
@@ -1116,6 +1082,87 @@ fn hex_only(fingerprint: &str) -> String {
         .collect()
 }
 
+/// The entry a fingerprint that a caller passes goes into the bookkeeping
+/// lists as: its hex digits, uppercase, which is what `Fingerprint::to_hex`
+/// gives.
+///
+/// It is the reduction [`Store::delete`] and every path here make through
+/// `hex_only`, so the entry set_trust_root writes for some input is the one
+/// delete takes out for the same input. set_trust_root used to store its
+/// input only upper-cased: given the spaced form the details pane shows, a
+/// delete removed the certificate and left its trust-root entry, a root again
+/// the day the certificate came back, and a newline in the input wrote two
+/// entries.
+///
+/// It is for what callers pass and never for the lines already in a list,
+/// which [`read_list`] reads more strictly.
+fn list_key(fingerprint: &str) -> String {
+    hex_only(fingerprint).to_uppercase()
+}
+
+/// One of the bookkeeping lists, a fingerprint per line. A list that does
+/// not exist is empty.
+///
+/// Each line is read the way the web of trust reads a trust-roots line, with
+/// Sequoia's fingerprint parser, and listed as the `to_hex` of what it parses
+/// to. The parser ignores case and whitespace and drops a leading 0x, so a
+/// line in any of those forms is the entry the rest of the store and the
+/// window compare, and they can show it and take it out. A spaced trust-roots
+/// line, which set_trust_root used to write for spaced input, was a working
+/// root that nothing comparing hex could see or remove.
+///
+/// A line the parser rejects is kept as written, and matches nothing. Not
+/// every line in these files is meant as an entry: someone editing one by
+/// hand may switch a fingerprint off with a `#` in front, and no reader of
+/// these lists has ever counted such a line. Reduced to its hex digits, as
+/// [`list_key`] reduces what callers pass, it would count again, in
+/// trust-roots as a live root, and the next write would store it as a plain
+/// fingerprint that older builds count as well. Kept as written, it goes back
+/// out as it came in.
+fn read_list(path: &Path) -> Result<BTreeSet<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text
+            .lines()
+            .map(|line| match line.parse::<sequoia_openpgp::Fingerprint>() {
+                Ok(fingerprint) => fingerprint.to_hex(),
+                Err(_) => line.trim().to_owned(),
+            })
+            .filter(|entry| !entry.is_empty())
+            .collect()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(e) => Err(Error::io(format!("reading {}", path.display()), e)),
+    }
+}
+
+/// Put `fingerprint` on one of the bookkeeping lists, or take it off, under
+/// the store's lock.
+///
+/// A list that would come out unchanged is not written again.
+/// [`Store::delete`] takes the certificate it deletes off two lists before it
+/// unlinks anything, whether it is on them or not, and a write it does not
+/// need is one more way for it to fail. Input with no hex digits in it names
+/// no entry and changes nothing, where it used to write a blank line into
+/// the list on every call.
+fn update_list(held: &StoreLock, path: &Path, fingerprint: &str, listed: bool) -> Result<()> {
+    let key = list_key(fingerprint);
+    if key.is_empty() {
+        return Ok(());
+    }
+    let mut list = read_list(path)?;
+    let changed = if listed {
+        list.insert(key)
+    } else {
+        list.remove(&key)
+    };
+    if !changed {
+        return Ok(());
+    }
+
+    let mut text = list.into_iter().collect::<Vec<_>>().join("\n");
+    text.push('\n');
+    write_private_atomic(held, path, text.as_bytes())
+}
+
 /// Unlink `path`, treating "it was not there" as success.
 fn remove_if_present(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
@@ -1328,9 +1375,9 @@ const LOCK_PATIENCE: Duration = Duration::from_secs(10);
 /// reader sees the old one or the new one.
 ///
 /// One lock for the whole store rather than one per file, because some writes
-/// span files — an import writes a key and marks it in imported-secrets, and
-/// a delete removes a key and its trust-root entry — and one lock has no
-/// order to take locks in and get wrong. Writes are rare and short, so
+/// span files — an import marks a key in imported-secrets and writes it, and
+/// a delete removes a key and its trust-root and SHA-1 entries — and one lock
+/// has no order to take locks in and get wrong. Writes are rare and short, so
 /// nothing is lost to a coarser lock.
 ///
 /// It cannot deadlock. It is never held while waiting on anything else — the
@@ -2744,6 +2791,67 @@ mod tests {
         assert!(!store.effective_roots().unwrap().contains(&fingerprint));
     }
 
+    /// An import that cannot mark its key imported writes no secret key.
+    ///
+    /// The mark used to come after the secret key was written, so a mark that
+    /// failed left an imported key held and unmarked, and an imported key with
+    /// no mark is a trust root. A retry then found the key already held and
+    /// never marked it at all. Here the mark fails because the list will not
+    /// read, where a full disk would fail its write.
+    #[test]
+    fn an_import_that_cannot_be_marked_imported_writes_no_secret_key() {
+        let (_dir, store) = scratch();
+        let key = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Stranger <stranger@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        let fingerprint = key.fingerprint().to_hex().to_uppercase();
+
+        // Bytes that are not UTF-8, so the read fails rather than coming back
+        // empty.
+        fs::write(&store.imported_secrets_path, b"\xff\xfe not utf-8 \xff").unwrap();
+        assert!(
+            store.insert_imported_secret(&key).is_err(),
+            "the damaged list did not fail the import, so this proves nothing"
+        );
+
+        // Once the list reads again, the key is no trust root, and a retry
+        // marks it.
+        fs::remove_file(&store.imported_secrets_path).unwrap();
+        assert!(
+            !store.effective_roots().unwrap().contains(&fingerprint),
+            "an import that could not be marked left its key a trust root"
+        );
+        assert!(!store.has_secret(&fingerprint));
+        store.insert_imported_secret(&key).unwrap();
+        assert!(store.imported_secrets().unwrap().contains(&fingerprint));
+        assert!(!store.effective_roots().unwrap().contains(&fingerprint));
+    }
+
+    /// An import handed a certificate with no secret key in it is refused
+    /// before anything is written, the imported mark included.
+    ///
+    /// The mark comes before the secret key is written, so a refusal left to
+    /// the write would come after the mark, and leave one behind for a key
+    /// that never arrived. A mark like that only withholds root status, but an
+    /// import that is refused should leave the store as it found it.
+    #[test]
+    fn an_import_with_no_secret_key_in_it_is_refused_before_it_is_marked() {
+        let (_dir, store) = scratch();
+        let public = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Stranger <stranger@example.org>",
+        ))
+        .unwrap()
+        .cert
+        .strip_secret_key_material();
+        assert!(store.insert_imported_secret(&public).is_err());
+        assert!(
+            !store.imported_secrets_path.exists(),
+            "a refused import marked its key imported"
+        );
+    }
+
     /// A delete that had to wait for the lock looks for a secret key only once
     /// it holds it.
     ///
@@ -3468,6 +3576,241 @@ mod tests {
             store.has_revocation(&fingerprint),
             "the revocation certificate must outlive the key",
         );
+    }
+
+    /// A delete removes the certificate's trust-root and SHA-1 entries before
+    /// anything else, and a certificate imported again gets neither back.
+    ///
+    /// The SHA-1 entry used to be left behind for good, and the trust-root
+    /// entry was removed last, so a delete that could not rewrite that list
+    /// had already unlinked the certificate: imported again, it was a trust
+    /// root once more. Here the list will not read at first, which fails the
+    /// delete at that step as a full disk would.
+    #[test]
+    fn a_delete_takes_the_list_entries_first_and_a_re_import_gets_none_back() {
+        let (_dir, store) = scratch();
+        let key =
+            crate::keygen::generate(&crate::keygen::KeyGenRequest::new("Bob <bob@example.org>"))
+                .unwrap()
+                .cert;
+        store.insert_imported_secret(&key).unwrap();
+        let fingerprint = key.fingerprint().to_hex();
+        store.set_trust_root(&fingerprint, true).unwrap();
+        store.set_sha1_accepted(&fingerprint, true).unwrap();
+
+        let listed = fs::read(&store.roots_path).unwrap();
+        let mut damaged = listed.clone();
+        damaged.extend_from_slice(b"\xff\xfe not utf-8 \xff\n");
+        fs::write(&store.roots_path, &damaged).unwrap();
+        assert!(
+            store.delete(&fingerprint, true).is_err(),
+            "the damaged list did not fail the delete, so this proves nothing"
+        );
+        assert!(
+            store.has_secret(&fingerprint),
+            "a delete that could not take the trust root out removed the secret key"
+        );
+        assert!(
+            store.cert_path(&fingerprint).exists(),
+            "a delete that could not take the trust root out removed the certificate"
+        );
+
+        fs::write(&store.roots_path, &listed).unwrap();
+        store.delete(&fingerprint, true).unwrap();
+        assert!(!store.trust_roots().unwrap().contains(&fingerprint));
+        assert!(
+            !store.sha1_accepted().unwrap().contains(&fingerprint),
+            "the SHA-1 entry outlived the delete"
+        );
+        // Kept on purpose: it only withholds trust-root status.
+        assert!(store.imported_secrets().unwrap().contains(&fingerprint));
+
+        // Back as the lookup dialog brings a certificate in, and as a keypair.
+        store.insert(&key).unwrap();
+        assert!(!store.effective_roots().unwrap().contains(&fingerprint));
+        assert!(store.sha1_policy().unwrap().is_strict());
+        store.insert_imported_secret(&key).unwrap();
+        assert!(!store.effective_roots().unwrap().contains(&fingerprint));
+    }
+
+    /// A delete leaves a list the certificate is not on as it was.
+    ///
+    /// The delete takes the certificate off both lists before it unlinks
+    /// anything, and writing a list that does not change would make every
+    /// delete depend on that write: an unwritable directory above the secrets
+    /// would then refuse to delete anything, even a certificate on no list.
+    /// A lowercase line tells a list written again from one left alone, since
+    /// the store writes every line uppercase.
+    #[test]
+    fn a_delete_leaves_a_list_the_certificate_is_not_on_as_it_was() {
+        let (_dir, store) = scratch();
+        let cert = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        store.insert(&cert).unwrap();
+        let fingerprint = cert.fingerprint().to_hex();
+        let other = format!("{}\n", "ab".repeat(20));
+        for list in [&store.roots_path, &store.sha1_path] {
+            fs::write(list, &other).unwrap();
+        }
+
+        store.delete(&fingerprint, false).unwrap();
+        assert!(!store.cert_path(&fingerprint).exists());
+        for list in [&store.roots_path, &store.sha1_path] {
+            assert_eq!(
+                fs::read_to_string(list).unwrap(),
+                other,
+                "{} was written again",
+                list.display()
+            );
+        }
+    }
+
+    /// A fingerprint names the same entry in every list, whatever form it
+    /// arrives in: spaced as the details pane shows it, lowercase, or after
+    /// 0x. Input with no hex digits in it names no entry at all.
+    ///
+    /// set_trust_root used to store its input only upper-cased, while delete
+    /// finds the files through `hex_only`. A delete given the spaced form
+    /// removed the certificate and left its trust-root entry, a root again the
+    /// day the certificate came back, and a newline in the input wrote two
+    /// entries the same input could not take out. The lists were read only
+    /// upper-cased as well, so a spaced or 0x entry already on disk matched no
+    /// fingerprint, though in trust-roots the web of trust counted it a root.
+    #[test]
+    fn a_fingerprint_is_one_list_entry_whatever_form_it_arrives_in() {
+        let (_dir, store) = scratch();
+        let cert = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        store.insert(&cert).unwrap();
+        let fingerprint = cert.fingerprint().to_hex();
+        let spaced = crate::cert::CertSummary::from_cert(&cert).fingerprint_pretty();
+        assert_ne!(spaced, fingerprint);
+
+        store.set_trust_root(&spaced, true).unwrap();
+        assert_eq!(
+            store.trust_roots().unwrap(),
+            BTreeSet::from([fingerprint.clone()])
+        );
+        store.delete(&spaced, false).unwrap();
+        assert!(
+            store.trust_roots().unwrap().is_empty(),
+            "a delete given the spaced form left the trust root behind"
+        );
+        store.insert(&cert).unwrap();
+        assert!(!store.effective_roots().unwrap().contains(&fingerprint));
+
+        // Two fingerprints on two lines are one malformed entry, not two
+        // roots, and the same input takes it out again.
+        let (first, second) = ("AB".repeat(20), "CD".repeat(20));
+        let both = format!("{first}\n{second}");
+        store.set_trust_root(&both, true).unwrap();
+        let roots = store.trust_roots().unwrap();
+        assert!(
+            !roots.contains(&first) && !roots.contains(&second),
+            "{roots:?}"
+        );
+        store.set_trust_root(&both, false).unwrap();
+        assert!(store.trust_roots().unwrap().is_empty());
+
+        // An entry already written in another form, by hand or by an earlier
+        // build, reads as the fingerprint the web of trust parses it as, in
+        // every list, and the fingerprint the window compares takes it out.
+        let other_forms = format!(
+            "{spaced}\n{}\n0x{}\n",
+            spaced.to_lowercase(),
+            fingerprint.to_lowercase()
+        );
+        for list in [
+            &store.roots_path,
+            &store.sha1_path,
+            &store.imported_secrets_path,
+        ] {
+            fs::write(list, &other_forms).unwrap();
+        }
+        let just_it = BTreeSet::from([fingerprint.clone()]);
+        assert_eq!(store.trust_roots().unwrap(), just_it);
+        assert_eq!(store.sha1_accepted().unwrap(), just_it);
+        assert_eq!(store.imported_secrets().unwrap(), just_it);
+        store.set_trust_root(&fingerprint, false).unwrap();
+        assert!(store.trust_roots().unwrap().is_empty());
+
+        // Input with no hex digits in it names nothing, so nothing is written.
+        fs::remove_file(&store.roots_path).unwrap();
+        for nothing in ["", " : "] {
+            store.set_trust_root(nothing, true).unwrap();
+        }
+        assert!(
+            !store.roots_path.exists(),
+            "input naming no fingerprint was written to the list"
+        );
+    }
+
+    /// A trust-roots line that is not a fingerprint makes no root, and the
+    /// next write to the list does not turn it into one.
+    ///
+    /// Someone editing the list by hand may switch a root off with a `#` in
+    /// front of it, and the web of trust has never counted a line like that,
+    /// or one written with colons. Read as their hex digits alone, the way
+    /// what callers pass is reduced, each of these lines would be a live root,
+    /// and the next write to the list would store it as a plain fingerprint,
+    /// which every build counts. The roots are checked here the way the web of
+    /// trust takes them, each parsed as a fingerprint, and the line has to go
+    /// back out exactly as it came in, case included.
+    #[test]
+    fn a_trust_roots_line_that_is_not_a_fingerprint_never_becomes_a_root() {
+        let (_dir, store) = scratch();
+        let cert = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        store.insert(&cert).unwrap();
+        let fingerprint = cert.fingerprint().to_hex();
+        let spaced = crate::cert::CertSummary::from_cert(&cert).fingerprint_pretty();
+        let colons = fingerprint
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| std::str::from_utf8(pair).unwrap())
+            .collect::<Vec<_>>()
+            .join(":");
+        let makes_it_a_root = |roots: BTreeSet<String>| {
+            roots
+                .iter()
+                .filter_map(|root| root.parse::<Fingerprint>().ok())
+                .any(|root| root == cert.fingerprint())
+        };
+        let other = "AB".repeat(20);
+
+        for line in [
+            format!("#{fingerprint}"),
+            format!("# {}", spaced.to_lowercase()),
+            format!("-{fingerprint}"),
+            colons,
+        ] {
+            assert!(line.parse::<Fingerprint>().is_err(), "{line:?} parses");
+            fs::write(&store.roots_path, format!("{line}\n")).unwrap();
+            assert!(
+                !makes_it_a_root(store.effective_roots().unwrap()),
+                "{line:?} was read as a trust root"
+            );
+
+            // Another certificate made a root and then not, which writes the
+            // list twice. The line goes back out as it came in.
+            store.set_trust_root(&other, true).unwrap();
+            store.set_trust_root(&other, false).unwrap();
+            assert_eq!(
+                fs::read_to_string(&store.roots_path).unwrap(),
+                format!("{line}\n"),
+                "a write to the list changed {line:?}"
+            );
+            assert!(!makes_it_a_root(store.effective_roots().unwrap()));
+        }
     }
 
     #[test]
