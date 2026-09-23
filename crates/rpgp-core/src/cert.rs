@@ -163,6 +163,13 @@ pub struct CertSummary {
     pub sha1_accepted: bool,
     /// Why the certificate was revoked, when it has been.
     pub revocation: Option<String>,
+    /// Whether that revocation is hard, invalidating the signatures the key
+    /// made before it as well as after. A key revoked only softly, retired or
+    /// superseded, still has a hard revocation to give if its secret turns
+    /// out to have been exposed, which is what keeps the details pane
+    /// offering one: without it, every signature the key made before it was
+    /// retired, or that a thief dates to then, goes on verifying.
+    pub revocation_hard: bool,
     /// Serial of the smartcard whose key can sign for this certificate, when
     /// the user's gpg-agent reports one. Filled in by the caller.
     pub card_serial: Option<String>,
@@ -322,6 +329,12 @@ impl CertSummary {
             can_encrypt = crate::ops::has_encryption_key(vc);
         }
 
+        // Read once for both fields that report it, the label and whether it
+        // is hard, so that the two cannot describe different revocations.
+        let reason = revoked
+            .then(|| crate::revoke::revocation_reason(cert))
+            .flatten();
+
         let expired = expires.is_some_and(|t| t <= now);
         let validity = if revoked {
             Validity::Revoked
@@ -351,7 +364,8 @@ impl CertSummary {
             implicit_root: false,
             sha1_blocked,
             sha1_accepted: false,
-            revocation: revoked.then(|| describe_revocation(cert)).flatten(),
+            revocation: reason.as_ref().map(describe_revocation),
+            revocation_hard: reason.is_some_and(|(reason, _)| reason.is_hard()),
             card_serial: None,
             agent_backed: false,
         }
@@ -556,13 +570,14 @@ pub(crate) fn resolve_user_id<'a>(cert: &'a Cert, wanted: &str) -> Result<UserID
     Ok(found)
 }
 
-fn describe_revocation(cert: &Cert) -> Option<String> {
-    let (reason, message) = crate::revoke::revocation_reason(cert)?;
-    Some(if message.is_empty() {
+/// A revocation's reason as the details pane shows it: the label, and the
+/// note after it where there is one.
+pub(crate) fn describe_revocation((reason, message): &(crate::revoke::Reason, String)) -> String {
+    if message.is_empty() {
         reason.label().to_string()
     } else {
         format!("{} — {message}", reason.label())
-    })
+    }
 }
 
 /// Render a timestamp as a local-time date, or `""` for "never".

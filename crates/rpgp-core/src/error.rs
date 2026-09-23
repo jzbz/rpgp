@@ -77,6 +77,23 @@ pub enum Error {
     #[error("saved with the secret key, but its public certificate could not be updated: {0}")]
     PublicCertNotUpdated(#[source] Box<Error>),
 
+    /// A revocation was stored in the public certificate, and the secret key
+    /// file then could not be brought in step with it.
+    ///
+    /// The mirror of [`Error::PublicCertNotUpdated`], for the one write that
+    /// goes the other way: a revocation reaches cert-d first, which is what
+    /// the list, exports and Publish read, so by the time the secret key file
+    /// fails to read or to write, the key is revoked for everything that
+    /// leaves the machine. Passed on as it came, that failure read as a
+    /// revocation that had not been made, and an emergency revocation applied
+    /// because the secret key file had become unreadable was reported as
+    /// failed however often it was tried. Every operation that makes something
+    /// new reads both halves through [`crate::Store::full_cert`], so it still
+    /// refuses the key; what goes without the revocation is the secret key
+    /// file itself, and any copy made of it.
+    #[error("revoked, but the secret key file could not be updated to match: {0}")]
+    SecretKeyNotUpdated(#[source] Box<Error>),
+
     /// An import that stopped at a certificate it could not store.
     ///
     /// `stored` is how many it had stored before that one, and those stay

@@ -202,6 +202,12 @@ struct State {
     /// certification rather than revoking the key itself.
     revoke_target: Option<String>,
     revoke_certification: bool,
+    /// Whether that key was revoked already when the dialog opened, which
+    /// leaves a hard revocation the only one that adds anything.
+    revoke_upgrade: bool,
+    /// A revocation certificate that Import read for one of the user's own
+    /// keys: what its dialog lists, and what its Revoke button stores.
+    import_revocations: Option<revoke::RevocationFile>,
 
     /// (fingerprint, warned): the certificate the delete dialog is about, and
     /// whether it warned that a secret key goes with it.
@@ -462,6 +468,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         lookup_results: Vec::new(),
         revoke_target: None,
         revoke_certification: false,
+        revoke_upgrade: false,
+        import_revocations: None,
         delete_target: None,
         lifecycle_fingerprint: None,
     }));
@@ -730,42 +738,75 @@ fn import_chosen_file(ui: &AppWindow, state: &Shared, path: PathBuf) {
     let (ui_weak, state) = (ui.as_weak(), state.clone());
     std::thread::spawn(move || {
         let _busy = BusyGuard(ui_weak.clone());
-        // Cloned out under a brief lock, exactly as the comment on State::store
-        // describes. Importing a GnuPG pubring parses and writes thousands of
-        // certificates, and holding the mutex across all of it blocked every
-        // other worker for the duration. Nothing below touches the State the
-        // lock protects — `all` is rebuilt by the reload in the completion
-        // closure.
-        let store = lock(&state).store.clone();
-        let outcome = import_into(&store, &path);
+        let outcome = run_import(&state, &path);
 
-        // One refresh at the end rather than progressive updates: the list
-        // stays as it was until the import is complete, which is what it did
-        // when this ran inline. A failure refreshes it too, since an import
-        // that stops partway has stored what came before it.
         let _ = slint::invoke_from_event_loop(move || {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            ui.set_busy(false);
-            match outcome {
-                Ok(message) => reload_after(
-                    &ui,
-                    &state,
-                    AfterReload {
-                        status: Some(message),
-                        ..Default::default()
-                    },
-                ),
-                Err(e) => report_and_reload(&ui, &state, format!("Import failed: {e}")),
-            }
+            finish_import(&ui, &state, outcome);
         });
     });
 }
 
+/// The event-loop half of Import: show what [`run_import`] came back with.
+///
+/// Split out of the closure that carries it there, so that a test can reach
+/// the step that turns a revocation certificate for the user's own key into a
+/// question rather than a revoked key.
+fn finish_import(ui: &AppWindow, state: &Shared, outcome: rpgp_core::Result<Imported>) {
+    ui.set_busy(false);
+    // One refresh at the end rather than progressive updates: the list stays
+    // as it was until the import is complete, which is what it did when this
+    // ran inline. A failure refreshes it too, since an import that stops
+    // partway has stored what came before it. A revocation certificate
+    // waiting on the user has stored nothing, so there is nothing to refresh
+    // until they answer.
+    match outcome {
+        Ok(Imported::Done(after)) => reload_after(ui, state, after),
+        Ok(Imported::Confirm(file)) => ask_to_store_revocations(ui, state, file),
+        Err(e) => report_and_reload(ui, state, format!("Import failed: {e}")),
+    }
+}
+
+/// What the blocking half of Import comes back with.
+#[derive(Debug)]
+enum Imported {
+    /// Done, with what the list and the status line should then show.
+    Done(AfterReload),
+    /// A revocation certificate for one of the user's own keys, read and
+    /// checked, of which nothing is stored until they say so.
+    Confirm(revoke::RevocationFile),
+}
+
+/// The worker's half of Import: what it needs from the state, and then
+/// [`import_into`].
+fn run_import(state: &Shared, path: &Path) -> rpgp_core::Result<Imported> {
+    // Cloned out under a brief lock, exactly as the comment on State::store
+    // describes. Importing a GnuPG pubring parses and writes thousands of
+    // certificates, and holding the mutex across all of it blocked every
+    // other worker for the duration. Nothing below touches the State the
+    // lock protects — `all` is rebuilt by the reload in the completion
+    // closure.
+    let (store, held_by_agent) = {
+        let guard = lock(state);
+        (guard.store.clone(), guard.held_by_agent())
+    };
+    import_into(&store, path, &held_by_agent)
+}
+
 /// The blocking half of Import: store what is in the file, and say what
-/// arrived.
-fn import_into(store: &Store, path: &Path) -> rpgp_core::Result<String> {
+/// arrived. A revocation certificate for one of the user's own keys is read
+/// and not stored, and comes back to be put to them.
+///
+/// `held_by_agent` names the certificates whose secret key gpg-agent holds,
+/// as [`State::held_by_agent`] gives them, since the store knows only of the
+/// secret keys it holds itself.
+fn import_into(
+    store: &Store,
+    path: &Path,
+    held_by_agent: &std::collections::HashSet<String>,
+) -> rpgp_core::Result<Imported> {
     // A revocation certificate is a bare signature, not a certificate, so
     // CertParser rejects it. Same button, because a user handed a .rev file
     // expects Import to take it.
@@ -776,7 +817,7 @@ fn import_into(store: &Store, path: &Path) -> rpgp_core::Result<String> {
             // certificate and taking custody of their key, and an imported
             // key is deliberately not a trust root.
             let secrets = certs.iter().filter(|c| c.is_tsk()).count();
-            Ok(if secrets == 0 {
+            let mut message = if secrets == 0 {
                 format!("Imported {} certificate(s)", certs.len())
             } else {
                 format!(
@@ -785,7 +826,18 @@ fn import_into(store: &Store, path: &Path) -> rpgp_core::Result<String> {
                      tick Trust root in its details pane if you meant to trust it.",
                     certs.len()
                 )
-            })
+            };
+            // A designated revoker's revocation arrives with the certificate
+            // it revokes, as GnuPG writes it, and is stored with it but not
+            // applied. Said here, because nothing else would say it: the list
+            // goes on showing the key as valid.
+            if let Some(note) = revoke::designated_revocations_note(&certs) {
+                append_sentence(&mut message, &note);
+            }
+            Ok(Imported::Done(AfterReload {
+                status: Some(message),
+                ..Default::default()
+            }))
         }
         // The file held a certificate, so it is no revocation certificate, and
         // what came before that one is stored. Handed to the fallback below as
@@ -793,14 +845,170 @@ fn import_into(store: &Store, path: &Path) -> rpgp_core::Result<String> {
         // stopped was reported as that certificate revoked, and the reason the
         // import stopped went unsaid.
         Err(stopped @ rpgp_core::Error::ImportStopped { .. }) => Err(stopped),
-        Err(import_error) => match revoke::apply_revocation_file(store, path) {
-            Ok(cert) => Ok(format!(
-                "Revoked {}",
-                rpgp_core::CertSummary::from_cert(&cert).primary_user_id
-            )),
-            Err(_) => Err(import_error),
-        },
+        Err(import_error) => {
+            // A file holding no revocation of a key is neither a keyring nor
+            // a revocation certificate, and the import's error says what it
+            // lacks.
+            let Ok(mut file) = revoke::read_revocation_file(store, path) else {
+                return Err(import_error);
+            };
+            // One that revokes nothing here is told why. That used to be the
+            // import's complaint that the file held no readable certificate,
+            // which is true of every revocation certificate, and was all
+            // anyone heard about a revocation that did not take, a designated
+            // revoker's among them.
+            if file.revocations.is_empty() {
+                return Err(rpgp_core::Error::invalid(format!(
+                    "nothing was revoked: {}",
+                    file.refused.join("; ")
+                )));
+            }
+            // Asked first when the file revokes one of the user's own keys.
+            // The app saves a revocation certificate for every key it
+            // generates, as a plain public key block this button takes, and
+            // one chosen by mistake, beside the key it belongs to in a backup
+            // being restored, used to revoke that key there and then. Nothing
+            // is written until the user says so, and what is then stored is
+            // what was read here. Only a bare revocation certificate reaches
+            // this question: a certificate carrying its own revocation, an
+            // export of a revoked key say, was merged by `import_file` above
+            // like any other.
+            //
+            // A key whose secret gpg-agent holds, in its own store or on a
+            // card, is the user's own as well. GnuPG's --gen-revoke writes a
+            // revocation certificate for one on request, to be put away until
+            // it is needed, as a plain public key block that reads here just
+            // as the app's own does. The agent is not asked again: the survey
+            // that follows every reload has asked it already, and the keys it
+            // found are the ones the sign and certify dialogs offer as the
+            // user's. So until that survey hears from the agent, whenever no
+            // agent answers, and for a key with no signing key still in use,
+            // which the survey does not match, a key the agent holds is taken
+            // for someone else's.
+            for pending in &mut file.revocations {
+                pending.yours |= held_by_agent.contains(&pending.fingerprint);
+            }
+            // Someone else's revocation is applied without asking. It is
+            // theirs to make, it verifies as theirs, and the same signature
+            // reaches the store unasked with their certificate, from a
+            // keyserver refresh or an import of the certificate itself; a
+            // question whose one sensible answer is yes would only teach the
+            // user to wave through the one that matters.
+            if file.revocations.iter().any(|pending| pending.yours) {
+                return Ok(Imported::Confirm(file));
+            }
+            store_revocations(store, &file)
+                .map(Imported::Done)
+                .map_err(|e| rpgp_core::Error::invalid(format!("nothing was revoked: {e}")))
+        }
     }
+}
+
+/// Add `sentence` to a status line as a sentence of its own.
+///
+/// A status line of one sentence carries no full stop, as "Imported 1
+/// certificate(s)" does not, so one is put in before a second sentence
+/// follows; joined by a space alone, the two would read as one.
+fn append_sentence(message: &mut String, sentence: &str) {
+    if !message.ends_with('.') {
+        message.push('.');
+    }
+    message.push(' ');
+    message.push_str(sentence);
+}
+
+/// Store the revocations Import read from a file, and say what became of
+/// them: the list is to select the first certificate revoked. An error means
+/// none was stored, and says why for each.
+fn store_revocations(
+    store: &Store,
+    file: &revoke::RevocationFile,
+) -> rpgp_core::Result<AfterReload> {
+    let outcomes = revoke::apply_revocations(store, &file.revocations);
+    let (mut revoked, mut behind, mut failed) = (Vec::new(), Vec::new(), Vec::new());
+    for (pending, outcome) in file.revocations.iter().zip(outcomes) {
+        match outcome {
+            Ok(_) => revoked.push(pending),
+            // Stored, in the half the list and every export read, so saying
+            // that the revocation failed, as this used to, would be false.
+            Err(rpgp_core::Error::SecretKeyNotUpdated(e)) => {
+                revoked.push(pending);
+                behind.push(format!(
+                    "the secret key file of {} could not be updated to match ({e})",
+                    pending.name
+                ));
+            }
+            Err(e) => failed.push(format!("{}: {e}", pending.name)),
+        }
+    }
+
+    let Some(first) = revoked.first() else {
+        return Err(rpgp_core::Error::invalid(failed.join("; ")));
+    };
+    let mut message = match revoked.as_slice() {
+        [one] => format!("Revoked {}: {}", one.name, one.describe()),
+        many => format!(
+            "Revoked {} certificates: {}",
+            many.len(),
+            many.iter()
+                .map(|pending| pending.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    // Most pressing first, since the status line elides what does not fit.
+    if !behind.is_empty() {
+        message.push_str(&format!(", but {}", behind.join("; ")));
+    }
+    if !failed.is_empty() {
+        message.push_str(&format!(". Not revoked: {}", failed.join("; ")));
+    }
+    if !file.refused.is_empty() {
+        message.push_str(&format!(
+            ". Also in the file, and not applied: {}",
+            file.refused.join("; ")
+        ));
+    }
+    if revoked.iter().any(|pending| pending.yours) {
+        message.push_str(". Publish or send the certificate so others stop using it.");
+    }
+    Ok(AfterReload {
+        select: Some(first.fingerprint.clone()),
+        status: Some(message),
+    })
+}
+
+/// Put a revocation certificate Import read for one of the user's own keys in
+/// front of them, before any of it is stored.
+///
+/// The file is kept as it was read: the dialog lists it, and its Revoke button
+/// stores exactly that, the way Delete acts on what its dialog named. Written
+/// afresh whenever Import reads one, which is the only way to open the dialog,
+/// and dropped once its revocations are stored, so it never answers for an
+/// earlier file.
+fn ask_to_store_revocations(ui: &AppWindow, state: &Shared, file: revoke::RevocationFile) {
+    let rows: Vec<PendingRevocationRow> = file
+        .revocations
+        .iter()
+        .map(|pending| PendingRevocationRow {
+            name: pending.name.clone().into(),
+            reason: pending.describe().into(),
+            hard: pending.reason.is_hard(),
+            yours: pending.yours,
+        })
+        .collect();
+    let yours = rows.iter().filter(|row| row.yours).count();
+    lock(state).import_revocations = Some(file);
+    ui.set_import_revocations(ModelRc::new(VecModel::from(rows)));
+    ui.set_import_revocation_yours(yours as i32);
+    ui.set_import_revocation_open(true);
+    ui.set_status(
+        format!(
+            "Nothing is revoked yet: the file is a revocation certificate for your own {}.",
+            if yours > 1 { "keys" } else { "key" }
+        )
+        .into(),
+    );
 }
 
 // ------------------------------------------------------------- key generation
@@ -3225,6 +3433,52 @@ fn wire_revoke(ui: &AppWindow, state: &Shared) {
         }
     });
 
+    ui.on_import_revocation_run({
+        let (ui_weak, state) = (ui.as_weak(), state.clone());
+        move || {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            if refuse_while_busy(&ui) {
+                return;
+            }
+            // What the dialog listed, as Import read it, and not the file read
+            // again, which may have changed since.
+            let (store, file) = {
+                let guard = lock(&state);
+                (guard.store.clone(), guard.import_revocations.clone())
+            };
+            let Some(file) = file else {
+                ui.set_status("No revocation certificate is waiting to be applied".into());
+                return;
+            };
+            ui.set_busy(true);
+            ui.set_status("Revoking…".into());
+
+            let (ui_weak, state) = (ui_weak.clone(), state.clone());
+            std::thread::spawn(move || {
+                let _busy = BusyGuard(ui_weak.clone());
+                let outcome = store_revocations(&store, &file);
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = ui_weak.upgrade() else {
+                        return;
+                    };
+                    ui.set_busy(false);
+                    match outcome {
+                        Ok(after) => {
+                            lock(&state).import_revocations = None;
+                            ui.set_import_revocation_open(false);
+                            reload_after(&ui, &state, after);
+                        }
+                        // Nothing was stored; the dialog stays open to try
+                        // again or to cancel.
+                        Err(e) => report_and_reload(&ui, &state, format!("Revocation failed: {e}")),
+                    }
+                });
+            });
+        }
+    });
+
     ui.on_save_revocation_cert({
         let (ui_weak, state) = (ui.as_weak(), state.clone());
         move || {
@@ -3280,12 +3534,18 @@ fn open_revoke_dialog(ui: &AppWindow, state: &Shared, certification: bool) {
         return;
     };
 
+    // Recorded with the target and from the same read: a key revoked when the
+    // dialog opened is offered the hard reasons alone, and the run is held to
+    // that.
+    let upgrade = !certification && target.revocation.is_some();
     guard.revoke_target = Some(target.fingerprint.clone());
     guard.revoke_certification = certification;
+    guard.revoke_upgrade = upgrade;
     drop(guard);
 
     ui.set_revoke_target(target.primary_user_id.into());
     ui.set_revoke_is_certification(certification);
+    ui.set_revoke_upgrade(upgrade);
     ui.set_revoke_open(true);
 }
 
@@ -3299,12 +3559,13 @@ fn run_revoke(
 ) -> Result<(String, String), String> {
     // Snapshot what is needed and release the lock: everything below is I/O,
     // and a card PIN prompt can hold it for a minute while the UI waits.
-    let (store, target, is_certification) = {
+    let (store, target, is_certification, upgrade) = {
         let guard = lock(state);
         (
             guard.store.clone(),
             guard.revoke_target.clone(),
             guard.revoke_certification,
+            guard.revoke_upgrade,
         )
     };
     let target = target.ok_or_else(|| "No certificate selected".to_string())?;
@@ -3362,16 +3623,40 @@ fn run_revoke(
         ));
     }
 
+    // A key revoked already is offered the hard reasons alone, since only a
+    // hard revocation adds anything to it. The reason arrives as a bare index
+    // into Reason::ALL, where a dialog that mislaid its offset would send a
+    // retirement, so a soft one is refused here rather than signed.
+    if upgrade && !reason.is_hard() {
+        return Err(
+            "This key is revoked already; only marking it compromised adds anything.".to_string(),
+        );
+    }
+
     let mut request = RevokeRequest::new(&target);
     request.reason = reason;
     request.message = message.to_string();
     request.password = password.map(|p| Zeroizing::new(p.to_owned()));
 
-    revoke::revoke_cert(&store, &request).map_err(|e| format!("Revocation failed: {e}"))?;
-    Ok((
-        target,
-        "Key revoked. Publish or send the certificate so others stop using it.".to_string(),
-    ))
+    let done = if upgrade {
+        "Key marked as compromised"
+    } else {
+        "Key revoked"
+    };
+    let publish = "Publish or send the certificate so others stop using it.";
+    match revoke::revoke_cert(&store, &request) {
+        Ok(_) => Ok((target, format!("{done}. {publish}"))),
+        // Revoked in the half the list, exports and Publish read, which is
+        // what the user acts on next; reported as a failure it read as a key
+        // still unrevoked.
+        Err(rpgp_core::Error::SecretKeyNotUpdated(e)) => Ok((
+            target,
+            format!(
+                "{done}, but its secret key file could not be updated to match ({e}). {publish}"
+            ),
+        )),
+        Err(e) => Err(format!("Revocation failed: {e}")),
+    }
 }
 
 // ------------------------------------------------------------------- plumbing
@@ -3384,7 +3669,7 @@ fn run_revoke(
 /// caller's writes landed last. Off the event loop it comes back a turn later,
 /// so what used to be the caller's next statement has to travel with the
 /// request instead.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct AfterReload {
     /// The row to put the selection back on. `None` keeps whichever row the
     /// user is on, which is not the same as clearing it: a reload no longer
@@ -3815,6 +4100,19 @@ impl State {
     fn shown_at(&self, row: usize) -> Option<&CertSummary> {
         self.all.get(*self.shown.get(row)?)
     }
+
+    /// The certificates whose secret key gpg-agent holds, in its own store or
+    /// on a card, as [`survey_agent_and_secrets`] last found them. A reload
+    /// reads every certificate afresh with none marked, so this is empty
+    /// until the survey that follows it hears from the agent, and stays so
+    /// when no agent answers.
+    fn held_by_agent(&self) -> std::collections::HashSet<String> {
+        self.all
+            .iter()
+            .filter(|c| c.agent_backed)
+            .map(|c| c.fingerprint.clone())
+            .collect()
+    }
 }
 
 /// Which certificates the list shows, in the order it shows them.
@@ -3913,6 +4211,7 @@ pub fn to_row(summary: &CertSummary) -> CertRow {
         sha1_blocked: summary.sha1_blocked,
         sha1_accepted: summary.sha1_accepted,
         revocation: summary.revocation.clone().unwrap_or_default().into(),
+        revocation_hard: summary.revocation_hard,
         card_serial: summary.card_serial.clone().unwrap_or_default().into(),
     }
 }
@@ -4033,6 +4332,7 @@ pub fn run_app() -> ExitCode {
 mod tests {
     use super::*;
     use rpgp_core::Authentication;
+    use std::collections::HashSet;
 
     fn report(fingerprint: &str, good: bool) -> ops::SignatureReport {
         ops::SignatureReport {
@@ -4390,6 +4690,8 @@ mod tests {
             lookup_results: Vec::new(),
             revoke_target: None,
             revoke_certification: false,
+            revoke_upgrade: false,
+            import_revocations: None,
             delete_target: None,
             lifecycle_fingerprint: None,
         }))
@@ -4949,7 +5251,7 @@ mod tests {
         let store = Store::open(&certs, dir.path().join("secrets")).unwrap();
         std::fs::write(certs.join(prefix(&other_fp)), b"").unwrap();
 
-        match import_into(&store, &keyring) {
+        match import_into(&store, &keyring, &HashSet::new()) {
             Err(e @ rpgp_core::Error::ImportStopped { stored: 1, .. }) => assert!(
                 e.to_string().starts_with("1 certificate(s) were stored"),
                 "{e}"
@@ -4963,6 +5265,286 @@ mod tests {
             .map(|c| c.fingerprint)
             .collect();
         assert_eq!(listed, [retired_fp], "what was stored should be listed");
+    }
+
+    /// Whether cert-d's copy of `fingerprint` is revoked.
+    fn revoked(store: &Store, fingerprint: &str) -> bool {
+        store.lookup(fingerprint).is_ok_and(|cert| {
+            CertSummary::from_cert(&cert).validity == rpgp_core::Validity::Revoked
+        })
+    }
+
+    /// A revocation certificate for one of the user's own keys is read and
+    /// put to them, and stored only when they say so. It used to be stored as
+    /// soon as Import was handed it: the one the app saves for every key it
+    /// generates, chosen by mistake while restoring a backup, hard-revoked the
+    /// key in both halves of the store with no question asked. What the
+    /// dialog's button stores is what Import read, the way Delete acts on
+    /// what its dialog named. Import's outcome goes through the step that
+    /// hands it to the event loop, which is what opens the dialog.
+    #[test]
+    fn a_revocation_certificate_for_your_own_key_waits_for_you_to_confirm_it() {
+        use slint::Model;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let mine = generated("Me <me@example.org>");
+        let fingerprint = mine.cert.fingerprint().to_hex();
+        store.insert_secret(&mine.cert).unwrap();
+        store
+            .save_revocation(&fingerprint, &revoke::armor(&mine.revocation).unwrap())
+            .unwrap();
+        let path = store.revocation_path(&fingerprint);
+
+        let outcome = import_into(&store, &path, &HashSet::new());
+        assert!(
+            matches!(outcome, Ok(Imported::Confirm(_))),
+            "the user was not asked first: {outcome:?}"
+        );
+        assert!(
+            !revoked(&store, &fingerprint),
+            "the key was revoked before the user was asked"
+        );
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        finish_import(&ui, &state, outcome);
+        assert!(
+            ui.get_import_revocation_open(),
+            "the import finished without asking"
+        );
+        assert_eq!(ui.get_import_revocation_yours(), 1);
+        let rows = ui.get_import_revocations();
+        assert_eq!(rows.row_count(), 1);
+        let row = rows.row_data(0).unwrap();
+        assert_eq!(row.name, "Me <me@example.org>");
+        assert!(
+            row.yours && row.hard,
+            "the dialog should say it is yours, and hard"
+        );
+
+        // Both halves, since the secret key file is written after cert-d.
+        ui.invoke_import_revocation_run();
+        let store = lock(&state).store.clone();
+        wait_for("the revocation to be stored in both halves", || {
+            revoked(&store, &fingerprint)
+                && store.secret_cert(&fingerprint).is_ok_and(|secret| {
+                    CertSummary::from_cert(&secret).validity == rpgp_core::Validity::Revoked
+                })
+        });
+    }
+
+    /// A revocation certificate for a key whose secret gpg-agent holds, in
+    /// its own store or on a card, is put to the user as one for a key held
+    /// here is. The store knows only of the secret keys it holds itself, and
+    /// GnuPG's --gen-revoke writes one for an agent's key as a plain public
+    /// key block that Import reads like the app's own. Taken for someone
+    /// else's, it would revoke the key with no question asked. No agent is
+    /// reached: the key is marked as the survey marks one the agent reports,
+    /// and Import learns of it from the state the survey leaves.
+    #[test]
+    fn a_revocation_certificate_for_a_key_in_gpg_agent_waits_for_you_to_confirm_it() {
+        use slint::Model;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        // The public half alone, as a key the agent holds is stored here.
+        let mine = generated("Me <me@example.org>");
+        let fingerprint = mine.cert.fingerprint().to_hex();
+        store.insert(&mine.cert).unwrap();
+        let path = dir.path().join("me.rev");
+        std::fs::write(&path, revoke::armor(&mine.revocation).unwrap()).unwrap();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        lock(&state)
+            .all
+            .iter_mut()
+            .find(|c| c.fingerprint == fingerprint)
+            .expect("the key is listed")
+            .agent_backed = true;
+        let store = lock(&state).store.clone();
+        assert!(!store.has_secret(&fingerprint));
+
+        let outcome = run_import(&state, &path);
+        assert!(
+            matches!(outcome, Ok(Imported::Confirm(_))),
+            "the user was not asked first: {outcome:?}"
+        );
+        assert!(
+            !revoked(&store, &fingerprint),
+            "the key was revoked before the user was asked"
+        );
+
+        finish_import(&ui, &state, outcome);
+        assert!(
+            ui.get_import_revocation_open(),
+            "the import finished without asking"
+        );
+        assert_eq!(ui.get_import_revocation_yours(), 1);
+        assert!(
+            ui.get_import_revocations().row_data(0).unwrap().yours,
+            "the dialog should say the key is the user's"
+        );
+
+        // What the dialog's Revoke button stores, and what it then says.
+        let file = lock(&state)
+            .import_revocations
+            .clone()
+            .expect("the dialog holds what Import read");
+        let status = store_revocations(&store, &file)
+            .expect("the revocation is stored")
+            .status
+            .unwrap_or_default();
+        assert!(revoked(&store, &fingerprint));
+        assert!(
+            status.ends_with("Publish or send the certificate so others stop using it."),
+            "the user's own key revoked should be published: {status}"
+        );
+    }
+
+    /// Someone else's revocation certificate is applied without a question,
+    /// and the list goes to the certificate it revoked.
+    #[test]
+    fn someone_elses_revocation_certificate_is_applied_without_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let theirs = generated("Bob <bob@example.org>");
+        let fingerprint = theirs.cert.fingerprint().to_hex();
+        store.insert(&theirs.cert).unwrap();
+        let path = dir.path().join("bob.rev");
+        std::fs::write(&path, revoke::armor(&theirs.revocation).unwrap()).unwrap();
+
+        match import_into(&store, &path, &HashSet::new()) {
+            Ok(Imported::Done(after)) => {
+                assert_eq!(after.select.as_deref(), Some(fingerprint.as_str()));
+                let status = after.status.unwrap_or_default();
+                assert!(
+                    status.starts_with("Revoked Bob <bob@example.org>"),
+                    "{status}"
+                );
+            }
+            other => panic!("expected the revocation applied: {other:?}"),
+        }
+        assert!(revoked(&store, &fingerprint));
+    }
+
+    /// A revocation certificate that revokes nothing here says why. The
+    /// import's own error was all that used to be said, that the file held no
+    /// readable certificate, which is true of every revocation certificate and
+    /// says nothing about this one.
+    #[test]
+    fn a_revocation_certificate_that_revokes_nothing_here_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let stranger = generated("Stranger <stranger@example.org>");
+        let path = dir.path().join("stranger.rev");
+        std::fs::write(&path, revoke::armor(&stranger.revocation).unwrap()).unwrap();
+
+        let refused = import_into(&store, &path, &HashSet::new())
+            .map(|_| ())
+            .expect_err("nothing here is revoked by it")
+            .to_string();
+        assert_eq!(
+            refused,
+            "nothing was revoked: the revocation is for a certificate that is not in this store"
+        );
+    }
+
+    /// What Import adds after its count, the note about a designated
+    /// revoker's revocation, is a sentence of its own, whichever way the count
+    /// ends. The count of certificates alone carries no full stop, and joined
+    /// to the note by a space it would read as one sentence running on into
+    /// the next.
+    #[test]
+    fn a_note_after_the_import_count_is_a_sentence_of_its_own() {
+        let note = "Alice <alice@example.org> carries a revocation naming a key it \
+                    designates to revoke it, which rPGP does not apply.";
+
+        let mut plain = "Imported 1 certificate(s)".to_string();
+        append_sentence(&mut plain, note);
+        assert_eq!(plain, format!("Imported 1 certificate(s). {note}"));
+
+        let mut with_secret = "Imported 1 certificate(s), 1 with a secret key. A secret key \
+                               that arrives in a file is not made a trust root; tick Trust \
+                               root in its details pane if you meant to trust it."
+            .to_string();
+        append_sentence(&mut with_secret, note);
+        assert!(
+            with_secret.ends_with(&format!("if you meant to trust it. {note}")),
+            "a sentence that has its full stop should not get a second: {with_secret}"
+        );
+    }
+
+    /// A key revoked already is offered only the hard reasons, and a soft one
+    /// that reaches the run anyway is refused rather than signed. The dialog
+    /// sends a bare index into Reason::ALL, and one sent from a shorter list
+    /// without its offset is a retirement, the revocation this is meant to go
+    /// past.
+    #[test]
+    fn marking_a_retired_key_compromised_takes_only_a_hard_reason() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let mine = generated("Me <me@example.org>").cert;
+        let fingerprint = mine.fingerprint().to_hex();
+        store.insert_secret(&mine).unwrap();
+        revoke::revoke_cert(&store, &RevokeRequest::new(&fingerprint)).unwrap();
+        let reason = |store: &Store| {
+            revoke::revocation_reason(&store.lookup(&fingerprint).unwrap()).map(|(r, _)| r)
+        };
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        click_row(&ui, &state, &fingerprint);
+        ui.invoke_open_revoke();
+        assert!(ui.get_revoke_open());
+        assert!(
+            ui.get_revoke_upgrade(),
+            "the dialog should open to mark a retired key compromised"
+        );
+
+        let store = lock(&state).store.clone();
+        let refused = run_revoke(&state, 0, "", "").expect_err("a second retirement was signed");
+        assert!(refused.contains("revoked already"), "{refused}");
+        assert_eq!(reason(&store), Some(Reason::Retired));
+
+        let (_, message) = run_revoke(&state, 2, "laptop stolen", "").unwrap();
+        assert!(
+            message.starts_with("Key marked as compromised"),
+            "{message}"
+        );
+        assert_eq!(reason(&store), Some(Reason::Compromised));
+    }
+
+    /// A revocation that cert-d took is reported as made when the secret key
+    /// file could not follow. The run used to say it had failed, over a key
+    /// that the list, exports and Publish all read as revoked.
+    #[test]
+    fn a_revocation_the_secret_key_file_missed_is_still_reported_as_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let mine = generated("Me <me@example.org>").cert;
+        let fingerprint = mine.fingerprint().to_hex();
+        store.insert_secret(&mine).unwrap();
+        // Every write to the secrets directory takes the store's lock, and a
+        // directory where its file goes fails the open.
+        let lock_file = dir.path().join("write.lock");
+        std::fs::remove_file(&lock_file).unwrap();
+        std::fs::create_dir(&lock_file).unwrap();
+
+        let state = state_for(store);
+        lock(&state).revoke_target = Some(fingerprint.clone());
+        let (target, message) =
+            run_revoke(&state, 2, "", "").expect("the key was revoked, so the run should say so");
+        assert_eq!(target, fingerprint);
+        assert!(
+            message.starts_with("Key revoked, but its secret key file could not be updated"),
+            "{message}"
+        );
+        assert!(revoked(&lock(&state).store, &fingerprint));
     }
 
     /// A lifecycle action changes the key its dialog was opened for, not

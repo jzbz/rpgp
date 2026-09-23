@@ -38,8 +38,24 @@ export struct CertRow {
     sha1-accepted: bool,
     // Why the certificate was revoked; empty when it has not been.
     revocation: string,
+    // That revocation is hard, so there is no harder one left to give. A key
+    // revoked only softly can still be marked compromised.
+    revocation-hard: bool,
     // Smartcard serial when gpg-agent signs for this key from a card.
     card-serial: string,
+}
+
+// A revocation read from a file and not yet stored, as the dialog that asks
+// before storing it lists it.
+export struct PendingRevocationRow {
+    name: string,
+    // The reason as the details pane will show it, with its note.
+    reason: string,
+    // Hard: signatures the key made in the past stop counting too.
+    hard: bool,
+    // The user holds this key's secret half, in the store or in gpg-agent,
+    // so it is their own.
+    yours: bool,
 }
 
 // One certification already on a certificate, flattened for display.

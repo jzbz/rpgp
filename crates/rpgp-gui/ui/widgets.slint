@@ -427,6 +427,29 @@ export component TrustRootCheck inherits VerticalLayout {
     }
 }
 
+// Whether the details pane offers to revoke the key it shows, and what that
+// button says. Functions here rather than a condition in app-window.slint so
+// that tests/accessibility.rs can ask them, as it reaches TrustRootCheck: the
+// window is compiled without the debug information the testing backend needs
+// to find an element.
+export global RevokeOffer {
+    // Offered for a key held here until a revocation of it is hard. It used to
+    // go with the first revocation of any kind, and a key retired with the
+    // default, soft, reason could then never be marked compromised: every
+    // signature it made before the retirement, and any a thief dates to
+    // then, goes on verifying until a hard revocation says otherwise.
+    public pure function shown(cert: CertRow) -> bool {
+        return cert.has-secret && !cert.revocation-hard;
+    }
+
+    // Once a key is retired, only a hard revocation is left to give, and
+    // both reasons the dialog then offers, a compromise and no reason given,
+    // have the key treated as compromised.
+    public pure function label(cert: CertRow) -> string {
+        return cert.revocation == "" ? "Revoke this key…" : "Mark as compromised…";
+    }
+}
+
 // A dropdown. std-widgets' ComboBox would be the platform style's, so this is
 // a plain button plus a PopupWindow.
 export component Select inherits Rectangle {

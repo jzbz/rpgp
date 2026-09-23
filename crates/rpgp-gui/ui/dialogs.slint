@@ -1,7 +1,7 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Theme, Icons, Icon } from "theme.slint";
 import { Btn, Check, DialogShell, Divider, Field, FieldRow, Monogram, Pill, SectionLabel, Select, TextArea, Tone, Variant } from "widgets.slint";
-import { CertRow, CertificationRow, LookupRow, RecipientRow, SignatureRow, SubkeyRow, UserIdDetailRow, UserIdRow } from "types.slint";
+import { CertRow, CertificationRow, LookupRow, PendingRevocationRow, RecipientRow, SignatureRow, SubkeyRow, UserIdDetailRow, UserIdRow } from "types.slint";
 
 // A file slot: label, the chosen path (or a hint), and a Choose button.
 component FilePick inherits VerticalLayout {
@@ -842,20 +842,33 @@ export component RevokeDialog inherits DialogShell {
     in property <string> target-name;
     /// Withdrawing a certification rather than revoking a whole key.
     in property <bool> certification;
+    /// The key is already revoked, softly, and this marks it compromised, so
+    /// only the two hard reasons are offered.
+    in property <bool> upgrade;
     in property <bool> busy;
     callback run(int, string, string);
 
     property <string> password;
     property <string> message;
-    property <int> reason: 0;
+    // Where the reasons offered start in Reason::ALL.
+    property <int> first: root.upgrade ? 2 : 0;
+    // An index into Reason::ALL, whichever reasons the list offers, since that
+    // is what run_revoke reads it as.
+    property <int> reason: root.first;
 
-    title: root.certification ? "Withdraw certification" : "Revoke this key";
+    title: root.certification
+        ? "Withdraw certification"
+        : (root.upgrade ? "Mark as compromised" : "Revoke this key");
     subtitle: root.certification
         ? "Withdraw your certification of " + root.target-name
             + ". Their key is unaffected — only your endorsement of it is retracted."
-        : "Revoke " + root.target-name
-            + ". This cannot be undone, and anyone who already has the key keeps the "
-            + "revocation forever. Publish it afterwards so others stop using the key.";
+        : root.upgrade
+            ? "Mark " + root.target-name + " as compromised. It is revoked already, but "
+                + "softly, which leaves every signature it made before then standing. "
+                + "This cannot be undone. Publish it afterwards so others see it too."
+            : "Revoke " + root.target-name
+                + ". This cannot be undone, and anyone who already has the key keeps the "
+                + "revocation forever. Publish it afterwards so others stop using the key.";
     card-width: 500px;
 
     VerticalLayout {
@@ -871,24 +884,36 @@ export component RevokeDialog inherits DialogShell {
             // Mirrors Reason::ALL in rpgp-core, soft reasons first. The default
             // used to be "No reason given", which reads as neutral and is not:
             // OpenPGP treats it as a hard revocation, the same as a compromise.
+            //
+            // Marking a retired key compromised offers the last two alone, and
+            // `first` puts the index back where Reason::ALL has them: read as
+            // it stands, the first entry of the shorter list is a retirement,
+            // the very revocation this is meant to go past.
             Select {
                 label: "Reason for revocation";
-                model: [
-                    "No longer used",
-                    "Replaced by a newer key",
-                    "Secret key may be compromised",
-                    "No reason given (treated as compromised)",
-                ];
+                model: root.upgrade
+                    ? [
+                        "Secret key may be compromised",
+                        "No reason given (treated as compromised)",
+                    ]
+                    : [
+                        "No longer used",
+                        "Replaced by a newer key",
+                        "Secret key may be compromised",
+                        "No reason given (treated as compromised)",
+                    ];
                 enabled: !root.busy;
-                current: root.reason;
-                changed(index) => { root.reason = index; }
+                current: root.reason - root.first;
+                changed(index) => { root.reason = index + root.first; }
             }
             // The two hard reasons are the last two, by construction of
             // Reason::ALL, so this stays right if their labels change.
             if root.reason >= 2: Text {
                 text: "This is a hard revocation: signatures this key made in the past "
-                    + "stop counting too. Choose \"No longer used\" or \"Replaced\" "
-                    + "if the key was never exposed.";
+                    + "stop counting too."
+                    + (root.upgrade
+                        ? ""
+                        : " Choose \"No longer used\" or \"Replaced\" if the key was never exposed.");
                 color: Theme.warn;
                 font-size: Theme.t-sm;
                 wrap: word-wrap;
@@ -922,11 +947,105 @@ export component RevokeDialog inherits DialogShell {
             Btn {
                 text: root.busy
                     ? "Working…"
-                    : (root.certification ? "Withdraw certification" : "Revoke key");
+                    : (root.certification
+                        ? "Withdraw certification"
+                        : (root.upgrade ? "Mark as compromised" : "Revoke key"));
                 glyph: Icons.revoke;
                 variant: Variant.danger;
                 enabled: !root.busy;
                 clicked => { root.run(root.reason, root.message, root.password); }
+            }
+        }
+    }
+}
+
+// Asks before a revocation certificate for one of the user's own keys is
+// stored. The app saves one for every key it generates, in a form the Import
+// button takes, and importing one used to revoke the key there and then: the
+// file chosen by mistake while restoring a backup, beside the key it belongs
+// to, and the key was revoked with no question asked. Every revocation the
+// file holds is listed, someone else's too, since Revoke stores them all and
+// Cancel none.
+export component ImportRevocationDialog inherits DialogShell {
+    in property <[PendingRevocationRow]> revocations;
+    /// How many of them revoke the user's own keys.
+    in property <int> yours: 1;
+    in property <bool> busy;
+    callback run();
+
+    title: root.yours > 1 ? "Revoke your keys" : "Revoke your key";
+    subtitle: "This file revokes " + (root.yours > 1 ? root.yours + " keys" : "a key")
+        + " you hold. Applying it cannot be undone, and once a revoked key is exported or "
+        + "published, anyone who has it keeps the revocation forever. If you are restoring "
+        + "a backup, this is probably a revocation certificate saved beside the key it "
+        + "revokes: Cancel stores nothing.";
+    card-width: 500px;
+
+    VerticalLayout {
+        spacing: Theme.s4;
+
+        // The list scrolls and the buttons do not. A file can revoke any
+        // number of keys, and the card is clamped to the window: listed
+        // straight into it, enough of them would push Cancel and Revoke off
+        // the bottom and out of the item tree, with no way left to answer.
+        // min-height 0 lets the card take height from the list rather than
+        // from the buttons, and preferred-height keeps the dialog its natural
+        // size whenever the list fits, as it does for the usual one key.
+        ScrollView {
+            min-height: 0px;
+            preferred-height: rows.preferred-height;
+            vertical-stretch: 1;
+            viewport-width: self.visible-width;
+            viewport-height: max(self.visible-height, rows.preferred-height);
+
+            rows := VerticalLayout {
+                // Clear of the scrollbar, which the fluent style draws over
+                // the viewport's right edge.
+                padding-right: Theme.s4;
+                spacing: Theme.s4;
+
+                for entry in root.revocations: VerticalLayout {
+                    spacing: 2px;
+                    Text {
+                        text: entry.yours ? entry.name + " (your key)" : entry.name;
+                        color: Theme.text;
+                        font-size: Theme.t-md;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: entry.reason;
+                        color: Theme.text-dim;
+                        font-size: Theme.t-sm;
+                        wrap: word-wrap;
+                    }
+                    if entry.hard: Text {
+                        text: "A hard revocation: signatures this key made in the past stop "
+                            + "counting too.";
+                        color: Theme.warn;
+                        font-size: Theme.t-sm;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+
+        Divider { }
+
+        HorizontalLayout {
+            spacing: Theme.s2;
+            alignment: end;
+            Btn {
+                text: "Cancel";
+                variant: Variant.ghost;
+                enabled: !root.busy;
+                clicked => { root.dismissed(); }
+            }
+            Btn {
+                text: root.busy ? "Revoking…" : "Revoke";
+                glyph: Icons.revoke;
+                variant: Variant.danger;
+                enabled: !root.busy;
+                clicked => { root.run(); }
             }
         }
     }

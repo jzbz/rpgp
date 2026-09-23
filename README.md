@@ -289,12 +289,29 @@ retracted, and the UI keeps them apart:
   note. Choosing *secret key may be compromised* makes it a **hard** revocation,
   which also invalidates signatures the key made in the past — including every
   certification it ever issued, so anyone it had authenticated drops back to
-  unverified.
+  unverified. A key retired with a soft reason keeps the button, as *Mark as
+  compromised…*, until it carries a hard revocation: the soft one leaves
+  standing every signature the key made before it, and any a thief dates to
+  then, and only a hard one takes those back.
 - **A certification you made**, without touching the other person's key. Only
   your endorsement is withdrawn.
 - **Someone else's key**, by importing the revocation certificate they
   published. The Import button takes it: a revocation is a bare signature rather
-  than a certificate, so it falls through `CertParser` to `apply_revocation_file`.
+  than a certificate, so it falls through `CertParser` to `read_revocation_file`,
+  which checks each revocation in the file against the certificate it names
+  before anything is stored. Every one that verifies is applied, however many
+  the file holds and in however many armor blocks; the status line names what
+  was revoked, and says why about any that revoked nothing here. A revocation
+  made by a *designated revoker* — a key another certificate names as allowed
+  to revoke it — is not applied, and Import says so, whether it comes alone or
+  attached to the certificate as GnuPG's `--desig-revoke` writes it. One that
+  comes alone is refused with the name of the certificate here that it revokes,
+  found by verifying the signature when the revoker's certificate is here too,
+  and otherwise by the two bytes of its hash that a signature carries in the
+  clear, the test Sequoia itself makes before keeping such a revocation with a
+  certificate. RFC 9580 deprecates the mechanism, and honouring one would take
+  every check of whether a key is revoked, Sequoia's own key filters among
+  them, consulting a second certificate.
 
 A revoked certificate is then refused for anything **new**: encrypting to it,
 signing with it, certifying it or vouching with it, changing its expiry, adding
@@ -337,6 +354,36 @@ disk say, the key is kept all the same and the status line says it has no
 revocation certificate; the details pane then offers none to export, and the
 key can still be revoked from there for as long as you hold it and its
 passphrase.
+
+Import is how it is applied, and Import is also where it goes by mistake: it is
+a plain public key block that sits beside the key in a backup being restored.
+So when Import is handed a bare revocation certificate, the form rPGP and GnuPG
+write, it asks before storing a revocation of any key whose secret you hold,
+naming the key and saying whether the revocation is hard, and stores nothing if
+you cancel. Someone else's revocation is applied without asking: it is theirs
+to make, and would arrive unasked with their certificate from a keyserver
+refresh. A key is yours when this store holds its secret, or when `gpg-agent`
+does, in its own store or on a card: `gpg --gen-revoke` writes a revocation
+certificate for such a key that reads just like rPGP's own. The agent's keys
+are known from the survey that follows each reload of the list, so until the
+agent has answered, when none answers, and for a key with no signing key still
+in use, a revocation of one of them is taken for someone else's.
+
+Only a bare revocation certificate is asked about. A certificate that arrives
+with its revocation already attached is merged like any other import, and
+revokes the key without a question even when it is yours: an export of a
+revoked key, a revocation certificate some tools write that way, and a backup
+made by appending a revocation certificate to the key it revokes, as
+`cat key.asc key.rev` does, since the second block's signature is read onto the
+key in the first. The copy GnuPG saves by itself, in `openpgp-revocs.d`, has a
+colon put before its armor, which has to be removed before Import will read it.
+
+If the secret key file itself no longer reads, which is when a revocation
+certificate is most likely to be needed, the revocation is still stored in the
+public certificate, the copy the list, exports and Publish use, and the status
+line says the secret key file could not be updated to match. The same holds
+when the Revoke button's revocation reaches the public certificate and the
+secret key file then cannot be written.
 
 One timing rule runs through all of this. OpenPGP gives the newest signature of
 a kind the last word — a key's expiry is read off its newest self-signature, a

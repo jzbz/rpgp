@@ -2,8 +2,11 @@
 // dialogs, so a Rust test can operate them and inspect what the accessibility
 // tree publishes. Not part of the application.
 import { Field, Btn, Check, Select, FieldRow, TextArea, TrustRootCheck } from "../widgets.slint";
+// The rule the details pane draws its Revoke button by, for a test to ask.
+export { RevokeOffer } from "../widgets.slint";
 import { SignEncryptDialog, CertifyDialog, NotepadDialog, DeleteDialog } from "../dialogs.slint";
 import { KeygenDialog, DecryptVerifyDialog, RevokeDialog, LifecycleDialog } from "../dialogs.slint";
+import { ImportRevocationDialog } from "../dialogs.slint";
 import { CertRow, RecipientRow, UserIdRow, SignatureRow } from "../types.slint";
 
 // One passphrase Field and one ordinary Field.
@@ -208,6 +211,55 @@ export component RevokeProbe inherits Window {
     width: 620px;
     height: 720px;
     RevokeDialog { width: 100%; height: 100%; target-name: "Alice"; }
+}
+
+// The Revoke dialog as it opens for a key retired earlier, to mark it
+// compromised, reporting the reason it hands back: an index into Reason::ALL,
+// which is what run_revoke reads it as.
+export component RevokeUpgradeProbe inherits Window {
+    in-out property <int> runs: 0;
+    in-out property <int> reason: -1;
+
+    width: 620px;
+    height: 720px;
+
+    RevokeDialog {
+        width: 100%;
+        height: 100%;
+        target-name: "Alice";
+        upgrade: true;
+        run(reason, message, password) => {
+            root.reason = reason;
+            root.runs += 1;
+        }
+    }
+}
+
+// The dialog that asks before a revocation certificate for the user's own
+// keys is stored, holding more revocations than fit in the window at the
+// smallest size the app allows.
+export component ImportRevocationProbe inherits Window {
+    in-out property <int> runs: 0;
+
+    width: 860px;
+    height: 520px;
+
+    ImportRevocationDialog {
+        width: 100%;
+        height: 100%;
+        yours: 2;
+        revocations: [
+            { name: "Me <me@example.org>", reason: "Secret key may be compromised", hard: true, yours: true },
+            { name: "Me <me@work.example.org>", reason: "Secret key may be compromised", hard: true, yours: true },
+            { name: "Ann <ann@example.org>", reason: "No longer used", hard: false, yours: false },
+            { name: "Ben <ben@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
+            { name: "Cai <cai@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
+            { name: "Dee <dee@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
+            { name: "Eve <eve@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
+            { name: "Fay <fay@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
+        ];
+        run => { root.runs += 1; }
+    }
 }
 
 export component LifecycleProbe inherits Window {

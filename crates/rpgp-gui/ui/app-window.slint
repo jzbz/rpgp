@@ -1,11 +1,11 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Theme, Icons, Icon } from "theme.slint";
 import {
-    Btn, Check, Divider, Field, FieldRow, Monogram, Pill, SectionLabel, Select, Tone,
-    TrustRootCheck, Variant,
+    Btn, Check, Divider, Field, FieldRow, Monogram, Pill, RevokeOffer, SectionLabel, Select,
+    Tone, TrustRootCheck, Variant,
 } from "widgets.slint";
-import { CertRow, CertificationRow, LookupRow, RecipientRow, SignatureRow, SubkeyRow, UserIdDetailRow, UserIdRow } from "types.slint";
-import { AboutDialog, CertifyDialog, DecryptVerifyDialog, DetailsDialog, KeygenDialog, LifecycleDialog, LookupDialog, NotepadDialog, DeleteDialog, RevokeDialog, SignEncryptDialog } from "dialogs.slint";
+import { CertRow, CertificationRow, LookupRow, PendingRevocationRow, RecipientRow, SignatureRow, SubkeyRow, UserIdDetailRow, UserIdRow } from "types.slint";
+import { AboutDialog, CertifyDialog, DecryptVerifyDialog, DetailsDialog, ImportRevocationDialog, KeygenDialog, LifecycleDialog, LookupDialog, NotepadDialog, DeleteDialog, RevokeDialog, SignEncryptDialog } from "dialogs.slint";
 
 // A bare file import is how Slint registers a custom font; the family it
 // declares ("Geo") is then usable as a font-family anywhere. Slint accepts
@@ -341,7 +341,15 @@ export component AppWindow inherits Window {
     in-out property <bool> revoke-open: false;
     /// The open dialog withdraws a certification rather than revoking a key.
     in property <bool> revoke-is-certification: false;
+    /// The open dialog marks a key retired earlier as compromised.
+    in property <bool> revoke-upgrade: false;
     in property <string> revoke-target: "";
+    /// A revocation certificate that Import read, for one of the user's own
+    /// keys, waiting for them to say whether to store it.
+    in-out property <bool> import-revocation-open: false;
+    in property <[PendingRevocationRow]> import-revocations;
+    /// How many of those revoke the user's own keys.
+    in property <int> import-revocation-yours: 0;
     /// A revocation certificate for the selected key is on disk.
     in property <bool> has-revocation-cert: false;
     /// We have certified this certificate and could withdraw that.
@@ -401,6 +409,7 @@ export component AppWindow inherits Window {
     callback delete-run();
     callback open-withdraw();
     callback revoke-run(int, string, string);
+    callback import-revocation-run();
     callback save-revocation-cert();
 
     VerticalLayout {
@@ -1018,8 +1027,8 @@ export component AppWindow inherits Window {
                                 clicked => { root.save-revocation-cert(); }
                             }
 
-                            if root.detail.has-secret && root.detail.revocation == "": Btn {
-                                text: "Revoke this key…";
+                            if RevokeOffer.shown(root.detail): Btn {
+                                text: RevokeOffer.label(root.detail);
                                 glyph: Icons.revoke;
                                 variant: Variant.danger;
                                 wide: true;
@@ -1219,8 +1228,17 @@ export component AppWindow inherits Window {
         busy: root.busy;
         target-name: root.revoke-target;
         certification: root.revoke-is-certification;
+        upgrade: root.revoke-upgrade;
         dismissed => { root.revoke-open = false; }
         run(reason, message, password) => { root.revoke-run(reason, message, password); }
+    }
+
+    if root.import-revocation-open: ImportRevocationDialog {
+        busy: root.busy;
+        revocations: root.import-revocations;
+        yours: root.import-revocation-yours;
+        dismissed => { root.import-revocation-open = false; }
+        run => { root.import-revocation-run(); }
     }
 
     if root.verify-open: DecryptVerifyDialog {

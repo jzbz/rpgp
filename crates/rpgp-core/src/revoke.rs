@@ -12,17 +12,17 @@ use std::time::SystemTime;
 use sequoia_openpgp::cert::CertRevocationBuilder;
 use sequoia_openpgp::packet::Signature;
 use sequoia_openpgp::packet::signature::SignatureBuilder;
-use sequoia_openpgp::parse::Parse;
+use sequoia_openpgp::parse::{PacketParser, PacketParserResult, Parse};
 use sequoia_openpgp::serialize::Serialize;
 use sequoia_openpgp::types::{
     ReasonForRevocation, RevocationStatus, RevocationType, SignatureType,
 };
-use sequoia_openpgp::{Cert, Packet, PacketPile};
+use sequoia_openpgp::{Cert, Fingerprint, KeyHandle, Packet};
 
 use crate::certify::Standing;
 use crate::error::{Error, Result};
 use crate::policy;
-use crate::store::Store;
+use crate::store::{CertRef, Store};
 use zeroize::Zeroizing;
 
 /// Why something is being revoked.
@@ -111,11 +111,23 @@ impl Reason {
         }
     }
 
+    /// The reason a key revocation's code reads as, hard exactly when sequoia
+    /// holds the code hard.
+    ///
+    /// A code with no reason of its own here takes one that sequoia treats
+    /// alike, since whether the reason read back is hard decides whether the
+    /// details pane still offers a compromise to declare. The code meant for a
+    /// user ID that is no longer valid is soft to sequoia on a key as well,
+    /// and is read as a retirement. Read as Unspecified, it would be called
+    /// hard, "treated as compromised", while every signature the key made
+    /// before it went on verifying, and the details pane would offer nothing
+    /// to take them back. Private and unknown codes are hard to sequoia, as
+    /// Unspecified is.
     fn from_openpgp(reason: ReasonForRevocation) -> Self {
         match reason {
             ReasonForRevocation::KeySuperseded => Reason::Superseded,
             ReasonForRevocation::KeyCompromised => Reason::Compromised,
-            ReasonForRevocation::KeyRetired => Reason::Retired,
+            ReasonForRevocation::KeyRetired | ReasonForRevocation::UIDRetired => Reason::Retired,
             _ => Reason::Unspecified,
         }
     }
@@ -142,6 +154,15 @@ impl RevokeRequest {
 }
 
 /// Revoke one of our own certificates, and store the result.
+///
+/// An already revoked certificate can be revoked again, which is how a key
+/// retired with a soft reason is later marked compromised: the hard
+/// revocation invalidates the signatures the soft one left standing, and
+/// [`revocation_reason`] reports it ahead of the soft one.
+///
+/// [`Error::SecretKeyNotUpdated`] means the certificate is revoked, in the
+/// public half every export reads, and the secret key file could not be
+/// brought in step.
 pub fn revoke_cert(store: &Store, request: &RevokeRequest) -> Result<Cert> {
     let cert = store.secret_cert(&request.fingerprint)?;
 
@@ -185,7 +206,7 @@ pub fn revoke_cert(store: &Store, request: &RevokeRequest) -> Result<Cert> {
         .set_reason_for_revocation(request.reason.to_openpgp(), request.message.as_bytes())?
         .build(&mut signer, &cert, None)?;
 
-    apply(store, cert, signature)
+    apply(store, cert, vec![signature])
 }
 
 /// Retract certifications we previously made over `target`'s user IDs.
@@ -342,25 +363,154 @@ pub fn armor(signature: &Signature) -> Result<Vec<u8>> {
     Ok(writer.finalize()?)
 }
 
-/// Read a revocation certificate from disk and apply it to the certificate it
-/// names.
+/// A revocation of a whole certificate, read from a file and checked against
+/// the certificate it revokes, and not yet stored.
 ///
-/// This is the emergency path: it needs no secret key and no passphrase,
-/// because the signature was made when the revocation certificate was created.
-pub fn apply_revocation_file(store: &Store, path: &Path) -> Result<Cert> {
-    // Read whole, so the size has to be settled before reading rather than
-    // after: `PacketPile` holds every packet in the file at once, and this path
-    // takes a file somebody else made. The network fetch has had a cap for the
-    // same reason since it was written; a file simply arrives by a different
-    // road.
+/// Reading a revocation certificate and storing what it revokes are two
+/// steps, [`read_revocation_file`] and [`apply_revocations`], so that what a
+/// file would do can be put to the user before anything is written. The app
+/// saves a revocation certificate for every key it generates, as a plain
+/// public key block that the Import button takes, and storing it used to
+/// follow straight from choosing it: one wrong file picked while restoring a
+/// backup hard-revoked the user's own key, with no question asked. See
+/// [`PendingRevocation::yours`].
+#[derive(Debug, Clone)]
+pub struct PendingRevocation {
+    /// The certificate it revokes.
+    pub fingerprint: String,
+    /// The certificate's name: its primary user ID, or its fingerprint where
+    /// it carries none.
+    pub name: String,
+    /// The reason the file gives, chosen from its revocations of this
+    /// certificate by the rule [`revocation_reason`] reads a certificate by:
+    /// the newest hard one, else the newest.
+    pub reason: Reason,
+    /// The note stored with that revocation, which may be empty.
+    pub message: String,
+    /// Whether the certificate is one of the user's own keys, which makes
+    /// the file one to ask about first. [`read_revocation_file`] sets it where
+    /// this store holds the secret key. Only the caller can know of one held
+    /// elsewhere, by gpg-agent in its own store or on a card, and sets it for
+    /// that too.
+    pub yours: bool,
+    /// Every revocation of it in the file, each already checked against it.
+    signatures: Vec<Signature>,
+}
+
+impl PendingRevocation {
+    /// This revocation's own reason and note, worded as the details pane words
+    /// a revocation. Once it is stored the pane may still name another, where
+    /// the key already carries one.
+    pub fn describe(&self) -> String {
+        crate::cert::describe_revocation(&(self.reason, self.message.clone()))
+    }
+}
+
+/// What a revocation certificate holds, read and checked but not stored.
+#[derive(Debug, Clone)]
+pub struct RevocationFile {
+    /// One entry per certificate in this store that the file revokes, in the
+    /// order the file first revokes them.
+    pub revocations: Vec<PendingRevocation>,
+    /// Why each revocation in the file that revokes nothing here was set
+    /// aside, one sentence each.
+    pub refused: Vec<String>,
+}
+
+/// Read a revocation certificate and work out what it would revoke in this
+/// store, without storing anything.
+///
+/// This is the emergency path: storing what it finds, with
+/// [`apply_revocations`], needs no secret key and no passphrase, because each
+/// signature was made when the revocation certificate was.
+///
+/// Every revocation of a whole key in the file is read, and each one that
+/// verifies against a certificate here is kept. This used to stop at the
+/// first that applied, so a file revoking two of a contact's keys revoked one
+/// of them, and one holding a retirement and then a compromise of the same key
+/// stored the retirement alone, which leaves standing every signature the key
+/// made before it. A revocation authenticates itself, so taking every one lets
+/// nobody revoke anything a file holding that one alone would not.
+///
+/// An error means the file is no revocation certificate at all. One holding
+/// revocations of nothing here comes back with each of them in
+/// [`RevocationFile::refused`], so that the caller can say why.
+pub fn read_revocation_file(store: &Store, path: &Path) -> Result<RevocationFile> {
+    let signatures = revocation_signatures(path)?;
+
+    let mut targets: Vec<(Cert, Vec<Signature>)> = Vec::new();
+    let mut refused = Vec::new();
+    let mut designations = None;
+    for signature in signatures {
+        match target_of(store, &signature) {
+            Ok(cert) => match targets
+                .iter_mut()
+                .find(|(target, _)| target.fingerprint() == cert.fingerprint())
+            {
+                Some((_, theirs)) if theirs.contains(&signature) => {}
+                Some((_, theirs)) => theirs.push(signature),
+                None => targets.push((cert, vec![signature])),
+            },
+            Err(e) => refused.push(
+                designated_revoker(store, &signature, &mut designations)
+                    .unwrap_or_else(|| e.to_string()),
+            ),
+        }
+    }
+
+    let revocations = targets
+        .into_iter()
+        .map(|(cert, signatures)| {
+            let fingerprint = cert.fingerprint().to_hex();
+            let (reason, message) =
+                described(&cert, &signatures).unwrap_or((Reason::Unspecified, String::new()));
+            PendingRevocation {
+                name: name_of(&cert),
+                yours: store.has_secret(&fingerprint),
+                fingerprint,
+                reason,
+                message,
+                signatures,
+            }
+        })
+        .collect();
+    Ok(RevocationFile {
+        revocations,
+        refused,
+    })
+}
+
+/// Store the revocations [`read_revocation_file`] found, returning one result
+/// for each, in the order given.
+///
+/// Each certificate is read again and each revocation checked again against
+/// it, so what is stored is the certificate as it is now, with the
+/// revocations that still count on it, rather than the copy the file was read
+/// against. An [`Error::SecretKeyNotUpdated`] means that certificate is
+/// revoked all the same; any other error means nothing was stored for it.
+pub fn apply_revocations(store: &Store, revocations: &[PendingRevocation]) -> Vec<Result<Cert>> {
+    revocations
+        .iter()
+        .map(|pending| {
+            let cert = store.lookup(&pending.fingerprint)?;
+            apply(store, cert, pending.signatures.clone())
+        })
+        .collect()
+}
+
+/// Every revocation of a whole key in the file at `path`.
+fn revocation_signatures(path: &Path) -> Result<Vec<Signature>> {
+    // Settled before reading rather than after: every signature in the file is
+    // held at once, and this path takes a file somebody else made. The network
+    // fetch has had a cap for the same reason since it was written; a file
+    // simply arrives by a different road.
     //
     // The number is generous by three orders of magnitude, which is what makes
     // it safe to apply here. A revocation certificate is one signature — GnuPG
-    // writes about seven hundred bytes — and even a certificate carrying a
-    // designated revoker adds only a handful more. Nor is this the door a large
-    // keyring comes through: `import_file` streams and handles those, and this
-    // function is only reached when it has already failed to find a single
-    // certificate in the file.
+    // writes about seven hundred bytes. Nor is this the door a large keyring
+    // comes through: `import_file` streams and handles those, and this is only
+    // reached when that has already failed to find a single certificate in the
+    // file.
     const MAX_REVOCATION: u64 = 1024 * 1024;
     if let Ok(metadata) = std::fs::metadata(path)
         && metadata.len() > MAX_REVOCATION
@@ -371,16 +521,43 @@ pub fn apply_revocation_file(store: &Store, path: &Path) -> Result<Cert> {
         )));
     }
 
-    let pile = PacketPile::from_file(path)
-        .map_err(|_| Error::invalid(format!("{} is not an OpenPGP file", path.display())))?;
-
-    let signatures: Vec<Signature> = pile
-        .into_children()
-        .filter_map(|packet| match packet {
-            Packet::Signature(signature) => Some(signature),
-            _ => None,
-        })
-        .collect();
+    // Armor block after armor block, as `CertParser` reads a keyring.
+    // `PacketPile`, which this used, stops at the end of the first block, so
+    // `cat a.rev b.rev`, the obvious way to hand someone two revocation
+    // certificates, lost the second before anything looked at it. A packet
+    // the first block cannot yield makes the file no OpenPGP file, as it did;
+    // past that block, whatever will not parse is taken for the end, the way
+    // the armor reader passes over text after a block's footer.
+    let not_openpgp = || Error::invalid(format!("{} is not an OpenPGP file", path.display()));
+    let mut signatures = Vec::new();
+    let mut first_block = true;
+    let mut parsed = PacketParser::from_file(path).map_err(|_| not_openpgp())?;
+    loop {
+        match parsed {
+            PacketParserResult::Some(parser) => match parser.next() {
+                Ok((packet, next)) => {
+                    // Only a revocation of a whole key can revoke a
+                    // certificate; a file of other signatures, a detached
+                    // signature say, is not a revocation certificate at all.
+                    if let Packet::Signature(signature) = packet
+                        && signature.typ() == SignatureType::KeyRevocation
+                    {
+                        signatures.push(signature);
+                    }
+                    parsed = next;
+                }
+                Err(_) if first_block => return Err(not_openpgp()),
+                Err(_) => break,
+            },
+            PacketParserResult::EOF(eof) => {
+                first_block = false;
+                match PacketParser::from_buffered_reader(eof.into_reader()) {
+                    Ok(next @ PacketParserResult::Some(_)) => parsed = next,
+                    _ => break,
+                }
+            }
+        }
+    }
 
     if signatures.is_empty() {
         return Err(Error::invalid(format!(
@@ -388,70 +565,307 @@ pub fn apply_revocation_file(store: &Store, path: &Path) -> Result<Cert> {
             path.display()
         )));
     }
+    Ok(signatures)
+}
 
-    // A revocation names its target through the issuer subpackets.
-    // Every issuer of every signature, not the first one that resolves. A
-    // revocation names its target through the issuer subpackets, and a
-    // designated-revoker certificate names the revoker as well — so the first
-    // resolvable handle is often the wrong certificate to apply it to, and
-    // returning on it meant the emergency path failed for exactly the
-    // certificates it exists to retract. `apply` re-checks cryptographically,
-    // so trying several costs nothing but a few merges that come to nothing.
+/// The certificate in this store that `signature` revokes.
+///
+/// A key revokes only itself, and a revocation names the key that made it in
+/// its issuer subpackets. Every name is tried, not only the first that
+/// resolves, since a key ID can resolve to another certificate that shares it
+/// or carries the key as a subkey; whether the revocation takes is what
+/// decides.
+fn target_of(store: &Store, signature: &Signature) -> Result<Cert> {
     let mut last = None;
-    for signature in &signatures {
-        for handle in signature.get_issuers() {
-            let Ok(cert) = store.lookup(&handle.to_string()) else {
-                continue;
-            };
-            match apply(store, cert, signature.clone()) {
-                Ok(revoked) => return Ok(revoked),
-                Err(e) => last = Some(e),
-            }
+    for handle in signature.get_issuers() {
+        let Ok(cert) = store.lookup(&handle.to_string()) else {
+            continue;
+        };
+        if revokes(&cert, signature) {
+            return Ok(cert);
+        }
+        last = Some(Error::invalid(format!(
+            "that signature does not revoke {}",
+            cert.fingerprint().to_hex()
+        )));
+    }
+    Err(last.unwrap_or_else(|| {
+        Error::invalid("the revocation is for a certificate that is not in this store")
+    }))
+}
+
+/// Whether `signature`, merged into `cert`, is among the revocations sequoia
+/// counts on it; see [`apply`] for why the question is about this signature.
+fn revokes(cert: &Cert, signature: &Signature) -> bool {
+    cert.clone()
+        .insert_packets(signature.clone())
+        .is_ok_and(|(merged, _)| counted(&merged, signature))
+}
+
+/// Whether `cert`, which carries `signature`, counts it as revoking it.
+fn counted(cert: &Cert, signature: &Signature) -> bool {
+    match cert.revocation_status(&policy(), None) {
+        RevocationStatus::Revoked(verified) => verified.contains(&signature),
+        _ => false,
+    }
+}
+
+/// The reason `signatures`, revocations of `cert`, give it, by the rule
+/// [`revocation_reason`] reads a certificate by.
+///
+/// Read off `cert` with them merged in, in the order sequoia keeps them
+/// there, which is the order the banner reads once they are stored. Sorted by
+/// time alone, two made in the same second would keep the file's order, where
+/// sequoia breaks the tie by the signatures' values, and the dialog could name
+/// one reason and the banner, a moment later, another.
+fn described(cert: &Cert, signatures: &[Signature]) -> Option<(Reason, String)> {
+    let merged = cert.clone().insert_packets(signatures.to_vec()).ok()?.0;
+    let RevocationStatus::Revoked(verified) = merged.revocation_status(&policy(), None) else {
+        return None;
+    };
+    reported(
+        verified
+            .into_iter()
+            .filter(|signature| signatures.contains(signature)),
+    )
+}
+
+/// Why `signature` revokes nothing here, where it is a revocation of a
+/// certificate in this store, made by a key that certificate designates to
+/// revoke it.
+///
+/// A designated revoker's revocation of another key names only the revoker,
+/// so it resolves to the revoker's own certificate, which it does not revoke,
+/// and the refusal used to say only that, as if the file were for some other
+/// key. Nor could it ever be applied where it belongs. Sequoia files a
+/// revocation of a key made by any other key among the ones it does not
+/// verify, and reports a certificate carrying one as one that could be
+/// revoked, never as revoked; [`refuse_if_revoked`] says why that is not taken
+/// as a revocation. Honouring one would take the revoker's certificate, the
+/// designation on the target's own self-signature, a check of the revoker's
+/// key as it stood when it signed, and then the same answer from every place
+/// that asks whether a key is revoked, the list, the pickers and sequoia's
+/// own key filters among them. RFC 9580 deprecates the designation, so this
+/// says instead that such a revocation is not applied.
+///
+/// The certificate it names is one the signature is over, by [`over`], and
+/// not merely one that designates its maker. One revoker designated on many
+/// keys, an organisation's, is how the mechanism is meant to be used, so a
+/// certificate found to designate the maker need not be the one the
+/// revocation is for, and the revoker's revocation of its own key, which
+/// names the same maker, is for none of them. Where more than one passes,
+/// which only a coincidence in the two bytes compared when the revoker's key
+/// is not here allows, each is named; where none does, the caller's plain
+/// refusal stands.
+///
+/// The store is read for designations once per file, and only once one of its
+/// revocations has been refused.
+fn designated_revoker(
+    store: &Store,
+    signature: &Signature,
+    designations: &mut Option<Vec<(Fingerprint, CertRef)>>,
+) -> Option<String> {
+    let designations = designations.get_or_insert_with(|| {
+        let policy = policy();
+        let Ok(certs) = store.certs() else {
+            return Vec::new();
+        };
+        certs
+            .iter()
+            .flat_map(|cert| {
+                cert.revocation_keys(&policy)
+                    .map(|key| (key.revoker().1.clone(), cert.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    });
+
+    let issuers = signature.get_issuers();
+    let mut targets: Vec<(&Fingerprint, &CertRef)> = Vec::new();
+    for (revoker, target) in designations.iter() {
+        let named = issuers
+            .iter()
+            .any(|issuer| KeyHandle::from(revoker).aliases(issuer));
+        if named
+            && !targets
+                .iter()
+                .any(|(_, seen)| seen.fingerprint() == target.fingerprint())
+            && over(store, signature, revoker, target)
+        {
+            targets.push((revoker, target));
         }
     }
-    if let Some(e) = last {
-        return Err(e);
-    }
 
-    Err(Error::invalid(
-        "the revocation is for a certificate that is not in this store",
+    let (revoker, _) = targets.first()?;
+    let revoker = store
+        .lookup(&revoker.to_hex())
+        .map_or_else(|_| revoker.to_hex(), |cert| name_of(&cert));
+    let names: Vec<String> = targets.iter().map(|(_, target)| name_of(target)).collect();
+    let (named, verb, whose) = match names.as_slice() {
+        [target] => (target.clone(), "was", target.clone()),
+        several => (several.join(" and "), "were", "each of them".to_string()),
+    };
+    Some(format!(
+        "{named} {verb} not revoked: the revocation names {revoker} as its maker, a key \
+         {whose} designates to revoke it, and rPGP does not apply revocations by \
+         designated revokers"
     ))
 }
 
-/// Merge `signature` into `cert`, confirm it really did revoke it, and store.
-fn apply(store: &Store, cert: Cert, signature: Signature) -> Result<Cert> {
+/// Whether `signature` is a revocation of `target`'s primary key made by
+/// `revoker`, as far as this store can tell.
+///
+/// Where the store holds the revoker's key, the signature is verified. Where
+/// it does not, the two bytes of its hash a signature carries in the clear are
+/// compared with the hash over `target`'s key, which is the test sequoia makes
+/// before it keeps a revocation by another key with a certificate: a
+/// signature over some other key passes it once in 65,536 times.
+fn over(store: &Store, signature: &Signature, revoker: &Fingerprint, target: &Cert) -> bool {
+    let primary = target.primary_key().key();
+    let mut held = false;
+    for cert in store.lookup_all(&revoker.to_hex()).unwrap_or_default() {
+        for key in cert.keys().key_handle(revoker.clone()) {
+            held = true;
+            if signature
+                .verify_primary_key_revocation(key.key(), primary)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+    !held
+        && signature
+            .hash_algo()
+            .context()
+            .and_then(|hash| {
+                let mut hash = hash.for_signature(signature.version());
+                signature.hash_direct_key(&mut hash, primary)?;
+                hash.into_digest()
+            })
+            .is_ok_and(|digest| digest.starts_with(signature.digest_prefix()))
+}
+
+/// What Import should add to its status line about `imported`, when any of
+/// them carries a revocation naming as its maker a key it designates to revoke
+/// it.
+///
+/// A revocation GnuPG's `--desig-revoke` writes arrives with the certificate
+/// it revokes, so Import takes the file as a certificate like any other and
+/// stores the revocation with it, where it is not applied. It went unmentioned
+/// while the key went on showing as valid under a status line that said only
+/// that it had been imported. The signature is not verified here: sequoia
+/// keeps a revocation by another key with a certificate once the two bytes of
+/// its hash carried in the clear match, the test [`over`] falls back on, and
+/// this goes by that and by the maker the packet names.
+pub fn designated_revocations_note(imported: &[Cert]) -> Option<String> {
+    let carrying: Vec<String> = imported
+        .iter()
+        .filter(|cert| carries_designated_revocation(cert))
+        .map(name_of)
+        .collect();
+    if carrying.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} {} a revocation naming a key it designates to revoke it, which rPGP does not \
+         apply.",
+        carrying.join(", "),
+        if carrying.len() == 1 {
+            "carries"
+        } else {
+            "carry"
+        },
+    ))
+}
+
+/// Whether a revocation `cert` carries names as its maker a key `cert`
+/// designates to revoke it.
+fn carries_designated_revocation(cert: &Cert) -> bool {
+    let revokers: Vec<KeyHandle> = cert
+        .revocation_keys(&policy())
+        .map(|key| KeyHandle::from(key.revoker().1))
+        .collect();
+    cert.primary_key()
+        .other_revocations()
+        .filter(|signature| signature.typ() == SignatureType::KeyRevocation)
+        .flat_map(|signature| signature.get_issuers())
+        .any(|issuer| revokers.iter().any(|revoker| revoker.aliases(&issuer)))
+}
+
+/// Merge into `cert` those of `signatures` that really do revoke it, and
+/// store.
+///
+/// An error means none of them does, or nothing was stored, except for an
+/// [`Error::SecretKeyNotUpdated`], which comes back once the revocation is in
+/// cert-d.
+fn apply(store: &Store, cert: Cert, signatures: Vec<Signature>) -> Result<Cert> {
     let fingerprint = cert.fingerprint().to_hex();
-    let revoked = cert.insert_packets(signature.clone())?.0;
 
     // Guard against silently storing a signature that changed nothing — a
     // revocation from the wrong key, or one the policy rejects.
     //
-    // The test is whether *this* signature was accepted, not whether the
+    // The test is whether *these* signatures were accepted, not whether the
     // certificate ends up revoked. Sequoia computes revocation_status from the
     // revocations it has already verified, so on a certificate that was
     // revoked before this call the status is Revoked whatever we just inserted
     // — the guard passed on its own history and wrote an arbitrary signature
     // packet into the secret key file. Asking whether the returned set
-    // contains this signature keeps the verification sequoia already did, and
-    // covers a designated revoker's signature as readily as a self-revocation.
-    let accepted = match revoked.revocation_status(&policy(), None) {
-        RevocationStatus::Revoked(verified) => verified.iter().any(|s| **s == signature),
-        _ => false,
-    };
-    if !accepted {
+    // contains each signature keeps the verification sequoia already did.
+    //
+    // Each is judged on its own, as sequoia judges them, and one that does not
+    // count is left out rather than failing the rest. Import reads a file
+    // before the user confirms it, and a revocation can stop counting in
+    // between: a newer self-signature, from a lookup say, overrides a soft
+    // revocation older than it. Refusing the whole file's worth would refuse
+    // the hard revocation beside it too, which is the one that matters and
+    // which nothing overrides. What is left out goes unreported, since
+    // storing it would have changed nothing.
+    let merged = cert.clone().insert_packets(signatures.clone())?.0;
+    let signatures: Vec<Signature> = signatures
+        .into_iter()
+        .filter(|signature| counted(&merged, signature))
+        .collect();
+    if signatures.is_empty() {
         return Err(Error::invalid(format!(
             "that signature does not revoke {fingerprint}"
         )));
     }
+    let revoked = cert.insert_packets(signatures.clone())?.0;
 
     store.insert(&revoked)?;
 
-    // Keep the secret copy in step, so the revocation survives a reload. The
-    // signature has to be merged into the *secret* certificate: `revoked` may
-    // have come from cert-d, which only ever holds the public half.
+    // Keep the secret copy in step, since it is the key's whole copy: what the
+    // lifecycle operations start from, and what a backup of the key holds. The
+    // signatures have to be merged into the *secret* certificate: `revoked`
+    // may have come from cert-d, which only ever holds the public half.
+    //
+    // The revocation is stored by now, so nothing past this point can make it
+    // a revocation that was not made. A secret key file that will not read
+    // used to fail the whole call here, after the write above, and it is the
+    // very case the emergency path serves: every attempt was reported as
+    // failed, with a reason about something else, while cert-d showed the key
+    // revoked. The file is left as it is for the damaged-file survey to go on
+    // reporting, since nothing can be merged into it.
     if store.has_secret(&fingerprint) {
-        let secret = store.secret_cert(&fingerprint)?;
-        store.insert_secret(&secret.insert_packets(signature)?.0)?;
+        let updated = store
+            .secret_cert(&fingerprint)
+            .map_err(|e| match e {
+                Error::NoSecretKey(_) => e,
+                e => Error::invalid(format!("the secret key file will not read ({e})")),
+            })
+            .and_then(|secret| store.insert_secret(&secret.insert_packets(signatures)?.0));
+        match updated {
+            Ok(()) => {}
+            // Deleted since `has_secret` looked, so there is no copy left to
+            // keep in step.
+            Err(Error::NoSecretKey(_)) => {}
+            // The secret key file took the revocation, and cert-d then
+            // refused the public half insert_secret merges into it, which
+            // already carries the revocation from the write above.
+            Err(Error::PublicCertNotUpdated(_)) => {}
+            Err(e) => return Err(Error::SecretKeyNotUpdated(Box::new(e))),
+        }
     }
     Ok(revoked)
 }
@@ -461,15 +875,22 @@ pub fn revocation_reason(cert: &Cert) -> Option<(Reason, String)> {
     let RevocationStatus::Revoked(signatures) = cert.revocation_status(&policy(), None) else {
         return None;
     };
+    reported(signatures)
+}
 
-    // Newest first, and a hard revocation stays in the set whatever follows
-    // it, because nothing undoes one. Reporting the newest would let a
-    // KeyRetired — which anyone holding the stolen secret can issue — hide a
-    // KeyCompromised behind "No longer used", so prefer the newest hard
-    // revocation and fall back to the newest of any kind. A revocation
-    // carrying no reason subpacket is hard (RFC 9580 §5.2.3.31), which is
-    // also why the reason-less case reports Unspecified rather than blanking
-    // the banner: returning None here left the certificate looking unrevoked.
+/// The reason a banner gives for `newest_first`, a certificate's revocations
+/// in that order, and the note that goes with it.
+///
+/// A hard revocation stays in force whatever follows it, because nothing
+/// undoes one. Reporting the newest would let a KeyRetired — which anyone
+/// holding the stolen secret can issue — hide a KeyCompromised behind "No
+/// longer used", so prefer the newest hard revocation and fall back to the
+/// newest of any kind. A revocation carrying no reason subpacket is hard (RFC
+/// 9580 §5.2.3.31), which is also why the reason-less case reports
+/// Unspecified rather than blanking the banner: returning None here left the
+/// certificate looking unrevoked.
+fn reported<'a>(newest_first: impl IntoIterator<Item = &'a Signature>) -> Option<(Reason, String)> {
+    let signatures: Vec<&Signature> = newest_first.into_iter().collect();
     let signature = signatures
         .iter()
         .find(|s| {
@@ -485,6 +906,23 @@ pub fn revocation_reason(cert: &Cert) -> Option<(Reason, String)> {
         ),
         None => (Reason::Unspecified, String::new()),
     })
+}
+
+/// The name to give `cert` in a sentence: its primary user ID, or its
+/// fingerprint where it carries none.
+///
+/// A certificate need carry no user ID at all — nothing on the import path
+/// asks for one — and for such a certificate `primary_user_id` answers "(no
+/// user ID)", which names nothing in a status bar or a dialog that has room
+/// for one identifier. The fingerprint is what the rest of the crate falls
+/// back to when there is no name, as `Error::NoSecretKey` does.
+fn name_of(cert: &Cert) -> String {
+    match cert.userids().next() {
+        Some(_) => {
+            crate::cert::primary_user_id(cert, cert.with_policy(&policy(), None).ok().as_ref())
+        }
+        None => cert.fingerprint().to_hex(),
+    }
 }
 
 /// Refuse a certificate whose owner has withdrawn it.
@@ -545,16 +983,7 @@ pub(crate) fn refuse_if_revoked_as(cert: &Cert, role: Option<&str>) -> Result<()
     // does not build. Naming the harshest reading of a missing reason keeps the
     // message honest if that ever changes.
     let reason = revocation_reason(cert).map_or(Reason::Unspecified, |(reason, _)| reason);
-    let valid = cert.with_policy(&policy, None).ok();
-    // A certificate need carry no user ID at all — nothing on the import path
-    // asks for one — and for such a certificate `primary_user_id` answers
-    // "(no user ID)", which names nothing in a status bar that has room for
-    // one identifier. The fingerprint is what the rest of the crate falls back
-    // to when there is no name, as `Error::NoSecretKey` does.
-    let name = match cert.userids().next() {
-        Some(_) => crate::cert::primary_user_id(cert, valid.as_ref()),
-        None => cert.fingerprint().to_hex(),
-    };
+    let name = name_of(cert);
     Err(Error::Revoked {
         name: match role {
             Some(role) => format!("{name} ({role})"),
@@ -682,7 +1111,7 @@ mod tests {
             .unwrap()
             .clone();
 
-        let outcome = apply(&store, revoked, foreign);
+        let outcome = apply(&store, revoked, vec![foreign]);
         assert!(
             outcome.is_err(),
             "a signature that does not revoke this certificate must be refused, \
@@ -789,6 +1218,61 @@ mod tests {
         // index >= 2 and rely on this.
         let hard: Vec<bool> = Reason::ALL.iter().map(|r| r.is_hard()).collect();
         assert_eq!(hard, [false, false, true, true]);
+    }
+
+    /// Every reason code a key revocation can carry reads back as a reason
+    /// exactly as hard as sequoia holds the code, since the details pane goes
+    /// by that to decide whether a compromise is still to be declared.
+    #[test]
+    fn every_revocation_code_reads_back_as_hard_as_sequoia_holds_it() {
+        for code in (0..=u8::MAX).map(ReasonForRevocation::from) {
+            assert_eq!(
+                Reason::from_openpgp(code).is_hard(),
+                code.revocation_type() == RevocationType::Hard,
+                "{code:?} reads back as {:?}",
+                Reason::from_openpgp(code)
+            );
+        }
+    }
+
+    /// A key revoked with the code meant for a user ID, which sequoia holds
+    /// soft on a key as well, is described as soft both by the summary the
+    /// details pane goes by and by what Import puts to the user, so that the
+    /// pane goes on offering a compromise to declare.
+    #[test]
+    fn a_key_revoked_with_a_code_sequoia_holds_soft_is_not_called_hard() {
+        let (dir, store) = scratch();
+        let mine = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert(&mine).unwrap();
+        let mut signer = primary_signer(&mine, None).unwrap();
+        let revocation = CertRevocationBuilder::new()
+            .set_reason_for_revocation(ReasonForRevocation::UIDRetired, b"left that job")
+            .unwrap()
+            .build(&mut signer, &mine, None)
+            .unwrap();
+
+        let path = dir.path().join("mine.rev");
+        write_revocations(&path, &[&revocation]);
+        let file = read_revocation_file(&store, &path).unwrap();
+        let [pending] = file.revocations.as_slice() else {
+            panic!("expected one certificate revoked: {:?}", file.refused);
+        };
+        assert!(
+            !pending.reason.is_hard(),
+            "Import would call it hard: {}",
+            pending.describe()
+        );
+
+        let revoked = mine.insert_packets(revocation).unwrap().0;
+        let summary = CertSummary::from_cert(&revoked);
+        assert_eq!(summary.validity, Validity::Revoked);
+        assert!(
+            !summary.revocation_hard,
+            "the details pane would call it hard: {:?}",
+            summary.revocation
+        );
     }
 
     /// The primary user ID's binding, re-issued from itself and dated `when`:
@@ -902,6 +1386,28 @@ mod tests {
         );
     }
 
+    /// Every certificate `path` revokes here, read and stored in one go, as
+    /// Import does for a file that revokes none of the user's own keys.
+    fn apply_file(store: &Store, path: &Path) -> Result<Vec<Cert>> {
+        let file = read_revocation_file(store, path)?;
+        apply_revocations(store, &file.revocations)
+            .into_iter()
+            .collect()
+    }
+
+    /// Whether the certificate cert-d holds for `fingerprint` is revoked.
+    fn revoked_in_cert_d(store: &Store, fingerprint: &str) -> bool {
+        CertSummary::from_cert(&store.lookup(fingerprint).unwrap()).validity == Validity::Revoked
+    }
+
+    /// The emergency path needs no passphrase, and is two steps. Reading the
+    /// file stores nothing, and says what storing it would do: revoke a key
+    /// whose secret this store holds, hard, since the certificate made at
+    /// generation gives no reason. Reading and storing used to be one call,
+    /// made as soon as Import was handed the file, so there was no moment at
+    /// which to ask whether the user meant to revoke their own key.
+    ///
+    /// Make reading store what it reads and this fails.
     #[test]
     fn an_emergency_revocation_certificate_works_without_the_passphrase() {
         let (_dir, store) = scratch();
@@ -916,11 +1422,42 @@ mod tests {
         assert!(store.has_revocation(&fingerprint));
         assert!(armored.starts_with(b"-----BEGIN PGP PUBLIC KEY BLOCK-----"));
 
+        let path = store.revocation_path(&fingerprint);
+        let file = read_revocation_file(&store, &path).unwrap();
+        assert!(file.refused.is_empty(), "{:?}", file.refused);
+        let [pending] = file.revocations.as_slice() else {
+            panic!("expected one certificate revoked: {:?}", file.revocations);
+        };
+        assert_eq!(pending.fingerprint, fingerprint);
+        assert_eq!(pending.name, "Me <me@example.org>");
+        assert!(pending.yours, "it is the user's own key");
+        assert!(pending.reason.is_hard(), "{:?}", pending.reason);
+        for (half, cert) in [
+            ("cert-d", store.lookup(&fingerprint).unwrap()),
+            (
+                "the secret key file",
+                store.secret_cert(&fingerprint).unwrap(),
+            ),
+        ] {
+            assert_eq!(
+                CertSummary::from_cert(&cert).validity,
+                Validity::Valid,
+                "reading the file stored its revocation in {half}"
+            );
+        }
+
         // Revoking normally would need the passphrase; the stored certificate
         // was signed at generation time and needs nothing.
-        let path = store.revocation_path(&fingerprint);
-        let revoked = apply_revocation_file(&store, &path).unwrap();
+        let revoked = apply_revocations(&store, &file.revocations)
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
         assert_eq!(CertSummary::from_cert(&revoked).validity, Validity::Revoked);
+        assert_eq!(
+            CertSummary::from_cert(&store.secret_cert(&fingerprint).unwrap()).validity,
+            Validity::Revoked
+        );
     }
 
     /// A real revocation certificate is under a kilobyte, so the cap is only
@@ -943,7 +1480,8 @@ mod tests {
         padded.extend(std::iter::repeat_n(b'\n', 1024 * 1024 + 1));
         std::fs::write(&path, &padded).unwrap();
 
-        let err = apply_revocation_file(&store, &path)
+        let err = read_revocation_file(&store, &path)
+            .map(|_| ())
             .expect_err("an oversized file was read whole")
             .to_string();
         assert!(
@@ -1779,10 +2317,553 @@ mod tests {
         std::fs::write(&path, armor(&generated.revocation).unwrap()).unwrap();
         let _ = other;
 
-        assert!(apply_revocation_file(&store, &path).is_err());
+        let file = read_revocation_file(&store, &path).unwrap();
+        assert!(file.revocations.is_empty(), "{:?}", file.revocations);
+        assert_eq!(
+            file.refused,
+            ["the revocation is for a certificate that is not in this store"]
+        );
         assert_eq!(
             CertSummary::from_cert(&store.lookup(&mine.fingerprint().to_hex()).unwrap()).validity,
             Validity::Valid
+        );
+    }
+
+    /// `signatures`, armored as one block, as a file at `path`.
+    fn write_revocations(path: &Path, signatures: &[&Signature]) {
+        let mut writer = sequoia_openpgp::armor::Writer::new(
+            Vec::new(),
+            sequoia_openpgp::armor::Kind::PublicKey,
+        )
+        .unwrap();
+        for signature in signatures {
+            Packet::from((*signature).clone())
+                .serialize(&mut writer)
+                .unwrap();
+        }
+        std::fs::write(path, writer.finalize().unwrap()).unwrap();
+    }
+
+    /// A contact's revocations of both their old keys, in one file, revoke
+    /// both. Only the first that applied used to be stored: the second key
+    /// stayed valid, and in use, while the status line named the first.
+    #[test]
+    fn every_revocation_in_a_file_is_applied() {
+        let (dir, store) = scratch();
+        let old = generate(&KeyGenRequest::new("Old <old@example.org>")).unwrap();
+        let older = generate(&KeyGenRequest::new("Older <older@example.org>")).unwrap();
+        store.insert(&old.cert).unwrap();
+        store.insert(&older.cert).unwrap();
+        let path = dir.path().join("both.asc");
+        write_revocations(&path, &[&old.revocation, &older.revocation]);
+
+        let revoked = apply_file(&store, &path).unwrap();
+        assert_eq!(revoked.len(), 2);
+        for cert in [&old.cert, &older.cert] {
+            assert!(
+                revoked_in_cert_d(&store, &cert.fingerprint().to_hex()),
+                "a revocation in the file was not applied"
+            );
+        }
+    }
+
+    /// Two revocation certificates, one after the other in a file, are both
+    /// read, which is what `cat a.rev b.rev` makes. The first armor block used
+    /// to be the whole of what was read, so the second was lost before any
+    /// signature in it was looked at. Text after the last block is passed
+    /// over, as the armor reader passes over it after the first.
+    #[test]
+    fn revocations_in_armor_blocks_one_after_another_are_all_read() {
+        let (dir, store) = scratch();
+        let first = generate(&KeyGenRequest::new("First <first@example.org>")).unwrap();
+        let second = generate(&KeyGenRequest::new("Second <second@example.org>")).unwrap();
+        store.insert(&first.cert).unwrap();
+        store.insert(&second.cert).unwrap();
+
+        let mut concatenated = armor(&first.revocation).unwrap();
+        concatenated.extend(armor(&second.revocation).unwrap());
+        concatenated.extend(b"\nSent from a phone\n");
+        let path = dir.path().join("concatenated.asc");
+        std::fs::write(&path, &concatenated).unwrap();
+
+        let file = read_revocation_file(&store, &path).unwrap();
+        let names: Vec<&str> = file
+            .revocations
+            .iter()
+            .map(|pending| pending.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["First <first@example.org>", "Second <second@example.org>"],
+            "every armor block in the file should be read"
+        );
+    }
+
+    /// A retirement and a compromise of one key, in one file, are both
+    /// stored, and the key reads as compromised. Only the retirement used to
+    /// be, as the first signature in the file: the banner said "No longer
+    /// used", and every signature the key made before it stood, whoever made
+    /// it. Checking that the key is revoked would not show that; checking what
+    /// it is revoked for does.
+    #[test]
+    fn a_retirement_and_a_compromise_in_one_file_leave_the_key_compromised() {
+        let (dir, store) = scratch();
+        let mine = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert(&mine).unwrap();
+        let fingerprint = mine.fingerprint().to_hex();
+
+        let mut signer = primary_signer(&mine, None).unwrap();
+        let mut revocation = |reason: ReasonForRevocation, note: &[u8]| {
+            CertRevocationBuilder::new()
+                .set_reason_for_revocation(reason, note)
+                .unwrap()
+                .build(&mut signer, &mine, None)
+                .unwrap()
+        };
+        let retired = revocation(ReasonForRevocation::KeyRetired, b"moving on");
+        let compromised = revocation(ReasonForRevocation::KeyCompromised, b"laptop stolen");
+        let path = dir.path().join("both.asc");
+        write_revocations(&path, &[&retired, &compromised]);
+
+        let file = read_revocation_file(&store, &path).unwrap();
+        let [pending] = file.revocations.as_slice() else {
+            panic!("expected one certificate revoked: {:?}", file.revocations);
+        };
+        assert_eq!(
+            (pending.reason, pending.message.as_str()),
+            (Reason::Compromised, "laptop stolen"),
+            "the file should be described by its hard revocation"
+        );
+
+        apply_file(&store, &path).unwrap();
+        assert_eq!(
+            revocation_reason(&store.lookup(&fingerprint).unwrap()),
+            Some((Reason::Compromised, "laptop stolen".to_string())),
+            "the compromise in the file was not stored"
+        );
+    }
+
+    /// Two hard revocations of a key made in the same second are described by
+    /// the one the banner reports once they are stored, whichever the file
+    /// puts first. Sorted by time alone, a tie would stay in the file's order,
+    /// while sequoia breaks it by the signatures' values: in one of the two
+    /// orders the dialog would name one reason, and the banner, a moment
+    /// later, the other.
+    #[test]
+    fn revocations_made_in_the_same_second_are_described_as_the_banner_will_describe_them() {
+        let (dir, store) = scratch();
+        let mine = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert(&mine).unwrap();
+        let fingerprint = mine.fingerprint().to_hex();
+
+        let when = SystemTime::now();
+        let mut signer = primary_signer(&mine, None).unwrap();
+        let mut revocation = |reason: ReasonForRevocation, note: &[u8]| {
+            CertRevocationBuilder::new()
+                .set_signature_creation_time(when)
+                .unwrap()
+                .set_reason_for_revocation(reason, note)
+                .unwrap()
+                .build(&mut signer, &mine, None)
+                .unwrap()
+        };
+        let compromised = revocation(ReasonForRevocation::KeyCompromised, b"laptop stolen");
+        let unspecified = revocation(ReasonForRevocation::Unspecified, b"just in case");
+        let described = |name: &str, signatures: &[&Signature]| {
+            let path = dir.path().join(name);
+            write_revocations(&path, signatures);
+            let file = read_revocation_file(&store, &path).unwrap();
+            let [pending] = file.revocations.as_slice() else {
+                panic!("expected one certificate revoked: {:?}", file.revocations);
+            };
+            (pending.reason, pending.message.clone())
+        };
+
+        let one_way = described("one.rev", &[&compromised, &unspecified]);
+        let other_way = described("other.rev", &[&unspecified, &compromised]);
+        assert_eq!(
+            one_way, other_way,
+            "the order of the file decided what it was described as"
+        );
+        apply_file(&store, &dir.path().join("one.rev")).unwrap();
+        assert_eq!(
+            revocation_reason(&store.lookup(&fingerprint).unwrap()),
+            Some(one_way),
+            "the banner reports a reason other than the one described"
+        );
+    }
+
+    /// A compromise read from a file is stored even when the retirement beside
+    /// it has stopped counting by the time the user confirms the file, as it
+    /// does once a newer self-signature arrives, from a lookup say. Were a
+    /// key's revocations stored all or none, the compromise would be refused
+    /// along with the retirement.
+    #[test]
+    fn a_compromise_is_stored_when_a_retirement_beside_it_no_longer_counts() {
+        let (dir, store) = scratch();
+        let now = SystemTime::now();
+        let hour = Duration::from_secs(60 * 60);
+        let (mine, _) = sequoia_openpgp::cert::CertBuilder::new()
+            .add_userid("Me <me@example.org>")
+            .set_creation_time(now - 2 * hour)
+            .generate()
+            .unwrap();
+        store.insert(&mine).unwrap();
+        let fingerprint = mine.fingerprint().to_hex();
+
+        let mut signer = primary_signer(&mine, None).unwrap();
+        let mut revocation = |reason: ReasonForRevocation, note: &[u8]| {
+            CertRevocationBuilder::new()
+                .set_signature_creation_time(now - hour)
+                .unwrap()
+                .set_reason_for_revocation(reason, note)
+                .unwrap()
+                .build(&mut signer, &mine, None)
+                .unwrap()
+        };
+        let retired = revocation(ReasonForRevocation::KeyRetired, b"moving on");
+        let compromised = revocation(ReasonForRevocation::KeyCompromised, b"laptop stolen");
+        let path = dir.path().join("both.asc");
+        write_revocations(&path, &[&retired, &compromised]);
+        let file = read_revocation_file(&store, &path).unwrap();
+        let [pending] = file.revocations.as_slice() else {
+            panic!("expected one certificate revoked: {:?}", file.revocations);
+        };
+        assert_eq!(pending.signatures.len(), 2, "both should have been read");
+
+        // A binding newer than the retirement, which overrides it.
+        let newer = binding_dated(&mine, now - hour / 2);
+        let refreshed = mine
+            .clone()
+            .insert_packets(vec![Packet::from(newer)])
+            .unwrap()
+            .0;
+        store.insert(&refreshed).unwrap();
+        assert!(!revokes(&store.lookup(&fingerprint).unwrap(), &retired));
+
+        for outcome in apply_revocations(&store, &file.revocations) {
+            if let Err(e) = outcome {
+                panic!("the compromise was refused with the retirement: {e}");
+            }
+        }
+        assert_eq!(
+            revocation_reason(&store.lookup(&fingerprint).unwrap()),
+            Some((Reason::Compromised, "laptop stolen".to_string()))
+        );
+    }
+
+    /// A certificate for `user_id` that names `revoker` as a key that may
+    /// revoke it, and a revocation of it signed by `revoker`.
+    fn designated_revocation(user_id: &str, revoker: &Cert) -> (Cert, Signature) {
+        let (cert, _) = sequoia_openpgp::cert::CertBuilder::new()
+            .add_userid(user_id)
+            .set_revocation_keys(vec![revoker.into()])
+            .generate()
+            .unwrap();
+        let mut signer = primary_signer(revoker, None).unwrap();
+        let revocation = SignatureBuilder::new(SignatureType::KeyRevocation)
+            .set_reason_for_revocation(ReasonForRevocation::KeyCompromised, b"per policy")
+            .unwrap()
+            .sign_direct_key(&mut signer, cert.primary_key().key())
+            .unwrap();
+        (cert, revocation)
+    }
+
+    /// A designated revoker's revocation is refused saying that that is what
+    /// it is, naming the key it is for, and that rPGP does not apply one. The
+    /// refusal used to say only that it did not revoke the revoker's own key,
+    /// or, without that key here, that it was for a certificate not in this
+    /// store, as if the file were for another certificate, while two comments
+    /// claimed the case was handled; it could never be applied.
+    ///
+    /// One revoker designated on two keys, as an organisation's is on many,
+    /// revokes each with a signature of its own, and each refusal names the
+    /// key its signature is over, whether or not the revoker's certificate is
+    /// here to verify it by. Naming the first key found to designate the
+    /// revoker would name it for both, and for the revoker's own revocation
+    /// of itself, which does not count yet. Where the revoker's certificate
+    /// is here, a revocation that names it as its maker and was made by
+    /// another key is no designated revocation either.
+    #[test]
+    fn a_designated_revokers_revocation_is_refused_naming_the_key_it_is_for() {
+        let (dir, store) = scratch();
+        let (revoker, _) = sequoia_openpgp::cert::CertBuilder::new()
+            .add_userid("Org Revoker <revoker@example.org>")
+            .generate()
+            .unwrap();
+        let (alice, of_alice) = designated_revocation("Alice <alice@example.org>", &revoker);
+        let (bob, of_bob) = designated_revocation("Bob <bob@example.org>", &revoker);
+        let mut signer = primary_signer(&revoker, None).unwrap();
+        let of_itself = CertRevocationBuilder::new()
+            .set_signature_creation_time(SystemTime::now() + Duration::from_secs(24 * 60 * 60))
+            .unwrap()
+            .set_reason_for_revocation(ReasonForRevocation::KeyRetired, b"")
+            .unwrap()
+            .build(&mut signer, &revoker, None)
+            .unwrap();
+        let (stranger, _) = sequoia_openpgp::cert::CertBuilder::new()
+            .add_userid("Stranger <stranger@example.org>")
+            .generate()
+            .unwrap();
+        let forged = SignatureBuilder::new(SignatureType::KeyRevocation)
+            .set_issuer(revoker.keyid())
+            .unwrap()
+            .set_issuer_fingerprint(revoker.fingerprint())
+            .unwrap()
+            .sign_direct_key(
+                &mut primary_signer(&stranger, None).unwrap(),
+                alice.primary_key().key(),
+            )
+            .unwrap();
+        store.insert(&alice).unwrap();
+        store.insert(&bob).unwrap();
+        let path = dir.path().join("desig.rev");
+        write_revocations(&path, &[&of_alice, &of_bob, &of_itself, &forged]);
+
+        // Without the revoker's certificate, by the two bytes of each hash
+        // that a signature carries in the clear. Asserted loosely, since a
+        // signature over the other key matches them once in 65,536 times, and
+        // both are then named.
+        let file = read_revocation_file(&store, &path).unwrap();
+        assert!(file.revocations.is_empty(), "{:?}", file.revocations);
+        let [for_alice, for_bob, _, _] = file.refused.as_slice() else {
+            panic!("expected four refusals: {:?}", file.refused);
+        };
+        assert!(
+            for_alice.contains("Alice <alice@example.org>")
+                && for_bob.contains("Bob <bob@example.org>"),
+            "each refusal should name the key its revocation is for: {:?}",
+            file.refused
+        );
+
+        // With it, by the signatures themselves.
+        store.insert(&revoker).unwrap();
+        let file = read_revocation_file(&store, &path).unwrap();
+        assert!(file.revocations.is_empty(), "{:?}", file.revocations);
+        let refusal = |name: &str| {
+            format!(
+                "{name} was not revoked: the revocation names Org Revoker \
+                 <revoker@example.org> as its maker, a key {name} designates to revoke it, \
+                 and rPGP does not apply revocations by designated revokers"
+            )
+        };
+        let plain = format!(
+            "that signature does not revoke {}",
+            revoker.fingerprint().to_hex()
+        );
+        assert_eq!(
+            file.refused,
+            [
+                refusal("Alice <alice@example.org>"),
+                refusal("Bob <bob@example.org>"),
+                plain.clone(),
+                plain,
+            ],
+            "neither the revoker's own revocation nor one made by another key is a \
+             revocation by the revoker of a key it may revoke"
+        );
+        for cert in [&alice, &bob, &revoker] {
+            assert!(!revoked_in_cert_d(&store, &cert.fingerprint().to_hex()));
+        }
+    }
+
+    /// A revocation by a designated revoker that arrives attached to the
+    /// certificate it revokes, as GnuPG's `--desig-revoke` writes it, is
+    /// named in what Import says, and one planted by a key the certificate
+    /// does not designate is not. Import used to say only that the
+    /// certificate had arrived, while the list showed it valid.
+    #[test]
+    fn a_designated_revokers_revocation_carried_by_its_certificate_is_named() {
+        let (revoker, _) = sequoia_openpgp::cert::CertBuilder::new()
+            .add_userid("Org Revoker <revoker@example.org>")
+            .generate()
+            .unwrap();
+        let (stranger, _) = sequoia_openpgp::cert::CertBuilder::new()
+            .add_userid("Stranger <stranger@example.org>")
+            .generate()
+            .unwrap();
+        let (alice, revocation) = designated_revocation("Alice <alice@example.org>", &revoker);
+        assert_eq!(
+            designated_revocations_note(&[alice.clone(), revoker.clone()]),
+            None
+        );
+
+        let carried = alice.clone().insert_packets(revocation).unwrap().0;
+        assert_eq!(
+            designated_revocations_note(std::slice::from_ref(&carried)).as_deref(),
+            Some(
+                "Alice <alice@example.org> carries a revocation naming a key it designates \
+                 to revoke it, which rPGP does not apply."
+            )
+        );
+
+        // A stranger's revocation, planted on Alice, who designates another
+        // key, and on the revoker's certificate, which designates none.
+        let mut theirs = primary_signer(&stranger, None).unwrap();
+        for target in [alice, revoker] {
+            let planted = SignatureBuilder::new(SignatureType::KeyRevocation)
+                .sign_direct_key(&mut theirs, target.primary_key().key())
+                .unwrap();
+            let name = name_of(&target);
+            assert_eq!(
+                designated_revocations_note(&[target.insert_packets(planted).unwrap().0]),
+                None,
+                "a revocation by a key {name} does not designate was taken for one"
+            );
+        }
+    }
+
+    /// A revocation stored in cert-d is reported as made when the secret key
+    /// file then will not read, which is the case the emergency path is kept
+    /// for. It used to fail after the revocation was stored, every time it was
+    /// tried, and the file was left where it was.
+    #[test]
+    fn a_revocation_is_stored_and_said_to_be_when_the_secret_key_file_will_not_read() {
+        let (dir, store) = scratch();
+        let generated = generate(&KeyGenRequest::new("Me <me@example.org>")).unwrap();
+        store.insert_secret(&generated.cert).unwrap();
+        let fingerprint = generated.cert.fingerprint().to_hex();
+        let path = dir.path().join("me.rev");
+        std::fs::write(&path, armor(&generated.revocation).unwrap()).unwrap();
+
+        let secret = dir
+            .path()
+            .join("secrets")
+            .join(format!("{fingerprint}.pgp"));
+        let whole = std::fs::read(&secret).unwrap();
+        std::fs::write(&secret, &whole[..40]).unwrap();
+        assert_eq!(store.damaged_secret_files(), std::slice::from_ref(&secret));
+
+        let file = read_revocation_file(&store, &path).unwrap();
+        assert!(file.revocations[0].yours);
+        match apply_revocations(&store, &file.revocations).remove(0) {
+            Err(Error::SecretKeyNotUpdated(_)) => {}
+            other => panic!("expected the revocation reported as stored: {other:?}"),
+        }
+        assert!(revoked_in_cert_d(&store, &fingerprint));
+        assert_eq!(
+            store.damaged_secret_files(),
+            [secret],
+            "the damaged file should be left for the survey to report"
+        );
+    }
+
+    /// A revocation made from the Revoke dialog is reported as made when the
+    /// secret key file cannot be written after cert-d has taken it. The store's
+    /// lock stands in for the disk: every write to the secrets directory takes
+    /// it, and a directory where its file goes fails the open.
+    #[test]
+    fn a_revocation_is_said_to_be_stored_when_the_secret_key_file_cannot_be_written() {
+        let (dir, store) = scratch();
+        let mine = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&mine).unwrap();
+        let fingerprint = mine.fingerprint().to_hex();
+        let lock = dir.path().join("write.lock");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+
+        let mut request = RevokeRequest::new(&fingerprint);
+        request.reason = Reason::Compromised;
+        match revoke_cert(&store, &request) {
+            Err(Error::SecretKeyNotUpdated(_)) => {}
+            other => panic!(
+                "expected the revocation reported as stored: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert!(revoked_in_cert_d(&store, &fingerprint));
+        assert_eq!(
+            CertSummary::from_cert(&store.secret_cert(&fingerprint).unwrap()).validity,
+            Validity::Valid,
+            "the secret key file was written after all, so this proves nothing"
+        );
+    }
+
+    /// A key retired with a soft reason can be marked compromised afterwards,
+    /// and that is a hard revocation: a signature dated before the retirement,
+    /// which the retirement leaves standing, stops verifying. The summary says
+    /// the first revocation is soft and the second hard, which is what keeps
+    /// the details pane offering the second.
+    #[test]
+    fn a_retired_key_marked_compromised_is_hard_revoked() {
+        use sequoia_openpgp::serialize::stream::{Armorer, Message, Signer};
+
+        let (_dir, store) = scratch();
+        let mine = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&mine).unwrap();
+        let fingerprint = mine.fingerprint().to_hex();
+
+        // Signed at the key's creation, before any revocation can be dated.
+        let created = mine.primary_key().key().creation_time();
+        let signing = mine
+            .keys()
+            .with_policy(&policy(), None)
+            .for_signing()
+            .secret()
+            .next()
+            .unwrap()
+            .key()
+            .clone()
+            .into_keypair()
+            .unwrap();
+        let mut detached = Vec::new();
+        {
+            let message = Armorer::new(Message::new(&mut detached))
+                .kind(sequoia_openpgp::armor::Kind::Signature)
+                .build()
+                .unwrap();
+            let mut signer = Signer::new(message, signing)
+                .unwrap()
+                .detached()
+                .creation_time(created)
+                .build()
+                .unwrap();
+            std::io::Write::write_all(&mut signer, b"backdated").unwrap();
+            signer.finalize().unwrap();
+        }
+        let verifies = || {
+            crate::ops::verify_detached(&store, &detached, b"backdated")
+                .unwrap()
+                .signatures
+                .iter()
+                .all(|report| report.good)
+        };
+        assert!(
+            verifies(),
+            "the signature should verify before any revocation"
+        );
+
+        let retired = revoke_cert(&store, &RevokeRequest::new(&fingerprint)).unwrap();
+        let summary = CertSummary::from_cert(&retired);
+        assert_eq!(summary.revocation.as_deref(), Some("No longer used"));
+        assert!(
+            !summary.revocation_hard,
+            "a retirement is soft, and a key retired has a compromise still to declare"
+        );
+        assert!(
+            verifies(),
+            "a soft revocation leaves earlier signatures standing"
+        );
+
+        let mut request = RevokeRequest::new(&fingerprint);
+        request.reason = Reason::Compromised;
+        let compromised = revoke_cert(&store, &request).unwrap();
+        assert_eq!(
+            revocation_reason(&compromised).map(|(reason, _)| reason),
+            Some(Reason::Compromised)
+        );
+        assert!(CertSummary::from_cert(&compromised).revocation_hard);
+        assert!(
+            !verifies(),
+            "a signature dated before the retirement still verifies after the compromise"
         );
     }
 

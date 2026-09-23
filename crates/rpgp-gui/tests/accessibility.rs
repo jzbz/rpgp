@@ -665,6 +665,155 @@ fn the_file_dialogs_say_when_run_will_ask_where_to_save() {
     assert!(!says("Writes message.txt.asc") && !says("Writes message.txt"));
 }
 
+/// The details pane offers to revoke a key held here until a revocation of it
+/// is hard, and once the key is retired, offers to mark it compromised.
+///
+/// The button used to go with the first revocation of any kind, so a key
+/// retired with the dialog's default, soft, reason could never be marked
+/// compromised from the app, and every signature it made before the
+/// retirement, or that a thief dated to then, went on verifying. Asked of the
+/// rule the pane draws the button by, since the window has no debug
+/// information to find the button itself.
+#[test]
+fn the_revoke_button_stays_until_a_revocation_is_hard() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let probe = TrustRootProbe::new().unwrap();
+    let offer = probe.global::<RevokeOffer>();
+    let yours = CertRow {
+        has_secret: true,
+        ..Default::default()
+    };
+    let retired = CertRow {
+        revocation: "No longer used".into(),
+        ..yours.clone()
+    };
+    let compromised = CertRow {
+        revocation: "Secret key may be compromised".into(),
+        revocation_hard: true,
+        ..yours.clone()
+    };
+
+    assert!(offer.invoke_shown(yours.clone()));
+    assert_eq!(offer.invoke_label(yours), "Revoke this key…");
+    assert!(
+        offer.invoke_shown(retired.clone()),
+        "a retired key has to stay revocable, to be marked compromised"
+    );
+    assert_eq!(offer.invoke_label(retired), "Mark as compromised…");
+    assert!(
+        !offer.invoke_shown(compromised),
+        "a hard revocation leaves nothing harder to give"
+    );
+    assert!(
+        !offer.invoke_shown(CertRow::default()),
+        "someone else's key is not ours to revoke"
+    );
+}
+
+/// Marking a retired key compromised offers only the two hard reasons, and
+/// hands back each as its index in Reason::ALL.
+///
+/// The list is the last two of the usual four, and the index it reports is
+/// its own. Handed back as it stands, its first entry would reach run_revoke
+/// as Reason::ALL's first, a retirement, and sign the very soft revocation
+/// the dialog was opened to go past.
+#[test]
+fn marking_a_key_compromised_offers_only_the_hard_reasons() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+    use slint::platform::{PointerEventButton, WindowEvent};
+
+    let probe = RevokeUpgradeProbe::new().unwrap();
+    probe.show().unwrap();
+    let select = || control(&probe, "Reason for revocation", AccessibleRole::Combobox);
+    let run = || control(&probe, "Mark as compromised", AccessibleRole::Button);
+    let shown = |name: &str| ElementHandle::find_by_accessible_label(&probe, name).count();
+
+    assert_eq!(
+        select().accessible_value().unwrap_or_default().as_str(),
+        "Secret key may be compromised"
+    );
+    run().invoke_accessible_default_action();
+    assert_eq!(
+        (probe.get_runs(), probe.get_reason()),
+        (1, 2),
+        "the first reason offered should reach the run as Compromised"
+    );
+
+    select().invoke_accessible_default_action();
+    assert_eq!(shown("No longer used"), 0, "a soft reason was offered");
+    assert_eq!(
+        shown("Replaced by a newer key"),
+        0,
+        "a soft reason was offered"
+    );
+
+    // Aimed from the Select, as in an_open_list_takes_no_choice_once_its_select_is_disabled.
+    let option =
+        ElementHandle::find_by_accessible_label(&probe, "No reason given (treated as compromised)")
+            .next()
+            .expect("the list should offer the other hard reason");
+    let (under, within) = (select().absolute_position(), option.absolute_position());
+    let position = slint::LogicalPosition::new(
+        under.x + within.x + option.size().width / 2.,
+        under.y + select().size().height + within.y + option.size().height / 2.,
+    );
+    let button = PointerEventButton::Left;
+    let window = probe.window();
+    window.dispatch_event(WindowEvent::PointerMoved { position });
+    window.dispatch_event(WindowEvent::PointerPressed { position, button });
+    window.dispatch_event(WindowEvent::PointerReleased { position, button });
+    assert_eq!(
+        select().accessible_value().unwrap_or_default().as_str(),
+        "No reason given (treated as compromised)"
+    );
+
+    run().invoke_accessible_default_action();
+    assert_eq!(
+        (probe.get_runs(), probe.get_reason()),
+        (2, 3),
+        "the second reason offered should reach the run as Unspecified"
+    );
+}
+
+/// The dialog that asks before a revocation certificate for the user's own
+/// keys is stored keeps its buttons inside the window however many
+/// revocations the file holds, and says "keys" when more than one is the
+/// user's own.
+///
+/// Listed straight into the card, which the window clamps, the revocations
+/// of a file holding more than fit would push Cancel and Revoke off the
+/// bottom and out of the item tree, where neither the pointer nor the
+/// keyboard could reach them.
+#[test]
+fn the_revocation_import_dialog_keeps_its_buttons_however_many_keys_it_lists() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+
+    let probe = ImportRevocationProbe::new().unwrap();
+    probe.show().unwrap();
+    assert!(
+        ElementHandle::find_by_accessible_label(&probe, "Revoke your keys")
+            .next()
+            .is_some(),
+        "the title should say that the file revokes more than one of your keys"
+    );
+
+    let window = probe.window();
+    let height = window.size().to_logical(window.scale_factor()).height;
+    for label in ["Cancel", "Revoke"] {
+        let button = control(&probe, label, AccessibleRole::Button);
+        let bottom = button.absolute_position().y + button.size().height;
+        assert!(
+            bottom <= height,
+            "{label} ends {bottom}px down a window {height}px tall"
+        );
+    }
+    control(&probe, "Revoke", AccessibleRole::Button).invoke_accessible_default_action();
+    assert_eq!(probe.get_runs(), 1);
+}
+
 /// Delete key does nothing, however it is activated, until the key ID has
 /// been typed, and nothing again once the delete is under way.
 ///
