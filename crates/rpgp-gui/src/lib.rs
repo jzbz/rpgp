@@ -6,7 +6,6 @@
 //! measuring. `main.rs` is now a wrapper around [`run_app`]; this module is
 //! unchanged otherwise.
 
-use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rpgp_core::cert::format_time;
-use rpgp_core::certify::{self, Certification, CertifyRequest};
+use rpgp_core::certify::{self, Certification, CertifyRequest, Standing};
 use rpgp_core::keygen::{self, KeyGenRequest, KeyType};
 use rpgp_core::lifecycle;
 use rpgp_core::ops::{self, Existing, InputKind, VerifyResult};
@@ -2051,21 +2050,13 @@ fn push_certifications(ui: &AppWindow, state: &State, summary: &CertSummary) {
         Err(_) => Vec::new(),
     };
 
-    // Offer to withdraw only what is actually still standing — per key and
-    // per user ID, not store-wide. The old test asked "have I certified
-    // anything, and have I revoked anything", so one key withdrawing hid the
-    // button while another key's endorsement was still in force, leaving no
-    // way to withdraw it from the app at all.
-    let withdrawn: HashSet<(&str, Option<&str>)> = certifications
-        .iter()
-        .filter(|c| c.by_me && c.is_revocation)
-        .map(|c| (c.user_id.as_str(), c.certifier_fingerprint.as_deref()))
-        .collect();
-    let withdrawable = certifications.iter().any(|c| {
-        c.by_me
-            && !c.is_revocation
-            && !withdrawn.contains(&(c.user_id.as_str(), c.certifier_fingerprint.as_deref()))
-    });
+    // Offer to withdraw only what a withdrawal would take back, per key and per
+    // user ID: what stands, or will once its date comes. That is the question
+    // `certify::withdrawable` answers for `run_revoke` as well. The test here
+    // used to be its own: whether a key had made any withdrawal on a user ID,
+    // whatever its date, so certifying again after withdrawing left a
+    // certification in force that the app offered no way to withdraw.
+    let withdrawable = !certify::withdrawable(&certifications).is_empty();
 
     let rows: Vec<CertificationRow> = certifications
         .iter()
@@ -2116,6 +2107,23 @@ fn certification_row(certification: &Certification, show_user_id: bool) -> Certi
         Some(false) => parts.push("signature does not check out".to_string()),
         None => parts.push("certifier not in this store".to_string()),
     }
+    // Why a certification that verified draws no tick, so that the row gives
+    // the reason the pill above it already acts on.
+    let discounted = match certification.standing {
+        None | Some(Standing::Stands) => None,
+        Some(Standing::Superseded) => Some("since replaced by a newer one"),
+        Some(Standing::Withdrawn) => Some("since withdrawn"),
+        Some(Standing::NotYet) => Some("dated in the future, so it does not count yet"),
+        Some(Standing::Expired) => Some("expired"),
+        Some(Standing::CertifierRevoked) => Some("certifier's key revoked"),
+        Some(Standing::NotByPrimaryKey) => Some("made by a subkey, so it does not count"),
+        Some(Standing::WeakHash) => Some("made with a hash no longer accepted, such as SHA-1"),
+        Some(Standing::TargetNotValid) => Some(
+            "key unusable when certified, or since revoked as compromised or refused by the policy",
+        ),
+        Some(Standing::Rejected) => Some("does not count"),
+    };
+    parts.extend(discounted.map(str::to_string));
 
     CertificationRow {
         certifier: certification.certifier.clone().into(),
@@ -3316,23 +3324,14 @@ fn run_revoke(
         // used to sign every withdrawal with whichever key happened to sort
         // first, so when two of our keys had certified the same person one
         // endorsement quietly survived while the status line said it had been
-        // withdrawn. The user IDs are deduplicated too: the flat list repeated
-        // them, and each repeat produced an identical revocation packet.
-        let mut by_certifier: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for c in certifications
-            .iter()
-            .filter(|c| c.by_me && !c.is_revocation)
-        {
-            let Some(fingerprint) = c.certifier_fingerprint.clone() else {
-                continue;
-            };
-            let ids = by_certifier.entry(fingerprint).or_default();
-            if !ids.contains(&c.user_id) {
-                ids.push(c.user_id.clone());
-            }
-        }
+        // withdrawn. Only what still stands is taken, the same answer the button
+        // that opened this was given: a key whose certification had already
+        // been withdrawn used to be asked to sign again, first if it sorted
+        // first, so a passphrase that opened only the key with something
+        // standing stopped on the other and never reached it.
+        let by_certifier = certify::withdrawable(&certifications);
         if by_certifier.is_empty() {
-            return Err("You have not certified this key".to_string());
+            return Err("You have no certification of this key in force".to_string());
         }
 
         // One passphrase is collected for the whole dialog, so a set of keys
@@ -5056,6 +5055,119 @@ mod tests {
             opened_for.key_id,
             "and give that key's ID"
         );
+    }
+
+    /// Withdrawing is offered again once a certification made after a
+    /// withdrawal stands. The button used to ask whether the key had withdrawn
+    /// anything on the user ID, whatever its date, so certifying, withdrawing
+    /// and certifying again left a certification in force that the details
+    /// pane offered no way to withdraw.
+    #[test]
+    fn withdrawing_is_offered_again_after_certifying_again() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let me = generated("Me <me@example.org>").cert;
+        let them = generated("Them <them@example.org>").cert;
+        store.insert_secret(&me).unwrap();
+        store.insert(&them).unwrap();
+        let (me_fp, them_fp) = (me.fingerprint().to_hex(), them.fingerprint().to_hex());
+        let user_id = "Them <them@example.org>".to_string();
+        let mut request = CertifyRequest::new(&me_fp, &them_fp);
+        request.user_ids = vec![user_id.clone()];
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let store = lock(&state).store.clone();
+        // Clicking the row again is what reads its certifications afresh.
+        let offered = || {
+            click_row(&ui, &state, &them_fp);
+            ui.get_can_withdraw()
+        };
+
+        certify::certify(&store, &request).unwrap();
+        assert!(offered(), "a certification that stands is offered");
+        revoke::revoke_certification(
+            &store,
+            &me_fp,
+            &them_fp,
+            std::slice::from_ref(&user_id),
+            Reason::Retired,
+            "",
+            None,
+        )
+        .unwrap();
+        assert!(!offered(), "a withdrawn one is not");
+        certify::certify(&store, &request).unwrap();
+        assert!(
+            offered(),
+            "a certification made after the withdrawal stands, and has to be offered"
+        );
+    }
+
+    /// Withdrawing asks only the keys whose certifications still stand.
+    ///
+    /// Of two of the user's keys that certified the same person, one had
+    /// already withdrawn. The run signed for both all the same: the first key
+    /// was asked to withdraw again, the status line counted two withdrawals
+    /// where one had stood, and where the two keys had different passphrases,
+    /// the passphrase for the key with something standing failed on the other
+    /// and, if that one sorted first, never reached its own.
+    #[test]
+    fn withdrawing_asks_only_the_keys_whose_certifications_still_stand() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let one = generated("One <one@example.org>").cert;
+        let two = generated("Two <two@example.org>").cert;
+        let them = generated("Them <them@example.org>").cert;
+        store.insert_secret(&one).unwrap();
+        store.insert_secret(&two).unwrap();
+        store.insert(&them).unwrap();
+        let (one_fp, two_fp, them_fp) = (
+            one.fingerprint().to_hex(),
+            two.fingerprint().to_hex(),
+            them.fingerprint().to_hex(),
+        );
+        let user_id = "Them <them@example.org>".to_string();
+        for certifier in [&one_fp, &two_fp] {
+            let mut request = CertifyRequest::new(certifier, &them_fp);
+            request.user_ids = vec![user_id.clone()];
+            certify::certify(&store, &request).unwrap();
+        }
+        revoke::revoke_certification(
+            &store,
+            &one_fp,
+            &them_fp,
+            std::slice::from_ref(&user_id),
+            Reason::Retired,
+            "",
+            None,
+        )
+        .unwrap();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        click_row(&ui, &state, &them_fp);
+        ui.invoke_open_withdraw();
+        assert_eq!(
+            run_revoke(&state, 0, "", ""),
+            Ok((them_fp.clone(), "Certification withdrawn.".to_string())),
+            "only the key whose certification stood had anything to withdraw"
+        );
+
+        let store = lock(&state).store.clone();
+        let listed = certify::certifications(&store, &store.lookup(&them_fp).unwrap()).unwrap();
+        let withdrawals_by = |fingerprint: &str| {
+            listed
+                .iter()
+                .filter(|c| c.is_revocation)
+                .filter(|c| c.certifier_fingerprint.as_deref() == Some(fingerprint))
+                .count()
+        };
+        assert_eq!(withdrawals_by(&one_fp), 1, "the first key withdrew again");
+        assert_eq!(withdrawals_by(&two_fp), 1);
+        assert!(certify::withdrawable(&listed).is_empty());
     }
 
     /// Publish refuses a certificate that is not one of the user's own keys,

@@ -84,9 +84,13 @@ fn claims(cert: &Cert) -> Claims {
     }
 }
 
-/// How many keys the certify and sign paths find locally. Both filter on the
-/// key flags, so a primary key that has lost them answers zero and the
-/// operation falls through to a gpg-agent that need not be running at all.
+/// How many local secret keys the key flags offer for certifying and for
+/// signing. The sign path picks its key by these flags, so a primary key that
+/// has lost them answers zero there and signing falls through to a gpg-agent
+/// that need not be running at all. certify() no longer asks them, since it
+/// signs with the primary key whatever its flags say, but the certifier
+/// picker's `can_certify` reads them, so a key that lost its certify flag
+/// would drop out of the dialog.
 fn local_keys(cert: &Cert) -> (usize, usize) {
     let policy = StandardPolicy::new();
     let valid = cert.with_policy(&policy, None).unwrap();

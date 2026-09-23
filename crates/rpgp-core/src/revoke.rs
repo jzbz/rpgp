@@ -19,6 +19,7 @@ use sequoia_openpgp::types::{
 };
 use sequoia_openpgp::{Cert, Packet, PacketPile};
 
+use crate::certify::Standing;
 use crate::error::{Error, Result};
 use crate::policy;
 use crate::store::Store;
@@ -190,7 +191,10 @@ pub fn revoke_cert(store: &Store, request: &RevokeRequest) -> Result<Cert> {
 /// Retract certifications we previously made over `target`'s user IDs.
 ///
 /// This does not touch the target's own self-signatures; it only withdraws our
-/// opinion of them.
+/// opinion of them. Each user ID named must carry a certification by
+/// `certifier` that still stands, or will once its date comes
+/// ([`crate::certify::Standing::is_withdrawable`]), and the call is refused
+/// otherwise; [`crate::certify::withdrawable`] says which do.
 pub fn revoke_certification(
     store: &Store,
     certifier: &str,
@@ -208,17 +212,17 @@ pub fn revoke_certification(
     // public certificate is enough for the agent to find it by keygrip. certify()
     // has always accepted one, and the GUI offers card keys as certifiers, so
     // refusing them here meant a certification the app let you make could not be
-    // withdrawn from the app.
-    let certifier = store
-        .secret_cert(certifier)
-        .or_else(|_| store.lookup(certifier))?;
+    // withdrawn from the app. Both halves of the store, as certify() reads them:
+    // whether a certification still stands turns on the certifier's own
+    // revocations, and one that reached cert-d alone, by import or refresh, is
+    // one the web of trust already acts on.
+    let certifier = store.full_cert(certifier)?;
     let target = store.lookup(target)?;
-    let mut signer = certification_signer(&certifier, password)?;
 
-    // Hoisted for the verification filter below, and invariant across user IDs.
-    let certifier_key = certifier.primary_key().key();
-
-    let mut signatures = Vec::new();
+    // What there is to withdraw, settled before any key is unlocked, so that a
+    // refusal never costs a passphrase or a PIN.
+    let now = SystemTime::now();
+    let mut withdrawing = Vec::new();
     for wanted in user_ids {
         // The mirror of certify()'s rule, which this path used to lack: the
         // first user ID whose lossy rendering matched was the one revoked, so a
@@ -226,7 +230,48 @@ pub fn revoke_certification(
         // certified while the real certification stood and the status bar said
         // it had been withdrawn. `cert::resolve_user_id` carries the reasoning.
         let amalgamation = crate::cert::resolve_user_id(&target, wanted)?;
-        let userid = amalgamation.userid().clone();
+        let verdicts = crate::certify::standing(&certifier, &target, &amalgamation, now);
+
+        // Only a certification that stands, or will, is withdrawn. A user ID
+        // on which nothing of this key's counts any more used to be signed over
+        // all the same, so a certification already withdrawn was withdrawn
+        // again, and a key with nothing left to withdraw was asked for its
+        // passphrase ahead of the one that had.
+        if !verdicts
+            .iter()
+            .any(|(_, standing)| standing.is_withdrawable())
+        {
+            return Err(Error::invalid(format!(
+                "no certification {} made of {wanted} is in force, so there is nothing to withdraw",
+                crate::certify::primary_user_id(&certifier),
+            )));
+        }
+
+        // Publishable only if something it takes back was. A withdrawal of a
+        // local certification used to be published regardless: export and
+        // upload leave out only signatures marked non-exportable, and this one
+        // was not marked, so it went out signed by the user over the very user
+        // ID a local certification exists to keep quiet about, with its date and
+        // its message. It retracts locally all the same, since sequoia-wot does
+        // not ask whether a withdrawal is exportable.
+        //
+        // "Takes back" means what still counted on its own: the certification
+        // that stands, or will once its date comes, and any it superseded,
+        // since someone holding an older publishable certification but not the
+        // local one that replaced it still counts the older one and needs the
+        // withdrawal to see it retracted. A certification already withdrawn is
+        // not among them, or an old published one would publish the withdrawal
+        // of every local one made since; nor is one that counts nowhere,
+        // expired or made by a subkey.
+        let exportable = verdicts
+            .iter()
+            .filter(|(_, standing)| {
+                matches!(
+                    standing,
+                    Standing::Stands | Standing::Superseded | Standing::NotYet
+                )
+            })
+            .any(|(signature, _)| signature.exportable_certification().unwrap_or(true));
 
         // A revocation only supersedes a certification made strictly earlier:
         // sequoia-wot ignores a withdrawal dated in the same second as the
@@ -243,34 +288,41 @@ pub fn revoke_certification(
         // yet, and our certification stood despite having been withdrawn.
         //
         // "This certifier's" means one that verifies against our key, not one
-        // that merely names it. certifications() hands back packets exactly as
-        // they were parsed, and an issuer subpacket is an unauthenticated hint
-        // anyone can write — so filtering on the name alone let a planted
-        // packet dated in the far future set `when` to that instant, producing
-        // a revocation that is not yet valid and never takes effect, leaving
-        // the certification the user asked to withdraw still standing. Were
-        // this filter removed, a date that far ahead would now be refused
-        // rather than signed, so the same packet would block the withdrawal
-        // outright instead. certify.rs makes exactly
-        // this check on the mirror path; this is the other half of it.
-        let when = crate::signature_time(
-            amalgamation
-                .certifications()
-                .filter(|sig| crate::cert::issued_by(sig, &certifier))
-                .filter(|sig| {
-                    (*sig)
-                        .clone()
-                        .verify_userid_binding(certifier_key, target.primary_key().key(), &userid)
-                        .is_ok()
-                }),
-        )?;
+        // that merely names it: a planted packet dated in the far future would
+        // otherwise date the withdrawal there, where it never takes effect, or
+        // now have it refused. [`crate::certify::own_certifications`] carries
+        // the reasoning, and certify() asks it on the mirror path.
+        //
+        // Dated here, with the rest of what is settled before any key is
+        // unlocked: withdrawing a certification dated too far ahead, which is
+        // offered like any that will count, is refused with its date, and that
+        // refusal should cost no passphrase or PIN either.
+        let when = crate::signature_time(crate::certify::own_certifications(
+            &amalgamation,
+            &target,
+            &certifier,
+        ))?;
 
-        signatures.push(
-            SignatureBuilder::new(SignatureType::CertificationRevocation)
-                .set_signature_creation_time(when)?
-                .set_reason_for_revocation(reason.to_openpgp(), message.as_bytes())?
-                .sign_userid_binding(&mut signer, target.primary_key().key(), &userid)?,
-        );
+        withdrawing.push((amalgamation, exportable, when));
+    }
+
+    let mut signer = certification_signer(&certifier, password)?;
+    let mut signatures = Vec::new();
+    for (amalgamation, exportable, when) in withdrawing {
+        let userid = amalgamation.userid().clone();
+        let mut builder = SignatureBuilder::new(SignatureType::CertificationRevocation)
+            .set_signature_creation_time(when)?
+            .set_reason_for_revocation(reason.to_openpgp(), message.as_bytes())?;
+        // Marked only when local, so that a publishable withdrawal is the same
+        // packet it always was.
+        if !exportable {
+            builder = builder.set_exportable_certification(false)?;
+        }
+        signatures.push(builder.sign_userid_binding(
+            &mut *signer,
+            target.primary_key().key(),
+            &userid,
+        )?);
     }
 
     let revoked = target.insert_packets(signatures)?.0;
@@ -524,7 +576,8 @@ fn primary_signer(cert: &Cert, password: Option<&str>) -> Result<sequoia_openpgp
     crate::secret::keypair(key, password)
 }
 
-/// A signer for [`revoke_certification`].
+/// A signer for [`revoke_certification`]: the certificate's primary key,
+/// whatever has happened to the certificate since.
 ///
 /// Deliberately does not ask [`refuse_if_revoked`], and takes the agent's
 /// withdrawal entry point rather than `certifier_for` so that the agent does
@@ -532,41 +585,43 @@ fn primary_signer(cert: &Cert, password: Option<&str>) -> Result<sequoia_openpgp
 /// something already said, not making new use of the key, and someone who has
 /// just revoked their own certificate is exactly the person who may now want to
 /// withdraw what it vouched for.
+///
+/// Nor is the key filtered as a key to make something new with would be. It
+/// used to be picked by `alive().revoked(false)`, and for a primary key both of
+/// those ask about the whole certificate, so once a key had expired or been
+/// retired its secret was passed over as if it were not there, the agent was
+/// asked instead, and the withdrawal failed saying there was no usable secret
+/// key — while every certification the key had made before then went on
+/// counting, since sequoia-wot judges an issuer as it stood when it certified.
+/// A withdrawal is checked against the certifier's primary key and nothing
+/// about the certifier's state now, so the primary signs it and it takes
+/// effect. The primary, and not the first key that can certify: sequoia-wot
+/// looks for a withdrawal from the primary key alone, so one a subkey signed
+/// withdraws nothing.
+///
+/// A local secret that is only a GnuPG stub goes to the agent, as a card key
+/// does, and so does one whose algorithm this build cannot use, as certify()
+/// already sends it there: the agent does the arithmetic, not this build.
 fn certification_signer(
     cert: &Cert,
     password: Option<&str>,
 ) -> Result<Box<dyn sequoia_openpgp::crypto::Signer + Send + Sync>> {
-    let policy = policy();
-    let valid = cert
-        .with_policy(&policy, None)
-        .map_err(|_| Error::NoSecretKey(cert.fingerprint().to_hex()))?;
-    let ka = valid
-        .keys()
-        .secret()
-        .alive()
-        .revoked(false)
-        .supported()
-        .for_certification()
-        .next();
+    let local = cert
+        .primary_key()
+        .key()
+        .clone()
+        .parts_into_secret()
+        .ok()
+        .filter(|key| key.pk_algo().is_supported() && crate::secret::is_usable(key.secret()));
 
-    // No local secret half means a card key: hand the agent the certificate and
-    // let it find the key by keygrip, as certify() does — but through the
-    // withdrawal entry point, which alone among the agent's signing paths does
-    // not refuse a revoked certificate.
-    //
-    // The filter above is a separate matter and predates that check: for the
-    // primary key `revoked(false)` *is* the certificate's status, so a revoked
-    // certificate whose primary key certifies — which is every key this app
-    // generates — already falls through to the agent here and fails there
-    // unless the agent happens to hold it. Withdrawing a certification made
-    // with a key since revoked therefore still does not work in general; what
-    // this entry point preserves is the case that did work, a card-held
-    // certification subkey.
-    match ka {
-        Some(ka) => Ok(Box::new(crate::secret::keypair(
-            ka.key().clone(),
-            password,
-        )?)),
+    // No usable local secret means a card key: hand the agent the certificate
+    // and let it find the primary by keygrip, as certify() does — but through
+    // the withdrawal entry point, which alone among the agent's signing paths
+    // neither refuses a revoked certificate nor passes over an expired key.
+    match local {
+        // Keeps its primary role: an RFC 9580 secret cannot be decrypted
+        // without it. See crate::secret::unlock.
+        Some(key) => crate::secret::signer(key, password),
         None => Ok(Box::new(crate::agent::certification_withdrawer_for(cert)?)),
     }
 }
@@ -1045,12 +1100,12 @@ mod tests {
     /// the far future push `when` to that instant, so the revocation carried a
     /// date it had not reached, never took effect, and the certification the
     /// user asked to withdraw kept standing. certify.rs makes the same check on
-    /// the mirror path; this is the other half.
+    /// the mirror path, and has a test of its own for it.
     ///
-    /// Delete the `verify_userid_binding` filter in revoke_certification and
-    /// this fails: the planted packet would date the withdrawal five years out,
-    /// which is now refused, so the withdrawal the user asked for is not made
-    /// at all.
+    /// Delete the `verify_userid_binding` filter in
+    /// `certify::own_certifications` and this fails: the planted packet would
+    /// date the withdrawal five years out, which is now refused, so the
+    /// withdrawal the user asked for is not made at all.
     #[test]
     fn a_planted_certification_cannot_date_the_withdrawal() {
         use sequoia_openpgp::packet::signature::subpacket::{Subpacket, SubpacketValue};
@@ -1268,6 +1323,440 @@ mod tests {
             authenticated(&store),
             crate::Authentication::Full,
             "the re-certification was born superseded by the revocation before it"
+        );
+    }
+
+    /// How `user_id` on `target` authenticates with `root` as the only trust
+    /// root.
+    fn under(store: &Store, root: &Cert, target: &Cert, user_id: &str) -> crate::Authentication {
+        let certs = store.certs().unwrap();
+        wot::for_user_id(
+            &wot::authenticate_all(&certs, &[root.fingerprint().to_hex()]),
+            &target.fingerprint().to_hex(),
+            user_id,
+        )
+    }
+
+    /// `certifier`'s certification of `user_id` on `target`, dated `when`, as
+    /// something other than certify() made it: certify() dates by the clock,
+    /// and these tests need a certification older than what follows it.
+    ///
+    /// Signed with the primary key's secret directly, not through
+    /// [`certification_signer`], which is what these tests are about: a
+    /// regression there has to fail on the withdrawal it breaks, not while the
+    /// certification to withdraw is being set up.
+    fn certified_at(
+        store: &Store,
+        certifier: &Cert,
+        target: &Cert,
+        user_id: &str,
+        when: SystemTime,
+    ) {
+        let userid = target
+            .userids()
+            .find(|ua| ua.userid().value() == user_id.as_bytes())
+            .unwrap()
+            .userid()
+            .clone();
+        let mut signer = certifier
+            .primary_key()
+            .key()
+            .clone()
+            .parts_into_secret()
+            .unwrap()
+            .into_keypair()
+            .unwrap();
+        let certification = SignatureBuilder::new(SignatureType::GenericCertification)
+            .set_signature_creation_time(when)
+            .unwrap()
+            .sign_userid_binding(&mut signer, target.primary_key().key(), &userid)
+            .unwrap();
+        store
+            .insert(
+                &target
+                    .clone()
+                    .insert_packets(vec![certification])
+                    .unwrap()
+                    .0,
+            )
+            .unwrap();
+    }
+
+    fn withdraw(store: &Store, certifier: &Cert, target: &Cert, user_id: &str) -> Result<Cert> {
+        revoke_certification(
+            store,
+            &certifier.fingerprint().to_hex(),
+            &target.fingerprint().to_hex(),
+            &[user_id.to_string()],
+            Reason::Retired,
+            "",
+            None,
+        )
+    }
+
+    /// A certification already withdrawn is not withdrawn again. It used to
+    /// be: every certification a key had ever made on the user ID was signed
+    /// over again, so the key was unlocked, or its card asked for its PIN, to
+    /// write a revocation that changed nothing — and the GUI, handing over
+    /// every key that had ever certified, stopped at such a key before it
+    /// reached the one whose certification still stood.
+    #[test]
+    fn withdrawing_what_is_already_withdrawn_is_refused_rather_than_signed_again() {
+        let (_dir, store) = scratch();
+        let me = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        let them = generate(&KeyGenRequest::new("Them <them@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&me).unwrap();
+        store.insert(&them).unwrap();
+        let user_id = "Them <them@example.org>";
+
+        let mut request =
+            CertifyRequest::new(me.fingerprint().to_hex(), them.fingerprint().to_hex());
+        request.user_ids = vec![user_id.to_string()];
+        certify(&store, &request).unwrap();
+        withdraw(&store, &me, &them, user_id).unwrap();
+
+        let refused = withdraw(&store, &me, &them, user_id)
+            .map(|_| ())
+            .expect_err("withdrew a certification that was already withdrawn");
+        assert!(
+            refused.to_string().contains("nothing to withdraw"),
+            "the refusal must say why: {refused}"
+        );
+        let revocations = store
+            .lookup(&them.fingerprint().to_hex())
+            .unwrap()
+            .userids()
+            .map(|ua| ua.other_revocations().count())
+            .sum::<usize>();
+        assert_eq!(revocations, 1, "a refused withdrawal must sign nothing");
+    }
+
+    /// A certification made before its certifier's key was retired, or before
+    /// it expired, goes on counting, because sequoia-wot judges a certifier as
+    /// it stood when it certified. So it has to stay withdrawable. The
+    /// withdrawal used to pick its key with the filter for making new
+    /// signatures, which for a primary key asks about the whole certificate:
+    /// the retired or expired key's secret was passed over as absent, and the
+    /// withdrawal failed saying there was no usable secret key, while the
+    /// certification it was asked to take back went on counting.
+    #[test]
+    fn a_certification_can_be_withdrawn_after_the_certifiers_key_is_retired_or_expired() {
+        let (_dir, store) = scratch();
+
+        // Retired: certified half a minute ago, so the retirement is
+        // certainly later and the certification counts on past it.
+        let me = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        let them = generate(&KeyGenRequest::new("Them <them@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&me).unwrap();
+        let user_id = "Them <them@example.org>";
+        certified_at(
+            &store,
+            &me,
+            &them,
+            user_id,
+            SystemTime::now() - Duration::from_secs(30),
+        );
+        let mut request = RevokeRequest::new(me.fingerprint().to_hex());
+        request.reason = Reason::Superseded;
+        revoke_cert(&store, &request).unwrap();
+        assert_eq!(
+            under(&store, &me, &them, user_id),
+            crate::Authentication::Full,
+            "a certification made before a soft revocation still counts"
+        );
+        withdraw(&store, &me, &them, user_id)
+            .expect("a retired key must still be able to withdraw what it said");
+        assert_eq!(
+            under(&store, &me, &them, user_id),
+            crate::Authentication::Unknown
+        );
+
+        // Expired: a key made two hours ago to last one, which certified while
+        // it was alive.
+        let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        let (old, _) = sequoia_openpgp::cert::CertBuilder::new()
+            .add_userid("Old <old@example.org>")
+            .set_creation_time(two_hours_ago)
+            .set_validity_period(Duration::from_secs(60 * 60))
+            .generate()
+            .unwrap();
+        let (then, _) = sequoia_openpgp::cert::CertBuilder::new()
+            .add_userid("Then <then@example.org>")
+            .set_creation_time(two_hours_ago)
+            .generate()
+            .unwrap();
+        store.insert_secret(&old).unwrap();
+        let user_id = "Then <then@example.org>";
+        certified_at(
+            &store,
+            &old,
+            &then,
+            user_id,
+            two_hours_ago + Duration::from_secs(30 * 60),
+        );
+        assert_eq!(
+            CertSummary::from_cert(&store.lookup(&old.fingerprint().to_hex()).unwrap()).validity,
+            Validity::Expired
+        );
+        assert_eq!(
+            under(&store, &old, &then, user_id),
+            crate::Authentication::Full,
+            "a certification made while its key was alive still counts"
+        );
+        withdraw(&store, &old, &then, user_id)
+            .expect("an expired key must still be able to withdraw what it said");
+        assert_eq!(
+            under(&store, &old, &then, user_id),
+            crate::Authentication::Unknown
+        );
+    }
+
+    /// What a withdrawal can be refused for is settled before the certifier's
+    /// key is unlocked: a user ID with nothing of the key's in force, and a
+    /// name two user IDs display alike. The key has a passphrase here and none
+    /// is given, so a refusal made after unlocking would read as the missing
+    /// passphrase instead. Both used to come after the unlock.
+    #[test]
+    fn withdrawing_refuses_before_asking_for_a_passphrase() {
+        use sequoia_openpgp::packet::UserID;
+
+        let (_dir, store) = scratch();
+        let mut request = KeyGenRequest::new("Me <me@example.org>");
+        // RFC 4880, whose passphrase protection is quick to open.
+        request.standard = crate::keygen::Standard::Rfc4880;
+        request.password = Some("correct horse".to_string().into());
+        let me = generate(&request).unwrap().cert;
+        let them = generate(&KeyGenRequest::new("Them <them@example.org>"))
+            .unwrap()
+            .cert;
+
+        // Two user IDs whose invalid bytes differ and display alike.
+        let twin = |byte: u8| [b"Twin <twin@".as_slice(), &[byte], b".example>"].concat();
+        let mut signer = them
+            .primary_key()
+            .key()
+            .clone()
+            .parts_into_secret()
+            .unwrap()
+            .into_keypair()
+            .unwrap();
+        let mut packets = Vec::new();
+        for byte in [0xFEu8, 0xFF] {
+            let userid = UserID::from(twin(byte));
+            let binding = SignatureBuilder::new(SignatureType::PositiveCertification)
+                .sign_userid_binding(&mut signer, them.primary_key().key(), &userid)
+                .unwrap();
+            packets.push(Packet::from(userid));
+            packets.push(Packet::from(binding));
+        }
+        let them = them.insert_packets(packets).unwrap().0;
+        store.insert_secret(&me).unwrap();
+        store.insert(&them).unwrap();
+        let displayed = String::from_utf8_lossy(&twin(0xFE)).into_owned();
+
+        for (user_id, why) in [
+            ("Them <them@example.org>", "nothing to withdraw"),
+            (displayed.as_str(), "more than one user ID"),
+        ] {
+            let refused = withdraw(&store, &me, &them, user_id)
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            assert!(
+                refused.as_ref().is_err_and(|e| e.contains(why)),
+                "withdrawing {user_id} must be refused, before the key is unlocked, saying why: {refused:?}"
+            );
+        }
+    }
+
+    /// Whether a certification still stands turns on its certifier's own
+    /// revocations, and a revocation met here by import or by a keyserver
+    /// refresh reaches cert-d alone: the secret half, which the withdrawal
+    /// signs with, still looks live. The listing, like sequoia-wot, reads
+    /// cert-d and counts nothing a key declared compromised has said, so it
+    /// offers nothing to withdraw; the withdrawal has to judge by the same
+    /// certificate, or it signs a revocation of a certification that no longer
+    /// counts anywhere.
+    #[test]
+    fn withdrawing_sees_a_compromise_of_the_certifiers_key_that_reached_only_cert_d() {
+        let (_dir, store) = scratch();
+        let me = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        let them = generate(&KeyGenRequest::new("Them <them@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&me).unwrap();
+        let (me_fp, them_fp) = (me.fingerprint().to_hex(), them.fingerprint().to_hex());
+        let user_id = "Them <them@example.org>";
+        certified_at(
+            &store,
+            &me,
+            &them,
+            user_id,
+            SystemTime::now() - Duration::from_secs(30),
+        );
+
+        // Declared compromised where the key also lives, and met here as the
+        // public certificate, which is all `insert` ever writes.
+        let elsewhere_dir = tempfile::tempdir().unwrap();
+        let elsewhere = Store::open(
+            elsewhere_dir.path().join("certs.d"),
+            elsewhere_dir.path().join("secrets"),
+        )
+        .unwrap();
+        elsewhere.insert_secret(&me).unwrap();
+        let mut request = RevokeRequest::new(&me_fp);
+        request.reason = Reason::Compromised;
+        revoke_cert(&elsewhere, &request).unwrap();
+        store.insert(&elsewhere.lookup(&me_fp).unwrap()).unwrap();
+        assert!(
+            !matches!(
+                store
+                    .secret_cert(&me_fp)
+                    .unwrap()
+                    .revocation_status(&policy(), None),
+                RevocationStatus::Revoked(_)
+            ),
+            "the secret half not knowing is the premise of this test"
+        );
+
+        let listed =
+            crate::certify::certifications(&store, &store.lookup(&them_fp).unwrap()).unwrap();
+        assert!(
+            crate::certify::withdrawable(&listed).is_empty(),
+            "the listing reads cert-d, and offers nothing to withdraw"
+        );
+        let refused = withdraw(&store, &me, &them, user_id)
+            .map(|_| ())
+            .expect_err("withdrew a certification its key's compromise had already taken back");
+        assert!(
+            refused.to_string().contains("nothing to withdraw"),
+            "the refusal must say why: {refused}"
+        );
+        assert_eq!(
+            withdrawals_on(&store.lookup(&them_fp).unwrap()),
+            0,
+            "a refused withdrawal must sign nothing"
+        );
+    }
+
+    /// `fingerprint` as `export_file` writes it, read back.
+    fn exported(store: &Store, fingerprint: &str) -> Cert {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exported.asc");
+        store
+            .export_file(std::slice::from_ref(&fingerprint.to_string()), &path)
+            .unwrap();
+        Cert::from_file(&path).unwrap()
+    }
+
+    fn withdrawals_on(cert: &Cert) -> usize {
+        cert.userids()
+            .map(|ua| ua.other_revocations().count())
+            .sum()
+    }
+
+    /// The withdrawal of a local certification is as local as the
+    /// certification. It used to be publishable whatever it withdrew: export
+    /// and upload leave out only signatures marked non-exportable, so the
+    /// certification stayed home while its withdrawal went out, signed by the
+    /// user over the very user ID a local certification exists to keep quiet
+    /// about, with its date and its message. A publishable certification's
+    /// withdrawal still goes out, since whoever has the certification needs it.
+    #[test]
+    fn withdrawing_a_local_certification_publishes_nothing() {
+        let (_dir, store) = scratch();
+        let me = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        let quiet = generate(&KeyGenRequest::new("Quiet <quiet@example.org>"))
+            .unwrap()
+            .cert;
+        let open = generate(&KeyGenRequest::new("Open <open@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&me).unwrap();
+        store.insert(&quiet).unwrap();
+        store.insert(&open).unwrap();
+
+        for (target, user_id, exportable) in [
+            (&quiet, "Quiet <quiet@example.org>", false),
+            (&open, "Open <open@example.org>", true),
+        ] {
+            let mut request =
+                CertifyRequest::new(me.fingerprint().to_hex(), target.fingerprint().to_hex());
+            request.user_ids = vec![user_id.to_string()];
+            request.exportable = exportable;
+            certify(&store, &request).unwrap();
+            withdraw(&store, &me, target, user_id).unwrap();
+            assert_eq!(
+                under(&store, &me, target, user_id),
+                crate::Authentication::Unknown,
+                "the withdrawal must take effect here, local or not"
+            );
+        }
+
+        let (quiet_fp, open_fp) = (quiet.fingerprint().to_hex(), open.fingerprint().to_hex());
+        assert_eq!(withdrawals_on(&store.lookup(&quiet_fp).unwrap()), 1);
+        assert_eq!(
+            withdrawals_on(&exported(&store, &quiet_fp)),
+            0,
+            "the withdrawal of a local certification was exported"
+        );
+        assert_eq!(
+            withdrawals_on(&exported(&store, &open_fp)),
+            1,
+            "the withdrawal of a publishable certification must go with it"
+        );
+    }
+
+    /// Publishable when anything it takes back was. A publishable
+    /// certification the user then changed to a local one is still out there,
+    /// and whoever holds it but not the local one counts it, so the
+    /// withdrawal that follows must reach them. But a publishable
+    /// certification already withdrawn, publicly, makes no later withdrawal of
+    /// a local one publishable: that would announce the local one.
+    #[test]
+    fn a_withdrawal_is_publishable_while_anything_it_takes_back_was() {
+        let (_dir, store) = scratch();
+        let me = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        let them = generate(&KeyGenRequest::new("Them <them@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&me).unwrap();
+        store.insert(&them).unwrap();
+        let them_fp = them.fingerprint().to_hex();
+        let user_id = "Them <them@example.org>";
+        let mut request = CertifyRequest::new(me.fingerprint().to_hex(), &them_fp);
+        request.user_ids = vec![user_id.to_string()];
+
+        certify(&store, &request).unwrap();
+        request.exportable = false;
+        certify(&store, &request).unwrap();
+        withdraw(&store, &me, &them, user_id).unwrap();
+        assert_eq!(
+            withdrawals_on(&exported(&store, &them_fp)),
+            1,
+            "the publishable certification the local one replaced needs its withdrawal published"
+        );
+
+        certify(&store, &request).unwrap();
+        withdraw(&store, &me, &them, user_id).unwrap();
+        assert_eq!(withdrawals_on(&store.lookup(&them_fp).unwrap()), 2);
+        assert_eq!(
+            withdrawals_on(&exported(&store, &them_fp)),
+            1,
+            "a withdrawal that takes back only a local certification was exported"
         );
     }
 

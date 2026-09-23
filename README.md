@@ -207,8 +207,32 @@ options map onto OpenPGP as follows:
 | --- | --- |
 | Confidence: Full / Partial | trust amount 120 / 60; anything but Full becomes a trust signature |
 | Publishable | an exportable certification, shareable and included in exports |
-| *(unticked)* | a local certification, never written out by `export_file` |
+| *(unticked)* | a local certification: `export_file` writes out neither it nor its withdrawal, unless that withdrawal also takes back a publishable one it replaced |
 | Trusted introducer | a trust signature of depth 1: keys *they* certify count here too |
+
+A certification is always made with the certifier's **primary key**, whatever
+flags the certificate puts on its subkeys, because that is the only key
+`sequoia-wot` accepts one from; a certification a subkey made counts for
+nobody. Nor is a certification made that `sequoia-wot` would discount from the
+start: certifying a key that has expired, has been revoked or is not valid under
+the standard policy, or a user ID that is not valid UTF-8, is refused before any
+key is unlocked.
+
+The details pane lists every certification on a certificate and ticks the ones
+`sequoia-wot` counts, by its own rule: a certifier's newest word on a user ID
+replaces the one before it, a withdrawal takes back what came before it, and a
+certification that has expired, that a subkey made, that was made with SHA-1
+(as GnuPG 1.x and 2.0 did by default), that was made of a key already expired
+or revoked or since revoked as compromised, or whose certifier's key has since
+been revoked as compromised is listed with the reason it does not count. A tick
+says that `sequoia-wot` counts the certification as an edge of the web of
+trust, and no more. Whether the name is authenticated is still the `verified`
+pill's to say: that takes a path of such edges from one of your trust roots,
+and the pill weighs the certificate and the user ID themselves as well, so a
+ticked row can sit under a pill that says otherwise. Only what counts, or will
+once the date it carries comes, is offered for withdrawal, so a certification
+of your own that `sequoia-wot` does not count, a SHA-1 one among them, is
+listed without a way to withdraw it.
 
 Trust roots are where authentication starts. Every key you **generate here** is
 a root automatically — the alternative is a fresh install where nothing
@@ -286,16 +310,14 @@ check of its own because Sequoia's per-key filters cannot express it:
 `revoked(false)` asks a *subkey* about its own revocation, and revoking a
 certificate as a whole leaves its subkeys unmarked.
 
-That second exemption preserves only what already worked. The key signing the
-withdrawal still has to be one the certificate offers for certification, and
-`revoked(false)` asked of the *primary* key does consult the certificate — so a
-key generated here, which certifies with its primary and has no certification
-subkey, cannot withdraw its certifications once it has been revoked: the attempt
-reports that there is no usable secret key. What survives is the shape that
-filter does not catch, a certification *subkey*, held locally or on a card.
-**Withdraw first, revoke second**, therefore — and the order matters most
-after a soft revocation, where every certification the key made still stands
-and withdrawing them is the only remedy there is.
+That second exemption holds whatever has happened to the key since. After a
+soft revocation, or once the key has expired, every certification it made
+before then still counts — `sequoia-wot` judges a certifier as it stood when it
+certified — and withdrawing them is the only remedy there is, so the withdrawal
+is signed with the primary key regardless, locally or through the agent, and
+takes effect. A hard revocation is where it ends: it already takes back every
+certification the key ever made, so there is nothing left to withdraw, and the
+details pane says so beside each of them rather than offering a withdrawal.
 
 The list says the same thing rather than something of its own. The capability
 letters on a row — `C`, `S`, `E` — are what this app will *do* with the
@@ -460,9 +482,10 @@ exempt, including a redirect away from that server.
 Publishing cannot be undone — a keyserver has no delete — so the dialog says so,
 names the key it is about to upload, and uses the same danger styling as
 revocation. Only your own keys are offered, and the upload refuses any other.
-Only the public half is ever sent, and no local certification goes with it:
-`publish` serialises the certificate rather than the transferable secret key,
-and uses `export_to_vec`, which omits signatures marked non-exportable. A test
+Only the public half is ever sent, and no local certification goes with it, nor
+the withdrawal of one: `publish` serialises the certificate rather than the
+transferable secret key, and uses `export_to_vec`, which omits signatures marked
+non-exportable, as a withdrawal is whenever all it takes back was local. A test
 asserts on the upload body itself, parsing it back to check both properties.
 
 ## Where outputs go

@@ -46,7 +46,8 @@ export struct CertRow {
 export struct CertificationRow {
     certifier: string,
     user-id: string,
-    // "full · publishable · 2026-08-10", or why it could not be checked.
+    // "full · publishable · 2026-08-10", then why it could not be checked
+    // or, where it was, why it does not count: "since withdrawn" and the like.
     detail: string,
     good: bool,
     by-me: bool,

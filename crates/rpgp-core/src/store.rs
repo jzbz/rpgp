@@ -943,8 +943,11 @@ impl Store {
     /// key, subkeys or user IDs still come here, for the date alone: what they
     /// sign over the secret half is written into cert-d as well, where a
     /// self-signature that reached cert-d alone would otherwise outrank a soft
-    /// revocation; see [`crate::signature_time`]. This is the only place both
-    /// files are in reach.
+    /// revocation; see [`crate::signature_time`]. Retracting a certification
+    /// comes here to judge what of the certifier's still stands, which turns
+    /// on revocations of its key that may have reached cert-d alone; see
+    /// [`crate::certify::Standing`]. This is the only place both files are in
+    /// reach.
     ///
     /// The secret half is the base, so its key material is what survives and
     /// the public half contributes signatures only. Where there is no secret

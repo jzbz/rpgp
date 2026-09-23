@@ -286,8 +286,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_trusted_introducer_extends_authentication_one_hop() {
+    /// Me, a trust root; an introducer whose secret key is here but was
+    /// imported, so that it can certify without being a root itself; and a
+    /// distant certificate only the introducer has certified. Me certifies the
+    /// introducer as `delegate` sets out.
+    ///
+    /// The introducer is imported rather than generated for the reason the
+    /// verdicts below depend on. A secret key generated here is a trust root,
+    /// and these tests used to store the introducer that way, so its own
+    /// certification made the distant certificate Full with or without the
+    /// delegation, and they would have passed with trust signatures ignored
+    /// altogether.
+    fn introduced(delegate: impl FnOnce(&mut CertifyRequest)) -> Authentication {
         let (_dir, store) = scratch();
         let me = generate(&KeyGenRequest::new("Me <me@example.org>"))
             .unwrap()
@@ -298,36 +308,70 @@ mod tests {
         let friend_of_friend = generate(&KeyGenRequest::new("Distant <far@example.org>"))
             .unwrap()
             .cert;
+        let distant = |store: &Store| {
+            authentication_of(
+                store,
+                &friend_of_friend.fingerprint().to_hex(),
+                "Distant <far@example.org>",
+            )
+        };
 
         store.insert_secret(&me).unwrap();
-        // The introducer's secret key is needed only to make the second
-        // certification inside this test; it is the delegation that matters.
-        store.insert_secret(&introducer).unwrap();
+        store.insert_imported_secret(&introducer).unwrap();
         store.insert(&friend_of_friend).unwrap();
+        assert!(
+            !store
+                .effective_roots()
+                .unwrap()
+                .contains(&introducer.fingerprint().to_hex()),
+            "the introducer must not be a trust root, or nothing here is tested"
+        );
 
-        // Without the delegation, the distant certificate is a stranger.
         let mut onward = CertifyRequest::new(
             introducer.fingerprint().to_hex(),
             friend_of_friend.fingerprint().to_hex(),
         );
         onward.user_ids = vec!["Distant <far@example.org>".to_string()];
         certify(&store, &onward).unwrap();
+        assert_eq!(
+            distant(&store),
+            Authentication::Unknown,
+            "certified only by someone nobody vouches for, the distant certificate is a stranger"
+        );
 
-        let mut delegate =
+        let mut request =
             CertifyRequest::new(me.fingerprint().to_hex(), introducer.fingerprint().to_hex());
-        delegate.user_ids = vec!["Introducer <intro@example.org>".to_string()];
-        delegate.depth = 1;
-        delegate.amount = FULL;
-        certify(&store, &delegate).unwrap();
-
+        request.user_ids = vec!["Introducer <intro@example.org>".to_string()];
+        delegate(&mut request);
+        certify(&store, &request).unwrap();
         assert_eq!(
             authentication_of(
                 &store,
-                &friend_of_friend.fingerprint().to_hex(),
-                "Distant <far@example.org>"
+                &introducer.fingerprint().to_hex(),
+                "Introducer <intro@example.org>"
             ),
-            Authentication::Full
+            Authentication::Full,
+            "the introducer is certified either way"
         );
+        distant(&store)
+    }
+
+    #[test]
+    fn a_trusted_introducer_extends_authentication_one_hop() {
+        let distant = introduced(|request| {
+            request.depth = 1;
+            request.amount = FULL;
+        });
+        assert_eq!(distant, Authentication::Full);
+    }
+
+    /// The dangerous direction: an ordinary certification vouches for the one
+    /// identity it names, and must not make its subject an introducer whose
+    /// own certifications count as well.
+    #[test]
+    fn a_plain_certification_does_not_make_an_introducer() {
+        let distant = introduced(|request| request.depth = 0);
+        assert_eq!(distant, Authentication::Unknown);
     }
 
     #[test]
@@ -339,9 +383,22 @@ mod tests {
         let vouched = generate(&KeyGenRequest::new("Vouched <v@example.org>"))
             .unwrap()
             .cert;
-        // Neither secret key is ours, so nothing is a root to begin with.
-        store.insert_secret(&outside).unwrap();
+        let vouched_for = |store: &Store| {
+            authentication_of(
+                store,
+                &vouched.fingerprint().to_hex(),
+                "Vouched <v@example.org>",
+            )
+        };
+        // Imported, so not a root until the user says so: a secret key
+        // generated here would be one already, which is what this test used
+        // to use while saying that nothing was a root to begin with.
+        store.insert_imported_secret(&outside).unwrap();
         store.insert(&vouched).unwrap();
+        assert!(
+            store.effective_roots().unwrap().is_empty(),
+            "nothing may be a root to begin with, or nothing here is tested"
+        );
 
         let mut request = CertifyRequest::new(
             outside.fingerprint().to_hex(),
@@ -349,25 +406,22 @@ mod tests {
         );
         request.user_ids = vec!["Vouched <v@example.org>".to_string()];
         certify(&store, &request).unwrap();
+        assert_eq!(vouched_for(&store), Authentication::Unknown);
 
-        assert!(store.trust_roots().unwrap().is_empty());
         store
             .set_trust_root(&outside.fingerprint().to_hex(), true)
             .unwrap();
         assert_eq!(store.trust_roots().unwrap().len(), 1);
-
-        assert_eq!(
-            authentication_of(
-                &store,
-                &vouched.fingerprint().to_hex(),
-                "Vouched <v@example.org>"
-            ),
-            Authentication::Full
-        );
+        assert_eq!(vouched_for(&store), Authentication::Full);
 
         store
             .set_trust_root(&outside.fingerprint().to_hex(), false)
             .unwrap();
         assert!(store.trust_roots().unwrap().is_empty());
+        assert_eq!(
+            vouched_for(&store),
+            Authentication::Unknown,
+            "a root taken away must stop authenticating what it vouched for"
+        );
     }
 }

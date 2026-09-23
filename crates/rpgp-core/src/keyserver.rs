@@ -1583,7 +1583,10 @@ mod tests {
     /// did, so the no-secrets assertion documents the invariant more than it
     /// defends it; swapping `export_to_vec` for `to_vec`, on the other hand,
     /// silently ships every private trust statement the user ever made, and
-    /// that is what this catches.
+    /// that is what this catches. A local certification's withdrawal is one of
+    /// those statements too, since it names who vouched for whom as surely as
+    /// the certification did, and it went out with every upload until
+    /// withdrawals learned to copy what they withdraw.
     #[test]
     fn the_upload_carries_no_secret_material_and_no_local_certifications() {
         use crate::certify::{CertifyRequest, certify};
@@ -1634,6 +1637,35 @@ mod tests {
             uploaded.userids().next().unwrap().certifications().count(),
             0,
             "a non-exportable local certification reached the upload"
+        );
+
+        // Withdrawn, the certification leaves a withdrawal behind, and that
+        // stays as local as the certification it takes back.
+        let bob = crate::revoke::revoke_certification(
+            &store,
+            &alice.fingerprint().to_hex(),
+            &bob.fingerprint().to_hex(),
+            &["Bob <bob@example.org>".to_string()],
+            crate::revoke::Reason::Retired,
+            "a private note",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            bob.userids().next().unwrap().other_revocations().count(),
+            1,
+            "the withdrawal must be on the cert we are about to upload"
+        );
+        let uploaded = Cert::from_bytes(upload_body(&bob).unwrap().as_bytes()).unwrap();
+        assert_eq!(
+            uploaded
+                .userids()
+                .next()
+                .unwrap()
+                .other_revocations()
+                .count(),
+            0,
+            "the withdrawal of a local certification reached the upload"
         );
 
         // And the signer's own secret key never armors into the body either.

@@ -214,26 +214,28 @@ where
     found
 }
 
-/// A certification key for `cert`, backed by the agent.
+/// A certification key for `cert`, backed by the agent: its primary key.
 ///
 /// Certifying uses a different capability from signing messages, so this
-/// cannot share `signer_for`: on most certificates the certification key is
-/// the primary key and the signing key is a subkey.
+/// cannot share `signer_for`: the certification key is the primary key and the
+/// signing key is usually a subkey. The primary alone, and not whichever
+/// certification-capable key the agent holds, card first: sequoia-wot checks a
+/// certification against the certifier's primary key and nothing else, so a
+/// certification made by a certification subkey on a card counted for nobody.
+/// See [`crate::certify::certify`].
 pub fn certifier_for(cert: &Cert) -> Result<sequoia_gpg_agent::KeyPair> {
     keypair_for(cert, Purpose::Certify)
 }
 
 /// [`certifier_for`] for a signature that *withdraws* a certification.
 ///
-/// The same key chosen by the same filter; the one difference is that a revoked
-/// certificate is not refused. Taking back what a key already said is not new
-/// use of it, so revoking your own certificate must not also freeze every
-/// endorsement you ever issued with it. See [`crate::revoke::revoke_certification`].
-///
-/// The filter is the limit of that, and it is a real one: it drops a revoked
-/// certificate's primary key like any other, so what survives here is a
-/// certification *subkey* on a card. `revoke::certification_signer` says what
-/// that leaves out.
+/// The same key, the primary. What differs is that nothing is refused on
+/// account of the certificate's state: not a revoked certificate, and not an
+/// expired key either. Taking back what a key already said is not new use of
+/// it, so revoking your own certificate, or letting it lapse, must not also
+/// freeze every endorsement you ever issued with it, and sequoia-wot honours a
+/// withdrawal whatever has happened to its maker since. See
+/// `revoke::certification_signer`.
 ///
 /// `pub(crate)` where its neighbours are `pub`: it is the one entry point here
 /// that does not ask about revocation, and a bypass is not something to offer
@@ -258,9 +260,9 @@ pub fn decryptor_for_with(cert: &Cert, held: &[AgentKey]) -> Result<sequoia_gpg_
 enum Purpose {
     Sign,
     Certify,
-    /// Certification again, for a signature that retracts one. The same key and
-    /// the same filter as [`Purpose::Certify`]; it is a variant of its own only
-    /// so that the revocation check can let it through.
+    /// Certification again, for a signature that retracts one: the same key as
+    /// [`Purpose::Certify`], the primary, which the revocation check lets
+    /// through and the selection takes whether or not it is still alive.
     WithdrawCertification,
     Decrypt,
 }
@@ -290,7 +292,7 @@ fn keypair_for(cert: &Cert, purpose: Purpose) -> Result<sequoia_gpg_agent::KeyPa
 /// used, and per the note on [`keypair_for_with`] it is use that raises the
 /// prompt. The two purposes that are not new use of the key are let through —
 /// reading, for the reason given on its arm there, and withdrawing a
-/// certification, for the reason given on [`Purpose::WithdrawCertification`].
+/// certification, for the reason given on [`certification_withdrawer_for`].
 /// Matched exhaustively so that a purpose added later has to say which it is.
 fn refuse_if_revoked_for(cert: &Cert, purpose: Purpose) -> Result<()> {
     match purpose {
@@ -326,14 +328,24 @@ fn keypair_for_with(
         .with_policy(&policy, None)
         .map_err(|_| Error::NoSecretKey(cert.fingerprint().to_hex()))?;
 
-    let usable: Vec<_> = match purpose {
-        Purpose::Sign => valid.keys().alive().revoked(false).for_signing().collect(),
-        Purpose::Certify | Purpose::WithdrawCertification => valid
+    let primary = || valid.primary_key().key().clone().role_into_unspecified();
+    let usable: Vec<Key<PublicParts, UnspecifiedRole>> = match purpose {
+        Purpose::Sign => valid
             .keys()
             .alive()
             .revoked(false)
-            .for_certification()
+            .for_signing()
+            .map(|ka| ka.key().clone())
             .collect(),
+        // The primary key alone, and without asking for its certify flag,
+        // which sequoia-wot does not ask for either; see `certifier_for`. Its
+        // revocation is the certificate's, which `refuse_if_revoked_for` has
+        // already asked about.
+        Purpose::Certify => match valid.primary_key().alive() {
+            Ok(()) => vec![primary()],
+            Err(_) => Vec::new(),
+        },
+        Purpose::WithdrawCertification => vec![primary()],
         // Deliberately *not* filtered by alive/revoked, matching the local
         // path in ops.rs: revoking or retiring a card key withdraws it for
         // future use, it does not burn the archive. Old mail must stay
@@ -343,17 +355,18 @@ fn keypair_for_with(
             .keys()
             .for_transport_encryption()
             .chain(valid.keys().for_storage_encryption())
+            .map(|ka| ka.key().clone())
             .collect(),
     };
 
     let mut candidates: Vec<_> = usable
         .into_iter()
-        .filter_map(|ka| {
-            let grip = Keygrip::of(ka.key().mpis()).ok()?.to_string();
+        .filter_map(|key| {
+            let grip = Keygrip::of(key.mpis()).ok()?.to_string();
             let held = held
                 .iter()
                 .find(|k| k.keygrip.eq_ignore_ascii_case(&grip))?;
-            Some((held.is_on_card(), ka.key().clone()))
+            Some((held.is_on_card(), key))
         })
         .collect();
 
@@ -364,7 +377,7 @@ fn keypair_for_with(
         .next()
         .ok_or_else(|| Error::NoSecretKey(cert.fingerprint().to_hex()))?;
 
-    signer(&key.role_into_unspecified())
+    signer(&key)
 }
 
 #[cfg(test)]
