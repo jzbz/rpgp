@@ -936,11 +936,14 @@ impl Store {
     /// — a signature, a certification, a lifecycle self-signature — resolves
     /// it here, so that the certificate reaching [`crate::ops`],
     /// [`crate::certify`] and [`crate::lifecycle`] is the whole of what the
-    /// store holds. Withdrawals read the secret half alone and are meant to:
-    /// revoking a certificate, a user ID or a subkey, and retracting a
-    /// certification, are what the owner of a revoked key may still need to
-    /// do, and none of them asks [`crate::revoke::refuse_if_revoked`], so
-    /// there is nothing there for a merge to feed. This is the only place both
+    /// store holds. Withdrawals are not refused: revoking a certificate, a
+    /// user ID or a subkey, and retracting a certification, are what the owner
+    /// of a revoked key may still need to do, and none of them asks
+    /// [`crate::revoke::refuse_if_revoked`]. Soft revocations of one's own
+    /// key, subkeys or user IDs still come here, for the date alone: what they
+    /// sign over the secret half is written into cert-d as well, where a
+    /// self-signature that reached cert-d alone would otherwise outrank a soft
+    /// revocation; see [`crate::signature_time`]. This is the only place both
     /// files are in reach.
     ///
     /// The secret half is the base, so its key material is what survives and

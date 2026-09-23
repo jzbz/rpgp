@@ -29,11 +29,16 @@ use crate::store::Store;
 ///
 /// A revoked certificate is refused outright; see the guard below for why.
 ///
-/// One wrinkle: signature timestamps have one-second resolution and a new
-/// self-signature only supersedes one made strictly earlier, so two expiry
-/// changes within the same second leave the first standing. It matters only to
-/// a caller changing expiry twice in a row, which a person clicking a button
-/// will not do, but a test will.
+/// Every signature this makes is newer than the newest self-signature already
+/// on the key. Where that one was made in the current second the call waits
+/// for the next, and where it is dated further ahead than a clock that keeps
+/// time would put it, the call is refused; see [`crate::signature_time`]. Two
+/// changes within the same second used to be dated alike, and the tie was not
+/// settled in either one's favour: sequoia orders two self-signatures of one
+/// second by comparing their MPIs, which are salted and so effectively random,
+/// and does so separately for the direct-key signature, for each user ID's
+/// binding and for each subkey's, so the certificate came out an unpredictable
+/// mix of the two expiries.
 pub fn set_expiry(
     store: &Store,
     fingerprint: &str,
@@ -41,6 +46,37 @@ pub fn set_expiry(
     password: Option<&str>,
 ) -> Result<Cert> {
     let cert = store.secret_cert(fingerprint)?;
+    let merged = store.full_cert(fingerprint)?;
+
+    // Each signature below replaces the newest self-signature on its
+    // component, and replaces nothing unless it is newer: a key's expiry is
+    // read off its newest binding. One already dated later — an extension made
+    // on a machine whose clock ran ahead, or on this one before its clock was
+    // stepped back — outranked the new signatures as soon as real time passed
+    // it, and the change reported here was undone, silently and for everyone
+    // the key had been published to. Sequoia's `set_expiration_time` dates what
+    // it signs by the clock and takes no time from its caller, so the only way
+    // to date these past that one is to wait for it, which
+    // [`crate::signature_time`] does within reason and refuses beyond. Ahead of
+    // `unlock_primary`, like the refusal below and for the same reasons.
+    //
+    // Every self-signature on the key counts, not only those of the components
+    // re-signed below, which are not known until `valid` is read after the
+    // wait. A subkey whose only binding is dated ahead of the clock is not in
+    // `valid` yet, and was passed over without a word; by the time the wait is
+    // over it is. A revoked component this leaves alone buys nothing by being
+    // counted, and costs at most a wait it did not need, or a refusal that is
+    // still true about the clock. Measured against `merged`, because
+    // `store_both` writes into cert-d as well, where a self-signature that
+    // never reached the secret key file would otherwise outrank everything
+    // this makes.
+    let when = crate::signature_time(
+        merged
+            .primary_key()
+            .self_signatures()
+            .chain(merged.userids().flat_map(|ua| ua.self_signatures()))
+            .chain(merged.keys().subkeys().flat_map(|ka| ka.self_signatures())),
+    )?;
 
     // The refusal is not merely tidy. Sequoia decides revocation status from
     // the newest of the primary key's self-signatures, and the direct-key
@@ -50,18 +86,22 @@ pub fn set_expiry(
     // everyone who refreshes it afterwards. `revoke` opens by saying there is
     // no un-revoke; this is where that stopped being true.
     //
-    // Asked of `full_cert` and not of `cert`, because one's own revocation can
+    // Asked of `merged` and not of `cert`, because one's own revocation can
     // reach the public half alone — by import, or by a keyserver refresh — and
     // `secret_cert`, which is the copy changed here, would still look live. The
     // change is still made to `cert`: `store_both` writes back whatever it is
     // handed, and folding cert-d's third-party signatures into the secret key
     // file is not this refusal's business.
     //
+    // Asked once the wait above is over, not before it. A revocation dated a
+    // moment ahead of the clock is in force only from then, and signatures
+    // dated past whatever the wait was for would override it.
+    //
     // Ahead of `unlock_primary`, which is not about prompts — it unlocks with
     // the passphrase it is given and never reaches the agent — but so that a
     // refused change unlocks no secret, and so that the owner of a revoked key
     // is told it is revoked rather than that the passphrase is wrong.
-    crate::revoke::refuse_if_revoked(&store.full_cert(fingerprint)?)?;
+    crate::revoke::refuse_if_revoked(&merged)?;
 
     let policy = policy();
     let mut signer = unlock_primary(&cert, password)?;
@@ -156,6 +196,7 @@ pub fn set_expiry(
                 ka.key(),
                 ka.binding_signature(),
                 expiration,
+                when,
             )?),
             // A secret that is real but will not open — no passphrase, or the
             // wrong one — is still an error rather than a reason to fall back.
@@ -186,6 +227,9 @@ pub fn set_expiry(
 /// been retired, in which case the new name takes it over rather than the
 /// retirement being quietly undone.
 ///
+/// A name already on the key is refused, unless its owner has retired it: then
+/// it is bound again, which is how a retirement is taken back.
+///
 /// A revoked certificate is refused, as in [`set_expiry`] and for the same
 /// reason, and so is one the standard policy cannot evaluate: the key's own
 /// account of itself is what this copies, and a certificate that cannot be
@@ -202,6 +246,74 @@ pub fn add_user_id(
     }
 
     let cert = store.secret_cert(fingerprint)?;
+    let merged = store.full_cert(fingerprint)?;
+
+    let policy = policy();
+    let userid = UserID::from(user_id);
+
+    // A name already on the key is refused rather than bound twice — unless its
+    // owner has retired it. Sequoia lets a newer binding supersede a user ID's
+    // revocation, whatever reason it gives, so binding the name again is the
+    // way back from retiring the wrong one, and it used to be refused with "is
+    // already on this key" beside a list that showed the name as revoked,
+    // which left no way back inside this app. The new binding supersedes the
+    // retirement only if it is newer, which the dating below sees to.
+    //
+    // Asked of both halves of the store, because that is the list the user is
+    // looking at and what the binding is merged into: a retirement that
+    // reached cert-d alone still shows as one there, and a name live there is
+    // on the key whatever the secret key file says. A name that only renders
+    // alike — other bytes, the same text once invalid UTF-8 is replaced — is
+    // still refused, retired or not: binding this one beside it would put two
+    // rows in the list that read the same.
+    if merged
+        .userids()
+        .filter(|ua| String::from_utf8_lossy(ua.userid().value()) == user_id)
+        .any(|ua| {
+            ua.userid() != &userid
+                || !matches!(
+                    ua.revocation_status(&policy, None),
+                    RevocationStatus::Revoked(_)
+                )
+        })
+    {
+        return Err(Error::invalid(format!("{user_id} is already on this key")));
+    }
+
+    // Both signatures below are dated together, by [`crate::signature_time`],
+    // after the key's direct-key signatures and every user ID's bindings and,
+    // where the name being added was on the key and retired, after every
+    // retirement of it too.
+    // A re-issued binding that tied with its predecessor would be settled by
+    // comparing the two signatures' MPIs — a coin toss that, lost, leaves the
+    // primary user ID unclaimed and moves it to the new name after all — and a
+    // binding that tied with a retirement would leave the retirement standing
+    // while this reported success.
+    //
+    // Every binding counts, not only the pinned identity's, and the wait comes
+    // before the template and the pin are read rather than after: both are
+    // read off whichever binding is in force, and one dated a moment ahead of
+    // the clock is not in force until the wait is over. Read before it, an
+    // older binding would be copied and re-issued past the newer one, and
+    // whatever the newer one said about the key — an expiry extended
+    // elsewhere, say — would be undone.
+    //
+    // Other identities' retirements are left out on purpose. One that could
+    // move the date is dated ahead of the clock — made on another machine, and
+    // not in force yet — and it is still its owner's decision, which a binding
+    // dated past it would undo.
+    let when = crate::signature_time(
+        merged
+            .primary_key()
+            .self_signatures()
+            .chain(merged.userids().flat_map(|ua| ua.self_signatures()))
+            .chain(
+                merged
+                    .userids()
+                    .filter(|ua| ua.userid() == &userid)
+                    .flat_map(|ua| ua.self_revocations()),
+            ),
+    )?;
 
     // Where the binding over the primary user ID is re-issued below — which is
     // every certificate whose bindings claim no primary identity, the shape
@@ -215,18 +327,10 @@ pub fn add_user_id(
     // precisely the kind of accident not to leave a guarantee resting on. Both
     // shapes are refused.
     //
-    // Both halves of the store are asked, and the guard sits ahead of
-    // `unlock_primary`, for the reasons set out in [`set_expiry`].
-    crate::revoke::refuse_if_revoked(&store.full_cert(fingerprint)?)?;
-
-    if cert
-        .userids()
-        .any(|ua| String::from_utf8_lossy(ua.userid().value()) == user_id)
-    {
-        return Err(Error::invalid(format!("{user_id} is already on this key")));
-    }
-
-    let policy = policy();
+    // Both halves of the store are asked, and the guard sits after the wait
+    // and ahead of `unlock_primary`, for the reasons set out in
+    // [`set_expiry`].
+    crate::revoke::refuse_if_revoked(&merged)?;
 
     // What a certificate says about its own primary key — the key flags, the
     // expiry, the preferred algorithms, the features — lives in the primary
@@ -296,31 +400,7 @@ pub fn add_user_id(
         (template, pin)
     };
 
-    // Both signatures are dated together, and one second on where the binding
-    // being replaced was made in this same second. Signature timestamps are
-    // whole seconds and a self-signature supersedes only one made strictly
-    // earlier, so a re-issued binding that ties with its predecessor is settled
-    // by comparing the two signatures' MPIs — a coin toss that, lost, leaves
-    // the primary user ID unclaimed and moves it to the new name after all.
-    // Dating both alike keeps the claim, not the clock, deciding which identity
-    // is primary, so the one second the pair can spend in the future costs
-    // nothing: until it arrives the certificate reads as it did before the call,
-    // rather than briefly reading with the wrong primary.
-    //
-    // This is not the general fix for same-second self-signatures, which is a
-    // change of its own; it is this operation not adding another instance.
-    let now = SystemTime::now();
-    let second = Duration::from_secs(1);
-    let when = match pin
-        .as_ref()
-        .and_then(|(_, sig)| sig.signature_creation_time())
-    {
-        Some(created) if created + second > now => now + second,
-        _ => now,
-    };
-
     let mut signer = unlock_primary(&cert, password)?;
-    let userid = UserID::from(user_id);
 
     let mut builder = SignatureBuilder::from(template)
         .set_type(SignatureType::PositiveCertification)
@@ -463,8 +543,28 @@ pub fn revoke_user_id(
         ));
     }
 
+    // A retirement stands only until a newer binding over the same name:
+    // sequoia lets any later self-signature on a user ID supersede its
+    // revocation. Dated by the clock alone, one that the list showed as
+    // revoked went back into service the moment real time passed a binding
+    // already dated after it — an expiry extended on a machine whose clock ran
+    // ahead, say — here and for everyone the key had been published to. See
+    // [`crate::signature_time`].
+    //
+    // Measured against both halves of the store, because `store_both` writes
+    // into cert-d as well, where a binding that arrived by import or refresh,
+    // and never reached the secret key file, would otherwise outrank it.
+    let merged = store.full_cert(fingerprint)?;
+    let when = crate::signature_time(
+        merged
+            .userids()
+            .filter(|ua| ua.userid() == &userid)
+            .flat_map(|ua| ua.self_signatures()),
+    )?;
+
     let mut signer = unlock_primary(&cert, password)?;
     let signature = UserIDRevocationBuilder::new()
+        .set_signature_creation_time(when)?
         .set_reason_for_revocation(ReasonForRevocation::UIDRetired, message.as_bytes())?
         .build(&mut signer, &cert, &userid, None)?;
 
@@ -498,8 +598,29 @@ pub fn revoke_subkey(
             Error::invalid(format!("{subkey_fingerprint} is not a subkey of this key"))
         })?;
 
+    // A soft revocation of a subkey — Retired, the default, or Superseded —
+    // stands only until a newer binding over the same subkey, so one dated by
+    // the clock alone lost to a binding already dated later, as the retirement
+    // in `revoke_user_id` did, and is dated the same way for the same reasons.
+    // A hard one is final whatever is dated after it, so it supersedes nothing
+    // and is dated now, as in `revoke::revoke_cert`: a subkey whose secret is
+    // exposed is not one to leave unrevoked over a clock.
+    let when = if reason.is_hard() {
+        SystemTime::now()
+    } else {
+        let merged = store.full_cert(fingerprint)?;
+        crate::signature_time(
+            merged
+                .keys()
+                .subkeys()
+                .filter(|ka| ka.key().fingerprint() == subkey.fingerprint())
+                .flat_map(|ka| ka.self_signatures()),
+        )?
+    };
+
     let mut signer = unlock_primary(&cert, password)?;
     let signature = SubkeyRevocationBuilder::new()
+        .set_signature_creation_time(when)?
         .set_reason_for_revocation(reason.to_openpgp(), message.as_bytes())?
         .build(&mut signer, &cert, &subkey, None)?;
 
@@ -536,12 +657,16 @@ fn store_both(store: &Store, cert: Cert, signatures: Vec<Signature>) -> Result<C
 /// it in flight is a stranger's; here the template is this subkey's own
 /// binding, and the one packet most likely to be sitting in that area is the
 /// back-signature GnuPG puts there.
+///
+/// Dated `when`, the time [`set_expiry`] waited for, so that it is newer than
+/// the binding it replaces, as sequoia's own re-issues beside it are.
 fn rebind_subkey(
     signer: &mut (dyn sequoia_openpgp::crypto::Signer + Send + Sync),
     primary: &Key<PublicParts, PrimaryRole>,
     subkey: &Key<PublicParts, SubordinateRole>,
     binding: &Signature,
     expiration: Option<SystemTime>,
+    when: SystemTime,
 ) -> Result<Signature> {
     // A key expiry is stored as a lifetime counted from that key's own
     // creation, which is why this is per subkey rather than one figure for the
@@ -558,7 +683,7 @@ fn rebind_subkey(
         })?;
 
     Ok(SignatureBuilder::from(binding.clone())
-        .set_signature_creation_time(SystemTime::now())?
+        .set_signature_creation_time(when)?
         .set_key_validity_period(validity)?
         .sign_subkey_binding(signer, primary, subkey)?)
 }
@@ -849,12 +974,12 @@ mod tests {
         let extended = CertSummary::from_cert(&updated).expires.unwrap();
         assert!(extended > original, "expiry should have moved outwards");
 
-        // Signature timestamps have one-second granularity, and a new
-        // self-signature only supersedes one made strictly earlier. Two expiry
-        // changes inside the same second tie, and the older wins — see the note
-        // on `set_expiry`.
-        std::thread::sleep(Duration::from_millis(1100));
-
+        // No wait between the two. Signature times are whole seconds, and two
+        // calls this close used to land in the same one and tie on every
+        // component; sequoia settles each tie separately, by comparing the
+        // signatures' salted MPIs, so the key came out a random mix of both
+        // expiries. The second call now waits for the next second by itself —
+        // see the note on `set_expiry`.
         let updated = set_expiry(&store, &fingerprint, None, None).unwrap();
         assert!(CertSummary::from_cert(&updated).expires.is_none());
 
@@ -869,6 +994,163 @@ mod tests {
                 .expires
                 .is_none()
         );
+    }
+
+    /// Every self-signature `set_expiry` replaces, re-issued dated `when`, with
+    /// the key and each subkey expiring at `expires`: what `set_expiry` leaves
+    /// on a key when it runs on a machine whose clock is ahead of this one.
+    fn reissued(secret: &Cert, when: SystemTime, expires: SystemTime) -> Vec<Signature> {
+        let policy = policy();
+        let valid = secret.with_policy(&policy, None).unwrap();
+        let primary = secret.primary_key().key();
+        let lifetime = expires.duration_since(primary.creation_time()).unwrap();
+        let mut signer = unlock_primary(secret, None).unwrap();
+
+        let mut signatures = vec![
+            SignatureBuilder::from(valid.direct_key_signature().unwrap().clone())
+                .set_signature_creation_time(when)
+                .unwrap()
+                .set_key_validity_period(lifetime)
+                .unwrap()
+                .sign_direct_key(&mut signer, primary)
+                .unwrap(),
+        ];
+        for ua in valid.userids() {
+            signatures.push(
+                SignatureBuilder::from(ua.binding_signature().clone())
+                    .set_signature_creation_time(when)
+                    .unwrap()
+                    .set_key_validity_period(lifetime)
+                    .unwrap()
+                    .sign_userid_binding(&mut signer, primary, ua.userid())
+                    .unwrap(),
+            );
+        }
+        for ka in valid.keys().subkeys() {
+            signatures.push(
+                rebind_subkey(
+                    &mut signer,
+                    primary,
+                    ka.key(),
+                    ka.binding_signature(),
+                    Some(expires),
+                    when,
+                )
+                .unwrap(),
+            );
+        }
+        signatures
+    }
+
+    /// Each signature `set_expiry` writes supersedes only an older one, and the
+    /// clock alone used to date them. A key already carrying self-signatures
+    /// dated later — an extension made on a machine whose clock runs ahead —
+    /// kept those as its newest, and once real time passed them theirs was the
+    /// expiry everyone saw, while the status bar said the expiry was updated
+    /// and the pane showed the new date.
+    ///
+    /// The later ones reach this store as a public certificate, which is how a
+    /// keyserver refresh brings them: in cert-d and not in the secret key file
+    /// the new signatures are made from, so the date has to come from both.
+    #[test]
+    fn a_new_expiry_outranks_self_signatures_dated_ahead_of_the_clock() {
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let day = Duration::from_secs(24 * 60 * 60);
+
+        let secret = store.secret_cert(&fingerprint).unwrap();
+        let planted = reissued(
+            &secret,
+            SystemTime::now() + Duration::from_secs(2),
+            SystemTime::now() + 60 * day,
+        );
+        let ahead = planted
+            .iter()
+            .filter_map(|sig| sig.signature_creation_time())
+            .max()
+            .unwrap();
+        store
+            .insert(&secret.insert_packets(planted).unwrap().0)
+            .unwrap();
+
+        set_expiry(&store, &fingerprint, Some(730 * day), None).unwrap();
+
+        // Read as of a minute past the planted signatures, when they would have
+        // taken over.
+        let later = ahead + Duration::from_secs(60);
+        let policy = policy();
+        let reloaded = store.lookup(&fingerprint).unwrap();
+        let expiries: Vec<Option<SystemTime>> = reloaded
+            .with_policy(&policy, later)
+            .unwrap()
+            .keys()
+            .map(|ka| ka.key_expiration_time())
+            .collect();
+        let a_year_on = SystemTime::now() + 365 * day;
+        assert_eq!(
+            expiries.len(),
+            cert.keys().count(),
+            "the primary key and every subkey"
+        );
+        assert!(
+            expiries.iter().all(|e| e.is_some_and(|e| e > a_year_on)),
+            "a self-signature dated ahead of the clock took the expiry back: {expiries:?}"
+        );
+    }
+
+    /// The refusal of a revoked key is asked once the wait for the newest
+    /// self-signature is over. A soft revocation dated a moment ahead of the
+    /// clock is not in force before then, and a binding in the same second as
+    /// it leaves it standing; asked before the wait, the refusal let the change
+    /// through, and the new signatures, dated past that binding and so past the
+    /// revocation, overrode it once its time came.
+    #[test]
+    fn a_revocation_dated_a_moment_ahead_still_refuses_a_new_expiry() {
+        use sequoia_openpgp::cert::CertRevocationBuilder;
+
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let day = Duration::from_secs(24 * 60 * 60);
+
+        let secret = store.secret_cert(&fingerprint).unwrap();
+        let ahead = SystemTime::now() + Duration::from_secs(2);
+        let mut planted = reissued(&secret, ahead, SystemTime::now() + 60 * day);
+        let mut signer = unlock_primary(&secret, None).unwrap();
+        planted.push(
+            CertRevocationBuilder::new()
+                .set_signature_creation_time(ahead)
+                .unwrap()
+                .set_reason_for_revocation(ReasonForRevocation::KeyRetired, b"")
+                .unwrap()
+                .build(&mut signer, &secret, None)
+                .unwrap(),
+        );
+        let later = ahead + Duration::from_secs(60);
+        store
+            .insert_secret(&secret.insert_packets(planted).unwrap().0)
+            .unwrap();
+        let revoked_later = || {
+            matches!(
+                store
+                    .lookup(&fingerprint)
+                    .unwrap()
+                    .revocation_status(&policy(), later),
+                RevocationStatus::Revoked(_)
+            )
+        };
+        assert!(
+            revoked_later(),
+            "the premise is a revocation that the bindings of its own second leave standing"
+        );
+
+        let refused = set_expiry(&store, &fingerprint, Some(730 * day), None)
+            .map(|_| ())
+            .expect_err("changed the expiry of a key revoked a moment ahead of the clock");
+        assert!(
+            refused.to_string().contains("revoked"),
+            "refused for the wrong reason: {refused}"
+        );
+        assert!(revoked_later(), "a refused change must not reach the store");
     }
 
     /// A GnuPG key is [S][E][A], and the authentication subkey is the one this
@@ -1200,6 +1482,134 @@ mod tests {
         // Adding the same identity twice is refused rather than duplicated.
         assert!(add_user_id(&store, &fingerprint, "Alice <alice@work.example>", None).is_err());
         assert!(add_user_id(&store, &fingerprint, "   ", None).is_err());
+    }
+
+    /// Retiring a user ID is not the end of it: sequoia lets a newer binding over
+    /// the name supersede the retirement, so binding it again is how a name
+    /// retired by mistake comes back. Adding it used to be refused as "already
+    /// on this key" beside a list that showed it as revoked, and nothing in the
+    /// app could bring it back. It is added straight after the retirement, as
+    /// someone who clicked the wrong row would, and a binding in the same
+    /// second as the retirement ties with it and leaves it standing.
+    ///
+    /// Then the same over a retirement made on the owner's other machine, met
+    /// here as a public certificate: cert-d alone knows of it, and it is what
+    /// the list shows and what the new binding has to outrank.
+    #[test]
+    fn a_retired_user_id_can_be_added_back() {
+        const WORK: &str = "Alice <alice@work.example>";
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let live = |cert: &Cert| -> Vec<bool> {
+            cert::user_ids(cert)
+                .into_iter()
+                .filter(|u| u.text == WORK)
+                .map(|u| !u.revoked)
+                .collect()
+        };
+
+        add_user_id(&store, &fingerprint, WORK, None).unwrap();
+        revoke_user_id(&store, &fingerprint, WORK, "wrong row", None).unwrap();
+        assert_eq!(live(&store.lookup(&fingerprint).unwrap()), [false]);
+
+        let updated = add_user_id(&store, &fingerprint, WORK, None)
+            .map_err(|e| e.to_string())
+            .expect("a retired name must be possible to bind again");
+        for reloaded in [
+            updated,
+            store.secret_cert(&fingerprint).unwrap(),
+            store.lookup(&fingerprint).unwrap(),
+        ] {
+            assert_eq!(
+                live(&reloaded),
+                [true],
+                "the name must be back, once, and live"
+            );
+        }
+
+        // Live again, so adding it once more is refused as it always was.
+        assert!(add_user_id(&store, &fingerprint, WORK, None).is_err());
+
+        let elsewhere_dir = tempfile::tempdir().unwrap();
+        let elsewhere = Store::open(
+            elsewhere_dir.path().join("certs.d"),
+            elsewhere_dir.path().join("secrets"),
+        )
+        .unwrap();
+        elsewhere
+            .insert_secret(&store.secret_cert(&fingerprint).unwrap())
+            .unwrap();
+        revoke_user_id(&elsewhere, &fingerprint, WORK, "left the job", None).unwrap();
+        store
+            .insert(&elsewhere.lookup(&fingerprint).unwrap())
+            .unwrap();
+        assert_eq!(live(&store.lookup(&fingerprint).unwrap()), [false]);
+        assert_eq!(
+            live(&store.secret_cert(&fingerprint).unwrap()),
+            [true],
+            "the secret half not knowing is the premise of this half"
+        );
+
+        add_user_id(&store, &fingerprint, WORK, None)
+            .map_err(|e| e.to_string())
+            .expect("a name retired elsewhere must be possible to bind again");
+        assert_eq!(live(&store.lookup(&fingerprint).unwrap()), [true]);
+    }
+
+    /// The new name's binding is copied from the primary user ID's, and it is
+    /// read once the wait for the newest binding is over. Read before it, a
+    /// binding dated a moment ahead of the clock was not yet the one in force,
+    /// so the older one was copied — the expiry the key had before an
+    /// extension made elsewhere — and, dated past both, that older account of
+    /// the key would have been the newest thing on it.
+    #[test]
+    fn a_new_user_id_copies_the_newest_binding_even_one_a_moment_ahead() {
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let policy = policy();
+        let lifetime = Duration::from_secs(3 * 365 * 24 * 60 * 60);
+
+        let secret = store.secret_cert(&fingerprint).unwrap();
+        let binding = {
+            let valid = secret.with_policy(&policy, None).unwrap();
+            let primary = valid.primary_userid().unwrap();
+            assert_ne!(
+                primary.binding_signature().key_validity_period(),
+                Some(lifetime),
+                "the planted binding must say something the old one does not"
+            );
+            let mut signer = unlock_primary(&secret, None).unwrap();
+            SignatureBuilder::from(primary.binding_signature().clone())
+                .set_signature_creation_time(SystemTime::now() + Duration::from_secs(2))
+                .unwrap()
+                .set_key_validity_period(lifetime)
+                .unwrap()
+                .sign_userid_binding(&mut signer, secret.primary_key().key(), primary.userid())
+                .unwrap()
+        };
+        store
+            .insert_secret(
+                &secret
+                    .insert_packets(vec![Packet::from(binding)])
+                    .unwrap()
+                    .0,
+            )
+            .unwrap();
+
+        let updated =
+            add_user_id(&store, &fingerprint, "Alice <alice@work.example>", None).unwrap();
+        let copied = updated
+            .userids()
+            .find(|ua| ua.userid().value() == b"Alice <alice@work.example>")
+            .expect("the new identity is on the key")
+            .binding_signature(&policy, None)
+            .unwrap()
+            .key_validity_period();
+        assert_eq!(
+            copied,
+            Some(lifetime),
+            "the new binding was copied from a binding that had been replaced"
+        );
     }
 
     /// Pinning the primary identity means re-issuing its binding, and a
@@ -1548,6 +1958,186 @@ mod tests {
         assert!(
             ids.iter()
                 .any(|u| u.text == "Alice <alice@example.org>" && !u.revoked)
+        );
+    }
+
+    /// A retirement stands only until a newer binding over the name, and one
+    /// dated by the clock alone lost to a binding already dated after it: the
+    /// list showed the name as revoked, and once real time passed that binding
+    /// it was back in service, here and for everyone the key had been published
+    /// to. The binding reaches this store as a public certificate, as a
+    /// refresh brings it, so in cert-d alone.
+    #[test]
+    fn retiring_a_user_id_outranks_a_binding_dated_ahead_of_the_clock() {
+        const OLD: &str = "Alice <alice@oldjob.example>";
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let policy = policy();
+        add_user_id(&store, &fingerprint, OLD, None).unwrap();
+
+        let secret = store.secret_cert(&fingerprint).unwrap();
+        let binding = {
+            let valid = secret.with_policy(&policy, None).unwrap();
+            let ua = valid
+                .userids()
+                .find(|ua| ua.userid().value() == OLD.as_bytes())
+                .unwrap();
+            let mut signer = unlock_primary(&secret, None).unwrap();
+            SignatureBuilder::from(ua.binding_signature().clone())
+                .set_signature_creation_time(SystemTime::now() + Duration::from_secs(2))
+                .unwrap()
+                .sign_userid_binding(&mut signer, secret.primary_key().key(), ua.userid())
+                .unwrap()
+        };
+        let ahead = binding.signature_creation_time().unwrap();
+        store
+            .insert(
+                &secret
+                    .insert_packets(vec![Packet::from(binding)])
+                    .unwrap()
+                    .0,
+            )
+            .unwrap();
+
+        revoke_user_id(&store, &fingerprint, OLD, "left the job", None).unwrap();
+
+        // Read as of a minute past the binding, when it would have taken over.
+        let later = ahead + Duration::from_secs(60);
+        for reloaded in [
+            store.lookup(&fingerprint).unwrap(),
+            store.full_cert(&fingerprint).unwrap(),
+        ] {
+            let ua = reloaded
+                .userids()
+                .find(|ua| ua.userid().value() == OLD.as_bytes())
+                .unwrap();
+            assert!(
+                matches!(
+                    ua.revocation_status(&policy, later),
+                    RevocationStatus::Revoked(_)
+                ),
+                "a binding dated ahead of the clock took the retired name back"
+            );
+        }
+    }
+
+    /// The same for a subkey and its soft reasons: Retired, the default, and
+    /// Superseded lose to a newer binding over the subkey, so one dated by the
+    /// clock alone had the subkey encrypted to again once real time passed a
+    /// binding already dated after it. The bindings reach this store as a
+    /// public certificate, as a refresh brings them, so in cert-d alone.
+    ///
+    /// Each subkey's own bindings are what date its revocation, so the second
+    /// subkey's binding, a day ahead, does not hold up the first's. It does
+    /// refuse a soft revocation of its own subkey, which could not stand, and
+    /// it does not hold up a hard one, which nothing dated after it undoes.
+    #[test]
+    fn a_soft_subkey_revocation_outranks_a_binding_dated_ahead_of_the_clock() {
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let policy = policy();
+        let day = Duration::from_secs(24 * 60 * 60);
+
+        let secret = store.secret_cert(&fingerprint).unwrap();
+        let subkeys: Vec<Key<PublicParts, SubordinateRole>> =
+            secret.keys().subkeys().map(|ka| ka.key().clone()).collect();
+        assert!(
+            subkeys.len() > 1,
+            "the test key should have several subkeys"
+        );
+        let (near, far) = (
+            SystemTime::now() + Duration::from_secs(2),
+            SystemTime::now() + day,
+        );
+        let bindings: Vec<Signature> = {
+            let valid = secret.with_policy(&policy, None).unwrap();
+            let mut signer = unlock_primary(&secret, None).unwrap();
+            [(&subkeys[0], near), (&subkeys[1], far)]
+                .into_iter()
+                .map(|(subkey, when)| {
+                    let ka = valid
+                        .keys()
+                        .subkeys()
+                        .find(|ka| ka.key().fingerprint() == subkey.fingerprint())
+                        .unwrap();
+                    rebind_subkey(
+                        &mut signer,
+                        secret.primary_key().key(),
+                        ka.key(),
+                        ka.binding_signature(),
+                        None,
+                        when,
+                    )
+                    .unwrap()
+                })
+                .collect()
+        };
+        let ahead = bindings
+            .iter()
+            .filter_map(|sig| sig.signature_creation_time())
+            .min()
+            .unwrap();
+        store
+            .insert(&secret.insert_packets(bindings).unwrap().0)
+            .unwrap();
+        let revoked = |subkey: &Key<PublicParts, SubordinateRole>, t: SystemTime| {
+            let reloaded = store.lookup(&fingerprint).unwrap();
+            let status = reloaded
+                .keys()
+                .subkeys()
+                .find(|ka| ka.key().fingerprint() == subkey.fingerprint())
+                .unwrap()
+                .bundle()
+                .revocation_status(&policy, t);
+            matches!(status, RevocationStatus::Revoked(_))
+        };
+
+        revoke_subkey(
+            &store,
+            &fingerprint,
+            &subkeys[0].fingerprint().to_hex(),
+            Reason::Retired,
+            "",
+            None,
+        )
+        .unwrap();
+        assert!(
+            revoked(&subkeys[0], ahead + Duration::from_secs(60)),
+            "a binding dated ahead of the clock took the retired subkey back"
+        );
+
+        let refused = revoke_subkey(
+            &store,
+            &fingerprint,
+            &subkeys[1].fingerprint().to_hex(),
+            Reason::Superseded,
+            "",
+            None,
+        )
+        .map(|_| ())
+        .expect_err("signed a soft revocation that a binding a day ahead would undo");
+        assert!(
+            refused.to_string().contains("clock"),
+            "the refusal must point at the clock: {refused}"
+        );
+        assert!(
+            !revoked(&subkeys[1], SystemTime::now()),
+            "a refused revocation must not reach the store"
+        );
+
+        revoke_subkey(
+            &store,
+            &fingerprint,
+            &subkeys[1].fingerprint().to_hex(),
+            Reason::Compromised,
+            "",
+            None,
+        )
+        .expect("a hard revocation must not wait on the clock");
+        assert!(revoked(&subkeys[1], SystemTime::now()));
+        assert!(
+            revoked(&subkeys[1], far + day),
+            "a hard revocation stands whatever is dated after it"
         );
     }
 

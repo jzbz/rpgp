@@ -176,40 +176,60 @@ pub fn certify(store: &Store, request: &CertifyRequest) -> Result<Cert> {
             )));
         }
 
-        // The mirror of revoke_certification's rule. A revocation supersedes
-        // a certification made strictly earlier, so a certification has to be
-        // dated strictly *later* than any revocation of ours on this user ID
-        // or it is born dead. Withdraw-then-recertify within a second is one
-        // person clicking twice; only our own revocations count, for the same
-        // reason only our own certifications count over there.
+        // The mirror of revoke_certification's rule: a certification has to be
+        // dated after every signature of ours on this user ID that it
+        // replaces, and [`crate::signature_time`] does the dating. Our own
+        // withdrawals are one kind. A certification dated before one is born
+        // dead, as a re-certification made straight after a withdrawal dated
+        // ahead of the clock would be — and withdraw-then-recertify within a
+        // second is one person clicking twice. Our own earlier
+        // certifications are the other, which this used to miss: sequoia-wot
+        // counts only a certifier's newest certification of a user ID, but it
+        // keeps every one sharing that newest second and walks the strongest of
+        // them, so a change of mind within the second — Full to Partial, or a
+        // trusted introducer demoted to a plain certification — changed
+        // nothing, and the delegation the user meant to take back went on
+        // vouching for everyone the introducer had certified. Only our own
+        // signatures count, for the same reason only our own certifications
+        // count over there.
         //
         // "Ours" means one that verifies against our key, not one that merely
-        // names it. other_revocations() hands back packets exactly as they were
-        // parsed, and an issuer subpacket is an unauthenticated hint anyone can
-        // write — so filtering on the name alone let a planted packet dated in
-        // the far future set `when` to that instant, producing a certification
-        // that is not yet valid and never takes effect. Refetching the target
-        // re-planted it, so every retry was neutralised the same way. This is
-        // the same verification certifications() already performs below.
+        // names it. certifications() and other_revocations() hand back packets
+        // exactly as they were parsed, and an issuer subpacket is an
+        // unauthenticated hint anyone can write — so filtering on the name
+        // alone let a planted packet dated in the far future set `when` to that
+        // instant, producing a certification that is not yet valid and never
+        // takes effect. Refetching the target re-planted it, so every retry was
+        // neutralised the same way; with a date that far ahead now refused,
+        // the same packet would block certifying outright. This is the same
+        // verification certifications() already performs below.
         let certifier_key = certifier.primary_key().key();
-        let mut when = SystemTime::now();
-        for revocation in amalgamation
-            .other_revocations()
-            .filter(|sig| crate::cert::issued_by(sig, &certifier))
-            .filter(|sig| {
-                (*sig)
-                    .clone()
-                    .verify_userid_revocation(certifier_key, target.primary_key().key(), &userid)
-                    .is_ok()
-            })
-        {
-            if let Some(created) = revocation.signature_creation_time() {
-                let after = created + Duration::from_secs(1);
-                if after > when {
-                    when = after;
-                }
-            }
-        }
+        let when = crate::signature_time(
+            amalgamation
+                .certifications()
+                .filter(|sig| crate::cert::issued_by(sig, &certifier))
+                .filter(|sig| {
+                    (*sig)
+                        .clone()
+                        .verify_userid_binding(certifier_key, target.primary_key().key(), &userid)
+                        .is_ok()
+                })
+                .chain(
+                    amalgamation
+                        .other_revocations()
+                        .filter(|sig| crate::cert::issued_by(sig, &certifier))
+                        .filter(|sig| {
+                            (*sig)
+                                .clone()
+                                .verify_userid_revocation(
+                                    certifier_key,
+                                    target.primary_key().key(),
+                                    &userid,
+                                )
+                                .is_ok()
+                        }),
+                ),
+        )?;
 
         let mut builder = SignatureBuilder::new(SignatureType::GenericCertification)
             .set_signature_creation_time(when)?
@@ -760,6 +780,68 @@ mod tests {
         assert_eq!(found[0].depth, 1);
         assert!(!found[0].exportable);
         assert!(found[0].is_good());
+    }
+
+    /// Changing a certification means making a new one, and sequoia-wot counts
+    /// a certifier's newest certification of a user ID — but it keeps every
+    /// one that shares the newest second, and walks the strongest of them. So a
+    /// change of mind made within the second of the certification it corrects,
+    /// as a script or a quick second click makes it, changed nothing: Full
+    /// stayed Full, and a trusted introducer demoted to a plain certification
+    /// went on vouching for everyone it had certified. The new certification is
+    /// dated after the old one instead, and so replaces it.
+    #[test]
+    fn a_certification_changed_within_the_second_replaces_the_one_before_it() {
+        let (_dir, store) = scratch();
+        let alice = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        let bob = generate(&KeyGenRequest::new("Bob <bob@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&alice).unwrap();
+        store.insert(&bob).unwrap();
+        let (alice_fp, bob_fp) = (alice.fingerprint().to_hex(), bob.fingerprint().to_hex());
+
+        let mut request = CertifyRequest::new(&alice_fp, &bob_fp);
+        request.user_ids = vec!["Bob <bob@example.org>".to_string()];
+        request.depth = 1;
+        certify(&store, &request).unwrap();
+
+        // Straight away, with no wait: Partial, and no longer an introducer.
+        request.depth = 0;
+        request.amount = PARTIAL;
+        certify(&store, &request).unwrap();
+
+        let mut made: Vec<(SystemTime, u8, u8)> =
+            certifications(&store, &store.lookup(&bob_fp).unwrap())
+                .unwrap()
+                .into_iter()
+                .filter(|c| c.by_me && c.is_good())
+                .map(|c| (c.created.unwrap(), c.depth, c.amount))
+                .collect();
+        made.sort();
+        assert_eq!(made.len(), 2, "{made:?}");
+        assert!(
+            made[0].0 < made[1].0,
+            "the change shares a second with the certification it corrects: {made:?}"
+        );
+        assert_eq!(
+            (made[1].1, made[1].2),
+            (0, PARTIAL),
+            "the newer certification must be the change: {made:?}"
+        );
+
+        let certs = store.certs().unwrap();
+        assert_eq!(
+            crate::wot::for_user_id(
+                &crate::wot::authenticate_all(&certs, std::slice::from_ref(&alice_fp)),
+                &bob_fp,
+                "Bob <bob@example.org>",
+            ),
+            crate::Authentication::Marginal,
+            "the Full certification the user changed to Partial still counts"
+        );
     }
 
     #[test]

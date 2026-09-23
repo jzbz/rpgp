@@ -7,7 +7,7 @@
 //! deliberately explicit about which of the two things is being retracted.
 
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use sequoia_openpgp::cert::CertRevocationBuilder;
 use sequoia_openpgp::packet::Signature;
@@ -143,9 +143,44 @@ impl RevokeRequest {
 /// Revoke one of our own certificates, and store the result.
 pub fn revoke_cert(store: &Store, request: &RevokeRequest) -> Result<Cert> {
     let cert = store.secret_cert(&request.fingerprint)?;
-    let mut signer = primary_signer(&cert, request.password.as_deref().map(String::as_str))?;
 
+    // A soft revocation stands only until a newer self-signature on the
+    // primary key: sequoia measures it against the newer of the direct-key
+    // signature and the primary user ID's binding, and drops it if that one is
+    // later. Dated by the clock alone, a revocation `apply` accepted, and the
+    // GUI reported, stopped counting the moment real time passed a
+    // self-signature dated after it — an expiry extended on a machine whose
+    // clock ran ahead, say — here and for everyone the key was sent to. Every
+    // user ID's bindings count, not only the primary one's, because which
+    // identity is primary is itself settled by those bindings and can come out
+    // differently at a later time or in another implementation. See
+    // [`crate::signature_time`].
+    //
+    // Measured against both halves of the store, because `apply` writes the
+    // revocation into cert-d as well, where a self-signature that arrived by
+    // import or refresh, and never reached the secret key file, would
+    // otherwise outrank it.
+    //
+    // A hard revocation is final whatever is dated after it — sequoia passes
+    // `hard_revocations_are_final` for keys — so it supersedes nothing and is
+    // dated now. A clock that disagrees with the key is no reason to hold up
+    // revoking one whose secret is exposed, and a refusal there would be the
+    // one place this rule did harm.
+    let when = if request.reason.is_hard() {
+        SystemTime::now()
+    } else {
+        let merged = store.full_cert(&request.fingerprint)?;
+        crate::signature_time(
+            merged
+                .primary_key()
+                .self_signatures()
+                .chain(merged.userids().flat_map(|ua| ua.self_signatures())),
+        )?
+    };
+
+    let mut signer = primary_signer(&cert, request.password.as_deref().map(String::as_str))?;
     let signature = CertRevocationBuilder::new()
+        .set_signature_creation_time(when)?
         .set_reason_for_revocation(request.reason.to_openpgp(), request.message.as_bytes())?
         .build(&mut signer, &cert, None)?;
 
@@ -193,15 +228,14 @@ pub fn revoke_certification(
         let amalgamation = crate::cert::resolve_user_id(&target, wanted)?;
         let userid = amalgamation.userid().clone();
 
-        // A revocation only supersedes a certification made strictly earlier.
-        // Certifying and then changing your mind within the same second — which
-        // is a normal thing for a person clicking two buttons to do — would
-        // otherwise leave the certification standing. Date the revocation one
-        // second past the newest certification it retracts.
-        // Signature timestamps have one-second granularity, so this compares
-        // `created + 1s` rather than `created`: a certification made 400ms ago
-        // is stamped with the same second as `now`, and a naive `created > now`
-        // test would never fire.
+        // A revocation only supersedes a certification made strictly earlier:
+        // sequoia-wot ignores a withdrawal dated in the same second as the
+        // certification or before it. Certifying and then changing your mind
+        // within the same second — which is a normal thing for a person
+        // clicking two buttons to do — would otherwise leave the certification
+        // standing. So the revocation is dated at least a second past the
+        // newest certification it retracts, by [`crate::signature_time`], which
+        // waits for that second rather than dating it ahead of the clock.
         //
         // Only *this certifier's* certifications set the clock. Everyone's did,
         // once, which meant a single future-dated certification from some third
@@ -214,27 +248,22 @@ pub fn revoke_certification(
         // anyone can write — so filtering on the name alone let a planted
         // packet dated in the far future set `when` to that instant, producing
         // a revocation that is not yet valid and never takes effect, leaving
-        // the certification the user asked to withdraw still standing.
-        // certify.rs makes exactly this check on the mirror path; this is the
-        // other half of it.
-        let mut when = SystemTime::now();
-        for existing in amalgamation
-            .certifications()
-            .filter(|sig| crate::cert::issued_by(sig, &certifier))
-            .filter(|sig| {
-                (*sig)
-                    .clone()
-                    .verify_userid_binding(certifier_key, target.primary_key().key(), &userid)
-                    .is_ok()
-            })
-        {
-            if let Some(created) = existing.signature_creation_time() {
-                let after = created + Duration::from_secs(1);
-                if after > when {
-                    when = after;
-                }
-            }
-        }
+        // the certification the user asked to withdraw still standing. Were
+        // this filter removed, a date that far ahead would now be refused
+        // rather than signed, so the same packet would block the withdrawal
+        // outright instead. certify.rs makes exactly
+        // this check on the mirror path; this is the other half of it.
+        let when = crate::signature_time(
+            amalgamation
+                .certifications()
+                .filter(|sig| crate::cert::issued_by(sig, &certifier))
+                .filter(|sig| {
+                    (*sig)
+                        .clone()
+                        .verify_userid_binding(certifier_key, target.primary_key().key(), &userid)
+                        .is_ok()
+                }),
+        )?;
 
         signatures.push(
             SignatureBuilder::new(SignatureType::CertificationRevocation)
@@ -544,6 +573,8 @@ fn certification_signer(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::cert::Validity;
     use crate::certify::{CertifyRequest, certify};
@@ -705,6 +736,117 @@ mod tests {
         assert_eq!(hard, [false, false, true, true]);
     }
 
+    /// The primary user ID's binding, re-issued from itself and dated `when`:
+    /// what a key's owner leaves on it by changing its expiry on a machine
+    /// whose clock runs ahead of this one.
+    fn binding_dated(secret: &Cert, when: SystemTime) -> Signature {
+        let policy = policy();
+        let valid = secret.with_policy(&policy, None).unwrap();
+        let primary = valid.primary_userid().unwrap();
+        let mut signer = primary_signer(secret, None).unwrap();
+        SignatureBuilder::from(primary.binding_signature().clone())
+            .set_signature_creation_time(when)
+            .unwrap()
+            .sign_userid_binding(&mut signer, secret.primary_key().key(), primary.userid())
+            .unwrap()
+    }
+
+    /// A soft revocation stands only until a newer self-signature, and one
+    /// dated by the clock alone lost to a binding already dated after it.
+    /// `apply` accepted it, because that binding was not in force yet, the GUI
+    /// said the key was revoked, and once real time passed the binding the key
+    /// read as live again, here and for everyone it had been sent to.
+    ///
+    /// The binding reaches this store as a public certificate, which is how a
+    /// keyserver refresh brings in an expiry extended on another machine: in
+    /// cert-d and not in the secret key file, which is what the revocation is
+    /// signed over. The date has to come from both.
+    #[test]
+    fn a_soft_revocation_outranks_a_self_signature_dated_ahead_of_the_clock() {
+        let (_dir, store) = scratch();
+        let mine = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        store.insert_secret(&mine).unwrap();
+        let fingerprint = mine.fingerprint().to_hex();
+
+        let binding = binding_dated(&mine, SystemTime::now() + Duration::from_secs(2));
+        let ahead = binding.signature_creation_time().unwrap();
+        store
+            .insert(&mine.insert_packets(vec![Packet::from(binding)]).unwrap().0)
+            .unwrap();
+
+        // Retired, the default, which is soft.
+        let revoked = revoke_cert(&store, &RevokeRequest::new(&fingerprint)).unwrap();
+        assert_eq!(CertSummary::from_cert(&revoked).validity, Validity::Revoked);
+
+        // Read as of a minute past the binding, when it would have taken over.
+        let later = ahead + Duration::from_secs(60);
+        for reloaded in [
+            store.lookup(&fingerprint).unwrap(),
+            store.full_cert(&fingerprint).unwrap(),
+        ] {
+            assert!(
+                matches!(
+                    reloaded.revocation_status(&policy(), later),
+                    RevocationStatus::Revoked(_)
+                ),
+                "a binding dated ahead of the clock undid the revocation once its time came"
+            );
+        }
+    }
+
+    /// Past what a clock that keeps time can explain, a soft revocation is
+    /// refused rather than signed: dated past a binding a day ahead it would
+    /// count nowhere for a day, and dated now it would never count at all. A
+    /// hard one is not held up, because nothing dated after it undoes it, and a
+    /// key whose secret is exposed is the last thing to leave unrevoked over a
+    /// clock.
+    #[test]
+    fn a_self_signature_far_ahead_refuses_a_soft_revocation_but_not_a_hard_one() {
+        let (_dir, store) = scratch();
+        let mine = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        let fingerprint = mine.fingerprint().to_hex();
+        let day = Duration::from_secs(24 * 60 * 60);
+        let tomorrow = SystemTime::now() + day;
+        let binding = binding_dated(&mine, tomorrow);
+        store
+            .insert_secret(&mine.insert_packets(vec![Packet::from(binding)]).unwrap().0)
+            .unwrap();
+        let revoked = |t: Option<SystemTime>| {
+            matches!(
+                store
+                    .lookup(&fingerprint)
+                    .unwrap()
+                    .revocation_status(&policy(), t),
+                RevocationStatus::Revoked(_)
+            )
+        };
+
+        let refused = revoke_cert(&store, &RevokeRequest::new(&fingerprint))
+            .map(|_| ())
+            .expect_err("signed a soft revocation that a binding a day ahead would undo");
+        assert!(
+            refused.to_string().contains("clock"),
+            "the refusal must point at the clock: {refused}"
+        );
+        assert!(
+            !revoked(None),
+            "a refused revocation must not reach the store"
+        );
+
+        let mut request = RevokeRequest::new(&fingerprint);
+        request.reason = Reason::Compromised;
+        revoke_cert(&store, &request).expect("a hard revocation must not wait on the clock");
+        assert!(revoked(None));
+        assert!(
+            revoked(Some(tomorrow + day)),
+            "a hard revocation stands whatever is dated after it"
+        );
+    }
+
     #[test]
     fn an_emergency_revocation_certificate_works_without_the_passphrase() {
         let (_dir, store) = scratch();
@@ -788,11 +930,10 @@ mod tests {
         };
         assert_eq!(authenticated(&store), crate::Authentication::Full);
 
-        // The revocation is dated one second past the certification it
-        // retracts, so it only takes effect once that second has passed. This
-        // sleep is the semantics, not a flake: see `revoke_certification`.
-        std::thread::sleep(std::time::Duration::from_millis(1300));
-
+        // No wait before withdrawing, and none after. The revocation is dated a
+        // second past the certification it retracts, and `revoke_certification`
+        // waits for that second itself rather than dating the revocation ahead
+        // of the clock, so it counts as soon as the call returns.
         revoke_certification(
             &store,
             &me.fingerprint().to_hex(),
@@ -869,7 +1010,6 @@ mod tests {
             None,
         )
         .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1300));
 
         assert_eq!(
             under(&a),
@@ -894,7 +1034,6 @@ mod tests {
             None,
         )
         .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1300));
         assert_eq!(under(&b), crate::Authentication::Unknown);
     }
 
@@ -909,8 +1048,9 @@ mod tests {
     /// the mirror path; this is the other half.
     ///
     /// Delete the `verify_userid_binding` filter in revoke_certification and
-    /// this fails: A's authentication stays Full because the withdrawal is
-    /// stamped five years out.
+    /// this fails: the planted packet would date the withdrawal five years out,
+    /// which is now refused, so the withdrawal the user asked for is not made
+    /// at all.
     #[test]
     fn a_planted_certification_cannot_date_the_withdrawal() {
         use sequoia_openpgp::packet::signature::subpacket::{Subpacket, SubpacketValue};
@@ -985,7 +1125,6 @@ mod tests {
             None,
         )
         .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1300));
 
         assert_eq!(
             under(&a),
@@ -1107,9 +1246,9 @@ mod tests {
         request.user_ids = vec!["Them <them@example.org>".to_string()];
 
         certify(&store, &request).unwrap();
-        // Withdraw immediately — no sleep. The revocation lands a second in
-        // the future, and the re-certification right after it must clear that
-        // second too, which is the case this guards.
+        // Withdraw immediately — no sleep. The revocation has to be dated in
+        // the second after the certification, and the re-certification right
+        // after it in the second after that, which is the case this guards.
         revoke_certification(
             &store,
             &me.fingerprint().to_hex(),
@@ -1122,9 +1261,9 @@ mod tests {
         .unwrap();
         certify(&store, &request).unwrap();
 
-        // Both stamps may sit up to two seconds ahead of the clock; let them
-        // arrive, then the re-certification has to be the one that counts.
-        std::thread::sleep(std::time::Duration::from_millis(2300));
+        // No wait for the stamps to arrive either: each call waits for its own
+        // second rather than dating its signature ahead of the clock, so the
+        // re-certification has to be the one that counts straight away.
         assert_eq!(
             authenticated(&store),
             crate::Authentication::Full,

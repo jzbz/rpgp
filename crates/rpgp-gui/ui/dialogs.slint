@@ -1619,7 +1619,8 @@ export component LifecycleDialog inherits DialogShell {
             : root.mode == 2
                 ? "Withdraw " + root.target + ". It stays on the key so anyone "
                   + "with an older copy can see it was retracted, rather than "
-                  + "simply not knowing about it."
+                  + "simply not knowing about it. Adding it again later brings "
+                  + "it back."
                 : root.mode == 4
                     ? "Retract subkey " + root.target + ". The rest of the key "
                       + "keeps working — use this when one subkey's secret is "

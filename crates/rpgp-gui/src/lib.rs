@@ -3356,7 +3356,7 @@ fn run_revoke(
         return Ok((
             target,
             if total == 1 {
-                "Certification withdrawn. It stops counting a second from now.".to_string()
+                "Certification withdrawn.".to_string()
             } else {
                 format!("{total} certifications withdrawn, one per key that made them.")
             },

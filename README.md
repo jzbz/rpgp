@@ -316,12 +316,26 @@ revocation certificate; the details pane then offers none to export, and the
 key can still be revoked from there for as long as you hold it and its
 passphrase.
 
-One timing wrinkle worth knowing. A revocation only supersedes a certification
-made *strictly earlier*, and OpenPGP timestamps have one-second granularity, so
-certifying and immediately changing your mind would otherwise leave the
-certification standing. `revoke_certification` dates the revocation one second
-past the certification it retracts — which means it takes effect a second
-later, and the status bar says so.
+One timing rule runs through all of this. OpenPGP gives the newest signature of
+a kind the last word — a key's expiry is read off its newest self-signature, a
+soft revocation stands only until a newer one, a certification counts until
+the same certifier makes a newer certification or withdrawal — and its
+timestamps have one-second granularity. So every signature rPGP makes to
+replace another is dated at least a second after the newest one it replaces:
+an expiry change, a revocation of a key, a subkey or a user ID, a
+certification, a withdrawal. Where that one was made in the current second, as
+it is when you certify and immediately change your mind, the operation waits
+for the next second rather than dating its signature ahead of the clock, so the
+change counts as soon as the status bar reports it. Where it is dated more than
+a few seconds ahead, a clock is wrong — this machine's, or the one that made
+it — and the operation is refused with that signature's date, rather than
+signing something that would count nowhere until then, or never at all. A hard
+revocation is the exception: nothing dated after one undoes it, so it is never
+held up.
+
+A user ID you retire can be brought back: adding the same name again binds it
+anew, and the newer binding supersedes the retirement. Anyone holding a copy of
+the key from between the two still sees it retired.
 
 ## Smartcards and YubiKeys
 
