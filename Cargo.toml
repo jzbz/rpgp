@@ -49,7 +49,6 @@ sequoia-gpg-agent = "0.6"
 # script needs the `capnp` compiler installed.
 sequoia-ipc = { version = "0.36", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread"] }
-futures = "0.3"
 # Keyserver and WKD lookup. reqwest with rustls only: sequoia-net would do this
 # for us but hardcodes hyper-tls and a dnssec-openssl resolver with no feature
 # to opt out, which would put OpenSSL into a build that has avoided C
@@ -61,7 +60,12 @@ futures = "0.3"
 # through the operating system, neither of which this build wants, so every
 # client is handed a TLS configuration of rpgp's own; `tls` in keyserver.rs
 # says why.
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset", "json"] }
+#
+# `charset`, one of reqwest's defaults, is left off. It only teaches
+# `Response::text` and `text_with_charset` to decode by the charset a reply
+# declares, and nothing here calls either: every body is read in bounded
+# chunks instead, so it would only compile encoding_rs and mime.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "json"] }
 # That configuration's parts. rustls has to stay on the major reqwest uses:
 # reqwest recognises a configuration it is handed by downcasting to its own
 # `rustls::ClientConfig`, so one built from a second copy would make every

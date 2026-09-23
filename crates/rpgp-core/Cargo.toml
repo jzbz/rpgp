@@ -14,7 +14,6 @@ sequoia-wot.workspace = true
 sequoia-gpg-agent.workspace = true
 sequoia-ipc.workspace = true
 tokio.workspace = true
-futures.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 webpki-roots.workspace = true
