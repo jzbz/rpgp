@@ -4428,27 +4428,27 @@ mod tests {
     /// `lookup_by_cert_or_subkey` sorts its candidates by certificate
     /// fingerprint, so which certificate comes first is not decided by who was
     /// inserted first — it is decided by the fingerprint, which an attacker
-    /// picks by generating keys until one sorts where he wants it. Two tries
-    /// on average, so the loop here is what he would do and not a contrivance;
-    /// the bound only stops a test hanging if key generation ever stopped
-    /// being random.
+    /// picks by generating keys until one sorts where he wants it, two tries on
+    /// average. Here Alice comes from the upper half of the fingerprint space
+    /// and Mallory from the lower, so his sorts first whatever hers turns out
+    /// to be. Drawing Mallory until he merely sorts below a fixed Alice runs
+    /// out whenever hers lands near the bottom, which over 64 draws is one run
+    /// in sixty-five. Each draw here takes two tries on average; the bound only
+    /// stops a test hanging if key generation ever stopped being random.
     fn alice_and_a_lower_sorting_mallory() -> (Cert, Cert) {
-        let alice = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
-            "Alice <alice@example.org>",
-        ))
-        .unwrap()
-        .cert;
-        for _ in 0..64 {
-            let mallory = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
-                "Mallory <mallory@example.org>",
-            ))
-            .unwrap()
-            .cert;
-            if mallory.fingerprint() < alice.fingerprint() {
-                return (alice, mallory);
-            }
-        }
-        panic!("64 generated keys all sorted above Alice's");
+        let draw = |name: &str, upper: bool| {
+            (0..64)
+                .map(|_| {
+                    crate::keygen::generate(&crate::keygen::KeyGenRequest::new(name))
+                        .unwrap()
+                        .cert
+                })
+                .find(|cert| (cert.fingerprint().as_bytes()[0] >= 0x80) == upper)
+                .expect("64 generated keys all sorted into the other half")
+        };
+        let alice = draw("Alice <alice@example.org>", true);
+        let mallory = draw("Mallory <mallory@example.org>", false);
+        (alice, mallory)
     }
 
     /// `carrier`, with `key` attached to it as an encryption subkey.
