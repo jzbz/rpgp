@@ -35,18 +35,24 @@ slint = { version = "1.17", default-features = false, features = [
     # `configure_renderer` in main.rs. The API is unstable and tied to wgpu's
     # major version, so it will need revisiting when Slint moves to wgpu 30.
     "unstable-wgpu-29",
+    # Window::window_handle, which is how the clipboard learns whether the
+    # window is on Wayland and reaches its connection; see src/clipboard.rs.
+    "raw-window-handle-06",
 ] }
 
 # Defaults are xdg-portal + wayland + pollster: no GTK, so no C dependency on
 # Linux. macOS uses the AppKit bindings.
 rfd = "0.17"
 
-# Slint exposes no clipboard API, only a platform trait for backend authors.
-# wayland-data-control is the wlr protocol, which GNOME does not implement, so
-# this falls back to X11 through XWayland there.
 # Hands a URL to the desktop's own opener: xdg-open on Linux, open on macOS.
 open = "5"
 
+# Slint exposes no clipboard API, only a platform trait for backend authors, so
+# the Copy buttons bring their own (src/clipboard.rs), which is arboard wherever
+# arboard can be built. wayland-data-control has it copy through the wlr or ext
+# data-control protocol whenever WAYLAND_DISPLAY is set and the compositor
+# offers the app either. Where none is offered it falls back to X11, which on a
+# Wayland session means XWayland, and which the Flatpak there does not have.
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 
 zeroize.workspace = true
@@ -56,6 +62,21 @@ zeroize.workspace = true
 # adds no C dependency.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
+
+# Copy for a window on Wayland for which arboard cannot be built: the core
+# wl_data_device protocol, on the window's own connection, which is how Slint's
+# text fields copy and which every compositor offers every client. The
+# data-control protocols arboard uses are not: GNOME implements neither, and
+# sway hides both from a Flatpak, which has no X11 for arboard to fall back to
+# on a Wayland session. Both crates are already in the graph through Slint's
+# winit backend, and the cfg is copypasta's, so they come in on exactly the
+# targets that already have them. build.rs sets cfg(wayland_target) on the same
+# condition for the code that uses them; change both together.
+# smithay-clipboard's default feature loads libwayland at runtime, as the rest
+# of the graph already does, rather than linking it.
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios", target_os = "emscripten"))))'.dependencies]
+smithay-clipboard = "0.7"
+raw-window-handle = "0.6"
 
 [dev-dependencies]
 # ElementHandle::accessible_value, to assert on what the accessibility tree

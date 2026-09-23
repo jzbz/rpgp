@@ -23,7 +23,28 @@ fn main() {
     slint_build::compile_with_config("ui/app-window.slint", config)
         .expect("compiling ui/app-window.slint");
 
+    wayland_target();
     windows_resources();
+}
+
+/// Set `cfg(wayland_target)` on the targets where a window can be on Wayland.
+///
+/// The clipboard has a Wayland half only there, and writing the whole
+/// condition out at every place that half is gated would bury the code it
+/// gates. The condition is the one copypasta puts on smithay-clipboard, and
+/// Cargo.toml gates the Wayland dependencies on the same one, written out,
+/// because a manifest cannot use a build script's cfg; the two have to agree.
+/// Read from CARGO_CFG_*, which describe the target rather than the host this
+/// script runs on.
+fn wayland_target() {
+    println!("cargo:rustc-check-cfg=cfg(wayland_target)");
+    let family = std::env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if family.split(',').any(|family| family == "unix")
+        && !["macos", "android", "ios", "emscripten"].contains(&os.as_str())
+    {
+        println!("cargo:rustc-cfg=wayland_target");
+    }
 }
 
 /// Give the Windows binary an icon, a version tab and a manifest.

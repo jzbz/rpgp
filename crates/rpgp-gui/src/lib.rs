@@ -6,7 +6,6 @@
 //! measuring. `main.rs` is now a wrapper around [`run_app`]; this module is
 //! unchanged otherwise.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -24,6 +23,7 @@ use rpgp_core::{CertSummary, Sha1Policy, Store, wot};
 use slint::{ModelRc, SharedString, VecModel};
 use zeroize::Zeroizing;
 
+mod clipboard;
 pub mod hardening;
 
 slint::include_modules!();
@@ -492,6 +492,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     wire_lifecycle(&ui, &state);
     wire_lookup(&ui, &state);
 
+    // Held across the event loop, and declared after `ui` so that it is dropped
+    // first on the way out of this function, on an error or an unwind as well:
+    // a clipboard on the window's own Wayland connection, where there is one,
+    // has to go while the window, whose connection it shares, still exists.
+    // See clipboard::attach.
+    let _clipboard = clipboard::attach(&ui);
     ui.run()?;
     Ok(())
 }
@@ -2670,7 +2676,7 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
             };
             // The row confirms itself in Slint; the status line is for the
             // case the clipboard refuses, which is otherwise invisible.
-            match copy_to_clipboard(text.to_string()) {
+            match clipboard::copy(text.to_string()) {
                 Ok(()) => ui.set_status("Copied to the clipboard".into()),
                 Err(e) => ui.set_status(format!("Could not copy: {e}").into()),
             }
@@ -2684,7 +2690,7 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
                 return;
             };
             let text = ui.get_np_output().to_string();
-            match copy_to_clipboard(text) {
+            match clipboard::copy(text) {
                 Ok(()) => {
                     ui.set_np_copied(true);
                     ui.set_status("Copied to the clipboard".into());
@@ -3699,39 +3705,6 @@ fn signature_verdict(known: &[CertSummary], result: &ops::VerifyResult) -> (Stri
             2,
         )
     }
-}
-
-/// Put `text` on the system clipboard.
-///
-/// One clipboard for the process, not one per click. On X11 arboard serves the
-/// selection from a window it owns, and dropping the last handle destroys that
-/// window after a single 100ms attempt to hand the contents to a clipboard
-/// manager — so a handle created and dropped inside a callback loses the text
-/// immediately on any session without one running. Both copy callbacks run on
-/// the event loop, so a thread-local is enough, and its destructor still makes
-/// the handover at exit, which is where that belongs.
-fn copy_to_clipboard(text: String) -> std::result::Result<(), String> {
-    thread_local! {
-        static CLIPBOARD: RefCell<Option<arboard::Clipboard>> = const { RefCell::new(None) };
-    }
-    CLIPBOARD.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
-        }
-        // A clipboard that has stopped working — the X server went away, say —
-        // is dropped so the next copy builds a fresh one rather than failing
-        // forever.
-        let result = slot
-            .as_mut()
-            .expect("just populated")
-            .set_text(text)
-            .map_err(|e| e.to_string());
-        if result.is_err() {
-            *slot = None;
-        }
-        result
-    })
 }
 
 /// The slow half of a reload: which keys gpg-agent holds, and which secret key

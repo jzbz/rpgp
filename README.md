@@ -180,7 +180,7 @@ BZip2-compressed messages cannot be read; nothing modern produces them.
 | --- | --- | --- |
 | `libsqlite3` | `sequoia-cert-store` → `rusqlite` | cert-d keeps a SQLite index for lookup by e-mail and subkey. Not optional in that crate. |
 | `fontconfig` | `i-slint-core` | System font discovery on Linux. |
-| `libwayland` | `winit` | Loaded at runtime on a Wayland session. |
+| `libwayland` | `winit`, `smithay-clipboard` | Loaded at runtime on a Wayland session. |
 
 Building also needs the Cap'n Proto compiler (`capnp`), for `sequoia-ipc`.
 
