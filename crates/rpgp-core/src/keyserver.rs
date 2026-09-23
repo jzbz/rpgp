@@ -5,7 +5,8 @@
 //! is why this is hand-rolled rather than delegated to `sequoia-net`: that
 //! crate hardcodes `hyper-tls` and a `dnssec-openssl` resolver with no feature
 //! to opt out, and OpenSSL is precisely what this build has avoided
-//! everywhere else. `reqwest` with `rustls-tls` keeps it pure Rust.
+//! everywhere else. `reqwest` over rustls, on a TLS configuration of this
+//! module's own ([`tls`]), keeps it out.
 //!
 //! WKD is tried before a keyserver. A certificate served from the domain of
 //! the address itself carries more weight than one anybody could upload —
@@ -91,6 +92,12 @@ fn client(peer: Peer) -> Result<reqwest::Client> {
         .and_then(|url| url.host_str().map(str::to_lowercase));
 
     reqwest::Client::builder()
+        // Taken whole. reqwest's own TLS options — the version bounds, SNI,
+        // CRLs, the `danger_` switches, and the ALPN it would choose for
+        // `http1_only` or `http2_prior_knowledge` — shape only a configuration
+        // it builds itself, which this replaces. So none of them is set here,
+        // and one set later would never reach the connection.
+        .tls_backend_preconfigured(tls()?)
         .timeout(TIMEOUT)
         .user_agent(concat!("rpgp/", env!("CARGO_PKG_VERSION")))
         // A proxy from the environment would undo the guard completely. For an
@@ -116,6 +123,40 @@ fn client(peer: Peer) -> Result<reqwest::Client> {
         ))
         .build()
         .map_err(|e| Error::invalid(format!("cannot build an HTTP client: {e}")))
+}
+
+/// The TLS configuration every [`client`] is built on: ring, TLS 1.3 and 1.2,
+/// Mozilla's roots as webpki-roots compiles them, and ALPN offering h2 before
+/// http/1.1 — what reqwest 0.12's `rustls-tls` built for itself.
+///
+/// reqwest 0.13 builds nothing of the kind. Its `rustls` feature encrypts with
+/// aws-lc-rs, a C library, which this build keeps out for the reason it keeps
+/// out OpenSSL. `rustls-no-provider` takes the process-wide `CryptoProvider`
+/// instead, and panics in `build` when none is installed. Either way it
+/// verifies through rustls-platform-verifier, which trusts the operating
+/// system's store and, on Windows and macOS, lets the system fetch revocation
+/// data over connections [`Guarded`] never sees: a fetch whose whole risk is
+/// that somebody else chose the host has no business opening those.
+///
+/// The provider is handed to this configuration alone rather than installed.
+/// `ClientConfig::builder` would install ring as the process default, which is
+/// state that outlives the fetch and belongs to anything else in the process
+/// that speaks TLS.
+///
+/// The roots are webpki-roots' trust anchors, not certificates to hand
+/// reqwest's `tls_certs_only`: one anchor carries a name constraint holding it
+/// to `.tr`, which a bare certificate cannot carry.
+fn tls() -> Result<rustls::ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::invalid(format!("cannot configure TLS: {e}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    // reqwest fills this in only on a configuration it built itself.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
 }
 
 /// Why a redirect must not be followed, or `None` to follow it.
@@ -1669,6 +1710,38 @@ mod tests {
         assert!(
             err.contains("lookup failed"),
             "refused for the wrong reason: {err}"
+        );
+    }
+
+    /// A client is built on [`tls`], and building one installs nothing
+    /// process-wide.
+    ///
+    /// A configuration reqwest makes for itself under `rustls-no-provider`
+    /// takes the process-wide crypto provider, and `build` panics when there
+    /// is none — which in this process there never is. So a client that builds
+    /// at all was handed its configuration, and one that builds because
+    /// something installed a provider fails the check that follows instead.
+    /// reqwest knows the configuration by its type, so this also fails the day
+    /// the lock holds two rustls majors and every build becomes an "Unknown TLS
+    /// backend" error.
+    ///
+    /// What the client negotiates on the wire is out of a unit test's sight.
+    /// What it offers for ALPN is not, and is pinned here because reqwest sets
+    /// it only on a configuration it built itself: without the line in `tls`,
+    /// h2 would quietly never be offered again.
+    #[test]
+    fn a_client_is_built_on_its_own_tls_configuration() {
+        client(Peer::Elsewhere).expect("a client did not build on its own TLS configuration");
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_none(),
+            "building a client installed a process-wide crypto provider"
+        );
+
+        let config = tls().unwrap();
+        assert_eq!(
+            config.alpn_protocols,
+            [b"h2".to_vec(), b"http/1.1".to_vec()],
+            "the configuration does not offer h2 and then http/1.1"
         );
     }
 
