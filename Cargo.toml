@@ -57,9 +57,10 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 # `rustls-no-provider` and not `rustls`, which since 0.13 means aws-lc-rs: a C
 # library, kept out for the same reason. `rustls-no-provider` in turn leaves
 # reqwest to encrypt with whatever provider the process installed and to verify
-# through the operating system, neither of which this build wants, so every
-# client is handed a TLS configuration of rpgp's own; `tls` in keyserver.rs
-# says why.
+# through rustls-platform-verifier, which on macOS and Windows hands each
+# certificate to the operating system to judge. This build wants neither, so
+# every client is handed a TLS configuration of rpgp's own; `tls` in
+# keyserver.rs says why.
 #
 # `charset`, one of reqwest's defaults, is left off. It only teaches
 # `Response::text` and `text_with_charset` to decode by the charset a reply
@@ -74,6 +75,12 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 # which is what that feature trusted.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
+# The operating system's trust anchors, added beside Mozilla's so that a
+# keyserver certified by an organisation's own CA can be reached. It only reads
+# certificates, from PEM files on Linux and from the system stores on macOS and
+# Windows, and builds no C: checking a certificate against them stays in
+# rustls.
+rustls-native-certs = "0.8"
 serde_json = "1"
 # Only for the WKD hash in keyserver.rs, which needs nothing beyond `Digest`.
 # Default features are off because `oid` would pull in const-oid 0.10 beside

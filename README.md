@@ -346,6 +346,47 @@ to `keys.openpgp.org`. `RPGP_KEYSERVER` overrides the server, for an internal
 one or for testing against a local stand-in rather than uploading to public
 infrastructure.
 
+An internal keyserver's certificate usually comes from the organisation's own
+CA, and that works wherever the CA is in the **operating system's certificate
+store**, where curl and gpg look for it too. A server's certificate is checked
+against Mozilla's roots, compiled in, and against the system's anchors beside
+them: the distribution's CA bundle and certificate directories on Linux, the
+certificates the user, administrator and system trust settings mark as trusted
+on macOS, and the Trusted Root Certification Authorities store as the current
+user sees it on Windows. Only the anchors come from the system. The check is
+rustls's own, so the system opens no connection for revocation data, or for
+anything else, that the network guard described below would not see. The store
+is read once, at the first lookup or upload, so a CA installed or removed while
+rPGP is running takes effect at its next start, and one removed stays trusted
+until then.
+
+`SSL_CERT_FILE`, a file of PEM certificates, and `SSL_CERT_DIR`, directories of
+them separated as in `PATH`, replace the system store when either is set, on
+every platform. Mozilla's roots stay either way, so `SSL_CERT_FILE` naming a
+private CA alone trusts that CA and the public roots, and nothing else.
+
+The cost is trusting whatever the store holds. On a managed network that
+inspects TLS, the inspecting CA is in the store: lookups there work where they
+used to fail, and that CA can read and rewrite what a WKD host or a keyserver
+sends, as it already can for curl and gpg on the same machine. Where that is not
+wanted, pointing `SSL_CERT_FILE` at a file holding only the CAs you mean to
+trust, or an empty one, leaves the rest of the store out.
+
+The Flatpak sees none of the host's store. Its `/etc/ssl` and `/etc/pki` are the
+freedesktop runtime's own, holding that runtime's copy of Mozilla's roots and
+nothing added on the host; the runtime hands the host's trust on through
+p11-kit, but only to software that asks p11-kit for it, and rPGP reads the PEM
+files instead. A private CA reaches the Flatpak through `SSL_CERT_FILE`, from a
+place the sandbox can read:
+
+```bash
+mkdir -p ~/.var/app/app.rpgp.rpgp/config
+cp corp-ca.pem ~/.var/app/app.rpgp.rpgp/config/
+flatpak override --user \
+  --env=SSL_CERT_FILE=$HOME/.var/app/app.rpgp.rpgp/config/corp-ca.pem \
+  app.rpgp.rpgp
+```
+
 What a WKD host serves is kept only where it **carries the address that was
 asked for**, and only that identity is kept on it — both are requirements of
 the specification, and neither was applied. A domain serving

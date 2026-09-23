@@ -5810,6 +5810,7 @@ dependencies = [
  "dirs 6.0.0",
  "reqwest",
  "rustls",
+ "rustls-native-certs",
  "sequoia-cert-store",
  "sequoia-gpg-agent",
  "sequoia-ipc",

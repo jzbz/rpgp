@@ -14,7 +14,7 @@
 //! host serves is kept only where it carries the address that was asked for.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use sequoia_openpgp::cert::CertParser;
@@ -126,17 +126,20 @@ fn client(peer: Peer) -> Result<reqwest::Client> {
 }
 
 /// The TLS configuration every [`client`] is built on: ring, TLS 1.3 and 1.2,
-/// Mozilla's roots as webpki-roots compiles them, and ALPN offering h2 before
-/// http/1.1 — what reqwest 0.12's `rustls-tls` built for itself.
+/// the anchors [`trust_anchors`] gathers (Mozilla's roots as webpki-roots
+/// compiles them, and the operating system's beside them), and ALPN offering
+/// h2 before http/1.1.
 ///
 /// reqwest 0.13 builds nothing of the kind. Its `rustls` feature encrypts with
 /// aws-lc-rs, a C library, which this build keeps out for the reason it keeps
 /// out OpenSSL. `rustls-no-provider` takes the process-wide `CryptoProvider`
 /// instead, and panics in `build` when none is installed. Either way it
-/// verifies through rustls-platform-verifier, which trusts the operating
-/// system's store and, on Windows and macOS, lets the system fetch revocation
-/// data over connections [`Guarded`] never sees: a fetch whose whole risk is
-/// that somebody else chose the host has no business opening those.
+/// verifies through rustls-platform-verifier, which on Windows and macOS hands
+/// the certificate to the system to judge, and lets the system fetch
+/// revocation data over connections [`Guarded`] never sees: a fetch whose whole
+/// risk is that somebody else chose the host has no business opening those.
+/// What the system's store says about trust is taken from it here as anchors
+/// instead, and the certificate is judged against them in rustls.
 ///
 /// The provider is handed to this configuration alone rather than installed.
 /// `ClientConfig::builder` would install ring as the process default, which is
@@ -145,10 +148,51 @@ fn client(peer: Peer) -> Result<reqwest::Client> {
 ///
 /// The roots are webpki-roots' trust anchors, not certificates to hand
 /// reqwest's `tls_certs_only`: one anchor carries a name constraint holding it
-/// to `.tr`, which a bare certificate cannot carry.
+/// to `.tr`, which a bare certificate cannot carry. It is also why a system
+/// anchor that repeats a bundled root is left out; see [`trust_anchors`].
+///
+/// The system's anchors are read once, by the first fetch, and kept for the
+/// life of the process. [`client`] runs for every fetch, and one lookup can
+/// make three; reading the store each time would parse every file in the
+/// system's CA directories again on Linux, and go through the system's
+/// certificate stores again on macOS and Windows, for an answer that changes
+/// only when somebody installs or removes a CA. The cost is that such a change
+/// made while rPGP runs takes effect at its next start, which the README says.
 fn tls() -> Result<rustls::ClientConfig> {
+    static ROOTS: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
+    let roots = ROOTS.get_or_init(|| {
+        Arc::new(trust_anchors(
+            webpki_roots::TLS_SERVER_ROOTS,
+            read_system_store(rustls_native_certs::load_native_certs),
+        ))
+    });
+    tls_trusting(Arc::clone(roots))
+}
+
+/// What `read` finds in the operating system's store, or nothing if it
+/// panics.
+///
+/// rustls-native-certs 0.8 unwraps, rather than reports, a failure to learn
+/// what a certificate in the Windows store may be used for. Rare as that is, a
+/// panic there would unwind out of `get_or_init` in [`tls`], which leaves the
+/// lock empty for the next fetch to try again: every lookup and upload would
+/// read the store again and panic in the same place, and none would reach even
+/// Mozilla's roots, which need nothing from the system. Caught, it costs the
+/// system's anchors, as a store that could not be opened does, and the panic
+/// hook has already written it to stderr.
+fn read_system_store(
+    read: fn() -> rustls_native_certs::CertificateResult,
+) -> rustls_native_certs::CertificateResult {
+    std::panic::catch_unwind(read).unwrap_or_default()
+}
+
+/// [`tls`] on the anchors it is handed.
+///
+/// A seam for the tests, which need a CA of their own among the anchors: the
+/// store [`tls`] reads is found through the process's environment and read
+/// once per process, and a test running beside others may change neither.
+fn tls_trusting(roots: Arc<rustls::RootCertStore>) -> Result<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::invalid(format!("cannot configure TLS: {e}")))?
@@ -157,6 +201,55 @@ fn tls() -> Result<rustls::ClientConfig> {
     // reqwest fills this in only on a configuration it built itself.
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(config)
+}
+
+/// The anchors a server's certificate may chain to: all of `bundled`, and
+/// after them each anchor in `system` that is not one of those over again.
+///
+/// `bundled` is Mozilla's root store as webpki-roots compiles it, and `system`
+/// is what rustls-native-certs read from the operating system's store.
+///
+/// The system's store is what lets `RPGP_KEYSERVER` do what it is for. An
+/// organisation's internal keyserver is certified by the organisation's own
+/// CA, which its machines carry in their system store, and with Mozilla's
+/// roots alone every fetch from it failed as an unknown issuer while curl and
+/// gpg on the same machine connected. A network that inspects TLS is the same
+/// case with another CA: whoever installed it put it where curl and gpg trust
+/// it, and a lookup there now does what they do.
+///
+/// Mozilla's roots stay, so a machine whose store is empty or unreadable, a
+/// minimal container say, still reaches keys.openpgp.org and a WKD host.
+///
+/// Nothing in the system's store can stop a client being built. A file or a
+/// store that could not be read is among `system.errors`, which are dropped:
+/// it costs the anchors it failed to give, and nothing else. A certificate
+/// that does not parse as an anchor is skipped the same way, by
+/// `add_parsable_certificates`, since a store of a hundred-odd roots holding
+/// one that rustls cannot read is ordinary. A reader that panics has been
+/// caught before this, by [`read_system_store`].
+///
+/// An anchor is a subject, a key and any name constraints on them, so a
+/// system anchor with the subject and key of a bundled one can differ from it
+/// only in its constraints, and there the bundled one is the one to believe.
+/// Mozilla's constraints are its own policy, which webpki-roots writes into
+/// the anchor and a system store, holding the bare certificate, does not
+/// carry. Kept beside the bundled copy, the system's would let the root that
+/// Mozilla holds to `.tr` vouch for any name at all.
+fn trust_anchors(
+    bundled: &[rustls::pki_types::TrustAnchor<'static>],
+    system: rustls_native_certs::CertificateResult,
+) -> rustls::RootCertStore {
+    let mut found = rustls::RootCertStore::empty();
+    found.add_parsable_certificates(system.certs);
+
+    let mut roots = rustls::RootCertStore::from_iter(bundled.iter().cloned());
+    roots.roots.extend(found.roots.into_iter().filter(|anchor| {
+        !bundled.iter().any(|root| {
+            root.subject == anchor.subject
+                && root.subject_public_key_info == anchor.subject_public_key_info
+        })
+    }));
+    roots
 }
 
 /// Why a redirect must not be followed, or `None` to follow it.
@@ -1727,8 +1820,8 @@ mod tests {
     ///
     /// What the client negotiates on the wire is out of a unit test's sight.
     /// What it offers for ALPN is not, and is pinned here because reqwest sets
-    /// it only on a configuration it built itself: without the line in `tls`,
-    /// h2 would quietly never be offered again.
+    /// it only on a configuration it built itself: without the line in
+    /// `tls_trusting`, h2 would quietly never be offered again.
     #[test]
     fn a_client_is_built_on_its_own_tls_configuration() {
         client(Peer::Elsewhere).expect("a client did not build on its own TLS configuration");
@@ -1742,6 +1835,248 @@ mod tests {
             config.alpn_protocols,
             [b"h2".to_vec(), b"http/1.1".to_vec()],
             "the configuration does not offer h2 and then http/1.1"
+        );
+    }
+
+    /// The CA an internal keyserver is certified by, as a system store would
+    /// hold it. It and the keyserver's certificate and key below were made once
+    /// with OpenSSL 3.6, and the CA's key thrown away:
+    ///
+    /// ```text
+    /// openssl req -config /dev/null -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -noenc \
+    ///   -keyout ca.key -out internal-ca.pem -subj '/CN=rPGP test fixture CA' -set_serial 1 \
+    ///   -not_before 20000101000000Z -not_after 99991231235959Z \
+    ///   -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign
+    /// openssl req -config /dev/null -newkey ec -pkeyopt ec_paramgen_curve:P-256 -noenc \
+    ///   -keyout server.key -out server.pem -subj '/CN=keys.corp.example' -set_serial 2 \
+    ///   -CA internal-ca.pem -CAkey ca.key \
+    ///   -not_before 20000101000000Z -not_after 99991231235959Z \
+    ///   -addext basicConstraints=critical,CA:FALSE -addext keyUsage=critical,digitalSignature \
+    ///   -addext extendedKeyUsage=serverAuth -addext subjectAltName=DNS:keys.corp.example
+    /// cat server.pem server.key > internal-keyserver.pem
+    /// ```
+    ///
+    /// `99991231235959Z` is how RFC 5280 writes "no expiry", so neither
+    /// certificate runs out while these tests are kept. `-config /dev/null`
+    /// keeps a local `openssl.cnf` from adding extensions of its own.
+    ///
+    /// A path rather than bytes, because the tests hand it to the same loader
+    /// rustls-native-certs reads `SSL_CERT_FILE` with.
+    const INTERNAL_CA: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/internal-ca.pem"
+    );
+
+    /// The certificate `keys.corp.example` presents, issued by [`INTERNAL_CA`],
+    /// and its private key.
+    const INTERNAL_KEYSERVER: &[u8] = include_bytes!("../tests/fixtures/internal-keyserver.pem");
+
+    /// [`INTERNAL_CA`] as the system's store would give it up.
+    fn internal_ca() -> rustls_native_certs::CertificateResult {
+        let loaded = rustls_native_certs::load_certs_from_paths(
+            Some(std::path::Path::new(INTERNAL_CA)),
+            None,
+        );
+        assert!(
+            loaded.errors.is_empty() && loaded.certs.len() == 1,
+            "the fixture CA did not load as one certificate: {loaded:?}"
+        );
+        loaded
+    }
+
+    /// [`INTERNAL_CA`] as an anchor, which rustls makes of it directly rather
+    /// than through [`trust_anchors`], so that a test of that function does not
+    /// take its expected answer from the function itself.
+    fn internal_ca_anchor() -> rustls::pki_types::TrustAnchor<'static> {
+        let mut store = rustls::RootCertStore::empty();
+        store.add(internal_ca().certs.remove(0)).unwrap();
+        store.roots.remove(0)
+    }
+
+    /// Answer one TLS handshake as the internal keyserver, on a throwaway
+    /// loopback socket, and hand back its address.
+    ///
+    /// rustls is the server, on ring like the client, and speaks no HTTP: what
+    /// is in question is only whether the client accepts the certificate.
+    fn serve_internal_keyserver() -> SocketAddr {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from_pem_slice(INTERNAL_KEYSERVER).unwrap()],
+            PrivateKeyDer::from_pem_slice(INTERNAL_KEYSERVER).unwrap(),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            let _ = socket.set_read_timeout(Some(TIMEOUT));
+            let mut server = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+            // A client that refuses the certificate ends the handshake with an
+            // alert, which is an error here and the outcome half the tests want.
+            while server.is_handshaking() && server.complete_io(&mut socket).is_ok() {}
+        });
+        addr
+    }
+
+    /// Shake hands with `addr` on `config`, asking for `keys.corp.example`,
+    /// and hand back what rustls made of the certificate it was shown.
+    fn handshake(
+        config: rustls::ClientConfig,
+        addr: SocketAddr,
+    ) -> std::result::Result<(), rustls::Error> {
+        let name = rustls::pki_types::ServerName::try_from("keys.corp.example").unwrap();
+        let mut client = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+        let mut socket = std::net::TcpStream::connect(addr).unwrap();
+        socket.set_read_timeout(Some(TIMEOUT)).unwrap();
+        while client.is_handshaking() {
+            if let Err(e) = client.complete_io(&mut socket) {
+                // What rustls decided arrives wrapped in an io::Error, whose
+                // own `source` skips straight past it: hence `get_ref`.
+                return Err(e
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+                    .cloned()
+                    .unwrap_or_else(|| panic!("the handshake failed outside TLS: {e}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// A keyserver certified by an organisation's own CA is reached when that
+    /// CA is in the system's store, and refused as an unknown issuer when it is
+    /// not.
+    ///
+    /// This is the handshake itself, on loopback, with the configuration a
+    /// client is built on. The CA comes in through the loader rustls-native-certs
+    /// reads `SSL_CERT_FILE` with, but from a path handed to it: the store that
+    /// [`tls`] reads is found through the process's environment and read once
+    /// per process, and a test running beside others must change neither. So
+    /// [`tls_trusting`] and [`trust_anchors`] are what is put to the question,
+    /// and [`tls`] only joins them to that store.
+    #[test]
+    fn a_keyserver_certified_by_a_ca_in_the_system_store_is_trusted() {
+        let trusting = tls_trusting(Arc::new(trust_anchors(
+            webpki_roots::TLS_SERVER_ROOTS,
+            internal_ca(),
+        )))
+        .unwrap();
+        assert_eq!(
+            handshake(trusting, serve_internal_keyserver()),
+            Ok(()),
+            "a keyserver certified by a CA in the system store was refused"
+        );
+
+        let bundled_only = tls_trusting(Arc::new(trust_anchors(
+            webpki_roots::TLS_SERVER_ROOTS,
+            rustls_native_certs::CertificateResult::default(),
+        )))
+        .unwrap();
+        assert_eq!(
+            handshake(bundled_only, serve_internal_keyserver()),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer
+            )),
+            "a keyserver certified by a CA nowhere among the anchors was not refused as an \
+             unknown issuer"
+        );
+    }
+
+    /// What the system's store fails to give costs that and nothing more: a
+    /// file that cannot be read and a certificate that does not parse are
+    /// passed over, the CA beside them is still an anchor, Mozilla's roots are
+    /// all still there, and a client is still built on them.
+    #[test]
+    fn a_system_store_that_partly_fails_to_load_still_gives_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        // Well-formed PEM around three zero bytes, which parse as nothing.
+        std::fs::write(
+            dir.path().join("malformed.pem"),
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        std::fs::copy(INTERNAL_CA, dir.path().join("internal-ca.pem")).unwrap();
+        let system = rustls_native_certs::load_certs_from_paths(
+            Some(&dir.path().join("missing.pem")),
+            Some(dir.path()),
+        );
+        assert!(
+            !system.errors.is_empty() && system.certs.len() == 2,
+            "the store was meant to fail on one file and give up two certificates, one of \
+             them malformed: {system:?}"
+        );
+
+        let roots = trust_anchors(webpki_roots::TLS_SERVER_ROOTS, system);
+        assert_eq!(
+            roots.roots,
+            [webpki_roots::TLS_SERVER_ROOTS, &[internal_ca_anchor()]].concat(),
+            "a store that partly failed to load did not give Mozilla's roots and the CA"
+        );
+        tls_trusting(Arc::new(roots))
+            .expect("a store that partly failed to load stopped a client being built");
+    }
+
+    /// A panic while the system's store is read costs the system's anchors
+    /// and nothing more, as a store that could not be opened does: Mozilla's
+    /// roots are all there, and a client is still built on them.
+    #[test]
+    fn a_panic_reading_the_system_store_leaves_mozillas_roots() {
+        let system = read_system_store(|| panic!("the system's store failed part-way"));
+        let roots = trust_anchors(webpki_roots::TLS_SERVER_ROOTS, system);
+        assert_eq!(
+            roots.roots,
+            webpki_roots::TLS_SERVER_ROOTS,
+            "a panic reading the system's store did not leave exactly Mozilla's roots"
+        );
+        tls_trusting(Arc::new(roots))
+            .expect("a panic reading the system's store stopped a client being built");
+    }
+
+    /// The system's copy of a bundled root is left out, so a name constraint
+    /// on the bundled one still holds.
+    ///
+    /// webpki-roots holds one of Mozilla's roots to `.tr`, and a system store
+    /// carries that root as the bare certificate. Here the internal CA plays
+    /// both parts: bundled with a constraint to `elsewhere.example`, and in
+    /// the system's store as itself, while the keyserver it certified is
+    /// `keys.corp.example`. With both copies kept, the handshake finds the
+    /// unconstrained one and succeeds.
+    #[test]
+    fn a_system_copy_of_a_bundled_root_does_not_lift_its_name_constraint() {
+        // Permitted subtrees holding the one DNS name `elsewhere.example`,
+        // encoded as webpki-roots encodes the `.tr` constraint.
+        let constrained = rustls::pki_types::TrustAnchor {
+            name_constraints: Some(rustls::pki_types::Der::from_slice(
+                b"\xa0\x15\x30\x13\x82\x11elsewhere.example",
+            )),
+            ..internal_ca_anchor()
+        };
+
+        let roots = trust_anchors(std::slice::from_ref(&constrained), internal_ca());
+        assert_eq!(
+            roots.roots,
+            [constrained],
+            "the system's copy of a bundled root was kept beside it"
+        );
+        // webpki's error reaches rustls's only as an opaque `Other`, which is
+        // why the reason is read out of its debug form.
+        let outcome = handshake(
+            tls_trusting(Arc::new(roots)).unwrap(),
+            serve_internal_keyserver(),
+        );
+        assert!(
+            matches!(&outcome, Err(rustls::Error::InvalidCertificate(e))
+                if format!("{e:?}").contains("NameConstraintViolation")),
+            "a name outside the bundled root's constraint was not refused for it: {outcome:?}"
         );
     }
 
