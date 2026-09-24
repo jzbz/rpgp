@@ -851,7 +851,7 @@ impl DecryptionHelper for Helper<'_> {
         // the path no longer does is multiply them by the store. It used to
         // try every packet against every certificate with a key the packet
         // could name, connecting to the agent to build a keypair for each; it
-        // now builds one keypair per key, which connects once, and asks it
+        // now builds one keypair per key, without connecting, and asks it
         // about the packets that key could open. See
         // [`crate::agent::decryption_attempts`].
         const MAX_ESK: usize = 256;
@@ -1069,7 +1069,8 @@ impl DecryptionHelper for Helper<'_> {
 ///
 /// One keypair per key, built when the key is first asked about and used for
 /// every packet after, where one used to be built, and the agent connected to,
-/// for each pair of packet and certificate.
+/// for each pair of packet and certificate. It is built for the key and the
+/// certificate the key was found on, which the agent's prompt names.
 ///
 /// The first refusal from the agent ends it, and is the answer. Sequoia's
 /// `PKESK::decrypt` turns every error into `None`, so a cancelled PIN prompt,
@@ -1101,7 +1102,7 @@ fn through_agent<'a, D: Decryptor>(
     attempts: &[crate::agent::Attempt<'a>],
     sym_algo: Option<SymmetricAlgorithm>,
     decrypt: &mut dyn FnMut(Option<SymmetricAlgorithm>, &SessionKey) -> bool,
-    mut keypair: impl FnMut(&Key<key::PublicParts, key::UnspecifiedRole>) -> Result<D>,
+    mut keypair: impl FnMut(&Cert, &Key<key::PublicParts, key::UnspecifiedRole>) -> Result<D>,
 ) -> Result<Option<&'a Cert>> {
     let refused = |attempt: &crate::agent::Attempt<'_>, reason: String| Error::AgentRefused {
         name: crate::revoke::name_of(attempt.cert),
@@ -1113,7 +1114,8 @@ fn through_agent<'a, D: Decryptor>(
         let pair = match pairs.entry(attempt.key.fingerprint()) {
             Entry::Occupied(pair) => pair.into_mut(),
             Entry::Vacant(slot) => slot.insert(Answering {
-                agent: keypair(&attempt.key).map_err(|e| refused(attempt, e.to_string()))?,
+                agent: keypair(attempt.cert, &attempt.key)
+                    .map_err(|e| refused(attempt, e.to_string()))?,
                 refusal: None,
             }),
         };
@@ -3871,7 +3873,7 @@ mod tests {
             &attempts,
             None,
             &mut |_, got: &SessionKey| *got == session_key,
-            |key| {
+            |_, key| {
                 asked.set(asked.get() + 1);
                 Ok(StandIn::Refuses(key.clone()))
             },
@@ -3896,7 +3898,7 @@ mod tests {
             &attempts,
             None,
             &mut |_, got: &SessionKey| *got == session_key,
-            |_| -> Result<StandIn> {
+            |_, _| -> Result<StandIn> {
                 asked.set(asked.get() + 1);
                 Err(Error::invalid("no gpg-agent to talk to: it went away"))
             },
@@ -3949,7 +3951,7 @@ mod tests {
             &attempts,
             None,
             &mut |_, got: &SessionKey| *got == session_key,
-            |_| {
+            |_, _| {
                 Ok(Counted {
                     agent: StandIn::Card(pair.clone()),
                     asked: &asked,
@@ -3967,7 +3969,7 @@ mod tests {
             &attempts,
             None,
             &mut |_, got: &SessionKey| *got == session_key,
-            |key| {
+            |_, key| {
                 Ok(Counted {
                     agent: StandIn::Refuses(key.clone()),
                     asked: &asked,
@@ -4011,13 +4013,14 @@ mod tests {
             let attempts = crate::agent::decryption_attempts(&pkesks, [&alice], || listing.clone());
             assert_eq!(attempts.len(), 2, "{case}: premise: two attempts");
             let asked = std::cell::Cell::new(0);
-            let refused = through_agent(&attempts, None, &mut |_, _: &SessionKey| false, |key| {
-                Ok(Counted {
-                    agent: StandIn::Refuses(key.clone()),
-                    asked: &asked,
+            let refused =
+                through_agent(&attempts, None, &mut |_, _: &SessionKey| false, |_, key| {
+                    Ok(Counted {
+                        agent: StandIn::Refuses(key.clone()),
+                        asked: &asked,
+                    })
                 })
-            })
-            .expect_err("opened with the prompt cancelled");
+                .expect_err("opened with the prompt cancelled");
             assert_eq!(asked.get(), 1, "{case}: the prompt went up again");
             assert!(
                 matches!(refused, Error::AgentRefused { .. }),
@@ -4040,7 +4043,7 @@ mod tests {
         let pairs = encryption_pairs(&alice);
         assert_eq!(pairs.len(), 2, "premise: a transport and a storage key");
         let listing = held(&[&pairs[0].0, &pairs[1].0]);
-        let stand_in = |key: &Key<key::PublicParts, key::UnspecifiedRole>| {
+        let stand_in = |_: &Cert, key: &Key<key::PublicParts, key::UnspecifiedRole>| {
             let (_, pair) = pairs
                 .iter()
                 .find(|(public, _)| public.fingerprint() == key.fingerprint())

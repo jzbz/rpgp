@@ -431,7 +431,9 @@ Signing, certifying and decrypting all work on a card. Where the agent puts its
 prompt is the agent's business: `sequoia-gpg-agent` builds those options from
 `GPG_TTY`, `TERM` and `DISPLAY` when a crypto operation opens its connection.
 The connection that only lists keys deliberately sets none, for the reason in
-the note above `connect` in `agent.rs`.
+the note in `connected` in `agent.rs`. What a passphrase prompt says is rPGP's
+to give, and it gives what GnuPG's own does: the certificate's primary user ID,
+the key's ID, and for a subkey the primary key's ID too.
 
 A message the keys in rPGP's own store do not open is taken to the agent, and
 only to a key it could be for: the key each of its session-key packets names,

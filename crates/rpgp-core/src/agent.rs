@@ -18,9 +18,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 
-use sequoia_gpg_agent::Agent;
+use sequoia_gpg_agent::{Agent, Context, KeyPair};
 use sequoia_ipc::Keygrip;
 use sequoia_openpgp::packet::key::{PublicParts, UnspecifiedRole};
 use sequoia_openpgp::packet::{Key, PKESK};
@@ -126,15 +126,73 @@ fn runtime() -> Result<&'static Runtime> {
 /// held to this: a PIN entry can legitimately take a minute. But enumeration
 /// is called from the reload path, and an agent that has hung, or a socket
 /// left behind by one that died, used to hang the whole application with it.
+///
+/// Connecting is held to it whole, gpgconf included; [`reach`] says how. The
+/// bound is on the caller only: a gpgconf that never exits is left running,
+/// with the thread that waits on it, and each connection made meanwhile starts
+/// another of each.
 const ENUMERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// What gpgconf said about the agent of one [`AgentHome`], kept from the first
+/// connection through it that worked.
+///
+/// A context is only paths: GnuPG's home and its sockets, which
+/// sequoia-gpg-agent 0.6.2 finds by running gpgconf twice (`Context::new`).
+/// Every connection used to build a new one, and then run gpgconf twice more,
+/// to create the socket directory and launch an agent that was almost always
+/// running already (`Agent::connect`): four processes before the socket was
+/// tried, and on Windows a `cygpath` for every line gpgconf printed. Every
+/// keypair paid for another connection besides, only to learn the socket's
+/// path. With the context kept, gpgconf runs for the first connection, and
+/// again only once the socket it named does not answer, as when the agent has
+/// been stopped.
+///
+/// Only a context an agent has answered through is kept. gpgconf failing, or
+/// naming a home that does not exist, is how a machine looks before GnuPG is
+/// installed or first run, and either can change while the app is open, which
+/// should not need the app restarted. A connection through the kept context
+/// that fails asks gpgconf again before it gives up, and one that gives up, or
+/// runs out of time, drops the context; see [`reach`].
+///
+/// Kept per home, because the tests point the process at agents of their own;
+/// the app asks one home for as long as it runs. Nothing the agent holds is
+/// kept, only where it listens: a card inserted since is in the next listing.
+static KNOWN: Mutex<Option<(AgentHome, Arc<Context>)>> = Mutex::new(None);
+
+/// The context kept for `home`, if one is.
+fn known(home: &AgentHome) -> Option<Arc<Context>> {
+    KNOWN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .filter(|(kept_for, _)| kept_for == home)
+        .map(|(_, ctx)| Arc::clone(ctx))
+}
+
+fn remember(home: &AgentHome, ctx: &Arc<Context>) {
+    *KNOWN.lock().unwrap_or_else(PoisonError::into_inner) = Some((home.clone(), Arc::clone(ctx)));
+}
+
+fn forget(home: &AgentHome) {
+    let mut kept = KNOWN.lock().unwrap_or_else(PoisonError::into_inner);
+    if kept.as_ref().is_some_and(|(kept_for, _)| kept_for == home) {
+        *kept = None;
+    }
+}
+
 fn connect() -> Result<Agent> {
+    Ok(connected()?.0)
+}
+
+/// A connection to the agent, and the context it was reached through.
+fn connected() -> Result<(Agent, Arc<Context>)> {
     #[cfg(test)]
     CONNECTS.with(|count| count.set(count.get() + 1));
 
-    let home = match HOME.read().unwrap_or_else(PoisonError::into_inner).clone() {
+    let home = HOME.read().unwrap_or_else(PoisonError::into_inner).clone();
+    let dir = match &home {
         AgentHome::User => None,
-        AgentHome::At(dir) => Some(dir),
+        AgentHome::At(dir) => Some(dir.clone()),
         AgentHome::Nowhere => {
             return Err(Error::invalid(
                 "no gpg-agent to talk to: this process was told to ask none",
@@ -150,15 +208,86 @@ fn connect() -> Result<Agent> {
         // Assuan options are per-connection state, so anything set here could
         // never have reached a prompt — it only cost three round trips on
         // every connect, which annotate and every crypto operation make.
-        let answer = match &home {
-            None => tokio::time::timeout(ENUMERATION_TIMEOUT, Agent::connect_to_default()).await,
-            Some(dir) => tokio::time::timeout(ENUMERATION_TIMEOUT, Agent::connect_to(dir)).await,
-        };
-        let agent = answer
-            .map_err(|_| Error::invalid("gpg-agent did not answer in time"))?
-            .map_err(|e| Error::invalid(format!("no gpg-agent to talk to: {e}")))?;
-        Ok(agent)
+        match tokio::time::timeout(ENUMERATION_TIMEOUT, reach(&home, dir)).await {
+            Ok(Ok(reached)) => Ok(reached),
+            Ok(Err(e)) => {
+                forget(&home);
+                Err(Error::invalid(format!("no gpg-agent to talk to: {e}")))
+            }
+            Err(_) => {
+                forget(&home);
+                Err(Error::invalid("gpg-agent did not answer in time"))
+            }
+        }
     })
+}
+
+/// Connect to the agent of `home`, whose GnuPG home is `dir`, or GnuPG's
+/// default where that is `None`.
+///
+/// Through the context kept for `home` when there is one. Otherwise, or when
+/// its socket does not answer, as sequoia-gpg-agent's `Agent::connect` would,
+/// in the same steps but in a different order: gpgconf is asked for a context,
+/// its socket is tried, and only if nothing is listening there is gpgconf told
+/// to launch an agent and the socket tried again. `Agent::connect` launches
+/// first, every time, and against an agent that accepts a connection and then
+/// never answers, which is what a hung agent does, gpgconf's launch never
+/// returns: it waits on that agent's greeting through `gpg-connect-agent`. A
+/// socket that is there but silent is left to the timeout instead, which lets
+/// go of it, and launches nothing that would outlive the attempt.
+///
+/// gpgconf runs on the runtime's blocking pool. `tokio::time::timeout` checks
+/// its deadline only when the future it holds is pending, and gpgconf, which
+/// sequoia-gpg-agent runs with `std::process::Command`, blocks inside the poll
+/// that started it: the timeout could not fire until gpgconf exited, and a
+/// gpgconf that hung held the caller with it. From the blocking pool, the wait
+/// is a pending task like any other. What is left inside the poll is the
+/// socket's own connect, which sequoia-gpg-agent makes blocking before it
+/// awaits the greeting. On Unix that blocks only while the socket's queue of
+/// connections waiting to be accepted is full, as that of an agent stopped
+/// outright can become. On Windows it is a TCP connect to the local port the
+/// socket file names, which the system bounds, and against a GnuPG built for
+/// Cygwin a handshake after it, which nothing does.
+///
+/// A new context is kept once an agent has answered through it. Nothing is
+/// forgotten here; the caller forgets the kept context if this fails.
+async fn reach(
+    home: &AgentHome,
+    dir: Option<PathBuf>,
+) -> std::result::Result<(Agent, Arc<Context>), sequoia_gpg_agent::Error> {
+    if let Some(ctx) = known(home)
+        && let Ok(agent) = Agent::connect_to_agent(ctx.socket("agent")?).await
+    {
+        return Ok((agent, ctx));
+    }
+
+    let ctx = Arc::new(
+        off_the_poll(move || match dir {
+            None => Context::new(),
+            Some(dir) => Context::with_homedir(dir),
+        })
+        .await?,
+    );
+    let agent = match Agent::connect_to_agent(ctx.socket("agent")?).await {
+        Ok(agent) => agent,
+        Err(_) => {
+            let launching = Arc::clone(&ctx);
+            off_the_poll(move || launching.start("gpg-agent")).await?;
+            Agent::connect_to_agent(ctx.socket("agent")?).await?
+        }
+    };
+    remember(home, &ctx);
+    Ok((agent, ctx))
+}
+
+/// Run `work`, which runs gpgconf, on the runtime's blocking pool, so that the
+/// deadline of whatever awaits it can pass while gpgconf runs.
+async fn off_the_poll<T: Send + 'static>(
+    work: impl FnOnce() -> std::result::Result<T, sequoia_gpg_agent::Error> + Send + 'static,
+) -> std::result::Result<T, sequoia_gpg_agent::Error> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| sequoia_gpg_agent::Error::Other(e.into()))?
 }
 
 /// Whether a gpg-agent is reachable at all.
@@ -203,20 +332,51 @@ pub fn card_keys() -> Result<Vec<AgentKey>> {
     Ok(keys()?.into_iter().filter(AgentKey::is_on_card).collect())
 }
 
-/// A signer backed by the agent, for a public key the agent has the secret
-/// half of.
+/// A signer, and decryptor, backed by the agent, for `key` of `cert`, a key
+/// the agent has the secret half of.
 ///
 /// The agent finds the secret half by keygrip, so only the public key is
-/// needed here. Any PIN or passphrase prompt happens in the user's pinentry
-/// while this call blocks.
-pub fn signer(key: &Key<PublicParts, UnspecifiedRole>) -> Result<sequoia_gpg_agent::KeyPair> {
-    let agent = connect()?;
-    // Only connecting is async. The returned KeyPair implements Sequoia's
-    // Signer and Decryptor synchronously, so it drops straight into the
-    // existing stream builders with no runtime in sight.
-    agent
-        .keypair(key)
-        .map_err(|e| Error::invalid(format!("the agent cannot use this key: {e}")))
+/// needed to reach it. `cert` is for the prompt. The agent is handed the
+/// words GnuPG's own passphrase prompt uses, which give the certificate's
+/// primary user ID, then the key's ID and, for a subkey, the primary key's
+/// (sequoia-gpg-agent 0.6.2 `KeyPair::with_cert`, sent as `SETKEYDESC`).
+/// Without it the prompt gave the key's ID and creation time alone, which for
+/// the subkey that decrypts is an ID few users have seen, and the decryption
+/// fallback asks with keys the user never picked. Where `cert` has no valid
+/// self-signature under the policy, the prompt stays that bare one. Whether a
+/// card's PIN prompt shows these words is gpg-agent's choice.
+///
+/// Building it does not connect. The keypair opens a connection of its own
+/// each time it is used, to the socket the last connection that worked went
+/// through, which is also when any PIN or passphrase prompt happens in the
+/// user's pinentry, while that use blocks. It used to connect here as well,
+/// running gpgconf four times, only to learn that socket's path. Only when no
+/// connection has worked yet, or the last one failed, does this connect, to
+/// find the socket.
+pub fn signer(cert: &Cert, key: &Key<PublicParts, UnspecifiedRole>) -> Result<KeyPair> {
+    // The returned KeyPair implements Sequoia's Signer and Decryptor
+    // synchronously, so it drops straight into the existing stream builders
+    // with no runtime in sight.
+    let pair = KeyPair::new_for_socket(socket()?, key)
+        .map_err(|e| Error::invalid(format!("the agent cannot use this key: {e}")))?;
+    let policy = crate::policy();
+    Ok(match cert.with_policy(&policy, None) {
+        Ok(valid) => pair.with_cert(&valid),
+        Err(_) => pair,
+    })
+}
+
+/// The agent's socket: that of the context the last connection that worked
+/// went through, or, when there is none, of a new connection's.
+fn socket() -> Result<PathBuf> {
+    let home = HOME.read().unwrap_or_else(PoisonError::into_inner).clone();
+    let ctx = match known(&home) {
+        Some(ctx) => ctx,
+        None => connected()?.1,
+    };
+    ctx.socket("agent")
+        .map(PathBuf::from)
+        .map_err(|e| Error::invalid(format!("no gpg-agent to talk to: {e}")))
 }
 
 /// Whether the agent can act for any signing-capable key of `cert`, and if so
@@ -348,7 +508,7 @@ fn keypair_for(cert: &Cert, purpose: Purpose) -> Result<sequoia_gpg_agent::KeyPa
     // saying the certificate is revoked rather than saying whatever the agent
     // says when it is not running at all.
     refuse_if_revoked_for(cert, purpose)?;
-    signer(&select_key(cert, purpose, &keys()?)?)
+    signer(cert, &select_key(cert, purpose, &keys()?)?)
 }
 
 /// Refuses `cert` when `purpose` is new use of a key its owner has withdrawn.
@@ -1247,7 +1407,7 @@ mod tests {
                 .collect();
             let held = keys().unwrap();
             for attempt in decryption_attempts(&pkesks, [&card], || held.clone()) {
-                match signer(&attempt.key) {
+                match signer(attempt.cert, &attempt.key) {
                     Ok(mut pair) => {
                         eprintln!(
                             "  asking the agent with key {}",

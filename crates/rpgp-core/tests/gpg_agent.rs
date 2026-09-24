@@ -45,12 +45,14 @@ use sequoia_openpgp::{Cert, Packet, PacketPile};
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 /// A pinentry whose user presses Cancel every time, and which writes a line to
-/// `LOG` each time it is asked for a PIN or passphrase.
+/// `LOG` each time it is asked for a PIN or passphrase, and to `@DESC@` the
+/// description the agent gives it for each prompt, as the agent sent it.
 const PINENTRY: &str = r#"#!/bin/sh
 echo "OK Pleased to meet you"
 while IFS= read -r line; do
   case "$line" in
     GETPIN*) echo asked >> 'LOG'; echo "ERR 83886179 Operation cancelled <Pinentry>" ;;
+    SETDESC\ *) printf '%s\n' "${line#SETDESC }" >> '@DESC@'; echo "OK" ;;
     BYE*) echo "OK closing connection"; exit 0 ;;
     *) echo "OK" ;;
   esac
@@ -63,6 +65,7 @@ struct Throwaway {
     /// and deletes its home.
     ctx: Context,
     pinentry_log: PathBuf,
+    descriptions: PathBuf,
     _one_at_a_time: MutexGuard<'static, ()>,
 }
 
@@ -81,10 +84,13 @@ impl Throwaway {
             .to_path_buf();
 
         let pinentry_log = home.join("pinentry.log");
+        let descriptions = home.join("descriptions.log");
         let pinentry = home.join("pinentry");
         std::fs::write(
             &pinentry,
-            PINENTRY.replace("LOG", &pinentry_log.display().to_string()),
+            PINENTRY
+                .replace("LOG", &pinentry_log.display().to_string())
+                .replace("@DESC@", &descriptions.display().to_string()),
         )
         .unwrap();
         std::fs::set_permissions(&pinentry, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -104,6 +110,7 @@ impl Throwaway {
         Some(Throwaway {
             ctx,
             pinentry_log,
+            descriptions,
             _one_at_a_time: one_at_a_time,
         })
     }
@@ -140,6 +147,37 @@ impl Throwaway {
             .map(|log| log.lines().count())
             .unwrap_or(0)
     }
+
+    /// The description the agent gave with each prompt, as the pinentry
+    /// shows it: the agent escapes a line break, and anything else Assuan
+    /// cannot carry, as `%` and two hex digits.
+    fn descriptions(&self) -> Vec<String> {
+        let log = std::fs::read_to_string(&self.descriptions).unwrap_or_default();
+        log.lines().map(unescape).collect()
+    }
+}
+
+/// `line` with the Assuan escapes, `%` and two hex digits, undone.
+fn unescape(line: &str) -> String {
+    let mut bytes = Vec::new();
+    let mut rest = line.as_bytes();
+    while let Some((&first, tail)) = rest.split_first() {
+        let decoded = (first == b'%')
+            .then(|| tail.get(..2))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
+        match decoded {
+            Some(byte) => {
+                bytes.push(byte);
+                rest = &tail[2..];
+            }
+            None => {
+                bytes.push(first);
+                rest = tail;
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 impl Drop for Throwaway {
@@ -453,4 +491,57 @@ fn signs_and_certifies_through_the_agent() {
         "{found:?}"
     );
     assert_eq!(agent_home.prompts(), 0);
+}
+
+/// The agent's passphrase prompt names the certificate whose key it unlocks:
+/// its primary user ID, and the primary key's ID beside the subkey's, as
+/// GnuPG's own prompt does, for decrypting and for signing.
+///
+/// It used to give the subkey's ID and creation time and nothing else. The
+/// decryption fallback asks with keys the user never picked, and a user with
+/// several keys in the agent could not tell from the prompt whose passphrase
+/// to type.
+#[test]
+fn the_passphrase_prompt_names_the_certificate() {
+    let Some(agent_home) = Throwaway::start() else {
+        return;
+    };
+    let alice = key("Alice <alice@example.org>", Some("alice's passphrase"));
+    agent_home.give(&alice);
+    let dir = tempfile::tempdir().unwrap();
+    let store = public_store(&dir, &[&alice]);
+    let public = store.lookup(&alice.fingerprint().to_hex()).unwrap();
+
+    let mut ciphertext = Vec::new();
+    ops::encrypt(
+        std::slice::from_ref(&alice),
+        &[],
+        None,
+        b"for alice",
+        &mut ciphertext,
+    )
+    .unwrap();
+    ops::decrypt(&store, &ciphertext, &[], &mut Vec::new())
+        .expect_err("opened with the prompt cancelled");
+    ops::sign_detached(&public, None, b"to be signed", Vec::new())
+        .expect_err("signed with the prompt cancelled");
+
+    let descriptions = agent_home.descriptions();
+    assert_eq!(
+        descriptions.len(),
+        2,
+        "premise: one prompt each: {descriptions:?}"
+    );
+    let main_key_id = format!("(main key ID {})", alice.keyid().to_hex());
+    for (operation, description) in ["decrypting", "signing"].iter().zip(&descriptions) {
+        eprintln!("{operation}: {description:?}");
+        assert!(
+            description.contains("Alice <alice@example.org>"),
+            "{operation}: the prompt does not name the certificate: {description:?}"
+        );
+        assert!(
+            description.contains(&main_key_id),
+            "{operation}: the prompt does not give the primary key's ID: {description:?}"
+        );
+    }
 }
