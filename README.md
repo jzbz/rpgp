@@ -65,8 +65,10 @@ cargo run -p rpgp-gui
 cargo test --workspace
 ```
 
-Some tests are `#[ignore]`d because they need the network, a smartcard, or a
-PIN prompt. Run them with `-- --ignored`.
+Some tests are `#[ignore]`d because they need the network, a smartcard, a PIN
+prompt or your own `gpg-agent`. Run them with `-- --ignored`. No other test
+reaches your agent: the ones that exercise the agent start one of their own in
+a temporary directory, and skip where GnuPG is not installed.
 
 To try the app with content in it, seed a throwaway store. It writes only
 inside the `XDG_DATA_HOME` you give it:
@@ -266,6 +268,15 @@ That is one field doing two jobs on the way in and two on the way out. In Sign
 *anyone* will need are deliberately separate fields, because confusing them
 would hand out the wrong secret.
 
+When a message is for one of your keys that has a passphrase, and none was
+entered or the one entered does not unlock it, the failure says so and names
+the key, rather than that no secret key opens the message. Only for a key the
+message names: one sent to hidden recipients could be for anybody, and asking
+for your passphrase then would ask for one that may never work. Where the
+message is for a password as well, the failure says that the key's passphrase
+or the message's password would open it, or that what was entered is neither,
+since the one field is tried as both.
+
 Reading such a message costs whatever its sender decided it should. The packet
 names the password-hashing parameters, and Argon2's are a memory size and a
 pass count that the recipient pays once for every (envelope × candidate
@@ -421,6 +432,37 @@ prompt is the agent's business: `sequoia-gpg-agent` builds those options from
 `GPG_TTY`, `TERM` and `DISPLAY` when a crypto operation opens its connection.
 The connection that only lists keys deliberately sets none, for the reason in
 the note above `connect` in `agent.rs`.
+
+A message the keys in rPGP's own store do not open is taken to the agent, and
+only to a key it could be for: the key each of its session-key packets names,
+or, for a packet that names none, each key the agent holds of the same kind.
+Packets that name a key come first, and card keys before those in the agent's
+own store. Each key is taken once, however many of your certificates carry it,
+and asked only about the packets it could open, of which a message to hidden
+recipients can have several. A message encrypted to a password alone, or to
+nobody in your store, never reaches the agent. If the agent refuses, because
+its prompt was cancelled, the card is not there or it has no pinentry to ask
+with, the decryption stops and reports what the agent said, rather than putting
+up the next prompt and then reporting that no secret key opens the message. The
+agent's answer reaches rPGP without its error code, and in your language, so a
+cancelled prompt cannot be told from a card that turned down one packet: a
+message another of your keys would have opened is not tried with that key after
+a refusal. Decrypt again with the card in, or with the passphrase to hand.
+
+The exception is an RSA key on a card, asked about a packet that names no key.
+A message to hidden recipients carries packets for other people's keys that can
+look just like one for yours, and the card turns down another RSA key's packet
+with an error, as it does a cancelled prompt. Stopping there would leave such a
+message unreadable on the card whenever someone else's packet came first, so
+rPGP goes on to the next packet, and reports the refusal only if none opens the
+message. If you cancel the PIN prompt for such a message, it comes back once
+for each packet left. A wrong PIN is turned down the same way and brings the
+prompt back too, and every wrong PIN entered uses up one of the card's tries.
+
+One case is not handled: when hidden recipients have keys on a NIST curve and
+on the Brainpool curve of the same size, whose points look alike, the agent
+turns down a packet for the other kind of curve, and a message where one comes
+before yours does not open through the agent.
 
 ## Keyservers
 

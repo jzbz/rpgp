@@ -11,18 +11,78 @@
 //!
 //! `sequoia-gpg-agent` is async and the rest of this crate is not, so calls are
 //! driven on a small dedicated runtime created once per process.
+//!
+//! Choosing a key and asking the agent are kept apart: `select_key` and
+//! `decryption_attempts` decide from what the agent listed, without a
+//! connection, so that what they choose can be tested where there is no agent.
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{OnceLock, PoisonError, RwLock};
 
 use sequoia_gpg_agent::Agent;
 use sequoia_ipc::Keygrip;
-use sequoia_openpgp::Cert;
-use sequoia_openpgp::packet::Key;
 use sequoia_openpgp::packet::key::{PublicParts, UnspecifiedRole};
+use sequoia_openpgp::packet::{Key, PKESK};
+use sequoia_openpgp::{Cert, Fingerprint};
 use tokio::runtime::Runtime;
 
 use crate::error::{Error, Result};
+
+/// Which gpg-agent this process asks. For tests only: the app must never set
+/// it, and it is public only because the integration tests and the GUI's
+/// tests, which are other crates, have to.
+///
+/// The app asks the user's own and never changes that. The choice exists for
+/// the tests, which must not reach it: an agent a test reaches can put up a PIN
+/// prompt for a real card, is started for a GnuPG home that was not running
+/// one, and answers with keys the test knows nothing about, so what the test
+/// checks depends on the machine it runs on. rpgp-core's own unit tests start
+/// pointed [`AgentHome::Nowhere`], and the tests in other crates that could
+/// reach one point themselves there. A test that wants an agent starts one of
+/// its own in a temporary directory and points the process [`AgentHome::At`]
+/// it; only a test that is `#[ignore]`d asks for the developer's by name.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentHome {
+    /// The agent GnuPG itself would use: that of `GNUPGHOME`, or of GnuPG's
+    /// default home when it is unset.
+    User,
+    /// The agent serving this GnuPG home directory, started there if none is
+    /// running yet.
+    At(PathBuf),
+    /// No agent at all. Every question fails at once, as it does on a machine
+    /// without GnuPG, and nothing is looked up or started.
+    Nowhere,
+}
+
+#[cfg(not(test))]
+const FIRST_HOME: AgentHome = AgentHome::User;
+#[cfg(test)]
+const FIRST_HOME: AgentHome = AgentHome::Nowhere;
+
+static HOME: RwLock<AgentHome> = RwLock::new(FIRST_HOME);
+
+/// Point every later question to the agent at `home`, from whichever thread it
+/// is asked.
+///
+/// For tests only, and never called by the app; see [`AgentHome`].
+/// Process-wide rather than per thread, because the questions are asked from
+/// threads a test does not start: the GUI's survey after a reload runs on one
+/// of its own.
+#[doc(hidden)]
+pub fn set_home(home: AgentHome) {
+    *HOME.write().unwrap_or_else(PoisonError::into_inner) = home;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How often this thread has tried to reach an agent, for the tests that
+    /// check an operation did not. Per thread, so that tests running beside
+    /// each other do not count each other's; the question is asked on the
+    /// caller's thread before anything moves to the runtime.
+    pub(crate) static CONNECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// A secret key the agent can use on our behalf.
 #[derive(Debug, Clone)]
@@ -69,6 +129,18 @@ fn runtime() -> Result<&'static Runtime> {
 const ENUMERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn connect() -> Result<Agent> {
+    #[cfg(test)]
+    CONNECTS.with(|count| count.set(count.get() + 1));
+
+    let home = match HOME.read().unwrap_or_else(PoisonError::into_inner).clone() {
+        AgentHome::User => None,
+        AgentHome::At(dir) => Some(dir),
+        AgentHome::Nowhere => {
+            return Err(Error::invalid(
+                "no gpg-agent to talk to: this process was told to ask none",
+            ));
+        }
+    };
     runtime()?.block_on(async {
         // No pinentry context is set here, deliberately. This connection only
         // ever lists keys and is dropped before any crypto runs; the prompting
@@ -78,8 +150,11 @@ fn connect() -> Result<Agent> {
         // Assuan options are per-connection state, so anything set here could
         // never have reached a prompt — it only cost three round trips on
         // every connect, which annotate and every crypto operation make.
-        let agent = tokio::time::timeout(ENUMERATION_TIMEOUT, Agent::connect_to_default())
-            .await
+        let answer = match &home {
+            None => tokio::time::timeout(ENUMERATION_TIMEOUT, Agent::connect_to_default()).await,
+            Some(dir) => tokio::time::timeout(ENUMERATION_TIMEOUT, Agent::connect_to(dir)).await,
+        };
+        let agent = answer
             .map_err(|_| Error::invalid("gpg-agent did not answer in time"))?
             .map_err(|e| Error::invalid(format!("no gpg-agent to talk to: {e}")))?;
         Ok(agent)
@@ -94,7 +169,7 @@ fn connect() -> Result<Agent> {
 /// to offer card-backed keys; no such gate was ever built, and a reader tracing
 /// how card keys reach the interface was sent somewhere nothing calls.
 ///
-/// Kept because it is the cheap reachability probe the tests below use, and the
+/// Kept because it is the cheap reachability probe the tests use, and the
 /// obvious primitive if that gate is ever wanted.
 pub fn available() -> bool {
     connect().is_ok()
@@ -244,19 +319,7 @@ pub(crate) fn certification_withdrawer_for(cert: &Cert) -> Result<sequoia_gpg_ag
     keypair_for(cert, Purpose::WithdrawCertification)
 }
 
-/// A decryptor for `cert`, backed by the agent. The returned `KeyPair`
-/// implements Sequoia's `Decryptor` as well as `Signer`.
-pub fn decryptor_for(cert: &Cert) -> Result<sequoia_gpg_agent::KeyPair> {
-    keypair_for(cert, Purpose::Decrypt)
-}
-
-/// [`decryptor_for`] against a key listing the caller already fetched with
-/// [`keys`], for callers walking many certificates in one operation.
-pub fn decryptor_for_with(cert: &Cert, held: &[AgentKey]) -> Result<sequoia_gpg_agent::KeyPair> {
-    keypair_for_with(cert, Purpose::Decrypt, held)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Purpose {
     Sign,
     Certify,
@@ -264,7 +327,6 @@ enum Purpose {
     /// [`Purpose::Certify`], the primary, which the revocation check lets
     /// through and the selection takes whether or not it is still alive.
     WithdrawCertification,
-    Decrypt,
 }
 
 /// A signer for `cert`, backed by the agent.
@@ -275,54 +337,50 @@ pub fn signer_for(cert: &Cert) -> Result<sequoia_gpg_agent::KeyPair> {
     keypair_for(cert, Purpose::Sign)
 }
 
+/// The agent's keypair for `purpose`: the key [`select_key`] chooses from the
+/// agent's listing, handed to the agent.
+///
+/// This does not move any PIN prompt: the agent asks when the returned keypair
+/// is *used*, not when it is built.
 fn keypair_for(cert: &Cert, purpose: Purpose) -> Result<sequoia_gpg_agent::KeyPair> {
     // Ahead of `keys()`, which is what opens the socket: a request that is going
     // to be refused should not enumerate the agent's keys first, and should fail
     // saying the certificate is revoked rather than saying whatever the agent
     // says when it is not running at all.
     refuse_if_revoked_for(cert, purpose)?;
-    keypair_for_with(cert, purpose, &keys()?)
+    signer(&select_key(cert, purpose, &keys()?)?)
 }
 
 /// Refuses `cert` when `purpose` is new use of a key its owner has withdrawn.
 ///
-/// The per-key filters in [`keypair_for_with`] cannot see a certificate-level
+/// The per-key filters in [`select_key`] cannot see a certificate-level
 /// revocation on a subkey, so this asks separately. Refusing before the keypair
 /// is built is what keeps the card quiet: it is never returned and so never
-/// used, and per the note on [`keypair_for_with`] it is use that raises the
-/// prompt. The two purposes that are not new use of the key are let through —
-/// reading, for the reason given on its arm there, and withdrawing a
+/// used, and per the note on [`keypair_for`] it is use that raises the prompt.
+/// The purpose that is not new use of the key is let through: withdrawing a
 /// certification, for the reason given on [`certification_withdrawer_for`].
-/// Matched exhaustively so that a purpose added later has to say which it is.
+/// Reading is not new use either, and the decryption path does not come
+/// through here at all; see [`decryption_attempts`]. Matched exhaustively so
+/// that a purpose added later has to say which it is.
 fn refuse_if_revoked_for(cert: &Cert, purpose: Purpose) -> Result<()> {
     match purpose {
         Purpose::Sign | Purpose::Certify => crate::revoke::refuse_if_revoked(cert),
-        Purpose::WithdrawCertification | Purpose::Decrypt => Ok(()),
+        Purpose::WithdrawCertification => Ok(()),
     }
 }
 
-/// [`keypair_for`] against a key listing the caller already has.
+/// The key of `cert` the agent should use for `purpose`, chosen from `held`,
+/// the agent's listing, without asking the agent anything.
 ///
-/// Every one of these calls connects to the agent and enumerates its keys, and
-/// the decrypt fallback in `ops` runs it inside a loop over (packet x
-/// certificate) — so a message that no local key opens paid a round trip per
-/// combination to re-fetch a list that does not change during one operation.
-/// Splitting the listing out lets that loop fetch it once.
-///
-/// This does not move any PIN prompt: the agent asks when the returned keypair
-/// is *used*, not when it is built.
-fn keypair_for_with(
+/// Split from [`keypair_for`], which connects, so that the choice can be tested
+/// with a listing made up for the purpose: which keys each purpose allows, and
+/// that a key on a smartcard is preferred, which no agent without a card can
+/// show.
+fn select_key(
     cert: &Cert,
     purpose: Purpose,
     held: &[AgentKey],
-) -> Result<sequoia_gpg_agent::KeyPair> {
-    // Asked again here, having already been asked by `keypair_for`: this is the
-    // entry point that takes a listing, and the only caller passing one today
-    // wants `Purpose::Decrypt`, which is exempt anyway. One revocation status
-    // against an IPC round trip is a price worth paying so that a caller added
-    // here later cannot reach the agent around the back.
-    refuse_if_revoked_for(cert, purpose)?;
-
+) -> Result<Key<PublicParts, UnspecifiedRole>> {
     let policy = crate::policy();
     let valid = cert
         .with_policy(&policy, None)
@@ -346,75 +404,739 @@ fn keypair_for_with(
             Err(_) => Vec::new(),
         },
         Purpose::WithdrawCertification => vec![primary()],
-        // Deliberately *not* filtered by alive/revoked, matching the local
-        // path in ops.rs: revoking or retiring a card key withdraws it for
-        // future use, it does not burn the archive. Old mail must stay
-        // readable after the subkey it was sent to has expired or been
-        // retired — and only for making new signatures does liveness matter.
-        Purpose::Decrypt => valid
-            .keys()
-            .for_transport_encryption()
-            .chain(valid.keys().for_storage_encryption())
-            .map(|ka| ka.key().clone())
-            .collect(),
     };
 
     let mut candidates: Vec<_> = usable
         .into_iter()
         .filter_map(|key| {
-            let grip = Keygrip::of(key.mpis()).ok()?.to_string();
-            let held = held
-                .iter()
-                .find(|k| k.keygrip.eq_ignore_ascii_case(&grip))?;
-            Some((held.is_on_card(), key))
+            let on_card = held_as(&key, held)?.is_on_card();
+            Some((on_card, key))
         })
         .collect();
 
     // Card first.
     candidates.sort_by_key(|(on_card, _)| std::cmp::Reverse(*on_card));
-    let (_, key) = candidates
+    candidates
         .into_iter()
         .next()
-        .ok_or_else(|| Error::NoSecretKey(cert.fingerprint().to_hex()))?;
+        .map(|(_, key)| key)
+        .ok_or_else(|| Error::NoSecretKey(cert.fingerprint().to_hex()))
+}
 
-    signer(&key)
+/// The entry of `held` for `key`, matched by keygrip, which is what the agent
+/// indexes by.
+fn held_as<'h>(
+    key: &Key<PublicParts, UnspecifiedRole>,
+    held: &'h [AgentKey],
+) -> Option<&'h AgentKey> {
+    let grip = Keygrip::of(key.mpis()).ok()?.to_string();
+    held.iter().find(|k| k.keygrip.eq_ignore_ascii_case(&grip))
+}
+
+/// One question for the agent while decrypting: whether `key` opens `pkesk`.
+#[derive(Debug)]
+pub(crate) struct Attempt<'a> {
+    /// The certificate `key` was found on, which a message it opens is
+    /// credited to.
+    pub(crate) cert: &'a Cert,
+    pub(crate) key: Key<PublicParts, UnspecifiedRole>,
+    pub(crate) pkesk: &'a PKESK,
+    /// Whether the agent reports `key` on a smartcard.
+    pub(crate) on_card: bool,
+}
+
+impl Attempt<'_> {
+    /// Whether the agent turning this attempt down is its answer for the whole
+    /// message, so that nothing more is asked; see `ops::through_agent`.
+    ///
+    /// It is, except where the packet names no key and the key is RSA on a
+    /// smartcard. Such a packet may be another recipient's, and [`could_open`]
+    /// cannot keep away every one made for another RSA key: what it carries is
+    /// in range for this key too whenever it is smaller than this modulus,
+    /// which for keys of one size it is more often than not. For a key in its
+    /// own store the agent hands back whatever the decryption gives, and
+    /// sequoia-ipc checks it on this side, where a packet that is not this
+    /// key's fails without a word. An RSA card removes the padding itself and
+    /// answers such a packet with an error instead, as it answers a cancelled
+    /// PIN prompt, and too little of either answer reaches rPGP to tell the
+    /// two apart (see [`refusal`]). Ending there would leave a message sent to
+    /// several hidden RSA recipients unreadable on the card whenever another's
+    /// packet came before this key's, however often it was tried. So the
+    /// attempts go on, and for such a message a cancelled prompt goes up again
+    /// for each packet left. So does the prompt after a wrong PIN, which
+    /// gpg-agent passes on from the card as an error rather than asking again
+    /// itself, and each wrong PIN entered there uses up one of the card's
+    /// tries.
+    ///
+    /// An ECDH key, on a card or not, turns another key's packet into a
+    /// shared secret that fails on this side in the same quiet way, and needs
+    /// no exception, unless the packet's point is not on its curve at all; see
+    /// [`could_open`] for that.
+    pub(crate) fn refusal_is_final(&self) -> bool {
+        use sequoia_openpgp::crypto::mpi::PublicKey;
+
+        self.pkesk.recipient().is_some()
+            || !self.on_card
+            || !matches!(self.key.mpis(), PublicKey::RSA { .. })
+    }
+}
+
+/// What to ask the agent, and in what order, to open a message whose
+/// session-key packets are `pkesks`, given the certificates in the store.
+///
+/// A packet names the key it was encrypted to, or no key at all when the
+/// sender hid its recipients. Each packet is tried only with a key it could be
+/// for: the one it names, or, for one that names none, each key whose shape
+/// it fits (see [`could_open`]). The agent opens a packet with whichever key
+/// it is told to use and does not compare the two, so asking it with any other
+/// key is a private-key operation, and on a card a PIN prompt, that cannot
+/// succeed. That is what the certificate's first held encryption key used to
+/// be whenever the agent held two: a subkey kept after a rotation, or an old
+/// file key beside a new card key, left every message to the one that sorted
+/// second unreadable, and on a card asked for the PIN of the wrong key first.
+///
+/// The same test on what a hidden packet carries keeps most packets made for
+/// someone else's key away from the agent, but not all: one for another RSA
+/// key of the same size fits this key's shape more often than not, and one
+/// for an ECDH key on a curve whose points are written the same way always
+/// does. Put to an RSA key on a card the first is turned down, and
+/// [`Attempt::refusal_is_final`] says why that does not end the decryption.
+///
+/// Encryption keys only, of both kinds, and each key taken once however many
+/// flags or certificates carry it, since every attempt can be a card
+/// operation. Deliberately *not* filtered by alive or revoked, as on the local
+/// path in `ops`: revoking or retiring a key withdraws it from future use, it
+/// does not burn the archive, and old mail must stay readable after the subkey
+/// it was sent to has expired or been retired.
+///
+/// A key is asked about every packet it could open, even two that name it.
+/// Sequoia hands over the packets of every container it has opened on the way
+/// to this one, so a message encrypted twice to one key names that key in two
+/// packets, and only the inner one opens the inner container.
+///
+/// Packets that name a key come first, then those that name none, and within
+/// each the keys the agent reports on a smartcard before those in its own
+/// store, then in the store's order. A named packet is almost certainly the one
+/// that opens the message; trying it first keeps a guess at a hidden recipient
+/// from putting up a prompt the named one would not have needed.
+///
+/// `held` is the agent's listing, asked for only when some key here could open
+/// some packet: a message with no packet for a key, which is every message
+/// encrypted to a password alone, or one addressed to nobody in the store,
+/// never reaches the agent.
+pub(crate) fn decryption_attempts<'a>(
+    pkesks: &'a [PKESK],
+    certs: impl IntoIterator<Item = &'a Cert>,
+    held: impl FnOnce() -> Vec<AgentKey>,
+) -> Vec<Attempt<'a>> {
+    let policy = crate::policy();
+
+    let mut seen: HashSet<Fingerprint> = HashSet::new();
+    let mut addressed: Vec<(&'a Cert, Key<PublicParts, UnspecifiedRole>)> = Vec::new();
+    for cert in certs {
+        let Ok(valid) = cert.with_policy(&policy, None) else {
+            continue;
+        };
+        for ka in valid
+            .keys()
+            .for_transport_encryption()
+            .chain(valid.keys().for_storage_encryption())
+        {
+            let key = ka.key();
+            if pkesks.iter().any(|pkesk| could_open(key, pkesk)) && seen.insert(key.fingerprint()) {
+                addressed.push((cert, key.clone()));
+            }
+        }
+    }
+    if addressed.is_empty() {
+        return Vec::new();
+    }
+
+    let held = held();
+    let mut keys: Vec<(bool, &'a Cert, Key<PublicParts, UnspecifiedRole>)> = addressed
+        .into_iter()
+        .filter_map(|(cert, key)| {
+            let on_card = held_as(&key, &held)?.is_on_card();
+            Some((on_card, cert, key))
+        })
+        .collect();
+    keys.sort_by_key(|(on_card, ..)| std::cmp::Reverse(*on_card));
+
+    let mut attempts = Vec::new();
+    for named in [true, false] {
+        for (on_card, cert, key) in &keys {
+            for pkesk in pkesks {
+                if pkesk.recipient().is_some() == named && could_open(key, pkesk) {
+                    attempts.push(Attempt {
+                        cert,
+                        key: key.clone(),
+                        pkesk,
+                        on_card: *on_card,
+                    });
+                }
+            }
+        }
+    }
+    attempts
+}
+
+/// Whether `pkesk` could have been made for `key`, judged from the packet: it
+/// names `key` or names nothing, and what it carries is shaped for `key`.
+///
+/// The shape is the algorithm; for ECDH, an ephemeral point encoded as the
+/// key's curve encodes its points; and for RSA, a ciphertext smaller than the
+/// modulus. A hidden recipient's packet says nothing else about whom it is
+/// for, and these are what a message to several hidden recipients differs in.
+///
+/// The encoding tells Curve25519 from the NIST curves, but not a NIST curve
+/// from the Brainpool curve of the same size, whose points are written alike;
+/// only arithmetic on the curve would, and nothing here does it. gpg-agent
+/// turns down a point that is not on the key's curve, and that refusal ends
+/// the decryption, so a message to hidden recipients on both kinds of curve
+/// of one size does not open through the agent when a packet for the other
+/// kind comes first. RSA needs no arithmetic: a ciphertext is always smaller
+/// than the modulus it was made with, so one that is not was made for another
+/// key, and is not worth an operation on the card.
+fn could_open(key: &Key<PublicParts, UnspecifiedRole>, pkesk: &PKESK) -> bool {
+    use sequoia_openpgp::crypto::mpi::{Ciphertext, PublicKey};
+
+    if pkesk
+        .recipient()
+        .is_some_and(|handle| !handle.aliases(key.key_handle()))
+    {
+        return false;
+    }
+    if pkesk.pk_algo() != key.pk_algo() {
+        return false;
+    }
+    match (pkesk.esk(), key.mpis()) {
+        (Ciphertext::ECDH { e, .. }, PublicKey::ECDH { curve, .. }) => {
+            e.decode_point(curve).is_ok()
+        }
+        (Ciphertext::RSA { c }, PublicKey::RSA { n, .. }) => c < n,
+        _ => true,
+    }
+}
+
+/// What the agent said, when `error` came from it: a cancelled PIN or
+/// passphrase prompt, a card that is not there, no pinentry to ask with, a
+/// decryption it turned down, or a connection that failed.
+///
+/// `None` for everything else, which is a key that did not fit: sequoia-ipc
+/// finishing the decryption on this side and finding the result is not a
+/// session key. That is kept quiet, as Sequoia keeps it, because saying which
+/// check a packet failed tells whoever made it something about the key.
+///
+/// The agent's own words, and not a kind of refusal read out of them:
+/// sequoia-gpg-agent 0.6.2 keeps the text of the Assuan `ERR` line and drops
+/// its code (`KeyPair::decrypt_async` through `Agent::operation_failed`), and
+/// the text is gpg-agent's `gpg_strerror`, which it translates into the user's
+/// language. So a cancelled prompt cannot be told apart from a card that could
+/// not use one packet, and matching on "Operation cancelled" would work only
+/// in English.
+///
+/// The code is there to be had by asking another way: `Agent` is also a
+/// stream of the agent's responses, and an `ERR` read from it keeps its code.
+/// Sending PKDECRYPT over that stream, as `decrypt_async` does, would tell a
+/// cancelled prompt from the rest and lift the rule that the first refusal
+/// ends a decryption. It needs the `Stream` trait, and so futures-core as a
+/// dependency of this crate, which it does not have today.
+pub(crate) fn refusal(error: &anyhow::Error) -> Option<String> {
+    use sequoia_gpg_agent::assuan;
+
+    Some(match error.downcast_ref::<sequoia_gpg_agent::Error>()? {
+        sequoia_gpg_agent::Error::Assuan(assuan::Error::OperationFailed(message)) => {
+            message.clone()
+        }
+        other => other.to_string(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use sequoia_openpgp::cert::prelude::SubkeyRevocationBuilder;
+    use sequoia_openpgp::cert::{CertBuilder, CipherSuite, KeyBuilder};
+    use sequoia_openpgp::crypto::SessionKey;
+    use sequoia_openpgp::crypto::mpi::{Ciphertext, MPI, PublicKey};
+    use sequoia_openpgp::packet::PKESK;
+    use sequoia_openpgp::packet::pkesk::PKESK3;
+    use sequoia_openpgp::types::{
+        KeyFlags, PublicKeyAlgorithm, ReasonForRevocation, SymmetricAlgorithm,
+    };
+
     use super::*;
 
-    /// Enumeration against whatever agent the developer happens to be running.
+    /// A key as generated here, to RFC 4880: GnuPG 2.4 has no version 6 keys,
+    /// and sequoia-ipc derives no keygrip for one, so no agent could hold it.
+    fn generated(user_id: &str) -> Cert {
+        let mut request = crate::keygen::KeyGenRequest::new(user_id);
+        request.standard = crate::keygen::Standard::Rfc4880;
+        crate::keygen::generate(&request).unwrap().cert
+    }
+
+    /// `cert` with an RSA encryption subkey added, of the smallest size the
+    /// standard policy accepts: a larger one takes this build many seconds
+    /// to generate.
+    fn with_rsa_key(cert: Cert) -> Cert {
+        let policy = crate::policy();
+        KeyBuilder::new(KeyFlags::empty().set_transport_encryption())
+            .set_cipher_suite(CipherSuite::RSA2k)
+            .subkey(cert.with_policy(&policy, None).unwrap())
+            .unwrap()
+            .attach_cert()
+            .unwrap()
+    }
+
+    /// What the agent lists for `keys`: each by its keygrip, on the card
+    /// `card` names or in the agent's own store.
+    fn listing<'k>(
+        keys: impl IntoIterator<Item = &'k Key<PublicParts, UnspecifiedRole>>,
+        card: Option<&str>,
+    ) -> Vec<AgentKey> {
+        keys.into_iter()
+            .map(|key| AgentKey {
+                keygrip: Keygrip::of(key.mpis()).unwrap().to_string(),
+                card_serial: card.map(str::to_owned),
+            })
+            .collect()
+    }
+
+    /// `cert`'s encryption keys, the transport key first. A key generated here
+    /// has one of each kind, which is the shape a message to the second one
+    /// could not be opened through: the agent was handed the first.
+    fn encryption_keys(cert: &Cert) -> Vec<Key<PublicParts, UnspecifiedRole>> {
+        let policy = crate::policy();
+        let valid = cert.with_policy(&policy, None).unwrap();
+        valid
+            .keys()
+            .for_transport_encryption()
+            .chain(valid.keys().for_storage_encryption())
+            .map(|ka| ka.key().clone())
+            .collect()
+    }
+
+    fn packet_for(key: &Key<PublicParts, UnspecifiedRole>) -> PKESK {
+        let session_key = SessionKey::new(32).unwrap();
+        PKESK3::for_recipient(SymmetricAlgorithm::AES256, &session_key, key)
+            .unwrap()
+            .into()
+    }
+
+    /// A packet for `key` that names no recipient, as `gpg --throw-keyids`
+    /// writes it.
+    fn hidden_packet_for(key: &Key<PublicParts, UnspecifiedRole>) -> PKESK {
+        let session_key = SessionKey::new(32).unwrap();
+        let mut pkesk =
+            PKESK3::for_recipient(SymmetricAlgorithm::AES256, &session_key, key).unwrap();
+        pkesk.set_recipient(None);
+        pkesk.into()
+    }
+
+    /// Which key each attempt asks with, and whether its packet names one.
+    fn asked(attempts: &[Attempt<'_>]) -> Vec<(Fingerprint, bool)> {
+        attempts
+            .iter()
+            .map(|a| (a.key.fingerprint(), a.pkesk.recipient().is_some()))
+            .collect()
+    }
+
+    /// A packet goes to the key it names and to no other, whichever of a
+    /// certificate's encryption keys that is.
     ///
-    /// Skips rather than fails when there is no agent: CI has none, and a test
-    /// that depends on the developer's GnuPG setup must not break the suite.
+    /// The agent used to be handed the certificate's first encryption key it
+    /// held, card first and then in Sequoia's order, which follows the key
+    /// material rather than age or anything the packet says. A key generated
+    /// here has two, one for each kind, so held by the agent one of the two
+    /// could never be opened through it: which one depended on the key.
     #[test]
-    fn lists_whatever_the_local_agent_holds() {
-        if !available() {
-            eprintln!("no gpg-agent reachable; skipping");
-            return;
-        }
+    fn a_packet_is_put_to_the_key_it_names_and_no_other() {
+        let alice = generated("Alice <alice@example.org>");
+        let keys = encryption_keys(&alice);
+        assert_eq!(keys.len(), 2, "premise: a transport and a storage key");
+        let held = listing(&keys, None);
 
-        let keys = keys().unwrap();
         for key in &keys {
-            // A keygrip is a 40-character hex SHA-1 of the key parameters.
-            assert_eq!(key.keygrip.len(), 40, "odd keygrip: {}", key.keygrip);
-            assert!(key.keygrip.chars().all(|c| c.is_ascii_hexdigit()));
+            let pkesks = [packet_for(key)];
+            let attempts = decryption_attempts(&pkesks, [&alice], || held.clone());
+            assert_eq!(
+                asked(&attempts),
+                [(key.fingerprint(), true)],
+                "the packet names {}",
+                key.fingerprint()
+            );
+            assert_eq!(attempts[0].cert.fingerprint(), alice.fingerprint());
         }
+    }
 
-        let on_card = card_keys().unwrap();
-        assert!(on_card.iter().all(AgentKey::is_on_card));
-        eprintln!(
-            "agent holds {} key(s), {} on a smartcard",
-            keys.len(),
-            on_card.len()
+    /// A key two packets name is asked about both, and not about one only.
+    ///
+    /// Sequoia hands over the packets of every container it has opened on the
+    /// way to the one it is opening, so a message encrypted twice to one key
+    /// names that key in two packets, and only the inner one opens the inner
+    /// container. Asking the key about the first packet that names it, and no
+    /// other, would leave such a message unopened.
+    #[test]
+    fn a_key_two_packets_name_is_asked_about_both() {
+        let alice = generated("Alice <alice@example.org>");
+        let keys = encryption_keys(&alice);
+        let held = listing(&keys, None);
+
+        // The storage key, which comes second, so that asking the first held
+        // key about everything would not pass either.
+        let pkesks = [packet_for(&keys[1]), packet_for(&keys[1])];
+        let attempts = decryption_attempts(&pkesks, [&alice], || held.clone());
+        assert_eq!(
+            asked(&attempts),
+            [(keys[1].fingerprint(), true), (keys[1].fingerprint(), true)]
+        );
+        assert!(
+            std::ptr::eq(attempts[0].pkesk, &pkesks[0])
+                && std::ptr::eq(attempts[1].pkesk, &pkesks[1]),
+            "one packet was asked about twice and the other not at all"
         );
     }
 
-    /// Signs with whatever `RPGP_TEST_CERT` points at, through the agent.
+    /// A packet that names no key is put to every held key it could be for,
+    /// and to each only once, however many flags or certificates carry it:
+    /// every attempt can be a card operation.
+    #[test]
+    fn a_hidden_packet_is_put_to_each_held_key_once() {
+        let (both, _) = CertBuilder::new()
+            .add_userid("Both <both@example.org>")
+            .add_subkey(
+                KeyFlags::empty()
+                    .set_transport_encryption()
+                    .set_storage_encryption(),
+                None,
+                None,
+            )
+            .generate()
+            .unwrap();
+        let keys = encryption_keys(&both);
+        assert_eq!(
+            keys.len(),
+            2,
+            "premise: one key, listed once for each flag it carries"
+        );
+        assert_eq!(keys[0].fingerprint(), keys[1].fingerprint());
+        let held = listing(&keys[..1], None);
+
+        let pkesks = [hidden_packet_for(&keys[0])];
+        // The same certificate twice stands for a key that two certificates
+        // carry, which nothing stops a stranger's certificate doing.
+        let attempts = decryption_attempts(&pkesks, [&both, &both], || held.clone());
+        assert_eq!(asked(&attempts), [(keys[0].fingerprint(), false)]);
+
+        let alice = generated("Alice <alice@example.org>");
+        let keys = encryption_keys(&alice);
+        let held = listing(&keys, None);
+        let pkesks = [hidden_packet_for(&keys[0])];
+        let attempts = decryption_attempts(&pkesks, [&alice], || held.clone());
+        assert_eq!(
+            asked(&attempts),
+            [
+                (keys[0].fingerprint(), false),
+                (keys[1].fingerprint(), false)
+            ],
+            "a hidden recipient could be either encryption key, and nothing else"
+        );
+    }
+
+    /// Packets that name a key are tried before those that name none, and a
+    /// key on a smartcard before one in the agent's own store.
+    #[test]
+    fn named_packets_come_first_and_a_card_before_the_agents_store() {
+        let alice = generated("Alice <alice@example.org>");
+        let bob = generated("Bob <bob@example.org>");
+        let on_card = encryption_keys(&alice).remove(0);
+        let in_file = encryption_keys(&bob).remove(0);
+        let mut held = listing([&on_card], Some("D2760001240100000006"));
+        held.extend(listing([&in_file], None));
+
+        // Bob's store comes first and the hidden packet first in the message,
+        // so neither order is what puts the card ahead or the named packet
+        // first.
+        let pkesks = [hidden_packet_for(&on_card), packet_for(&in_file)];
+        let attempts = decryption_attempts(&pkesks, [&bob, &alice], || held.clone());
+        assert_eq!(
+            asked(&attempts),
+            [
+                (in_file.fingerprint(), true),
+                (on_card.fingerprint(), false),
+                (in_file.fingerprint(), false),
+            ]
+        );
+    }
+
+    /// A packet that names no key is not put to a key it cannot be for: one of
+    /// another algorithm, an ECDH packet whose ephemeral point is encoded for
+    /// another curve, or an RSA packet carrying a number no smaller than the
+    /// key's modulus. Each would be a private-key operation that cannot
+    /// succeed, and on a card a PIN prompt. The agent would refuse the first
+    /// two, and that refusal ends the decryption, so a message to several
+    /// hidden recipients would stop at the first that was someone else's.
+    #[test]
+    fn a_hidden_packet_shaped_for_another_key_is_not_put_to_this_one() {
+        let alice = generated("Alice <alice@example.org>");
+        let keys = encryption_keys(&alice);
+        let held = listing(&keys, None);
+
+        // An ECDH packet for a NIST P-256 key: its point is 65 octets and
+        // starts 0x04, where a Curve25519 point is 33 and starts 0x40.
+        let p256 = PKESK3::new(
+            None,
+            PublicKeyAlgorithm::ECDH,
+            Ciphertext::ECDH {
+                e: MPI::new(&[0x04; 65]),
+                key: vec![0; 40].into_boxed_slice(),
+            },
+        )
+        .unwrap();
+        #[allow(deprecated)]
+        let rsa = PKESK3::new(
+            None,
+            PublicKeyAlgorithm::RSAEncryptSign,
+            Ciphertext::RSA {
+                c: MPI::new(&[0x42; 384]),
+            },
+        )
+        .unwrap();
+        let pkesks = [PKESK::from(p256), PKESK::from(rsa)];
+        let attempts = decryption_attempts(&pkesks, [&alice], || held.clone());
+        assert!(attempts.is_empty(), "asked: {:?}", asked(&attempts));
+
+        // The same key, asked about a packet shaped for it, is asked.
+        let pkesks = [hidden_packet_for(&keys[0])];
+        assert!(!decryption_attempts(&pkesks, [&alice], || held.clone()).is_empty());
+
+        // An RSA packet of the key's length, but carrying a number at or
+        // above its modulus, as one for another key of that size can: nothing
+        // made with this key is that large. Below the modulus, it could be for
+        // this key and is put to it.
+        let bob = with_rsa_key(generated("Bob <bob@example.org>"));
+        let rsa = encryption_keys(&bob)
+            .into_iter()
+            .find(|key| matches!(key.mpis(), PublicKey::RSA { .. }))
+            .expect("premise: an RSA key");
+        let PublicKey::RSA { n, .. } = rsa.mpis() else {
+            unreachable!()
+        };
+        let held = listing(encryption_keys(&bob).iter(), None);
+        let carrying = |c: Vec<u8>| -> PKESK {
+            PKESK3::new(None, rsa.pk_algo(), Ciphertext::RSA { c: MPI::new(&c) })
+                .unwrap()
+                .into()
+        };
+        let mut above = n.value().to_vec();
+        *above.last_mut().unwrap() = 0xff;
+        let pkesks = [carrying(above)];
+        let attempts = decryption_attempts(&pkesks, [&bob], || held.clone());
+        assert!(attempts.is_empty(), "asked: {:?}", asked(&attempts));
+        let mut below = n.value().to_vec();
+        below[0] >>= 1;
+        let pkesks = [carrying(below)];
+        let attempts = decryption_attempts(&pkesks, [&bob], || held.clone());
+        assert_eq!(asked(&attempts), [(rsa.fingerprint(), false)]);
+    }
+
+    /// An encryption key its owner has retired, or that has expired, is still
+    /// asked about the packets made for it, as the local path does: revoking a
+    /// key withdraws it from future use, it does not burn the archive. This is
+    /// the rule the agent's path lost once already, filtering by alive and not
+    /// revoked, so that a retired card key could not read its own mail.
+    #[test]
+    fn a_retired_or_expired_encryption_key_is_still_asked() {
+        let alice = generated("Alice <alice@example.org>");
+        let retired = encryption_keys(&alice).remove(0);
+        let mut signer = alice
+            .primary_key()
+            .key()
+            .clone()
+            .parts_into_secret()
+            .unwrap()
+            .into_keypair()
+            .unwrap();
+        let subkey = alice
+            .keys()
+            .subkeys()
+            .find(|ka| ka.key().fingerprint() == retired.fingerprint())
+            .unwrap();
+        let revocation = SubkeyRevocationBuilder::new()
+            .set_reason_for_revocation(ReasonForRevocation::KeyRetired, b"rotated")
+            .unwrap()
+            .build(&mut signer, &alice, subkey.key(), None)
+            .unwrap();
+        let alice = alice.insert_packets(revocation).unwrap().0;
+        let policy = crate::policy();
+        assert!(
+            alice
+                .with_policy(&policy, None)
+                .unwrap()
+                .keys()
+                .revoked(false)
+                .all(|ka| ka.key().fingerprint() != retired.fingerprint()),
+            "premise: the subkey is revoked"
+        );
+
+        let pkesks = [packet_for(&retired)];
+        let held = listing([&retired], Some("D2760001240100000006"));
+        let attempts = decryption_attempts(&pkesks, [&alice], || held.clone());
+        assert_eq!(asked(&attempts), [(retired.fingerprint(), true)]);
+
+        // Made two days ago to last one.
+        let day = Duration::from_secs(24 * 60 * 60);
+        let (lapsed, _) = CertBuilder::new()
+            .add_userid("Lapsed <lapsed@example.org>")
+            .set_creation_time(SystemTime::now() - 2 * day)
+            .set_validity_period(day)
+            .add_transport_encryption_subkey()
+            .generate()
+            .unwrap();
+        let key = lapsed
+            .keys()
+            .subkeys()
+            .next()
+            .unwrap()
+            .key()
+            .clone()
+            .role_into_unspecified();
+        assert!(
+            lapsed
+                .with_policy(&policy, None)
+                .unwrap()
+                .keys()
+                .alive()
+                .all(|ka| ka.key().fingerprint() != key.fingerprint()),
+            "premise: the subkey has expired"
+        );
+        let pkesks = [packet_for(&key)];
+        let held = listing([&key], None);
+        let attempts = decryption_attempts(&pkesks, [&lapsed], || held.clone());
+        assert_eq!(asked(&attempts), [(key.fingerprint(), true)]);
+    }
+
+    /// Nothing here could open a message with no packet for a key, which is
+    /// every message encrypted to a password alone, or one addressed only to
+    /// keys the store does not have, so neither asks the agent what it holds.
+    #[test]
+    fn a_message_no_key_here_could_open_does_not_ask_the_agent() {
+        let alice = generated("Alice <alice@example.org>");
+        let stranger = generated("Stranger <stranger@example.org>");
+        let not_asked = || -> Vec<AgentKey> { panic!("the agent was asked what it holds") };
+
+        assert!(decryption_attempts(&[], [&alice], not_asked).is_empty());
+        let pkesks: Vec<PKESK> = encryption_keys(&stranger).iter().map(packet_for).collect();
+        assert!(decryption_attempts(&pkesks, [&alice], not_asked).is_empty());
+
+        // And when some key here could open it, the agent is asked once.
+        let asked = std::cell::Cell::new(0);
+        let pkesks: Vec<PKESK> = encryption_keys(&alice).iter().map(packet_for).collect();
+        decryption_attempts(&pkesks, [&alice, &stranger], || {
+            asked.set(asked.get() + 1);
+            Vec::new()
+        });
+        assert_eq!(asked.get(), 1);
+    }
+
+    /// Signing takes a live signing key, one on a card before one in the
+    /// agent's own store, and passes over a key its owner has retired.
+    #[test]
+    fn signing_prefers_a_card_and_passes_over_a_retired_key() {
+        let (cert, _) = CertBuilder::new()
+            .add_userid("Alice <alice@example.org>")
+            .add_signing_subkey()
+            .add_signing_subkey()
+            .generate()
+            .unwrap();
+        let signing: Vec<Key<PublicParts, UnspecifiedRole>> = cert
+            .keys()
+            .subkeys()
+            .map(|ka| ka.key().clone().role_into_unspecified())
+            .collect();
+        let (first, second) = (&signing[0], &signing[1]);
+
+        for (card, file) in [(first, second), (second, first)] {
+            let mut held = listing([file], None);
+            held.extend(listing([card], Some("D2760001240100000006")));
+            let chosen = select_key(&cert, Purpose::Sign, &held).unwrap();
+            assert_eq!(chosen.fingerprint(), card.fingerprint());
+        }
+
+        // Retire the first and put it on the card: a key its owner has
+        // retired is passed over however the agent holds it.
+        let mut signer = cert
+            .primary_key()
+            .key()
+            .clone()
+            .parts_into_secret()
+            .unwrap()
+            .into_keypair()
+            .unwrap();
+        let subkey = cert
+            .keys()
+            .subkeys()
+            .find(|ka| ka.key().fingerprint() == first.fingerprint())
+            .unwrap();
+        let revocation = SubkeyRevocationBuilder::new()
+            .set_reason_for_revocation(ReasonForRevocation::KeyRetired, b"rotated")
+            .unwrap()
+            .build(&mut signer, &cert, subkey.key(), None)
+            .unwrap();
+        let cert = cert.insert_packets(revocation).unwrap().0;
+        let mut held = listing([first], Some("D2760001240100000006"));
+        held.extend(listing([second], None));
+        let chosen = select_key(&cert, Purpose::Sign, &held).unwrap();
+        assert_eq!(
+            chosen.fingerprint(),
+            second.fingerprint(),
+            "signed with a key its owner retired, because it was on the card"
+        );
+    }
+
+    /// Certifying takes the primary key and nothing else, and only while it is
+    /// alive; withdrawing a certification takes it whatever its state.
+    #[test]
+    fn certifying_takes_the_primary_alone_and_only_while_it_is_alive() {
+        let alice = generated("Alice <alice@example.org>");
+        let primary = alice.primary_key().key().clone().role_into_unspecified();
+        let subkeys: Vec<_> = alice
+            .keys()
+            .subkeys()
+            .map(|ka| ka.key().clone().role_into_unspecified())
+            .collect();
+
+        let everything = listing(std::iter::once(&primary).chain(&subkeys), None);
+        let chosen = select_key(&alice, Purpose::Certify, &everything).unwrap();
+        assert_eq!(chosen.fingerprint(), primary.fingerprint());
+        assert!(
+            select_key(&alice, Purpose::Certify, &listing(&subkeys, Some("D276"))).is_err(),
+            "certified with a subkey, which sequoia-wot credits to nobody"
+        );
+
+        let day = Duration::from_secs(24 * 60 * 60);
+        let (lapsed, _) = CertBuilder::new()
+            .add_userid("Lapsed <lapsed@example.org>")
+            .set_creation_time(SystemTime::now() - 2 * day)
+            .set_validity_period(day)
+            .generate()
+            .unwrap();
+        let primary = lapsed.primary_key().key().clone().role_into_unspecified();
+        let held = listing([&primary], None);
+        assert!(select_key(&lapsed, Purpose::Certify, &held).is_err());
+        let chosen = select_key(&lapsed, Purpose::WithdrawCertification, &held).unwrap();
+        assert_eq!(chosen.fingerprint(), primary.fingerprint());
+    }
+
+    /// Signs with whatever `RPGP_TEST_CERT` points at, through the developer's
+    /// own agent.
     ///
     /// `#[ignore]` because it is interactive: a card key makes the agent's
-    /// pinentry ask for the PIN, and an unattended run would hang on it.
+    /// pinentry ask for the PIN, and an unattended run would hang on it. It
+    /// points the whole test process at that agent, so run it with
+    /// `--ignored`, not `--include-ignored`, or the tests beside it reach the
+    /// developer's agent too.
     #[test]
     #[ignore = "interactive: the agent will prompt for a PIN or passphrase"]
     fn signs_through_the_agent() {
@@ -422,6 +1144,7 @@ mod tests {
             eprintln!("RPGP_TEST_CERT unset; skipping");
             return;
         };
+        set_home(AgentHome::User);
 
         use sequoia_openpgp::parse::Parse;
         let cert = Cert::from_file(&path).unwrap();
@@ -443,8 +1166,8 @@ mod tests {
         eprintln!("verified: {}", result.signatures[0].signer);
     }
 
-    /// Decrypting to, and certifying with, a card key. Interactive for the
-    /// same reason as `signs_through_the_agent`.
+    /// Decrypting to, and certifying with, a card key. Interactive, and run
+    /// alone, for the same reasons as `signs_through_the_agent`.
     #[test]
     #[ignore = "interactive: the agent will prompt for a PIN or passphrase"]
     fn decrypts_and_certifies_through_the_agent() {
@@ -452,6 +1175,7 @@ mod tests {
             eprintln!("RPGP_TEST_CERT unset; skipping");
             return;
         };
+        set_home(AgentHome::User);
 
         use sequoia_openpgp::parse::Parse;
         let card = Cert::from_file(&path).unwrap();
@@ -509,25 +1233,34 @@ mod tests {
         )
         .unwrap();
 
-        // Surface whichever of the two steps is actually failing.
+        // Surface whichever of the two steps is actually failing: what the
+        // decryption would ask the agent, and what the agent answers.
         {
             use sequoia_openpgp::crypto::Decryptor;
-            use sequoia_openpgp::parse::Parse;
-            let pile = sequoia_openpgp::PacketPile::from_bytes(&ciphertext).unwrap();
-            for packet in pile.into_children() {
-                if let sequoia_openpgp::Packet::PKESK(pkesk) = packet {
-                    match decryptor_for(&card) {
-                        Ok(mut pair) => {
-                            eprintln!("  decryptor_for: ok, key {}", pair.public().fingerprint());
-                            // PKESK::decrypt swallows the Decryptor error into
-                            // None; call the decryptor directly to see it.
-                            match pair.decrypt(pkesk.esk(), None) {
-                                Ok(_) => eprintln!("  decryptor.decrypt: ok"),
-                                Err(e) => eprintln!("  decryptor.decrypt: {e:#}"),
-                            }
+            let pkesks: Vec<PKESK> = sequoia_openpgp::PacketPile::from_bytes(&ciphertext)
+                .unwrap()
+                .into_children()
+                .filter_map(|packet| match packet {
+                    sequoia_openpgp::Packet::PKESK(pkesk) => Some(pkesk),
+                    _ => None,
+                })
+                .collect();
+            let held = keys().unwrap();
+            for attempt in decryption_attempts(&pkesks, [&card], || held.clone()) {
+                match signer(&attempt.key) {
+                    Ok(mut pair) => {
+                        eprintln!(
+                            "  asking the agent with key {}",
+                            pair.public().fingerprint()
+                        );
+                        // PKESK::decrypt swallows the Decryptor error into
+                        // None; call the decryptor directly to see it.
+                        match pair.decrypt(attempt.pkesk.esk(), None) {
+                            Ok(_) => eprintln!("  decryptor.decrypt: ok"),
+                            Err(e) => eprintln!("  decryptor.decrypt: {e:#}"),
                         }
-                        Err(e) => eprintln!("  decryptor_for failed: {e}"),
                     }
+                    Err(e) => eprintln!("  signer failed: {e}"),
                 }
             }
         }
@@ -540,16 +1273,20 @@ mod tests {
     }
 
     /// Matching a certificate to the agent's copy of its secret, against a real
-    /// certificate when one is offered via `RPGP_TEST_CERT`.
+    /// certificate offered via `RPGP_TEST_CERT`.
     ///
-    /// Skipped by default: it needs a running agent that actually holds the
-    /// key, which is a property of the developer's machine, not of the code.
+    /// `#[ignore]` because it asks the developer's own agent, which only a test
+    /// run for the purpose may do; see [`AgentHome`], and run it alone for the
+    /// reason `signs_through_the_agent` gives. The same match against an agent
+    /// the test starts itself runs with the rest, in `tests/gpg_agent.rs`.
     #[test]
+    #[ignore = "asks the developer's own gpg-agent about RPGP_TEST_CERT"]
     fn matches_a_certificate_to_the_agents_key() {
         let Some(path) = std::env::var_os("RPGP_TEST_CERT") else {
             eprintln!("RPGP_TEST_CERT unset; skipping");
             return;
         };
+        set_home(AgentHome::User);
         if !available() {
             eprintln!("no gpg-agent reachable; skipping");
             return;

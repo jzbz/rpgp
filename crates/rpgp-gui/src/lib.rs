@@ -4665,7 +4665,15 @@ mod tests {
     /// A `State` holding nothing but the store, with everything else as `run`
     /// starts it. A test that needs the list fills `all` itself, or builds a
     /// window over the state with `window_for`, which reads it in.
+    ///
+    /// It also points the test process away from every gpg-agent, which the
+    /// operations a state drives would otherwise ask: the survey after a
+    /// reload, and the decrypt, sign and certify fallbacks. rpgp-core's own
+    /// tests start that way, but this crate links it without them, and an
+    /// agent reached from here is the developer's, with its keys and its PIN
+    /// prompts. Every test that can reach an agent builds its state here.
     fn state_for(store: Store) -> Shared {
+        rpgp_core::agent::set_home(rpgp_core::agent::AgentHome::Nowhere);
         Arc::new(Mutex::new(State {
             store: Arc::new(store),
             all: Vec::new(),
@@ -4998,6 +5006,60 @@ mod tests {
 
     fn generated(user_id: &str) -> rpgp_core::keygen::GeneratedKey {
         rpgp_core::keygen::generate(&rpgp_core::keygen::KeyGenRequest::new(user_id)).unwrap()
+    }
+
+    /// A message for a passphrase-protected key, run with the passphrase left
+    /// out, says in the dialog and on the status line that the key wants its
+    /// passphrase and whose key it is, where it used to say that no secret key
+    /// opened it. Run again with the passphrase, it opens. Nothing is tried
+    /// again on the user's behalf: each Run is one decryption.
+    #[test]
+    fn a_message_for_a_protected_key_asks_for_its_passphrase() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let mut request = rpgp_core::keygen::KeyGenRequest::new("Alice <alice@example.org>");
+        request.password = Some("correct horse".to_string().into());
+        let alice = rpgp_core::keygen::generate(&request).unwrap().cert;
+        store.insert_secret(&alice).unwrap();
+
+        let mut ciphertext = Vec::new();
+        ops::encrypt(
+            std::slice::from_ref(&alice),
+            &[],
+            None,
+            b"for Alice",
+            &mut ciphertext,
+        )
+        .unwrap();
+        let message = dir.path().join("note.txt.asc");
+        std::fs::write(&message, &ciphertext).unwrap();
+        let opened = dir.path().join("note.txt");
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        ui.invoke_open_decrypt_verify();
+        choose_dv_input(&ui, &state, message.clone(), ops::classify_file(&message));
+
+        let (read, outcome) = run_decrypt_verify(&state, "", Some(opened.clone()));
+        show_decrypt_verify(&ui, &state, read, outcome);
+        let status = ui.get_status();
+        assert!(
+            status.starts_with(
+                "Decryption failed: this message is for a passphrase-protected key: \
+                 enter its passphrase"
+            ) && status.contains("Alice <alice@example.org>"),
+            "{status}"
+        );
+        assert_eq!(ui.get_dv_result(), status);
+        assert_eq!(ui.get_dv_tone(), 3);
+        assert!(!opened.exists(), "a failed decryption wrote its output");
+
+        let (read, outcome) = run_decrypt_verify(&state, "correct horse", Some(opened.clone()));
+        show_decrypt_verify(&ui, &state, read, outcome);
+        let status = ui.get_status();
+        assert!(status.starts_with("Decrypted to"), "{status}");
+        assert_eq!(std::fs::read(&opened).unwrap(), b"for Alice");
     }
 
     /// The window `run` builds, over `state`, wired by every `wire_*` function
@@ -6368,15 +6430,11 @@ mod tests {
     /// single thread per process, and a second test setting one up would
     /// panic, so the others drive the two halves of an operation directly.
     ///
-    /// It is also the one GUI test that can talk to gpg-agent. A reload that
-    /// lands starts the agent survey on a thread of its own, which asks
-    /// whichever agent `GNUPGHOME` names for the keys it holds and may start
-    /// one if none is running; whether it gets that far before the test
-    /// process exits varies from run to run. That is the same `KEYINFO
-    /// --list` rpgp-core's `lists_whatever_the_local_agent_holds` sends, and
-    /// as with that test, GnuPG 2.4.9's agent starts scdaemon to answer it.
-    /// Run with `GNUPGHOME` unset, it is the developer's own agent that
-    /// answers.
+    /// A reload that lands starts the agent survey on a thread of its own. It
+    /// used to ask whichever agent `GNUPGHOME` named, the developer's own when
+    /// it was unset, and start one if none was running, and GnuPG 2.4.9's
+    /// agent starts scdaemon to answer. `state_for` points the process at no
+    /// agent, so the survey here finds none and changes nothing.
     #[test]
     fn a_reload_leaves_the_selection_where_the_user_moved_it() {
         i_slint_backend_testing::init_integration_test_with_system_time();

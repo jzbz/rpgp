@@ -59,19 +59,24 @@
 //!
 //! Nothing here runs gpg. The fixtures are bytes and the store is a tempdir.
 
+use std::io::Write;
 use std::time::{Duration, SystemTime};
 
-use rpgp_core::{Store, lifecycle};
+use rpgp_core::{Error, Store, lifecycle, ops};
 use sequoia_openpgp::Cert;
 use sequoia_openpgp::crypto::S2K;
 use sequoia_openpgp::packet::key::SecretKeyMaterial;
 use sequoia_openpgp::parse::Parse;
+use sequoia_openpgp::serialize::stream::{Encryptor, LiteralWriter, Message, Recipient};
 
 const FULL: &[u8] = include_bytes!("fixtures/gnupg-secret-keys.asc");
 const SUBKEYS_ONLY: &[u8] = include_bytes!("fixtures/gnupg-secret-subkeys.asc");
 const SUBKEY_STUBS: &[u8] = include_bytes!("fixtures/gnupg-subkey-stubs.asc");
 
 fn scratch() -> (tempfile::TempDir, Store) {
+    // Nothing here asks gpg-agent, and should a later change make something
+    // do so, it must not be the developer's own; see `agent::AgentHome`.
+    rpgp_core::agent::set_home(rpgp_core::agent::AgentHome::Nowhere);
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
     (dir, store)
@@ -347,4 +352,55 @@ fn a_stubbed_primary_is_reported_as_a_stub_and_not_as_a_passphrase() {
         store.secret_cert(&fingerprint).unwrap().userids().count(),
         cert.userids().count()
     );
+}
+
+/// A message for a subkey whose secret GnuPG keeps on a card is not reported
+/// as one for a locked key. Sequoia reads the stub as an encrypted secret, but
+/// there is no passphrase to enter: the key opens through gpg-agent or not at
+/// all, and asking for its passphrase would send the user after one that does
+/// not exist. No agent holds it here, so this is a message no secret key
+/// opens, whatever was entered.
+#[test]
+fn a_message_for_a_stubbed_subkey_does_not_ask_for_its_passphrase() {
+    let (dir, store) = scratch();
+    import(&dir, &store, "subkey-stubs.asc", SUBKEY_STUBS);
+    let cert = Cert::from_bytes(SUBKEY_STUBS).unwrap();
+
+    // Encrypted by hand, to the subkey by name: it has long since expired,
+    // and rPGP encrypts only to live keys. Decryption does not ask whether a
+    // key is alive, so old mail stays readable.
+    let policy = rpgp_core::policy();
+    let valid = cert.with_policy(&policy, None).unwrap();
+    let recipients: Vec<Recipient> = valid
+        .keys()
+        .for_transport_encryption()
+        .map(|ka| {
+            use sequoia_openpgp::cert::Preferences;
+            Recipient::new(valid.features(), ka.key().key_handle(), ka.key())
+        })
+        .collect();
+    assert_eq!(recipients.len(), 1, "premise: one encryption subkey");
+    let mut ciphertext = Vec::new();
+    {
+        let message = Message::new(&mut ciphertext);
+        let message = Encryptor::for_recipients(message, recipients)
+            .build()
+            .unwrap();
+        let mut message = LiteralWriter::new(message).build().unwrap();
+        message.write_all(b"for the card").unwrap();
+        message.finalize().unwrap();
+    }
+
+    for passwords in [&[][..], &["fixture"][..]] {
+        let refused = ops::decrypt(&store, &ciphertext, passwords, &mut Vec::new())
+            .expect_err("nothing here holds the subkey's secret");
+        assert!(
+            !matches!(refused, Error::KeyLocked { .. }),
+            "{passwords:?}: asked for the passphrase of a stub: {refused}"
+        );
+        assert!(
+            refused.to_string().contains("no secret key"),
+            "{passwords:?}: {refused}"
+        );
+    }
 }

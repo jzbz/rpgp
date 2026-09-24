@@ -248,6 +248,21 @@ jobs:
           echo "::error::apt failed twice; the Ubuntu mirrors are not answering"
           exit 1
 
+      # For rpgp-core's agent tests, which start a gpg-agent of their own and
+      # which the Test step below requires to run on Linux. Installed only
+      # where the image lacks it, from the lists the step above refreshed,
+      # and bounded as that step's installs are.
+      - name: Install GnuPG (Linux)
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          if ! command -v gpg-agent >/dev/null || ! command -v gpgconf >/dev/null; then
+            sudo DEBIAN_FRONTEND=noninteractive timeout --kill-after=15s 180s \
+              apt-get install -y gpg-agent
+          fi
+          gpg-agent --version
+
       # Homebrew has never stalled here, but it is the same kind of unbounded
       # network call and costs one line to bound.
       - name: Install build dependencies (macOS)
@@ -271,12 +286,23 @@ jobs:
       # No display is set up, and none is needed: the GUI tests drive Slint
       # through its testing backend with no event loop.
       #
-      # Six tests stay ignored, for four different reasons: one hits the
-      # network, one wants a local stand-in for the VKS API, two are
-      # interactive because the agent prompts for a PIN, one reads the
-      # developer's own GnuPG keyring, and the last is not a test at all — it
-      # is the helper process the hardening tests re-exec.
+      # Seven tests stay ignored: one hits the network, one wants a local
+      # stand-in for the VKS API, three ask the developer's own gpg-agent
+      # about a key of theirs (two of them interactive, because the agent
+      # prompts for a PIN), one reads the developer's own GnuPG keyring, and
+      # the last is not a test at all — it is the helper process the
+      # hardening tests re-exec.
+      #
+      # No other test reaches a gpg-agent. rpgp-core's agent tests
+      # (tests/gpg_agent.rs) start one of their own in a temporary directory,
+      # and skip where GnuPG is not installed. On Linux, where a step above
+      # makes sure it is, RPGP_TEST_REQUIRE_GPG_AGENT makes them fail instead,
+      # so that the agent paths cannot quietly stop being tested. macOS runs
+      # them only if its image happens to carry GnuPG, and Windows not at all:
+      # their stand-in pinentry is a shell script.
       - name: Test
+        env:
+          RPGP_TEST_REQUIRE_GPG_AGENT: ${{ runner.os == 'Linux' && '1' || '' }}
         run: cargo test --workspace --locked
 
   windows-core:

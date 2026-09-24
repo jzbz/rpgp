@@ -916,7 +916,7 @@ fn reported<'a>(newest_first: impl IntoIterator<Item = &'a Signature>) -> Option
 /// user ID)", which names nothing in a status bar or a dialog that has room
 /// for one identifier. The fingerprint is what the rest of the crate falls
 /// back to when there is no name, as `Error::NoSecretKey` does.
-fn name_of(cert: &Cert) -> String {
+pub(crate) fn name_of(cert: &Cert) -> String {
     match cert.userids().next() {
         Some(_) => {
             crate::cert::primary_user_id(cert, cert.with_policy(&policy(), None).ok().as_ref())

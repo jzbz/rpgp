@@ -1,15 +1,19 @@
 //! Message operations: encrypt, decrypt, sign, verify.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fs;
 use std::io::{BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
+use sequoia_openpgp::Fingerprint;
 use sequoia_openpgp::cert::ValidCert;
 use sequoia_openpgp::cert::amalgamation::key::{
     ValidErasedKeyAmalgamation, ValidKeyAmalgamationIter,
 };
-use sequoia_openpgp::crypto::{Password, S2K, SessionKey};
-use sequoia_openpgp::packet::{PKESK, SKESK, key};
+use sequoia_openpgp::crypto::mpi::Ciphertext;
+use sequoia_openpgp::crypto::{Decryptor, Password, S2K, SessionKey};
+use sequoia_openpgp::packet::{Key, PKESK, SKESK, key};
 use sequoia_openpgp::parse::Parse;
 use sequoia_openpgp::parse::stream::{
     DecryptionHelper, DecryptorBuilder, DetachedVerifierBuilder, MessageLayer, MessageStructure,
@@ -315,8 +319,9 @@ pub fn decrypt_stream<R: std::io::Read + Send + Sync>(
     let policy = sha1_policy_or_strict(store);
     let helper = Helper::new(store, passwords, &policy);
 
-    let mut decryptor =
-        DecryptorBuilder::from_reader(source)?.with_policy(policy.verification(), None, helper)?;
+    let mut decryptor = DecryptorBuilder::from_reader(source)?
+        .with_policy(policy.verification(), None, helper)
+        .map_err(as_made)?;
     std::io::copy(&mut decryptor, &mut sink).map_err(|e| Error::io("decrypting message", e))?;
 
     let helper = decryptor.into_helper();
@@ -325,6 +330,22 @@ pub fn decrypt_stream<R: std::io::Read + Send + Sync>(
         encrypted: helper.encrypted,
         decrypted_with: helper.decrypted_with,
     })
+}
+
+/// An error from [`Helper::decrypt`] as the helper made it.
+///
+/// The helper answers Sequoia in `anyhow::Error`, and Sequoia hands its error
+/// back unchanged, so one of this crate's own comes back wrapped. Left in
+/// [`Error::OpenPgp`], a refusal from gpg-agent or a key left locked read
+/// "OpenPGP operation failed:" before saying what happened, which the GUI puts
+/// after its own "Decryption failed:". Only those two are taken out, so that
+/// every other failure reads as it did.
+fn as_made(error: anyhow::Error) -> Error {
+    match error.downcast::<Error>() {
+        Ok(error @ (Error::AgentRefused { .. } | Error::KeyLocked { .. })) => error,
+        Ok(other) => Error::OpenPgp(other.into()),
+        Err(error) => Error::OpenPgp(error),
+    }
 }
 
 /// Produce a detached, armored signature over `data`.
@@ -815,6 +836,24 @@ impl DecryptionHelper for Helper<'_> {
         // like twenty-five minutes per candidate. That is arithmetic from the
         // two ceilings rather than a measurement, and it is a residual this cap
         // does not close, not the "seconds" this comment used to claim.
+        //
+        // The gpg-agent path at the end is bounded by the same cap and no
+        // better. Each of its attempts is a private-key operation in the
+        // agent, over a connection of its own (sequoia-gpg-agent 0.6.2 opens
+        // one for every decryption), and for a card key an operation on the
+        // card, which for RSA can take the better part of a second. A packet
+        // that names a key is put to that key alone, but one that names none
+        // is put to every key the agent holds whose shape it fits, so the 256
+        // packets come to at most 256 operations for each key the agent holds
+        // that they could be for, and the same again at each of sixteen
+        // containers. For a single card key that is thousands of card
+        // operations, and minutes, again by arithmetic and not measured. What
+        // the path no longer does is multiply them by the store. It used to
+        // try every packet against every certificate with a key the packet
+        // could name, connecting to the agent to build a keypair for each; it
+        // now builds one keypair per key, which connects once, and asks it
+        // about the packets that key could open. See
+        // [`crate::agent::decryption_attempts`].
         const MAX_ESK: usize = 256;
         let esks = pkesks.len() + skesks.len();
         if esks > MAX_ESK {
@@ -831,6 +870,12 @@ impl DecryptionHelper for Helper<'_> {
         // different failure from an empty one, and reporting it as "no key
         // opens this message" sent the user looking at the wrong thing.
         let secrets = self.store.secret_certs()?;
+
+        // The first key here that a packet names, that is protected by a
+        // passphrase, and that nothing offered opened. Kept for the error at
+        // the end: "no secret key" sent the user looking for a key they had,
+        // when what was missing was its passphrase.
+        let mut locked: Option<String> = None;
 
         // Keys outside, packets inside. The other way round re-derived every
         // protected key's passphrase once per packet, so the cost was
@@ -877,6 +922,25 @@ impl DecryptionHelper for Helper<'_> {
                     .chain(self.passwords.iter().map(|p| Some(p.as_str())))
                     .find_map(|p| crate::secret::try_unlock(ka.key().clone(), p))
                 else {
+                    // Only a key a packet names. One that names no key could
+                    // be for anybody, and asking for the passphrase of every
+                    // protected key here on account of a message meant for
+                    // someone else would ask for one that can never work. Nor
+                    // a GnuPG stub, which is encrypted as far as Sequoia can
+                    // tell but has no passphrase, being where a card key's
+                    // secret is not; the agent below is how that one opens.
+                    let secret = ka.key().secret();
+                    if locked.is_none()
+                        && secret.is_encrypted()
+                        && crate::secret::is_usable(secret)
+                        && pkesks.iter().any(|pkesk| {
+                            pkesk
+                                .recipient()
+                                .is_some_and(|handle| handle.aliases(ka.key().key_handle()))
+                        })
+                    {
+                        locked = Some(crate::revoke::name_of(cert));
+                    }
                     continue;
                 };
                 let Ok(mut pair) = key.into_keypair() else {
@@ -935,58 +999,54 @@ impl DecryptionHelper for Helper<'_> {
             }
         }
 
-        // Nothing local fits. The message may be for a card key, whose secret
-        // half exists only on the card — ask the agent, which will raise its
-        // own PIN prompt if the card needs one.
-        // Read the store once, not once per recipient: certs() parses every
-        // certificate it returns, and a message to several people would
-        // otherwise re-parse the whole store for each of them.
-        let candidates = self.store.certs()?;
+        // Nothing local fits. The message may be for a key only gpg-agent
+        // holds, a card key among them, whose secret half exists only on the
+        // card: ask the agent, which raises its own prompt if the key needs
+        // one.
+        //
+        // Not when the message has no packet for a key, which is every message
+        // encrypted to a password alone. There is nothing to ask the agent
+        // about, and asking cost a mistyped password a parse of every
+        // certificate in the store and, where GnuPG is installed, an agent
+        // started for nothing, with a certificate that would not parse
+        // reported in place of the password.
+        if !pkesks.is_empty() {
+            // Read once, not once per packet: certs() parses every certificate
+            // it returns.
+            let certs = self.store.certs()?;
 
-        // The agent's key list, fetched once. decryptor_for connects and
-        // enumerates on every call, and the loop below runs it for every
-        // (packet x certificate) pair — so a message no local key opened paid a
-        // round trip per combination to re-fetch a list that cannot change
-        // during one decrypt. An unreachable agent is not an error here: it
-        // means there is nothing on a card to try, and the loop falls through
-        // to the same "nothing opens this" it would have reached anyway.
-        let held = crate::agent::keys().unwrap_or_default();
-
-        for pkesk in pkesks {
-            for cert in &candidates {
-                let Ok(valid) = cert.with_policy(&policy, None) else {
-                    continue;
-                };
-                // Same permissive rule as the local path above: a card key
-                // that has since been revoked must still open what it
-                // encrypted while it was current.
-                let matches = valid
-                    .keys()
-                    .for_transport_encryption()
-                    .chain(valid.keys().for_storage_encryption())
-                    .any(|ka| {
-                        pkesk
-                            .recipient()
-                            .is_none_or(|handle| handle.aliases(ka.key().key_handle()))
-                    });
-                if !matches {
-                    continue;
-                }
-
-                let Ok(mut pair) = crate::agent::decryptor_for_with(cert, &held) else {
-                    continue;
-                };
-                if pkesk
-                    .decrypt(&mut pair, sym_algo)
-                    .is_some_and(|(algo, session_key)| decrypt(algo, &session_key))
-                {
-                    self.decrypted_with = Some(cert.fingerprint().to_hex());
-                    // The one place a caller genuinely needs an owned Cert:
-                    // DecryptionHelper returns it by value. Exactly one clone,
-                    // of the certificate that opened the message.
-                    return Ok(Some((**cert).clone()));
-                }
+            // The agent's listing, fetched once and only when some key in the
+            // store could open some packet here. An unreachable agent is not
+            // an error at this point: it means there is nothing on a card to
+            // try, and the decryption goes on to the same "nothing opens this"
+            // it would have reached anyway.
+            let attempts =
+                crate::agent::decryption_attempts(pkesks, certs.iter().map(|c| &**c), || {
+                    crate::agent::keys().unwrap_or_default()
+                });
+            if let Some(cert) = through_agent(&attempts, sym_algo, decrypt, crate::agent::signer)? {
+                self.decrypted_with = Some(cert.fingerprint().to_hex());
+                // The one place a caller genuinely needs an owned Cert:
+                // DecryptionHelper returns it by value. Exactly one clone, of
+                // the certificate that opened the message.
+                return Ok(Some(cert.clone()));
             }
+        }
+
+        // A key the message names, here and locked, comes first: its
+        // passphrase is what opens the message, where the price below only
+        // says why one way in was not tried.
+        if let Some(name) = locked {
+            return Err(Error::KeyLocked {
+                name,
+                tried: !self.passwords.is_empty(),
+                // The message's password would have done as well, and what
+                // was entered, which Decrypt / Verify offers as both, did not
+                // open it either. Not where an envelope was passed over as too
+                // dear: what was entered was never tried as its password.
+                or_password: !skesks.is_empty() && too_expensive.is_none(),
+            }
+            .into());
         }
 
         // What an envelope cost beats "no password opens this message", which
@@ -1000,6 +1060,107 @@ impl DecryptionHelper for Helper<'_> {
         Err(anyhow::anyhow!(
             "no secret key, and no password, opens this message"
         ))
+    }
+}
+
+/// Ask gpg-agent each of `attempts` in turn, as
+/// [`crate::agent::decryption_attempts`] ordered them, until one opens the
+/// message, and give back the certificate that did.
+///
+/// One keypair per key, built when the key is first asked about and used for
+/// every packet after, where one used to be built, and the agent connected to,
+/// for each pair of packet and certificate.
+///
+/// The first refusal from the agent ends it, and is the answer. Sequoia's
+/// `PKESK::decrypt` turns every error into `None`, so a cancelled PIN prompt,
+/// a card that was not there or an agent with no pinentry to ask with read as
+/// a key that did not fit: the next attempt put up the prompt again, for the
+/// same key when a message named two of its subkeys, and when nothing was left
+/// the user was told no secret key opened the message and went looking at
+/// their keys instead of their card. So the keypair is wrapped to keep what
+/// the agent said, and trying stops there. That the agent refused rather than
+/// that the key did not fit is all there is to go on: sequoia-gpg-agent keeps
+/// the words of the agent's answer and drops its code, so a cancelled prompt
+/// cannot be told apart from a card that would not use one packet (see
+/// [`crate::agent::refusal`]). A second key that would have opened the message
+/// is therefore not asked after the first is refused, which is the price of
+/// not prompting again. An agent that cannot be reached to build a keypair
+/// ends it the same way, as the agent's answer for every key.
+///
+/// The one refusal that does not end it is an RSA card turning down a packet
+/// that names no key, which may be the card saying the packet is someone
+/// else's; [`crate::agent::Attempt::refusal_is_final`] gives the reasons. The
+/// next attempt is made, and if nothing opens the message the first such
+/// refusal is the answer, since it may have been a cancelled prompt.
+///
+/// A key that simply did not fit says nothing, and the next attempt is made.
+///
+/// `keypair` is [`crate::agent::signer`] outside the tests, which hand in a
+/// stand-in for the agent.
+fn through_agent<'a, D: Decryptor>(
+    attempts: &[crate::agent::Attempt<'a>],
+    sym_algo: Option<SymmetricAlgorithm>,
+    decrypt: &mut dyn FnMut(Option<SymmetricAlgorithm>, &SessionKey) -> bool,
+    mut keypair: impl FnMut(&Key<key::PublicParts, key::UnspecifiedRole>) -> Result<D>,
+) -> Result<Option<&'a Cert>> {
+    let refused = |attempt: &crate::agent::Attempt<'_>, reason: String| Error::AgentRefused {
+        name: crate::revoke::name_of(attempt.cert),
+        reason,
+    };
+    let mut pairs: HashMap<Fingerprint, Answering<D>> = HashMap::new();
+    let mut passed_over: Option<Error> = None;
+    for attempt in attempts {
+        let pair = match pairs.entry(attempt.key.fingerprint()) {
+            Entry::Occupied(pair) => pair.into_mut(),
+            Entry::Vacant(slot) => slot.insert(Answering {
+                agent: keypair(&attempt.key).map_err(|e| refused(attempt, e.to_string()))?,
+                refusal: None,
+            }),
+        };
+        if attempt
+            .pkesk
+            .decrypt(pair, sym_algo)
+            .is_some_and(|(algo, session_key)| decrypt(algo, &session_key))
+        {
+            return Ok(Some(attempt.cert));
+        }
+        if let Some(reason) = pair.refusal.take() {
+            if attempt.refusal_is_final() {
+                return Err(refused(attempt, reason));
+            }
+            passed_over.get_or_insert_with(|| refused(attempt, reason));
+        }
+    }
+    match passed_over {
+        Some(refusal) => Err(refusal),
+        None => Ok(None),
+    }
+}
+
+/// An agent-backed decryptor that keeps what `PKESK::decrypt` would drop: the
+/// agent's answer when it refused. See [`through_agent`].
+struct Answering<D> {
+    agent: D,
+    refusal: Option<String>,
+}
+
+impl<D: Decryptor> Decryptor for Answering<D> {
+    fn public(&self) -> &Key<key::PublicParts, key::UnspecifiedRole> {
+        self.agent.public()
+    }
+
+    fn decrypt(
+        &mut self,
+        ciphertext: &Ciphertext,
+        plaintext_len: Option<usize>,
+    ) -> sequoia_openpgp::Result<SessionKey> {
+        self.agent
+            .decrypt(ciphertext, plaintext_len)
+            .inspect_err(|error| {
+                if let Some(reason) = crate::agent::refusal(error) {
+                    self.refusal = Some(reason);
+                }
+            })
     }
 }
 
@@ -1502,6 +1663,7 @@ fn read(path: &Path) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::keygen::{KeyGenRequest, generate};
+    use sequoia_openpgp::crypto::mpi;
     use sequoia_openpgp::packet::skesk::{SKESK4, SKESK6};
     use sequoia_openpgp::serialize::Serialize;
     use sequoia_openpgp::types::AEADAlgorithm;
@@ -1971,7 +2133,8 @@ mod tests {
         // spend, so the wording alone does not establish the guard. The
         // measured separation is not subtle: the derivation this skips takes
         // about 30 s in an unoptimised build, against 16 ms measured here for
-        // the guarded path, most of it asking the agent about card keys.
+        // the guarded path, and most of that was asking gpg-agent about card
+        // keys, which a message with no packet for a key no longer does.
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "the refusal has to come before the derivation, not after it: took {elapsed:?}"
@@ -3512,6 +3675,644 @@ mod tests {
         let mut by_password = Vec::new();
         decrypt(&bare, &ciphertext, &["shared secret"], &mut by_password).unwrap();
         assert_eq!(by_password, b"either way in");
+    }
+
+    /// A key generated to RFC 4880, the only kind gpg-agent can hold: GnuPG
+    /// 2.4 has no version 6 keys, and sequoia-ipc derives no keygrip for one.
+    fn agent_shaped(user_id: &str) -> Cert {
+        let mut request = KeyGenRequest::new(user_id);
+        request.standard = crate::keygen::Standard::Rfc4880;
+        generate(&request).unwrap().cert
+    }
+
+    /// `cert`'s encryption keys as the agent would be handed them, the
+    /// transport key first, each with its secret half.
+    fn encryption_pairs(
+        cert: &Cert,
+    ) -> Vec<(
+        Key<key::PublicParts, key::UnspecifiedRole>,
+        sequoia_openpgp::crypto::KeyPair,
+    )> {
+        let policy = policy();
+        let valid = cert.with_policy(&policy, None).unwrap();
+        valid
+            .keys()
+            .for_transport_encryption()
+            .chain(valid.keys().for_storage_encryption())
+            .map(|ka| {
+                let public = ka.key().clone();
+                let pair = public
+                    .clone()
+                    .parts_into_secret()
+                    .unwrap()
+                    .into_keypair()
+                    .unwrap();
+                (public, pair)
+            })
+            .collect()
+    }
+
+    /// The agent's listing, for keys held in its own store.
+    fn held(keys: &[&Key<key::PublicParts, key::UnspecifiedRole>]) -> Vec<crate::agent::AgentKey> {
+        keys.iter()
+            .map(|key| crate::agent::AgentKey {
+                keygrip: sequoia_ipc::Keygrip::of(key.mpis()).unwrap().to_string(),
+                card_serial: None,
+            })
+            .collect()
+    }
+
+    /// Stands in for gpg-agent in [`through_agent`].
+    enum StandIn {
+        /// It holds the secret half and uses it, whichever packet it is given.
+        Holds(sequoia_openpgp::crypto::KeyPair),
+        /// It refuses, as it does when the user cancels its prompt.
+        Refuses(Key<key::PublicParts, key::UnspecifiedRole>),
+        /// An RSA key on a card: the card removes the padding itself, and
+        /// turns down with an error a packet that is not its key's.
+        Card(sequoia_openpgp::crypto::KeyPair),
+    }
+
+    /// What sequoia-gpg-agent 0.6.2 makes of an Assuan ERR line saying
+    /// `words`.
+    fn agent_error(words: &str) -> anyhow::Error {
+        sequoia_gpg_agent::Error::from(sequoia_gpg_agent::assuan::Error::OperationFailed(
+            words.into(),
+        ))
+        .into()
+    }
+
+    impl Decryptor for StandIn {
+        fn public(&self) -> &Key<key::PublicParts, key::UnspecifiedRole> {
+            match self {
+                StandIn::Holds(pair) | StandIn::Card(pair) => pair.public(),
+                StandIn::Refuses(key) => key,
+            }
+        }
+
+        fn decrypt(
+            &mut self,
+            ciphertext: &Ciphertext,
+            plaintext_len: Option<usize>,
+        ) -> sequoia_openpgp::Result<SessionKey> {
+            match self {
+                StandIn::Holds(pair) => pair.decrypt(ciphertext, plaintext_len),
+                StandIn::Refuses(_) => Err(agent_error("Operation cancelled <Pinentry>")),
+                // The words are the stand-in's; a real card's depend on the
+                // card and the language.
+                StandIn::Card(pair) => pair
+                    .decrypt(ciphertext, plaintext_len)
+                    .map_err(|_| agent_error("Bad data <SCD>")),
+            }
+        }
+    }
+
+    /// `D`, counting in `asked` how often it is asked to decrypt: each is a
+    /// private-key operation in the agent, and a prompt if one is needed.
+    struct Counted<'c, D> {
+        agent: D,
+        asked: &'c std::cell::Cell<usize>,
+    }
+
+    impl<D: Decryptor> Decryptor for Counted<'_, D> {
+        fn public(&self) -> &Key<key::PublicParts, key::UnspecifiedRole> {
+            self.agent.public()
+        }
+
+        fn decrypt(
+            &mut self,
+            ciphertext: &Ciphertext,
+            plaintext_len: Option<usize>,
+        ) -> sequoia_openpgp::Result<SessionKey> {
+            self.asked.set(self.asked.get() + 1);
+            self.agent.decrypt(ciphertext, plaintext_len)
+        }
+    }
+
+    /// `cert` with an RSA encryption subkey added, of the smallest size the
+    /// standard policy accepts: a larger one takes this build many seconds
+    /// to generate.
+    fn with_rsa_key(cert: Cert) -> Cert {
+        use sequoia_openpgp::cert::{CipherSuite, KeyBuilder};
+        use sequoia_openpgp::types::KeyFlags;
+
+        let policy = policy();
+        KeyBuilder::new(KeyFlags::empty().set_transport_encryption())
+            .set_cipher_suite(CipherSuite::RSA2k)
+            .subkey(cert.with_policy(&policy, None).unwrap())
+            .unwrap()
+            .attach_cert()
+            .unwrap()
+    }
+
+    /// A packet that names no key, carrying what a packet for another RSA
+    /// key of `key`'s size could: a number below `key`'s modulus that was not
+    /// made with it.
+    fn someone_elses_rsa_packet(key: &Key<key::PublicParts, key::UnspecifiedRole>) -> PKESK {
+        let mpi::PublicKey::RSA { n, .. } = key.mpis() else {
+            panic!("premise: an RSA key");
+        };
+        let mut c = vec![0; n.value().len()];
+        sequoia_openpgp::crypto::random(&mut c).unwrap();
+        c[0] = n.value()[0] >> 1;
+        sequoia_openpgp::packet::pkesk::PKESK3::new(
+            None,
+            key.pk_algo(),
+            Ciphertext::RSA {
+                c: mpi::MPI::new(&c),
+            },
+        )
+        .unwrap()
+        .into()
+    }
+
+    /// A session key and a packet wrapping it for `key`, named or hidden.
+    fn wrapped_for(
+        key: &Key<key::PublicParts, key::UnspecifiedRole>,
+        named: bool,
+    ) -> (SessionKey, PKESK) {
+        let session_key = SessionKey::new(32).unwrap();
+        let mut pkesk = sequoia_openpgp::packet::pkesk::PKESK3::for_recipient(
+            SymmetricAlgorithm::AES256,
+            &session_key,
+            key,
+        )
+        .unwrap();
+        if !named {
+            pkesk.set_recipient(None);
+        }
+        (session_key, pkesk.into())
+    }
+
+    /// The first refusal from the agent is the answer, and nothing is asked
+    /// after it.
+    ///
+    /// Sequoia's `PKESK::decrypt` turns every error into `None`, so a cancelled
+    /// prompt read as a key that did not fit: the next packet the agent held a
+    /// key for put the prompt up again, and when nothing was left the user was
+    /// told no secret key opened the message.
+    #[test]
+    fn the_agents_refusal_is_the_answer_and_nothing_is_asked_after_it() {
+        let alice = agent_shaped("Alice <alice@example.org>");
+        let bob = agent_shaped("Bob <bob@example.org>");
+        let (for_alice, _) = encryption_pairs(&alice).remove(0);
+        let (for_bob, _) = encryption_pairs(&bob).remove(0);
+        let (session_key, first) = wrapped_for(&for_alice, true);
+        let (_, second) = wrapped_for(&for_bob, true);
+        let pkesks = [first, second];
+
+        let listing = held(&[&for_alice, &for_bob]);
+        let attempts =
+            crate::agent::decryption_attempts(&pkesks, [&alice, &bob], || listing.clone());
+        assert_eq!(attempts.len(), 2, "premise: two keys to ask");
+
+        let asked = std::cell::Cell::new(0);
+        let refused = through_agent(
+            &attempts,
+            None,
+            &mut |_, got: &SessionKey| *got == session_key,
+            |key| {
+                asked.set(asked.get() + 1);
+                Ok(StandIn::Refuses(key.clone()))
+            },
+        )
+        .expect_err("a refusal read as a key that did not fit");
+        assert_eq!(asked.get(), 1, "the agent was asked again after refusing");
+        assert!(
+            matches!(&refused, Error::AgentRefused { reason, .. } if reason == "Operation cancelled <Pinentry>"),
+            "{refused:?}"
+        );
+        let message = refused.to_string();
+        assert!(
+            message.starts_with("gpg-agent: Operation cancelled <Pinentry>")
+                && message.contains("Alice <alice@example.org>"),
+            "the status line must say what the agent said, first: {message}"
+        );
+
+        // An agent that listed its keys and then cannot be reached to build a
+        // keypair is answered the same way, and the next key is not tried.
+        let asked = std::cell::Cell::new(0);
+        let unreachable = through_agent(
+            &attempts,
+            None,
+            &mut |_, got: &SessionKey| *got == session_key,
+            |_| -> Result<StandIn> {
+                asked.set(asked.get() + 1);
+                Err(Error::invalid("no gpg-agent to talk to: it went away"))
+            },
+        )
+        .expect_err("opened with no agent to ask");
+        assert_eq!(asked.get(), 1);
+        assert!(
+            matches!(&unreachable, Error::AgentRefused { reason, .. } if reason == "no gpg-agent to talk to: it went away"),
+            "{unreachable:?}"
+        );
+    }
+
+    /// An RSA key on a card that turns down a packet naming no key does not
+    /// end the decryption, and the key's own packet after it is still tried.
+    ///
+    /// The card removes RSA's padding itself, and so answers a packet made for
+    /// another RSA key of its size with an error, where a key in the agent's
+    /// own store hands it back to fail quietly on this side. Ending at that
+    /// error left a message sent to several hidden RSA recipients unreadable
+    /// on the card whenever another's packet came first. The price, when the
+    /// error was a cancelled prompt instead, is that the prompt goes up again
+    /// for each packet left, and the first refusal is the answer. Everywhere
+    /// else the first refusal still ends the decryption.
+    #[test]
+    fn a_card_turning_down_a_hidden_rsa_packet_goes_on_to_the_next() {
+        let alice = with_rsa_key(agent_shaped("Alice <alice@example.org>"));
+        let (rsa, pair) = encryption_pairs(&alice)
+            .into_iter()
+            .find(|(key, _)| matches!(key.mpis(), mpi::PublicKey::RSA { .. }))
+            .expect("premise: an RSA key");
+        let on_card = |keys: &[&Key<key::PublicParts, key::UnspecifiedRole>]| {
+            let mut listing = held(keys);
+            for key in &mut listing {
+                key.card_serial = Some("D2760001240100000006".into());
+            }
+            listing
+        };
+        let (session_key, own) = wrapped_for(&rsa, false);
+        let pkesks = [
+            someone_elses_rsa_packet(&rsa),
+            someone_elses_rsa_packet(&rsa),
+            own,
+        ];
+        let listing = on_card(&[&rsa]);
+        let attempts = crate::agent::decryption_attempts(&pkesks, [&alice], || listing.clone());
+        assert_eq!(attempts.len(), 3, "premise: every packet fits the key");
+
+        let asked = std::cell::Cell::new(0);
+        let opened = through_agent(
+            &attempts,
+            None,
+            &mut |_, got: &SessionKey| *got == session_key,
+            |_| {
+                Ok(Counted {
+                    agent: StandIn::Card(pair.clone()),
+                    asked: &asked,
+                })
+            },
+        )
+        .unwrap_or_else(|e| panic!("the card's own packet was never tried: {e}"));
+        assert_eq!(opened.map(Cert::fingerprint), Some(alice.fingerprint()));
+        assert_eq!(asked.get(), 3);
+
+        // A cancelled prompt: asked again for each packet, and then the
+        // refusal is the answer rather than that no key opens the message.
+        let asked = std::cell::Cell::new(0);
+        let refused = through_agent(
+            &attempts,
+            None,
+            &mut |_, got: &SessionKey| *got == session_key,
+            |key| {
+                Ok(Counted {
+                    agent: StandIn::Refuses(key.clone()),
+                    asked: &asked,
+                })
+            },
+        )
+        .expect_err("opened with every prompt cancelled");
+        assert_eq!(asked.get(), 3);
+        assert!(
+            matches!(&refused, Error::AgentRefused { reason, .. } if reason == "Operation cancelled <Pinentry>"),
+            "{refused:?}"
+        );
+
+        // The first refusal still ends it for the same key in the agent's
+        // own store, for a packet that names the card key, and for a card key
+        // that is not RSA.
+        let curve = encryption_pairs(&alice)
+            .into_iter()
+            .map(|(key, _)| key)
+            .find(|key| key.fingerprint() != rsa.fingerprint())
+            .unwrap();
+        let (_, named) = wrapped_for(&rsa, true);
+        let cases = [
+            (
+                "RSA in the agent's store",
+                held(&[&rsa]),
+                vec![someone_elses_rsa_packet(&rsa), wrapped_for(&rsa, false).1],
+            ),
+            (
+                "a named packet",
+                on_card(&[&rsa]),
+                vec![named, someone_elses_rsa_packet(&rsa)],
+            ),
+            (
+                "Curve25519 on a card",
+                on_card(&[&curve]),
+                vec![wrapped_for(&curve, false).1, wrapped_for(&curve, false).1],
+            ),
+        ];
+        for (case, listing, pkesks) in cases {
+            let attempts = crate::agent::decryption_attempts(&pkesks, [&alice], || listing.clone());
+            assert_eq!(attempts.len(), 2, "{case}: premise: two attempts");
+            let asked = std::cell::Cell::new(0);
+            let refused = through_agent(&attempts, None, &mut |_, _: &SessionKey| false, |key| {
+                Ok(Counted {
+                    agent: StandIn::Refuses(key.clone()),
+                    asked: &asked,
+                })
+            })
+            .expect_err("opened with the prompt cancelled");
+            assert_eq!(asked.get(), 1, "{case}: the prompt went up again");
+            assert!(
+                matches!(refused, Error::AgentRefused { .. }),
+                "{case}: {refused:?}"
+            );
+        }
+    }
+
+    /// A key that does not fit a packet is passed over without a word, and the
+    /// next attempt is made; what went wrong with it is not reported, as
+    /// Sequoia does not report it, because which check a packet failed says
+    /// something about the key to whoever made the packet.
+    ///
+    /// Either of a certificate's encryption keys opens what was sent to it
+    /// through the agent, which a key generated here could not when the agent
+    /// held both: the agent was handed the certificate's first.
+    #[test]
+    fn a_key_that_does_not_fit_is_passed_over_quietly() {
+        let alice = agent_shaped("Alice <alice@example.org>");
+        let pairs = encryption_pairs(&alice);
+        assert_eq!(pairs.len(), 2, "premise: a transport and a storage key");
+        let listing = held(&[&pairs[0].0, &pairs[1].0]);
+        let stand_in = |key: &Key<key::PublicParts, key::UnspecifiedRole>| {
+            let (_, pair) = pairs
+                .iter()
+                .find(|(public, _)| public.fingerprint() == key.fingerprint())
+                .unwrap();
+            Ok(StandIn::Holds(pair.clone()))
+        };
+
+        // For the storage key and naming none, so the transport key, asked
+        // first, does not fit it.
+        for (public, _) in &pairs {
+            for named in [true, false] {
+                let (session_key, pkesk) = wrapped_for(public, named);
+                let pkesks = [pkesk];
+                let attempts =
+                    crate::agent::decryption_attempts(&pkesks, [&alice], || listing.clone());
+                let opened = through_agent(
+                    &attempts,
+                    None,
+                    &mut |_, got: &SessionKey| *got == session_key,
+                    stand_in,
+                )
+                .unwrap_or_else(|e| panic!("named: {named}: {e}"));
+                assert_eq!(
+                    opened.map(Cert::fingerprint),
+                    Some(alice.fingerprint()),
+                    "named: {named}, for {}",
+                    public.fingerprint()
+                );
+            }
+        }
+
+        // A packet neither key fits leaves nothing to report.
+        let stranger = agent_shaped("Stranger <stranger@example.org>");
+        let (for_stranger, _) = encryption_pairs(&stranger).remove(0);
+        let (session_key, pkesk) = wrapped_for(&for_stranger, false);
+        let pkesks = [pkesk];
+        let attempts = crate::agent::decryption_attempts(&pkesks, [&alice], || listing.clone());
+        assert_eq!(attempts.len(), 2, "premise: both keys are asked");
+        let opened = through_agent(
+            &attempts,
+            None,
+            &mut |_, got: &SessionKey| *got == session_key,
+            stand_in,
+        )
+        .expect("a key that did not fit was reported as the agent refusing");
+        assert!(opened.is_none());
+    }
+
+    /// A message for a passphrase-protected key held here says so when the key
+    /// was left locked, rather than that no secret key opens it.
+    ///
+    /// Only for a key a packet names. A packet that names none could be for
+    /// anybody, and asking for the passphrase of a key on account of a message
+    /// meant for someone else would ask for one that can never work.
+    #[test]
+    fn a_protected_key_left_locked_is_named_rather_than_missing() {
+        let (_dir, store) = scratch_store();
+        let mut request = KeyGenRequest::new("Alice <alice@example.org>");
+        request.password = Some("correct horse".to_string().into());
+        let alice = generate(&request).unwrap().cert;
+        store.insert_secret(&alice).unwrap();
+
+        let mut ciphertext = Vec::new();
+        encrypt(
+            std::slice::from_ref(&alice),
+            &[],
+            None,
+            b"for Alice",
+            &mut ciphertext,
+        )
+        .unwrap();
+
+        for (candidates, tried) in [(vec![], false), (vec!["hunter2"], true)] {
+            let refused = decrypt(&store, &ciphertext, &candidates, &mut Vec::new())
+                .expect_err("opened without the passphrase");
+            assert!(
+                matches!(&refused, Error::KeyLocked { name, tried: t, or_password: false } if name == "Alice <alice@example.org>" && *t == tried),
+                "{candidates:?}: {refused:?}"
+            );
+        }
+        let message = decrypt(&store, &ciphertext, &[], &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("passphrase-protected") && message.contains("enter its passphrase"),
+            "{message}"
+        );
+        let message = decrypt(&store, &ciphertext, &["hunter2"], &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("does not unlock it"), "{message}");
+
+        let mut plaintext = Vec::new();
+        decrypt(&store, &ciphertext, &["correct horse"], &mut plaintext).unwrap();
+        assert_eq!(plaintext, b"for Alice");
+
+        // The same key, behind a packet that names no one.
+        let policy = policy();
+        let valid = alice.with_policy(&policy, None).unwrap();
+        let hidden: Vec<Recipient> = valid
+            .keys()
+            .for_transport_encryption()
+            .map(|ka| {
+                use sequoia_openpgp::cert::Preferences;
+                Recipient::new(valid.features(), None, ka.key())
+            })
+            .collect();
+        let mut ciphertext = Vec::new();
+        {
+            let message = Message::new(&mut ciphertext);
+            let message = Encryptor::for_recipients(message, hidden).build().unwrap();
+            let mut message = LiteralWriter::new(message).build().unwrap();
+            message.write_all(b"for someone").unwrap();
+            message.finalize().unwrap();
+        }
+        let refused = decrypt(&store, &ciphertext, &[], &mut Vec::new())
+            .expect_err("opened without the passphrase");
+        assert!(
+            !matches!(refused, Error::KeyLocked { .. }),
+            "asked for the passphrase of a key the message does not name: {refused}"
+        );
+    }
+
+    /// A message for a locked key here and for a password as well says that
+    /// either would open it, or that what was entered opened neither, rather
+    /// than speaking of the key alone: Decrypt / Verify has one field for
+    /// both, and what was entered may have been meant as the password.
+    ///
+    /// Not where the password's envelope was passed over as too dear to
+    /// derive, since what was entered was then never tried as the password.
+    #[test]
+    fn a_locked_key_beside_a_password_is_named_with_it() {
+        let (_dir, store) = scratch_store();
+        let mut request = KeyGenRequest::new("Alice <alice@example.org>");
+        request.password = Some("correct horse".to_string().into());
+        let alice = generate(&request).unwrap().cert;
+        store.insert_secret(&alice).unwrap();
+
+        let password = Zeroizing::new("open sesame".to_string());
+        let mut ciphertext = Vec::new();
+        encrypt(
+            std::slice::from_ref(&alice),
+            std::slice::from_ref(&password),
+            None,
+            b"for Alice, or the password",
+            &mut ciphertext,
+        )
+        .unwrap();
+
+        for (candidates, tried, says) in [
+            (
+                vec![],
+                false,
+                "enter the key's passphrase or the message's password",
+            ),
+            (
+                vec!["hunter2"],
+                true,
+                "neither unlocks the key nor opens the message",
+            ),
+        ] {
+            let refused = decrypt(&store, &ciphertext, &candidates, &mut Vec::new())
+                .expect_err("opened with neither");
+            assert!(
+                matches!(&refused, Error::KeyLocked { name, tried: t, or_password: true } if name == "Alice <alice@example.org>" && *t == tried),
+                "{candidates:?}: {refused:?}"
+            );
+            assert!(refused.to_string().contains(says), "{refused}");
+        }
+        let mut plaintext = Vec::new();
+        decrypt(&store, &ciphertext, &["open sesame"], &mut plaintext).unwrap();
+        assert_eq!(plaintext, b"for Alice, or the password");
+
+        // The same key, beside an envelope asking for 16 MiB hashed 255 times
+        // over, which is declined before anything is derived.
+        let mut for_alice = Vec::new();
+        encrypt(
+            std::slice::from_ref(&alice),
+            &[],
+            None,
+            b"for Alice",
+            &mut for_alice,
+        )
+        .unwrap();
+        let priced: Vec<Packet> = std::iter::once(Packet::from(
+            SKESK4::new(
+                SymmetricAlgorithm::AES256,
+                S2K::Argon2 {
+                    salt: [0u8; 16],
+                    t: 255,
+                    p: 4,
+                    m: 14,
+                },
+                None,
+            )
+            .unwrap(),
+        ))
+        .chain(PacketPile::from_bytes(&for_alice).unwrap().into_children())
+        .collect();
+        let refused = decrypt(
+            &store,
+            &packet_bytes(&priced),
+            &["hunter2"],
+            &mut Vec::new(),
+        )
+        .expect_err("opened with neither");
+        assert!(
+            matches!(
+                &refused,
+                Error::KeyLocked {
+                    tried: true,
+                    or_password: false,
+                    ..
+                }
+            ),
+            "said the password was tried against an envelope it never was: {refused:?}"
+        );
+    }
+
+    /// A message nothing here could open is not taken to the agent: one
+    /// encrypted to a password alone, tried with the wrong one, and one for a
+    /// key the store does not have. Each used to ask the agent for its
+    /// listing, which on a machine with GnuPG starts an agent if none is
+    /// running. One for a key the store does have asks it once.
+    #[test]
+    fn a_message_nothing_here_could_open_is_not_taken_to_the_agent() {
+        let (_dir, store) = scratch_store();
+        let alice = agent_shaped("Alice <alice@example.org>");
+        let stranger = agent_shaped("Stranger <stranger@example.org>");
+        store.insert(&alice).unwrap();
+        let connects = || crate::agent::CONNECTS.with(std::cell::Cell::get);
+
+        let mut for_a_password = Vec::new();
+        encrypt(
+            &[],
+            &[Zeroizing::new("hunter2".to_string())],
+            None,
+            b"no keys involved",
+            &mut for_a_password,
+        )
+        .unwrap();
+        let mut for_a_stranger = Vec::new();
+        encrypt(
+            std::slice::from_ref(&stranger),
+            &[],
+            None,
+            b"not for us",
+            &mut for_a_stranger,
+        )
+        .unwrap();
+        let mut for_alice = Vec::new();
+        encrypt(
+            std::slice::from_ref(&alice),
+            &[],
+            None,
+            b"for a key only the agent could hold",
+            &mut for_alice,
+        )
+        .unwrap();
+
+        let before = connects();
+        assert!(decrypt(&store, &for_a_password, &["hunter3"], &mut Vec::new()).is_err());
+        assert_eq!(connects(), before, "a wrong password went to the agent");
+        assert!(decrypt(&store, &for_a_stranger, &[], &mut Vec::new()).is_err());
+        assert_eq!(connects(), before, "a stranger's message went to the agent");
+
+        let refused = decrypt(&store, &for_alice, &[], &mut Vec::new()).unwrap_err();
+        assert_eq!(connects(), before + 1, "the agent is asked once");
+        assert!(
+            refused.to_string().contains("no secret key"),
+            "an agent that answers nothing leaves the usual message: {refused}"
+        );
     }
 
     #[test]

@@ -62,6 +62,43 @@ pub enum Error {
     #[error("{name} has been revoked — {reason}")]
     Revoked { name: String, reason: String },
 
+    /// gpg-agent was asked to decrypt with a key it holds, and did not.
+    ///
+    /// `reason` is the agent's own answer as it gave it, such as "Operation
+    /// cancelled <Pinentry>" when the user pressed Cancel, or what scdaemon
+    /// said about a card that was not there, or else why the agent could not
+    /// be reached. It is not sorted into kinds, because sequoia-gpg-agent
+    /// passes on the words of the answer and not its code, and gpg-agent words
+    /// it in the user's language. `name` is whose key the agent was asked
+    /// about, as [`Error::Revoked`] names one.
+    ///
+    /// The reason comes first because the status bar elides the end of a
+    /// line, and the reason is what the user acts on. It used to be dropped
+    /// altogether, and the decryption reported that no secret key opened the
+    /// message.
+    #[error("gpg-agent: {reason} (the key of {name})")]
+    AgentRefused { name: String, reason: String },
+
+    /// A message is for a passphrase-protected key held here, and that key
+    /// was not opened: `tried` is false when no passphrase was given, true
+    /// when those given did not unlock it.
+    ///
+    /// `or_password` is true when the message was encrypted to a password as
+    /// well, and what was given, if anything, was tried as that password too
+    /// and did not open it. Decrypt / Verify has one field for both, so what
+    /// was entered may have been meant as the message's password, and a
+    /// failure about the key alone would send the user to the wrong one.
+    ///
+    /// Only for a key a packet in the message names. It used to read as "no
+    /// secret key, and no password, opens this message", which sent the user
+    /// looking for a key they had when what was missing was its passphrase.
+    #[error("{}", key_locked(.name, *.tried, *.or_password))]
+    KeyLocked {
+        name: String,
+        tried: bool,
+        or_password: bool,
+    },
+
     /// A secret key was written, and its public certificate then could not
     /// be.
     ///
@@ -120,6 +157,28 @@ fn import_stopped(stored: &usize, source: &Error) -> String {
     match stored {
         0 => source.to_string(),
         stored => format!("{stored} certificate(s) were stored, and then: {source}"),
+    }
+}
+
+/// How [`Error::KeyLocked`] reads, depending on whether a passphrase was
+/// given at all, and whether the message's password would open it too.
+fn key_locked(name: &str, tried: bool, or_password: bool) -> String {
+    match (tried, or_password) {
+        (false, false) => {
+            format!("this message is for a passphrase-protected key: enter its passphrase ({name})")
+        }
+        (true, false) => format!(
+            "this message is for a passphrase-protected key, and the passphrase entered \
+             does not unlock it ({name})"
+        ),
+        (false, true) => format!(
+            "this message is for a passphrase-protected key and a password: enter the key's \
+             passphrase or the message's password ({name})"
+        ),
+        (true, true) => format!(
+            "this message is for a passphrase-protected key and a password, and what was \
+             entered neither unlocks the key nor opens the message ({name})"
+        ),
     }
 }
 

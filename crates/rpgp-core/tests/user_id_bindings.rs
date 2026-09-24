@@ -43,6 +43,9 @@ const ORIGINAL: &str = "Flags Fixture <flags@example.invalid>";
 const ADDED: &str = "Flags Fixture <work@example.invalid>";
 
 fn scratch() -> (tempfile::TempDir, Store, String) {
+    // Nothing here asks gpg-agent, and should a later change make something
+    // do so, it must not be the developer's own; see `agent::AgentHome`.
+    rpgp_core::agent::set_home(rpgp_core::agent::AgentHome::Nowhere);
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
     let path = dir.path().join("fixture.asc");
