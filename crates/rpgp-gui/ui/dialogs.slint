@@ -801,8 +801,13 @@ export component CertifyDialog inherits DialogShell {
             edited(text) => { root.password = text; }
         }
 
+        // The Certify button opens only when some key can certify, and the
+        // list leaves out the certificate being certified, so an empty list
+        // means that certificate is the one key that can: one of the user's
+        // own that only gpg-agent holds, whose row has no secret key file to
+        // disable the button by.
         if root.certifiers.length == 0: Text {
-            text: "No key in this store can certify. Create a key pair first.";
+            text: "No other key of yours can certify, and a certificate cannot certify itself.";
             color: Theme.warn;
             font-size: Theme.t-sm;
             wrap: word-wrap;

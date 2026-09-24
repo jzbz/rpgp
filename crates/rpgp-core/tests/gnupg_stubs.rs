@@ -62,7 +62,9 @@
 use std::io::Write;
 use std::time::{Duration, SystemTime};
 
-use rpgp_core::{Error, Store, lifecycle, ops};
+use rpgp_core::certify::{CertifyRequest, certify};
+use rpgp_core::keygen::{KeyGenRequest, generate};
+use rpgp_core::{CertSummary, Error, Store, lifecycle, ops};
 use sequoia_openpgp::Cert;
 use sequoia_openpgp::crypto::S2K;
 use sequoia_openpgp::packet::key::SecretKeyMaterial;
@@ -403,4 +405,56 @@ fn a_message_for_a_stubbed_subkey_does_not_ask_for_its_passphrase() {
             "{passwords:?}: {refused}"
         );
     }
+}
+
+/// A secret key file whose primary is a stub is not one the store can certify
+/// with, and the store says so before anything is asked of it: the key is
+/// among those it holds a secret key file for, and not among those whose
+/// primary is here, and a summary of the file says the same. That is what
+/// the Certify button goes by, and certify() agrees: with no gpg-agent to
+/// hand the primary to, it refuses, whichever passphrase is given. The full
+/// export of the same key, imported over it, is counted, and certifies.
+#[test]
+fn a_stubbed_primary_is_not_counted_among_the_keys_that_certify_here() {
+    let (dir, store) = scratch();
+    import(&dir, &store, "subkeys.asc", SUBKEYS_ONLY);
+    let fingerprint = Cert::from_bytes(SUBKEYS_ONLY)
+        .unwrap()
+        .fingerprint()
+        .to_hex();
+    let target = generate(&KeyGenRequest::new("Target <target@example.org>"))
+        .unwrap()
+        .cert;
+    store.insert(&target).unwrap();
+    let mut request = CertifyRequest::new(&fingerprint, target.fingerprint().to_hex());
+    request.user_ids = vec!["Target <target@example.org>".to_string()];
+    request.password = Some("fixture".to_string().into());
+
+    assert!(
+        store.secret_fingerprints().unwrap().contains(&fingerprint),
+        "premise: the store holds a secret key file for it"
+    );
+    assert!(
+        !store
+            .primary_secret_fingerprints()
+            .unwrap()
+            .contains(&fingerprint),
+        "a stubbed primary was counted as one that certifies here"
+    );
+    assert!(!CertSummary::from_cert(&store.secret_cert(&fingerprint).unwrap()).primary_secret);
+    assert!(
+        certify(&store, &request).is_err(),
+        "certified with a primary the store does not hold"
+    );
+
+    import(&dir, &store, "full.asc", FULL);
+    assert!(
+        store
+            .primary_secret_fingerprints()
+            .unwrap()
+            .contains(&fingerprint),
+        "the full export's primary was not counted"
+    );
+    assert!(CertSummary::from_cert(&store.secret_cert(&fingerprint).unwrap()).primary_secret);
+    certify(&store, &request).expect("the full export certifies");
 }

@@ -598,6 +598,27 @@ impl Store {
         Ok(out)
     }
 
+    /// The fingerprint of every secret key here that can certify without
+    /// gpg-agent: whose file holds the primary key's secret as key material
+    /// this build can sign with ([`crate::secret::can_sign_here`]), rather
+    /// than a GnuPG stub for a primary kept offline or on a card.
+    ///
+    /// [`crate::certify::certify`] signs with the primary key alone and goes
+    /// to the agent for it when this says no, so this, and not
+    /// [`Store::secret_fingerprints`], is the store's half of whether a
+    /// certificate can certify. Unlike that listing it has to open and parse
+    /// every file, and a file that will not parse is left out, as
+    /// [`Store::secret_certs`] leaves it out: certify() cannot sign with it
+    /// either, and goes to the agent.
+    pub fn primary_secret_fingerprints(&self) -> Result<BTreeSet<String>> {
+        Ok(self
+            .secret_certs()?
+            .iter()
+            .filter(|cert| crate::secret::can_sign_here(cert.primary_key().key()))
+            .map(|cert| cert.fingerprint().to_hex())
+            .collect())
+    }
+
     /// Every public certificate in the store, parsed.
     ///
     /// cert-d hands back `LazyCert`s that are only parsed on demand; the GUI

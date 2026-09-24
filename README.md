@@ -376,10 +376,11 @@ you cancel. Someone else's revocation is applied without asking: it is theirs
 to make, and would arrive unasked with their certificate from a keyserver
 refresh. A key is yours when this store holds its secret, or when `gpg-agent`
 does, in its own store or on a card: `gpg --gen-revoke` writes a revocation
-certificate for such a key that reads just like rPGP's own. The agent's keys
-are known from the survey that follows each reload of the list, so until the
-agent has answered, when none answers, and for a key with no signing key still
-in use, a revocation of one of them is taken for someone else's.
+certificate for such a key that reads just like rPGP's own. The agent holds a
+key when it holds any of the keys rPGP would ask it to sign, certify or decrypt
+with. Those are known from the survey that follows each reload of the list, so
+until the agent has answered, and when none answers, a revocation of one of
+them is taken for someone else's.
 
 Only a bare revocation certificate is asked about. A certificate that arrives
 with its revocation already attached is merged like any other import, and
@@ -460,6 +461,19 @@ The connection that only lists keys deliberately sets none, for the reason in
 the note in `connected` in `agent.rs`. What a passphrase prompt says is rPGP's
 to give, and it gives what GnuPG's own does: the certificate's primary user ID,
 the key's ID, and for a subkey the primary key's ID too.
+
+Certifying takes the certificate's primary key, so **Certify identity…** is
+offered once some key's primary can sign: its secret is in rPGP's store, as key
+material rather than the stub GnuPG exports in place of a primary kept offline
+or on a card, or the agent holds it, in its own store or on a card. The
+certifier list marks one on a card "(smartcard)". A card holding only the
+subkeys, the primary being kept offline as many YubiKey guides advise, signs
+and decrypts through the agent but is not offered as a certifier, and nor is a
+key imported from `gpg --export-secret-subkeys`, unless the agent holds its
+primary. What the agent holds is learnt by the survey after each reload of the
+list, so a key only the agent holds opens Certify once the agent has answered,
+which is at once unless the agent has hung; a dialog opened before then lists
+only the keys in rPGP's store.
 
 A message the keys in rPGP's own store do not open is taken to the agent, and
 only to a key it could be for: the key each of its session-key packets names,

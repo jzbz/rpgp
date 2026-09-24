@@ -342,6 +342,11 @@ pub fn certify(store: &Store, request: &CertifyRequest) -> Result<Cert> {
     // passphrase opens it. An expired primary, or one of an algorithm this
     // build cannot use, goes to the agent too, as it did when this was a key
     // filter, and the agent turns the first of those away.
+    //
+    // The Certify button asks the same two questions ahead of time, of the
+    // secret key file through `can_sign_here` and of the agent through what
+    // `agent::annotate` finds for certifying, so that it is offered for the
+    // keys this will sign with.
     let valid = certifier
         .with_policy(&policy, None)
         .map_err(|_| Error::NoSecretKey(request.certifier.clone()))?;
@@ -351,11 +356,7 @@ pub fn certify(store: &Store, request: &CertifyRequest) -> Result<Cert> {
         .clone()
         .parts_into_secret()
         .ok()
-        .filter(|key| {
-            primary.alive().is_ok()
-                && key.pk_algo().is_supported()
-                && crate::secret::is_usable(key.secret())
-        });
+        .filter(|key| primary.alive().is_ok() && crate::secret::can_sign_here(key));
 
     let mut signer: Box<dyn sequoia_openpgp::crypto::Signer + Send + Sync> = match local {
         Some(key) => crate::secret::signer(key, request.password.as_deref().map(String::as_str))?,

@@ -19,7 +19,7 @@
 
 use sequoia_openpgp::crypto::{KeyPair, Password, Signer};
 use sequoia_openpgp::packet::Key;
-use sequoia_openpgp::packet::key::{KeyRole, SecretKeyMaterial, SecretParts};
+use sequoia_openpgp::packet::key::{KeyParts, KeyRole, SecretKeyMaterial, SecretParts};
 
 use crate::error::{Error, Result};
 
@@ -48,6 +48,18 @@ pub fn is_usable(secret: &SecretKeyMaterial) -> bool {
         SecretKeyMaterial::Unencrypted(_) => true,
         SecretKeyMaterial::Encrypted(encrypted) => encrypted.s2k().is_supported(),
     }
+}
+
+/// Whether this process can sign with `key` itself, without gpg-agent: its
+/// secret half is here as key material rather than a stub ([`is_usable`]), and
+/// its algorithm is one this build has.
+///
+/// Asked of the primary key by [`crate::certify::certify`], which goes to the
+/// agent for the primary when the answer is no, and by what tells the Certify
+/// button which keys the store can certify with, `primary_secret` on
+/// [`crate::CertSummary`], so that the two cannot come apart.
+pub fn can_sign_here<P: KeyParts, R: KeyRole>(key: &Key<P, R>) -> bool {
+    key.pk_algo().is_supported() && key.optional_secret().is_some_and(is_usable)
 }
 
 /// Decrypt `key` if it is passphrase-protected, otherwise hand it back as-is.

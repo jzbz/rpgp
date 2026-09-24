@@ -12,9 +12,10 @@
 //! `sequoia-gpg-agent` is async and the rest of this crate is not, so calls are
 //! driven on a small dedicated runtime created once per process.
 //!
-//! Choosing a key and asking the agent are kept apart: `select_key` and
-//! `decryption_attempts` decide from what the agent listed, without a
-//! connection, so that what they choose can be tested where there is no agent.
+//! Choosing a key and asking the agent are kept apart: `select_key`,
+//! `decryption_attempts` and `holds` decide from what the agent listed, without
+//! a connection, so that what they choose can be tested where there is no
+//! agent.
 //!
 //! Finding the agent is rPGP's own, in [`gpgconf`], because sequoia-gpg-agent's
 //! way cannot find it on macOS or Windows, or from inside the Flatpak; that
@@ -29,6 +30,7 @@ use std::sync::{Mutex, OnceLock, PoisonError, RwLock};
 
 use sequoia_gpg_agent::{Agent, KeyPair};
 use sequoia_ipc::Keygrip;
+use sequoia_openpgp::cert::ValidCert;
 use sequoia_openpgp::packet::key::{PublicParts, UnspecifiedRole};
 use sequoia_openpgp::packet::{Key, PKESK};
 use sequoia_openpgp::{Cert, Fingerprint};
@@ -105,6 +107,39 @@ pub struct AgentKey {
 impl AgentKey {
     pub fn is_on_card(&self) -> bool {
         self.card_serial.is_some()
+    }
+}
+
+/// What the agent holds of one certificate, for each use rPGP puts it to: the
+/// key each operation would ask it for, chosen as that operation chooses it.
+///
+/// Per use, because one answer served them all and was right for signing
+/// alone. [`annotate`] marked a certificate when the agent held a live signing
+/// key of it, and the certify dialog read the mark as "can certify", which
+/// needs the primary key. In the layout most YubiKey guides recommend, the
+/// primary kept offline and the subkeys on the card, the certificate was
+/// offered as a certifier and every certification failed for want of the
+/// primary; and one whose primary the agent held, but none of its signing
+/// keys, was never offered at all.
+#[derive(Debug, Clone, Default)]
+pub struct AgentHolds {
+    /// The key signing asks for: a live signing key, one on a card before one
+    /// in the agent's own store. See [`signer_for`].
+    pub sign: Option<AgentKey>,
+    /// The primary key, which certifying asks for, and only while it is
+    /// alive. See [`certifier_for`].
+    pub certify: Option<AgentKey>,
+    /// An encryption key of either kind, one on a card first, whether or not
+    /// it is still in use: decrypting asks every one a message could be for,
+    /// retired and expired ones too.
+    pub decrypt: Option<AgentKey>,
+}
+
+impl AgentHolds {
+    /// Whether the agent holds nothing of the certificate for any of the
+    /// three.
+    pub fn is_empty(&self) -> bool {
+        self.sign.is_none() && self.certify.is_none() && self.decrypt.is_none()
     }
 }
 
@@ -379,37 +414,22 @@ fn socket() -> Result<PathBuf> {
     }
 }
 
-/// Whether the agent can act for any signing-capable key of `cert`, and if so
-/// which smartcard — if any — it is on.
+/// Whether the agent can act for a signing key of `cert`, the one signing
+/// would use, and if so which smartcard — if any — it is on.
 ///
 /// Matching is by keygrip, which is what the agent indexes by, so a
 /// certificate imported from anywhere lines up with the agent's copy of its
 /// secret without the two ever having been introduced.
 pub fn holds_signing_key(cert: &Cert) -> Result<Option<AgentKey>> {
-    let held = keys()?;
-    let policy = crate::policy();
-    let Ok(valid) = cert.with_policy(&policy, None) else {
-        return Ok(None);
-    };
-
-    for ka in valid.keys().alive().revoked(false).for_signing() {
-        let Ok(grip) = Keygrip::of(ka.key().mpis()) else {
-            continue;
-        };
-        let grip = grip.to_string();
-        if let Some(found) = held.iter().find(|k| k.keygrip.eq_ignore_ascii_case(&grip)) {
-            return Ok(Some(found.clone()));
-        }
-    }
-    Ok(None)
+    Ok(holds(cert, &keys()?).sign)
 }
 
 /// Match a whole set of certificates against the agent in one round trip.
 ///
-/// Returns fingerprint -> the agent key backing it. Per-certificate lookups
-/// would re-connect and re-list for every row in the list; the store is read
-/// wholesale, so this is too.
-pub fn annotate<C>(certs: &[C]) -> HashMap<String, AgentKey>
+/// Returns fingerprint -> what the agent holds of it, for each certificate it
+/// holds anything of. Per-certificate lookups would re-connect and re-list for
+/// every row in the list; the store is read wholesale, so this is too.
+pub fn annotate<C>(certs: &[C]) -> HashMap<String, AgentHolds>
 where
     C: std::ops::Deref<Target = Cert>,
 {
@@ -419,34 +439,43 @@ where
     };
     // An agent that answers but holds nothing — a fresh GnuPG install, or a
     // machine whose secrets live only here — makes every match below fail, so
-    // the policy walk and the keygrip of every signing key would rebuild the
-    // empty map we already have.
+    // the policy walk and the keygrip of every key would rebuild the empty map
+    // we already have.
     if held.is_empty() {
         return found;
     }
-    let policy = crate::policy();
 
     for cert in certs {
-        let Ok(valid) = cert.with_policy(&policy, None) else {
-            continue;
-        };
-        for ka in valid.keys().alive().revoked(false).for_signing() {
-            let Ok(grip) = Keygrip::of(ka.key().mpis()) else {
-                continue;
-            };
-            let grip = grip.to_string();
-            if let Some(key) = held.iter().find(|k| k.keygrip.eq_ignore_ascii_case(&grip)) {
-                // A card-held key wins over a file-held one for the same cert.
-                let better = found
-                    .get(&cert.fingerprint().to_hex())
-                    .is_none_or(|existing: &AgentKey| !existing.is_on_card());
-                if better {
-                    found.insert(cert.fingerprint().to_hex(), key.clone());
-                }
-            }
+        let held_of_cert = holds(cert, &held);
+        if !held_of_cert.is_empty() {
+            found.insert(cert.fingerprint().to_hex(), held_of_cert);
         }
     }
     found
+}
+
+/// What of `cert` the agent holds, for each use, judged from `held`, the
+/// agent's listing, without asking the agent anything.
+///
+/// Each use takes the key its operation would take: signing and certifying
+/// through [`usable_keys`], as [`select_key`] does, and decrypting through
+/// [`decryption_keys`], as [`decryption_attempts`] does, so that what the
+/// pickers offer on the strength of this is what the operation behind them
+/// will find. Nothing for a certificate that is not valid under the policy,
+/// which none of the three will use.
+fn holds(cert: &Cert, held: &[AgentKey]) -> AgentHolds {
+    let policy = crate::policy();
+    let Ok(valid) = cert.with_policy(&policy, None) else {
+        return AgentHolds::default();
+    };
+    let held_of = |keys: Vec<&Key<PublicParts, UnspecifiedRole>>| {
+        choose(keys, held).map(|(_, entry)| entry.clone())
+    };
+    AgentHolds {
+        sign: held_of(usable_keys(&valid, Purpose::Sign)),
+        certify: held_of(usable_keys(&valid, Purpose::Certify)),
+        decrypt: held_of(decryption_keys(&valid).collect()),
+    }
 }
 
 /// A certification key for `cert`, backed by the agent: its primary key.
@@ -546,41 +575,55 @@ fn select_key(
         .with_policy(&policy, None)
         .map_err(|_| Error::NoSecretKey(cert.fingerprint().to_hex()))?;
 
-    let primary = || valid.primary_key().key().clone().role_into_unspecified();
-    let usable: Vec<Key<PublicParts, UnspecifiedRole>> = match purpose {
+    choose(usable_keys(&valid, purpose), held)
+        .map(|(key, _)| key.clone())
+        .ok_or_else(|| Error::NoSecretKey(cert.fingerprint().to_hex()))
+}
+
+/// The keys of `valid` that `purpose` may use, whether or not the agent holds
+/// them, in the certificate's order.
+///
+/// Shared by [`select_key`], which picks one to use, and [`holds`], which says
+/// ahead of time whether there will be one to pick.
+fn usable_keys<'a>(
+    valid: &ValidCert<'a>,
+    purpose: Purpose,
+) -> Vec<&'a Key<PublicParts, UnspecifiedRole>> {
+    let primary = valid.primary_key();
+    match purpose {
         Purpose::Sign => valid
             .keys()
             .alive()
             .revoked(false)
             .for_signing()
-            .map(|ka| ka.key().clone())
+            .map(|ka| ka.key())
             .collect(),
         // The primary key alone, and without asking for its certify flag,
         // which sequoia-wot does not ask for either; see `certifier_for`. Its
         // revocation is the certificate's, which `refuse_if_revoked_for` has
         // already asked about.
-        Purpose::Certify => match valid.primary_key().alive() {
-            Ok(()) => vec![primary()],
+        Purpose::Certify => match primary.alive() {
+            Ok(()) => vec![primary.key().role_as_unspecified()],
             Err(_) => Vec::new(),
         },
-        Purpose::WithdrawCertification => vec![primary()],
-    };
+        Purpose::WithdrawCertification => vec![primary.key().role_as_unspecified()],
+    }
+}
 
-    let mut candidates: Vec<_> = usable
+/// The first of `keys` that `held` lists, a key on a smartcard before one in
+/// the agent's own store, with the agent's entry for it.
+fn choose<'k, 'h>(
+    keys: impl IntoIterator<Item = &'k Key<PublicParts, UnspecifiedRole>>,
+    held: &'h [AgentKey],
+) -> Option<(&'k Key<PublicParts, UnspecifiedRole>, &'h AgentKey)> {
+    let mut candidates: Vec<_> = keys
         .into_iter()
-        .filter_map(|key| {
-            let on_card = held_as(&key, held)?.is_on_card();
-            Some((on_card, key))
-        })
+        .filter_map(|key| Some((key, held_as(key, held)?)))
         .collect();
 
     // Card first.
-    candidates.sort_by_key(|(on_card, _)| std::cmp::Reverse(*on_card));
-    candidates
-        .into_iter()
-        .next()
-        .map(|(_, key)| key)
-        .ok_or_else(|| Error::NoSecretKey(cert.fingerprint().to_hex()))
+    candidates.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.is_on_card()));
+    candidates.into_iter().next()
 }
 
 /// The entry of `held` for `key`, matched by keygrip, which is what the agent
@@ -697,12 +740,7 @@ pub(crate) fn decryption_attempts<'a>(
         let Ok(valid) = cert.with_policy(&policy, None) else {
             continue;
         };
-        for ka in valid
-            .keys()
-            .for_transport_encryption()
-            .chain(valid.keys().for_storage_encryption())
-        {
-            let key = ka.key();
+        for key in decryption_keys(&valid) {
             if pkesks.iter().any(|pkesk| could_open(key, pkesk)) && seen.insert(key.fingerprint()) {
                 addressed.push((cert, key.clone()));
             }
@@ -738,6 +776,22 @@ pub(crate) fn decryption_attempts<'a>(
         }
     }
     attempts
+}
+
+/// The keys of `valid` a message could have been encrypted to: encryption keys
+/// of both kinds, with no test of alive or revoked, for the reason
+/// [`decryption_attempts`] gives. A key carrying both flags comes twice.
+///
+/// Shared with [`holds`], so that what the survey says the agent can decrypt
+/// with is what a decryption will ask it about.
+fn decryption_keys<'a>(
+    valid: &ValidCert<'a>,
+) -> impl Iterator<Item = &'a Key<PublicParts, UnspecifiedRole>> + use<'a> {
+    valid
+        .keys()
+        .for_transport_encryption()
+        .chain(valid.keys().for_storage_encryption())
+        .map(|ka| ka.key())
 }
 
 /// Whether `pkesk` could have been made for `key`, judged from the packet: it
@@ -1287,6 +1341,81 @@ mod tests {
         assert!(select_key(&lapsed, Purpose::Certify, &held).is_err());
         let chosen = select_key(&lapsed, Purpose::WithdrawCertification, &held).unwrap();
         assert_eq!(chosen.fingerprint(), primary.fingerprint());
+    }
+
+    /// With the primary key kept offline and the subkeys on a card, the layout
+    /// most YubiKey guides recommend, the agent signs and decrypts for the
+    /// certificate but does not certify for it, since certifying takes the
+    /// primary. The survey used to give one answer for all three, from the
+    /// signing keys, and the certify dialog listed such a card as a certifier
+    /// that then failed for want of the primary.
+    #[test]
+    fn a_card_holding_only_the_subkeys_signs_and_decrypts_but_does_not_certify() {
+        let alice = generated("Alice <alice@example.org>");
+        let subkeys: Vec<_> = alice
+            .keys()
+            .subkeys()
+            .map(|ka| ka.key().clone().role_into_unspecified())
+            .collect();
+        let held = listing(&subkeys, Some("D2760001240100000006"));
+
+        let found = holds(&alice, &held);
+        assert!(
+            found.sign.as_ref().is_some_and(AgentKey::is_on_card),
+            "the card's signing key was not found: {found:?}"
+        );
+        assert!(
+            found.decrypt.as_ref().is_some_and(AgentKey::is_on_card),
+            "the card's encryption key was not found: {found:?}"
+        );
+        assert!(
+            found.certify.is_none(),
+            "a card without the primary key was taken to certify: {found:?}"
+        );
+        // Which is what certifying through the agent finds, and signing too.
+        assert!(select_key(&alice, Purpose::Certify, &held).is_err());
+        assert!(select_key(&alice, Purpose::Sign, &held).is_ok());
+    }
+
+    /// A primary key the agent holds certifies, though the agent holds none of
+    /// the certificate's signing keys, and a signing key on a card says
+    /// nothing about where the primary is. The survey used to look at the
+    /// signing keys alone: it missed the first, and took the card for the
+    /// key that certifies in the second.
+    #[test]
+    fn a_held_primary_certifies_wherever_the_signing_key_is() {
+        let alice = generated("Alice <alice@example.org>");
+        let primary = alice.primary_key().key().clone().role_into_unspecified();
+        let policy = crate::policy();
+        let signing: Vec<_> = alice
+            .with_policy(&policy, None)
+            .unwrap()
+            .keys()
+            .for_signing()
+            .map(|ka| ka.key().clone())
+            .collect();
+        assert!(
+            signing.len() == 1 && signing[0].fingerprint() != primary.fingerprint(),
+            "premise: one signing key, and not the primary"
+        );
+
+        let held = listing([&primary], None);
+        let found = holds(&alice, &held);
+        assert!(
+            found.certify.as_ref().is_some_and(|key| !key.is_on_card()),
+            "the primary in the agent's store was not found to certify: {found:?}"
+        );
+        assert!(found.sign.is_none() && found.decrypt.is_none(), "{found:?}");
+        assert!(select_key(&alice, Purpose::Certify, &held).is_ok());
+
+        let mut held = listing([&primary], None);
+        held.extend(listing(&signing, Some("D2760001240100000006")));
+        let found = holds(&alice, &held);
+        assert!(found.sign.as_ref().is_some_and(AgentKey::is_on_card));
+        assert!(
+            found.certify.as_ref().is_some_and(|key| !key.is_on_card()),
+            "certifying was put on the card that holds the signing key: {found:?}"
+        );
     }
 
     /// Signs with whatever `RPGP_TEST_CERT` points at, through the developer's

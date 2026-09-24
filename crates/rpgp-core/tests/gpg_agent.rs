@@ -37,8 +37,8 @@ use sequoia_openpgp::packet::pkesk::PKESK3;
 use sequoia_openpgp::packet::{Key, PKESK};
 use sequoia_openpgp::parse::Parse;
 use sequoia_openpgp::policy::StandardPolicy;
-use sequoia_openpgp::serialize::Serialize;
 use sequoia_openpgp::serialize::stream::{Encryptor, LiteralWriter, Message, Recipient};
+use sequoia_openpgp::serialize::{Serialize, SerializeInto};
 use sequoia_openpgp::types::{KeyFlags, ReasonForRevocation};
 use sequoia_openpgp::{Cert, Packet, PacketPile};
 
@@ -489,6 +489,86 @@ fn signs_and_certifies_through_the_agent() {
             .iter()
             .any(|c| c.verified == Some(true) && c.certifier.contains("Alice")),
         "{found:?}"
+    );
+    assert_eq!(agent_home.prompts(), 0);
+}
+
+/// `cert` with the secret halves of its primary key alone, or of its subkeys
+/// alone, as a card holds them when the primary is kept offline.
+fn with_secrets_of(cert: &Cert, primary: bool) -> Cert {
+    let primary_key = cert.fingerprint();
+    let bytes = cert
+        .as_tsk()
+        .set_filter(move |key| (key.fingerprint() == primary_key) == primary)
+        .to_vec()
+        .unwrap();
+    Cert::from_bytes(&bytes).unwrap()
+}
+
+/// The survey after a reload asks the agent, for each use, about the key that
+/// use takes. Given only the subkeys, as a card holds them when the primary is
+/// kept offline, the agent signs and decrypts for the certificate but is not
+/// found to certify for it, and certifying through it is refused. Given only
+/// the primary, it is found to certify, and a certification made through it
+/// counts, though it holds no key that signs.
+///
+/// The survey used to look at signing keys alone, and the certify dialog took
+/// what it found for certifying: it listed the first as a certifier, which
+/// then failed, and never listed the second.
+#[test]
+fn the_agent_is_found_to_certify_only_where_it_holds_the_primary() {
+    let Some(agent_home) = Throwaway::start() else {
+        return;
+    };
+    let alice = key("Alice <alice@example.org>", None);
+    let bob = key("Bob <bob@example.org>", None);
+    let carol = key("Carol <carol@example.org>", None);
+    agent_home.give(&with_secrets_of(&alice, false));
+    agent_home.give(&with_secrets_of(&bob, true));
+    let dir = tempfile::tempdir().unwrap();
+    let store = public_store(&dir, &[&alice, &bob, &carol]);
+    let public = |cert: &Cert| store.lookup(&cert.fingerprint().to_hex()).unwrap();
+
+    let found = agent::annotate(&[&public(&alice), &public(&bob), &public(&carol)]);
+    let of = |cert: &Cert| found.get(&cert.fingerprint().to_hex());
+    let subkeys_only = of(&alice).expect("the agent holds Alice's subkeys");
+    assert!(
+        subkeys_only.sign.is_some() && subkeys_only.decrypt.is_some(),
+        "{subkeys_only:?}"
+    );
+    assert!(
+        subkeys_only.certify.is_none(),
+        "found to certify without the primary: {subkeys_only:?}"
+    );
+    let primary_only = of(&bob).expect("the agent holds Bob's primary");
+    assert!(
+        primary_only.certify.is_some(),
+        "the primary was not found to certify: {primary_only:?}"
+    );
+    assert!(
+        primary_only.sign.is_none() && primary_only.decrypt.is_none(),
+        "{primary_only:?}"
+    );
+    assert!(of(&carol).is_none(), "the agent holds nothing of Carol's");
+
+    let certify_carol = |certifier: &Cert| {
+        let mut request = rpgp_core::certify::CertifyRequest::new(
+            certifier.fingerprint().to_hex(),
+            carol.fingerprint().to_hex(),
+        );
+        request.user_ids = vec!["Carol <carol@example.org>".to_string()];
+        rpgp_core::certify::certify(&store, &request)
+    };
+    let refused = certify_carol(&alice).expect_err("certified without the primary");
+    assert!(matches!(refused, Error::NoSecretKey(_)), "{refused}");
+    certify_carol(&bob).expect("the agent's primary certifies");
+    let listed = rpgp_core::certify::certifications(&store, &public(&carol)).unwrap();
+    let bob_fp = bob.fingerprint().to_hex();
+    assert!(
+        listed
+            .iter()
+            .any(|c| c.is_good() && c.certifier_fingerprint.as_deref() == Some(bob_fp.as_str())),
+        "{listed:?}"
     );
     assert_eq!(agent_home.prompts(), 0);
 }

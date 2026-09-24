@@ -192,7 +192,8 @@ struct State {
     certify_target: Option<String>,
     /// (user ID, ticked)
     certify_user_ids: Vec<(String, bool)>,
-    /// (fingerprint, label) of our own certification-capable keys.
+    /// (fingerprint, label) of our own keys that can certify, from the store
+    /// or through gpg-agent (see [`can_certify_with`]), the target excepted.
     certify_certifiers: Vec<(String, String)>,
 
     /// Certificates found on the network, not yet in the store.
@@ -879,12 +880,12 @@ fn import_into(
             // revocation certificate for one on request, to be put away until
             // it is needed, as a plain public key block that reads here just
             // as the app's own does. The agent is not asked again: the survey
-            // that follows every reload has asked it already, and the keys it
-            // found are the ones the sign and certify dialogs offer as the
-            // user's. So until that survey hears from the agent, whenever no
-            // agent answers, and for a key with no signing key still in use,
-            // which the survey does not match, a key the agent holds is taken
-            // for someone else's.
+            // that follows every reload has asked it already, for the keys
+            // that sign, certify and decrypt, which are what the sign and
+            // certify dialogs offer and decryption asks it for, and a key
+            // counts as held when it holds any of them. So until that survey
+            // hears from the agent, and whenever no agent answers, a key the
+            // agent holds is taken for someone else's.
             for pending in &mut file.revocations {
                 pending.yours |= held_by_agent.contains(&pending.fingerprint);
             }
@@ -1971,14 +1972,27 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
                 .map(|uid| (uid.clone(), !revoked.contains(uid)))
                 .collect();
 
+            // The keys the Certify button was offered for, less the one being
+            // certified, which core refuses as a certificate vouching for
+            // itself: a key the agent alone holds is the user's own, and yet
+            // has no secret key file to disable the button on its row, as one
+            // in the store has. "(smartcard)" goes by the key certifying uses,
+            // the primary, and only where the agent is what signs with it: a
+            // usable one in the store is taken first.
             let certifiers: Vec<(String, String)> = guard
                 .all
                 .iter()
-                .filter(|c| c.can_certify && (c.has_secret || c.agent_backed))
+                .filter(|c| can_certify_with(c) && c.fingerprint != target.fingerprint)
                 .map(|c| {
-                    let label = match &c.card_serial {
-                        Some(_) => format!("{} (smartcard)", c.primary_user_id),
-                        None => c.primary_user_id.clone(),
+                    let on_card = !c.primary_secret
+                        && c.agent
+                            .certify
+                            .as_ref()
+                            .is_some_and(rpgp_core::agent::AgentKey::is_on_card);
+                    let label = if on_card {
+                        format!("{} (smartcard)", c.primary_user_id)
+                    } else {
+                        c.primary_user_id.clone()
                     };
                     (c.fingerprint.clone(), label)
                 })
@@ -3180,9 +3194,9 @@ fn build_signing_targets(state: &mut State, preselect: Option<&str>) {
     let signers: Vec<(String, String)> = state
         .all
         .iter()
-        .filter(|c| c.can_sign && (c.has_secret || c.agent_backed))
+        .filter(|c| c.can_sign && (c.has_secret || c.agent.sign.is_some()))
         .map(|c| {
-            let label = match &c.card_serial {
+            let label = match c.card_serial() {
                 Some(_) => format!("{} (smartcard)", c.primary_user_id),
                 None => c.primary_user_id.clone(),
             };
@@ -3703,11 +3717,13 @@ struct Loaded {
 /// straight away with `reselect` — [`AfterReload`] carries that intent across
 /// the gap instead.
 ///
-/// It reads the secrets directory but does not open the keys in it: which
-/// certificates have a secret half is answered from the filenames, via
-/// [`Store::secret_fingerprints`]. The parts that leave the machine, and the
-/// damaged-file survey that does re-parse every secret key, are handed to
-/// [`survey_agent_and_secrets`] instead.
+/// Which certificates have a secret half is answered from the filenames in the
+/// secrets directory, via [`Store::secret_fingerprints`]. The keys in it are
+/// opened for one question only, whether each holds its primary key's secret
+/// or a stub ([`Store::primary_secret_fingerprints`]), which the Certify button
+/// needs; `read_store` says why there. The parts that leave the machine, and
+/// the damaged-file survey that re-parses every secret key again, are handed
+/// to [`survey_agent_and_secrets`].
 fn reload(ui: &AppWindow, state: &Shared) {
     reload_after(ui, state, AfterReload::default());
 }
@@ -3902,9 +3918,22 @@ fn read_store(store: &Store) -> std::result::Result<Loaded, String> {
         degraded.push("secret keys");
         Default::default()
     });
+    // Which of those hold the primary key's secret, rather than the GnuPG stub
+    // left for a primary kept offline or on a card. Certifying signs with the
+    // primary alone, so the Certify button turns on this and not on the
+    // listing. It is the one read here that opens the secret key files, a
+    // parse of each, where the listing opens none; a user holds few, and this
+    // is the reload's worker. Asked here, and not by the survey that follows
+    // and parses them again, so that the button is right for the store's own
+    // keys when the list appears, and only the agent's can come late.
+    let primary_secrets = store.primary_secret_fingerprints().unwrap_or_else(|_| {
+        degraded.push("secret keys");
+        Default::default()
+    });
     for summary in all.iter_mut() {
         let key = summary.fingerprint.to_uppercase();
         summary.has_secret = secrets.contains(&key);
+        summary.primary_secret = primary_secrets.contains(&key);
         summary.is_trust_root = explicit_roots.contains(&key);
         summary.implicit_root = implicit_roots.contains(&key);
         summary.sha1_accepted = sha1_accepted.contains(&key);
@@ -3997,8 +4026,9 @@ fn signature_verdict(known: &[CertSummary], result: &ops::VerifyResult) -> (Stri
 /// Off the event loop, because asking the agent leaves the process. An agent
 /// that has hung — or a stale socket left by one that died — used to freeze the
 /// window until it gave up, holding the state lock the whole time. The list now
-/// appears immediately and the smartcard badges arrive when the agent answers,
-/// or never, with nothing waiting on it.
+/// appears immediately, and the smartcard badges, and the Certify button for a
+/// key only the agent holds, arrive when the agent answers, or never, with
+/// nothing waiting on it. See [`land_survey`] for what arrives.
 ///
 /// The damaged-file survey rides along because it re-parses every secret key,
 /// which is the other thing in a reload that has no business on the UI thread.
@@ -4023,76 +4053,97 @@ fn survey_agent_and_secrets(ui: &AppWindow, state: &Shared, store: std::sync::Ar
         }
 
         let _ = slint::invoke_from_event_loop(move || {
-            let Some(ui) = ui_weak.upgrade() else {
-                return;
-            };
-
-            if !agent_keys.is_empty() {
-                // Of the two fields the survey sets, only card_serial can reach
-                // a row: CertRow carries card-serial, while agent_backed is read
-                // straight off State when the certify and sign dialogs build
-                // their key lists. So the rows only need rebuilding when a card
-                // serial actually changed — otherwise reload's own apply_filter
-                // already produced exactly the rows this would produce again,
-                // and for anyone whose key is merely in gpg-agent rather than on
-                // a card, that second pass rebuilt every row to no effect.
-                let mut rows_changed = false;
-                {
-                    let mut guard = lock(&state);
-                    for summary in guard.all.iter_mut() {
-                        if let Some(key) = agent_keys.get(&summary.fingerprint) {
-                            summary.agent_backed = true;
-                            if summary.card_serial != key.card_serial {
-                                summary.card_serial = key.card_serial.clone();
-                                rows_changed = true;
-                            }
-                        }
-                    }
-                }
-                if rows_changed {
-                    // Read the selection now rather than before the agent was
-                    // asked: the user may have moved since. apply_filter clears
-                    // the selection, so it has to be put back.
-                    let selected = ui
-                        .get_has_selection()
-                        .then(|| ui.get_detail().fingerprint.to_string());
-
-                    // And the status line with it. Every mutation sets its own
-                    // confirmation — "Imported 3 certificates" — and reload
-                    // then spawns this survey, which ends in apply_filter,
-                    // which overwrites the status with its generic count.
-                    // from_cert resets card_serial to None on every reload, so
-                    // for anyone whose agent reports a card this fired every
-                    // time: the confirmation was replaced before it could be
-                    // read.
-                    let status = ui.get_status();
-
-                    apply_filter(&ui, &state);
-                    if let Some(fingerprint) = selected {
-                        reselect(&ui, &state, &fingerprint);
-                    }
-                    ui.set_status(status);
-                }
-            }
-
-            // Last, so it survives: apply_filter above always overwrites the
-            // status with its own count. A secret key file that will not parse
-            // is skipped rather than allowed to hide every other key, but
-            // skipping silently would turn "my key is gone" into a mystery.
-            if !damaged.is_empty() {
-                ui.set_status(
-                    format!(
-                        "{} secret key file{} could not be read and {} skipped: {}",
-                        damaged.len(),
-                        if damaged.len() == 1 { "" } else { "s" },
-                        if damaged.len() == 1 { "was" } else { "were" },
-                        damaged.join(", ")
-                    )
-                    .into(),
-                );
+            if let Some(ui) = ui_weak.upgrade() {
+                land_survey(&ui, &state, &agent_keys, &damaged);
             }
         });
     });
+}
+
+/// Put what [`survey_agent_and_secrets`] found on screen: `agent_keys`, what
+/// the agent holds of each certificate by fingerprint, and `damaged`, the
+/// secret key files that would not parse.
+///
+/// Split from the survey, which asks the agent, so that a test can land what a
+/// survey would find without one.
+fn land_survey(
+    ui: &AppWindow,
+    state: &Shared,
+    agent_keys: &std::collections::HashMap<String, rpgp_core::agent::AgentHolds>,
+    damaged: &[String],
+) {
+    if !agent_keys.is_empty() {
+        // Of what the survey sets, only the signing key's card serial reaches
+        // a row: CertRow carries card-serial, while the rest is read straight
+        // off State when the certify and sign dialogs build their key lists,
+        // and when the Certify button is decided just below. So the rows only
+        // need rebuilding when a card serial actually changed — otherwise
+        // reload's own apply_filter already produced exactly the rows this
+        // would produce again, and for anyone whose key is merely in gpg-agent
+        // rather than on a card, that second pass rebuilt every row to no
+        // effect.
+        let mut rows_changed = false;
+        let can_certify = {
+            let mut guard = lock(state);
+            for summary in guard.all.iter_mut() {
+                if let Some(holds) = agent_keys.get(&summary.fingerprint) {
+                    let before = summary.card_serial().map(str::to_owned);
+                    summary.agent = holds.clone();
+                    rows_changed |= summary.card_serial() != before.as_deref();
+                }
+            }
+            guard.all.iter().any(can_certify_with)
+        };
+        // The Certify button, whether or not a row changed. The reload that
+        // spawned this survey decided it before the agent had answered, from
+        // the store's keys alone, so a key only the agent holds, in its own
+        // store or on a card, opens it from here, and until here the button
+        // is disabled for a user who has no other, and a dialog opened by
+        // another key does not list it. A key the agent holds only subkeys
+        // of does not open it at all.
+        ui.set_can_certify(can_certify);
+
+        if rows_changed {
+            // Read the selection now rather than before the agent was asked:
+            // the user may have moved since. apply_filter clears the
+            // selection, so it has to be put back.
+            let selected = ui
+                .get_has_selection()
+                .then(|| ui.get_detail().fingerprint.to_string());
+
+            // And the status line with it. Every mutation sets its own
+            // confirmation — "Imported 3 certificates" — and reload then
+            // spawns this survey, which ends in apply_filter, which
+            // overwrites the status with its generic count. from_cert leaves
+            // the agent's keys unmarked on every reload, so for anyone whose
+            // agent reports a card this fired every time: the confirmation
+            // was replaced before it could be read.
+            let status = ui.get_status();
+
+            apply_filter(ui, state);
+            if let Some(fingerprint) = selected {
+                reselect(ui, state, &fingerprint);
+            }
+            ui.set_status(status);
+        }
+    }
+
+    // Last, so it survives: apply_filter above always overwrites the status
+    // with its own count. A secret key file that will not parse is skipped
+    // rather than allowed to hide every other key, but skipping silently
+    // would turn "my key is gone" into a mystery.
+    if !damaged.is_empty() {
+        ui.set_status(
+            format!(
+                "{} secret key file{} could not be read and {} skipped: {}",
+                damaged.len(),
+                if damaged.len() == 1 { "" } else { "s" },
+                if damaged.len() == 1 { "was" } else { "were" },
+                damaged.join(", ")
+            )
+            .into(),
+        );
+    }
 }
 
 impl State {
@@ -4102,14 +4153,15 @@ impl State {
     }
 
     /// The certificates whose secret key gpg-agent holds, in its own store or
-    /// on a card, as [`survey_agent_and_secrets`] last found them. A reload
-    /// reads every certificate afresh with none marked, so this is empty
-    /// until the survey that follows it hears from the agent, and stays so
-    /// when no agent answers.
+    /// on a card, as [`survey_agent_and_secrets`] last found them: a key of
+    /// theirs that signs, the primary that certifies or a key that decrypts,
+    /// any one of the three. A reload reads every certificate afresh with none
+    /// marked, so this is empty until the survey that follows it hears from
+    /// the agent, and stays so when no agent answers.
     fn held_by_agent(&self) -> std::collections::HashSet<String> {
         self.all
             .iter()
-            .filter(|c| c.agent_backed)
+            .filter(|c| !c.agent.is_empty())
             .map(|c| c.fingerprint.clone())
             .collect()
     }
@@ -4165,7 +4217,7 @@ fn apply_filter(ui: &AppWindow, state: &Shared) {
     let total = guard.all.len();
     let mine = guard.all.iter().filter(|c| c.has_secret).count();
     let shown = rows.len();
-    let can_certify = guard.all.iter().any(|c| c.has_secret && c.can_certify);
+    let can_certify = guard.all.iter().any(can_certify_with);
     drop(guard);
 
     ui.set_certs(ModelRc::new(VecModel::from(rows)));
@@ -4185,6 +4237,25 @@ fn apply_filter(ui: &AppWindow, state: &Shared) {
         }
         .into(),
     );
+}
+
+/// Whether `summary`'s certificate can certify someone else's from where its
+/// keys are held: the Certify button is offered when any can, and the dialog
+/// lists those that can.
+///
+/// [`certify::certify`] signs with the primary key alone, from the store when
+/// its secret there is key material this build can use, and otherwise through
+/// gpg-agent, which has to hold it, on a card or in its own store. Those are
+/// `primary_secret` and what the survey found the agent holds for certifying,
+/// asked the same way. A certificate whose secret key file stubs the primary,
+/// or whose card holds only its subkeys, as when the primary is kept offline,
+/// signs and decrypts but cannot certify, and is not offered. The button used
+/// to count any secret key file and ignore the agent, and the dialog to count
+/// any key the agent could sign with: a card-only user could not open the
+/// dialog at all, while a card holding only subkeys was listed in it, and
+/// failed at the last step for want of the primary.
+fn can_certify_with(summary: &CertSummary) -> bool {
+    summary.can_certify && (summary.primary_secret || summary.agent.certify.is_some())
 }
 
 pub fn to_row(summary: &CertSummary) -> CertRow {
@@ -4212,7 +4283,7 @@ pub fn to_row(summary: &CertSummary) -> CertRow {
         sha1_accepted: summary.sha1_accepted,
         revocation: summary.revocation.clone().unwrap_or_default().into(),
         revocation_hard: summary.revocation_hard,
-        card_serial: summary.card_serial.clone().unwrap_or_default().into(),
+        card_serial: summary.card_serial().unwrap_or_default().into(),
     }
 }
 
@@ -5426,7 +5497,8 @@ mod tests {
             .iter_mut()
             .find(|c| c.fingerprint == fingerprint)
             .expect("the key is listed")
-            .agent_backed = true;
+            .agent
+            .sign = agent_key(None);
         let store = lock(&state).store.clone();
         assert!(!store.has_secret(&fingerprint));
 
@@ -5465,6 +5537,53 @@ mod tests {
             status.ends_with("Publish or send the certificate so others stop using it."),
             "the user's own key revoked should be published: {status}"
         );
+    }
+
+    /// The same holds for a key of which the agent holds no signing key: only
+    /// the primary, which certifies, or only a key that decrypts. The survey
+    /// used to look at signing keys alone, so a revocation of such a key was
+    /// taken for someone else's and stored with no question asked.
+    #[test]
+    fn a_revocation_certificate_for_a_key_the_agent_cannot_sign_with_waits_for_you_to_confirm_it() {
+        let certifies_only = rpgp_core::agent::AgentHolds {
+            certify: agent_key(Some("D2760001240100000006")),
+            ..Default::default()
+        };
+        let decrypts_only = rpgp_core::agent::AgentHolds {
+            decrypt: agent_key(None),
+            ..Default::default()
+        };
+        for holds in [certifies_only, decrypts_only] {
+            let dir = tempfile::tempdir().unwrap();
+            let store =
+                Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+            let mine = generated("Me <me@example.org>");
+            let fingerprint = mine.cert.fingerprint().to_hex();
+            store.insert(&mine.cert).unwrap();
+            let path = dir.path().join("me.rev");
+            std::fs::write(&path, revoke::armor(&mine.revocation).unwrap()).unwrap();
+
+            let state = state_for(store);
+            {
+                let mut guard = lock(&state);
+                let loaded = read_store(&guard.store).expect("a healthy store reads");
+                guard.all = loaded.all;
+                guard
+                    .all
+                    .iter_mut()
+                    .find(|c| c.fingerprint == fingerprint)
+                    .expect("the key is listed")
+                    .agent = holds.clone();
+            }
+
+            let outcome = run_import(&state, &path);
+            assert!(
+                matches!(outcome, Ok(Imported::Confirm(_))),
+                "the user was not asked first when the agent holds {holds:?}: {outcome:?}"
+            );
+            let store = lock(&state).store.clone();
+            assert!(!revoked(&store, &fingerprint));
+        }
     }
 
     /// Someone else's revocation certificate is applied without a question,
@@ -5812,6 +5931,293 @@ mod tests {
         assert_eq!(withdrawals_by(&one_fp), 1, "the first key withdrew again");
         assert_eq!(withdrawals_by(&two_fp), 1);
         assert!(certify::withdrawable(&listed).is_empty());
+    }
+
+    /// An entry of the agent's listing, as far as the list and the dialogs
+    /// care: on the card `card` names, or in the agent's own store.
+    fn agent_key(card: Option<&str>) -> Option<rpgp_core::agent::AgentKey> {
+        Some(rpgp_core::agent::AgentKey {
+            keygrip: "0".repeat(40),
+            card_serial: card.map(str::to_owned),
+        })
+    }
+
+    /// What a survey finds when the agent holds `holds` of `fingerprint`, and
+    /// nothing else.
+    fn found(
+        fingerprint: &str,
+        holds: rpgp_core::agent::AgentHolds,
+    ) -> std::collections::HashMap<String, rpgp_core::agent::AgentHolds> {
+        std::collections::HashMap::from([(fingerprint.to_string(), holds)])
+    }
+
+    /// The certifiers the dialog lists once opened on `fingerprint`'s row.
+    fn certifiers_for(ui: &AppWindow, state: &Shared, fingerprint: &str) -> Vec<(String, String)> {
+        click_row(ui, state, fingerprint);
+        ui.invoke_open_certify();
+        lock(state).certify_certifiers.clone()
+    }
+
+    /// A key whose primary only gpg-agent holds opens Certify when the survey
+    /// after a reload finds it there, and the dialog lists it, although no
+    /// row changes: the agent keeps it in its own store, so there is no card
+    /// serial to show.
+    ///
+    /// The button counted secret key files alone, and the survey, which
+    /// learns what the agent holds after the reload has drawn the list,
+    /// touched the rows and nothing else, and those only for a card. So a
+    /// user whose only key was in the agent, or on a card, could never open
+    /// the dialog that would have certified with it.
+    #[test]
+    fn a_primary_only_the_agent_holds_opens_certify_once_the_survey_finds_it() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        // The public halves alone, as a key the agent holds is stored here.
+        let me = generated("Me <me@example.org>").cert;
+        let bob = generated("Bob <bob@example.org>").cert;
+        store.insert(&me).unwrap();
+        store.insert(&bob).unwrap();
+        let (me_fp, bob_fp) = (me.fingerprint().to_hex(), bob.fingerprint().to_hex());
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        assert!(
+            !ui.get_can_certify(),
+            "premise: nothing in the store itself can certify"
+        );
+
+        let survey = found(
+            &me_fp,
+            rpgp_core::agent::AgentHolds {
+                certify: agent_key(None),
+                ..Default::default()
+            },
+        );
+        land_survey(&ui, &state, &survey, &[]);
+        assert!(
+            ui.get_can_certify(),
+            "the survey found a primary in the agent and left Certify closed"
+        );
+        assert_eq!(
+            certifiers_for(&ui, &state, &bob_fp),
+            [(me_fp, "Me <me@example.org>".to_string())]
+        );
+    }
+
+    /// A key whose card holds only its subkeys, the primary being kept
+    /// offline as most YubiKey guides advise, is not offered to certify with:
+    /// it opens no Certify button, and the dialog another key opens does not
+    /// list it. It can sign, and the sign dialog still offers it.
+    ///
+    /// The dialog listed every certificate the agent could sign for, labelled
+    /// "(smartcard)", and certifying with it failed at the last step for want
+    /// of the primary key.
+    #[test]
+    fn a_card_holding_only_the_subkeys_is_not_offered_to_certify_with() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let card = generated("Card <card@example.org>").cert;
+        let bob = generated("Bob <bob@example.org>").cert;
+        store.insert(&card).unwrap();
+        store.insert(&bob).unwrap();
+        let (card_fp, bob_fp) = (card.fingerprint().to_hex(), bob.fingerprint().to_hex());
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let subkeys_only = rpgp_core::agent::AgentHolds {
+            sign: agent_key(Some("D2760001240100000006")),
+            decrypt: agent_key(Some("D2760001240100000006")),
+            certify: None,
+        };
+        land_survey(&ui, &state, &found(&card_fp, subkeys_only.clone()), &[]);
+        assert!(
+            !ui.get_can_certify(),
+            "a card without the primary key opened Certify"
+        );
+
+        // With a key in the store that can certify, the dialog opens, and
+        // lists that key alone.
+        let local = generated("Local <local@example.org>").cert;
+        let local_fp = local.fingerprint().to_hex();
+        let store = lock(&state).store.clone();
+        store.insert_secret(&local).unwrap();
+        lock(&state).all = read_store(&store).expect("a healthy store reads").all;
+        apply_filter(&ui, &state);
+        land_survey(&ui, &state, &found(&card_fp, subkeys_only), &[]);
+        assert!(ui.get_can_certify(), "premise: the local key can certify");
+        assert_eq!(
+            certifiers_for(&ui, &state, &bob_fp),
+            [(local_fp, "Local <local@example.org>".to_string())],
+            "the dialog offered a key that cannot certify"
+        );
+
+        ui.invoke_open_sign_encrypt();
+        assert!(
+            lock(&state).se_signers.iter().any(|(f, _)| *f == card_fp),
+            "the card signs, and should be offered as a signer"
+        );
+    }
+
+    /// A certificate is not offered to certify itself, which core refuses. A
+    /// key the agent alone holds is the user's own, yet the details pane has
+    /// no secret key file to disable Certify by on its row, as it does for a
+    /// key in the store; so its own dialog can open, and must not list it.
+    #[test]
+    fn a_certificate_is_not_offered_to_certify_itself() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let me = generated("Me <me@example.org>").cert;
+        let bob = generated("Bob <bob@example.org>").cert;
+        store.insert(&me).unwrap();
+        store.insert(&bob).unwrap();
+        let (me_fp, bob_fp) = (me.fingerprint().to_hex(), bob.fingerprint().to_hex());
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let survey = found(
+            &me_fp,
+            rpgp_core::agent::AgentHolds {
+                certify: agent_key(Some("D2760001240100000006")),
+                ..Default::default()
+            },
+        );
+        land_survey(&ui, &state, &survey, &[]);
+        assert!(ui.get_can_certify());
+
+        assert!(
+            certifiers_for(&ui, &state, &me_fp).is_empty(),
+            "a certificate was offered to certify itself"
+        );
+        assert_eq!(certifiers_for(&ui, &state, &bob_fp).len(), 1);
+    }
+
+    /// "(smartcard)" beside a certifier says that certifying with it will ask
+    /// for the card, so it goes by where the agent holds the primary key,
+    /// which certifies, and not the signing key, which the list's badge
+    /// shows; and not at all where the store holds a usable primary, which is
+    /// signed with first.
+    #[test]
+    fn a_certifier_is_labelled_smartcard_when_its_primary_is_on_one() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let card = generated("Card <card@example.org>").cert;
+        let file = generated("File <file@example.org>").cert;
+        let local = generated("Local <local@example.org>").cert;
+        let bob = generated("Bob <bob@example.org>").cert;
+        store.insert(&card).unwrap();
+        store.insert(&file).unwrap();
+        store.insert_secret(&local).unwrap();
+        store.insert(&bob).unwrap();
+        let (card_fp, file_fp, local_fp, bob_fp) = (
+            card.fingerprint().to_hex(),
+            file.fingerprint().to_hex(),
+            local.fingerprint().to_hex(),
+            bob.fingerprint().to_hex(),
+        );
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let on_card = || agent_key(Some("D2760001240100000006"));
+        let survey = std::collections::HashMap::from([
+            (
+                card_fp.clone(),
+                rpgp_core::agent::AgentHolds {
+                    certify: on_card(),
+                    ..Default::default()
+                },
+            ),
+            // The signing key on a card, the primary in the agent's store.
+            (
+                file_fp.clone(),
+                rpgp_core::agent::AgentHolds {
+                    sign: on_card(),
+                    certify: agent_key(None),
+                    ..Default::default()
+                },
+            ),
+            // The primary on a card, and usable in the store as well.
+            (
+                local_fp.clone(),
+                rpgp_core::agent::AgentHolds {
+                    certify: on_card(),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        land_survey(&ui, &state, &survey, &[]);
+
+        let mut listed = certifiers_for(&ui, &state, &bob_fp);
+        listed.sort();
+        let mut expected = vec![
+            (card_fp, "Card <card@example.org> (smartcard)".to_string()),
+            (file_fp, "File <file@example.org>".to_string()),
+            (local_fp, "Local <local@example.org>".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(listed, expected);
+    }
+
+    /// A secret key file whose primary is a GnuPG stub, as `gpg
+    /// --export-secret-subkeys` writes one for a primary kept offline, does
+    /// not open Certify, and the dialog does not list it: certifying signs
+    /// with the primary, and there is none here to sign with. The full
+    /// export of the same key, imported over it, does both.
+    ///
+    /// The button counted any secret key file, and the dialog too, so the
+    /// key was offered and certifying with it failed at the last step.
+    #[test]
+    fn a_secret_key_file_whose_primary_is_a_stub_does_not_open_certify() {
+        const SUBKEYS_ONLY: &[u8] =
+            include_bytes!("../../rpgp-core/tests/fixtures/gnupg-secret-subkeys.asc");
+        const FULL: &[u8] = include_bytes!("../../rpgp-core/tests/fixtures/gnupg-secret-keys.asc");
+        const STUBBED: &str = "B44CCCCF9992862E40561636268C734A550768D8";
+
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let import = |store: &Store, name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            store.import_file(&path).unwrap();
+        };
+        import(&store, "subkeys.asc", SUBKEYS_ONLY);
+        let bob = generated("Bob <bob@example.org>").cert;
+        store.insert(&bob).unwrap();
+        let bob_fp = bob.fingerprint().to_hex();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let summary = |state: &Shared| {
+            lock(state)
+                .all
+                .iter()
+                .find(|c| c.fingerprint == STUBBED)
+                .cloned()
+                .expect("the fixture is listed")
+        };
+        assert!(
+            summary(&state).has_secret && summary(&state).can_certify,
+            "premise: a secret key file, for a key whose flags certify"
+        );
+        assert!(!ui.get_can_certify(), "a stubbed primary opened Certify");
+        assert!(certifiers_for(&ui, &state, &bob_fp).is_empty());
+
+        let store = lock(&state).store.clone();
+        import(&store, "full.asc", FULL);
+        lock(&state).all = read_store(&store).expect("a healthy store reads").all;
+        apply_filter(&ui, &state);
+        assert!(ui.get_can_certify(), "the full export should open Certify");
+        assert_eq!(
+            certifiers_for(&ui, &state, &bob_fp)
+                .into_iter()
+                .map(|(fingerprint, _)| fingerprint)
+                .collect::<Vec<_>>(),
+            [STUBBED]
+        );
     }
 
     /// Publish refuses a certificate that is not one of the user's own keys,

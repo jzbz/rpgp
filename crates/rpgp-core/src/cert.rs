@@ -141,6 +141,16 @@ pub struct CertSummary {
     pub can_encrypt: bool,
     /// Whether this certificate carries secret key material.
     pub has_secret: bool,
+    /// Whether that secret key material includes the primary key's, in a form
+    /// this process can sign with ([`crate::secret::can_sign_here`]), rather
+    /// than the GnuPG stub `has_secret` counts as well: `gpg
+    /// --export-secret-subkeys` writes one where the primary is kept offline,
+    /// and `--export-secret-keys` one for every key on a card. Certifying signs
+    /// with the primary key and nothing else, so this, and not `has_secret`,
+    /// says whether the certificate can certify without gpg-agent. The caller
+    /// that sets `has_secret` from the store fills this in from
+    /// [`crate::Store::primary_secret_fingerprints`].
+    pub primary_secret: bool,
     /// Filled in by the caller from [`crate::wot`]; `from_cert` cannot know it,
     /// because authentication is a property of the whole store, not of one
     /// certificate.
@@ -170,11 +180,12 @@ pub struct CertSummary {
     /// offering one: without it, every signature the key made before it was
     /// retired, or that a thief dates to then, goes on verifying.
     pub revocation_hard: bool,
-    /// Serial of the smartcard whose key can sign for this certificate, when
-    /// the user's gpg-agent reports one. Filled in by the caller.
-    pub card_serial: Option<String>,
-    /// The agent can sign for this certificate, card or not.
-    pub agent_backed: bool,
+    /// What the user's gpg-agent holds of this certificate, in its own store
+    /// or on a smartcard, for signing, certifying and decrypting each. Filled
+    /// in by the caller from [`crate::agent::annotate`], which asks the agent,
+    /// so empty until the caller has heard from it, and whenever no agent
+    /// answers.
+    pub agent: crate::agent::AgentHolds,
 }
 
 impl CertSummary {
@@ -359,6 +370,7 @@ impl CertSummary {
             can_sign,
             can_encrypt,
             has_secret,
+            primary_secret: crate::secret::can_sign_here(cert.primary_key().key()),
             authentication: crate::Authentication::Unknown,
             is_trust_root: false,
             implicit_root: false,
@@ -366,9 +378,16 @@ impl CertSummary {
             sha1_accepted: false,
             revocation: reason.as_ref().map(describe_revocation),
             revocation_hard: reason.is_some_and(|(reason, _)| reason.is_hard()),
-            card_serial: None,
-            agent_backed: false,
+            agent: Default::default(),
         }
+    }
+
+    /// Serial of the smartcard holding the key gpg-agent signs for this
+    /// certificate with, when it is on one: the key [`CertSummary::agent`]
+    /// holds for signing, which is what the list's smartcard badge has always
+    /// stood for. The key it certifies with can be elsewhere.
+    pub fn card_serial(&self) -> Option<&str> {
+        self.agent.sign.as_ref()?.card_serial.as_deref()
     }
 
     /// `SCE` in Kleopatra's shorthand: certify, sign, encrypt.
