@@ -1,24 +1,28 @@
-//! Connecting to gpg-agent: how long a connection may take, and how often
-//! gpgconf runs to make one.
+//! Connecting to gpg-agent: how long a connection may take, how often gpgconf
+//! runs to make one, and which agent it reaches when the GnuPG home cannot be
+//! seen.
 //!
-//! sequoia-gpg-agent finds the agent by running gpgconf, which it looks up on
-//! PATH, so each test here puts a stand-in first on this process's PATH for as
-//! long as it runs, and puts PATH back when it ends. The stand-in writes down
-//! every time it is run and with what, and then runs the real gpgconf, or, when
-//! a test asks, never answers. Nothing outside this test process sees it. The
-//! tests run one at a time, since PATH, and the agent rpgp-core asks, are the
-//! whole process's.
+//! rpgp-core finds the agent by running gpgconf, which it looks for on PATH
+//! first, so each test here puts a stand-in first on this process's PATH for
+//! as long as it runs, and puts PATH back when it ends. The stand-in writes
+//! down every time it is run and with what, and then runs the real gpgconf,
+//! or, when a test asks, never answers, or answers with a listing the test
+//! wrote. Nothing outside this test process sees it. The tests run one at a
+//! time, since PATH, and the agent rpgp-core asks, are the whole process's.
 //!
-//! The agents they reach are their own, as in `tests/gpg_agent.rs`: started in
-//! a temporary GnuPG home, told never to start scdaemon, given no pinentry that
-//! could show anything, and stopped when the test ends, however it ends. Where
-//! GnuPG is not installed, the tests that need it skip rather than fail, unless
-//! `RPGP_TEST_REQUIRE_GPG_AGENT` is set. Unix only: the stand-in is a shell
-//! script.
+//! The agents they reach are their own. Either one is started, as in
+//! `tests/gpg_agent.rs`, in a temporary GnuPG home, told never to start
+//! scdaemon, given no pinentry that could show anything, and stopped when the
+//! test ends, however it ends; or a stand-in answers on a socket in a
+//! temporary directory, which the stand-in for gpgconf names. Where GnuPG is
+//! not installed, the tests that need it skip rather than fail, unless
+//! `RPGP_TEST_REQUIRE_GPG_AGENT` is set. Unix only: the stand-in for gpgconf is
+//! a shell script.
 
 #![cfg(unix)]
 
 use std::ffi::OsString;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -83,6 +87,9 @@ impl StandIn {
              \x20 echo $$ >> '{at}/hanging'\n\
              \x20 exec sleep 120\n\
              fi\n\
+             if [ -e '{at}/listing' ]; then\n\
+             \x20 exec cat '{at}/listing'\n\
+             fi\n\
              {run_the_real_one}\n"
         );
         let gpgconf = dir.path().join("gpgconf");
@@ -130,6 +137,12 @@ impl StandIn {
     /// From now on, gpgconf never answers.
     fn hang(&self) {
         std::fs::write(self.dir.path().join("hang"), b"").unwrap();
+    }
+
+    /// From now on, gpgconf prints `listing`, whatever it is asked, and
+    /// succeeds, and the real one is not run.
+    fn answer_with(&self, listing: &str) {
+        std::fs::write(self.dir.path().join("listing"), listing).unwrap();
     }
 }
 
@@ -300,6 +313,100 @@ impl Drop for Silent {
     }
 }
 
+/// The key [`Answering`] holds: its keygrip, and the serial number of the
+/// card it says the key is on.
+const HELD: (&str, &str) = (
+    "EF8CE31AE9E310D660C7C9709A028442A8B52112",
+    "D2760001240103040006123456780000",
+);
+
+/// A stand-in for an agent, on a socket: it greets every connection, answers
+/// every question, says it holds one key, [`HELD`], and writes down what it
+/// was asked.
+struct Answering {
+    socket: PathBuf,
+    stop: Arc<AtomicBool>,
+    asked: Arc<Mutex<Vec<String>>>,
+    listening: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Answering {
+    fn bind(socket: &Path) -> Self {
+        let listener = UnixListener::bind(socket).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let listening = {
+            let (stop, asked) = (Arc::clone(&stop), Arc::clone(&asked));
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if let Ok(stream) = stream {
+                        let asked = Arc::clone(&asked);
+                        std::thread::spawn(move || Answering::answer(stream, &asked));
+                    }
+                }
+            })
+        };
+        Answering {
+            socket: socket.to_path_buf(),
+            stop,
+            asked,
+            listening: Some(listening),
+        }
+    }
+
+    /// Hold one conversation, as gpg-agent would for what rpgp-core asks
+    /// while it lists keys.
+    fn answer(stream: UnixStream, asked: &Mutex<Vec<String>>) {
+        let mut replies = &stream;
+        let _ = replies.write_all(b"OK Pleased to meet you\n");
+        for line in BufReader::new(&stream).lines() {
+            let Ok(line) = line else { break };
+            asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(line.clone());
+            let reply = match line.as_str() {
+                "KEYINFO --list" => format!(
+                    "S KEYINFO {} T {} OPENPGP.1 - - - - -\nOK\n",
+                    HELD.0, HELD.1
+                ),
+                "GETINFO version" => "D 2.4.9\nOK\n".to_string(),
+                // What gpg-agent says on a connection that is not restricted.
+                "GETINFO restricted" => "ERR 67109120 False <GPG Agent>\n".to_string(),
+                "BYE" => {
+                    let _ = replies.write_all(b"OK closing connection\n");
+                    break;
+                }
+                _ => "OK\n".to_string(),
+            };
+            if replies.write_all(reply.as_bytes()).is_err() {
+                break;
+            }
+        }
+    }
+
+    fn asked(&self) -> Vec<String> {
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for Answering {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = UnixStream::connect(&self.socket);
+        if let Some(listening) = self.listening.take() {
+            let _ = listening.join();
+        }
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
 /// Ask the agent what it holds, on a thread of its own, and give back its
 /// answer and how long it took, or panic if it has not answered by the time
 /// [`WATCHDOG`] is up.
@@ -363,7 +470,7 @@ fn a_gpgconf_that_never_answers_holds_the_caller_only_until_the_timeout() {
     let error = answer.expect_err("a gpgconf that never answered found an agent");
     assert!(error.contains("did not answer in time"), "{error}");
     assert!(took < BOUND, "took {took:?}");
-    assert_eq!(stand_in.calls(), ["--list-dirs homedir"]);
+    assert_eq!(stand_in.calls(), ["--list-dirs"]);
 }
 
 /// An agent that accepts a connection and then never says a word costs the
@@ -424,21 +531,12 @@ fn gpgconf_runs_until_an_agent_answers_and_again_only_once_it_is_gone() {
     agent::set_home(AgentHome::At(home.dir.clone()));
 
     let missing = agent::keys().expect_err("an agent answered for a home that does not exist");
-    assert_eq!(
-        stand_in.calls(),
-        ["--list-dirs homedir", "--list-dirs"],
-        "{missing}"
-    );
+    assert_eq!(stand_in.calls(), ["--list-dirs"], "{missing}");
 
     home.create();
     stand_in.clear();
     agent::keys().unwrap_or_else(|e| panic!("no agent was found or started: {e}"));
-    let discovered = [
-        "--list-dirs homedir",
-        "--list-dirs",
-        "--create-socketdir",
-        "--launch gpg-agent",
-    ];
+    let discovered = ["--list-dirs", "--create-socketdir", "--launch gpg-agent"];
     assert_eq!(
         stand_in.calls(),
         discovered,
@@ -481,4 +579,75 @@ fn gpgconf_runs_until_an_agent_answers_and_again_only_once_it_is_gone() {
     stand_in.clear();
     agent::keys().unwrap();
     assert_eq!(stand_in.calls(), Vec::<String>::new());
+}
+
+/// An agent listening on the socket gpgconf names for a home that is not
+/// there is reached, and no agent is started for that home, whether one
+/// answers or not.
+///
+/// This is the Flatpak: its manifest shares the host agent's socket
+/// directory, and not `~/.gnupg`, which the sandbox therefore never sees.
+/// sequoia-gpg-agent refused a home that did not exist before it tried the
+/// socket, so the host's agent, listening where the runtime's gpgconf said,
+/// was never asked, and no card key was found or used from inside it.
+///
+/// Here gpgconf is a stand-in too, which names, as the runtime's does inside
+/// the Flatpak, a socket in a directory that is there and a home that is not:
+/// a socket in a temporary directory, where a stand-in for the agent listens,
+/// and a home that is never made. So this needs neither GnuPG nor a runtime
+/// directory for its socket, and runs on macOS as on Linux.
+#[test]
+fn an_agent_whose_home_cannot_be_seen_is_reached_on_its_socket_and_none_is_started() {
+    let stand_in = StandIn::install();
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, home) = (dir.path().join("S.gpg-agent"), dir.path().join("gnupg"));
+    stand_in.answer_with(&format!(
+        "socketdir:{}\nagent-socket:{}\nhomedir:{}\n",
+        escaped(dir.path()),
+        escaped(&socket),
+        escaped(&home)
+    ));
+    let agent = Answering::bind(&socket);
+    agent::set_home(AgentHome::At(home.clone()));
+
+    let keys =
+        agent::keys().unwrap_or_else(|e| panic!("the agent on the socket went unasked: {e}"));
+    assert!(!home.exists(), "premise: the home was never made");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].keygrip, HELD.0);
+    assert_eq!(keys[0].card_serial.as_deref(), Some(HELD.1));
+    assert!(
+        agent.asked().iter().any(|asked| asked == "KEYINFO --list"),
+        "asked: {:?}",
+        agent.asked()
+    );
+    assert_eq!(
+        stand_in.calls(),
+        ["--list-dirs"],
+        "gpgconf was asked for more than where the agent listens"
+    );
+
+    // With nothing listening there any more, nothing is started in its place.
+    drop(agent);
+    stand_in.clear();
+    let error = agent::keys()
+        .expect_err("an agent answered where none was listening")
+        .to_string();
+    assert!(
+        error.contains("does not exist or cannot be seen"),
+        "{error}"
+    );
+    assert_eq!(stand_in.calls(), ["--list-dirs"], "{error}");
+    assert!(!home.exists(), "a home was made for an agent to start in");
+}
+
+/// `path` as gpgconf writes a value in its listing, with a percent sign, a
+/// colon, a comma and a line break escaped.
+fn escaped(path: &Path) -> String {
+    path.to_str()
+        .expect("a temporary directory's path is UTF-8")
+        .replace('%', "%25")
+        .replace(':', "%3a")
+        .replace(',', "%2c")
+        .replace('\n', "%0a")
 }

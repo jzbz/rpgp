@@ -68,7 +68,8 @@ cargo test --workspace
 Some tests are `#[ignore]`d because they need the network, a smartcard, a PIN
 prompt or your own `gpg-agent`. Run them with `-- --ignored`. No other test
 reaches your agent: the ones that exercise the agent start one of their own in
-a temporary directory, and skip where GnuPG is not installed.
+a temporary directory, or stand in for one, and those that need GnuPG skip
+where it is not installed.
 
 To try the app with content in it, seed a throwaway store. It writes only
 inside the `XDG_DATA_HOME` you give it:
@@ -426,6 +427,31 @@ PC/SC transaction, so a second process asking the reader directly gets
 
 Two things follow, both good. **rPGP never sees a PIN** — the agent runs the
 user's own `pinentry`. And there is no PC/SC dependency.
+
+rPGP finds the agent by asking `gpgconf` where it listens, and has `gpgconf`
+start one if none is running and the GnuPG home is there. It looks for `gpgconf`
+on `PATH` first, and then where GnuPG is installed. An app opened from the Finder
+or the Dock is not given the `PATH` a shell has, so on macOS that is where
+Homebrew (`/opt/homebrew/bin`, `/usr/local/bin`), GPG Suite
+(`/usr/local/MacGPG2/bin`) and MacPorts (`/opt/local/bin`) put it; on Windows,
+`GnuPG\bin` under `Program Files (x86)` and `Program Files`; and elsewhere,
+`/usr/bin`. On Windows the paths Gpg4win's `gpgconf` prints are used as they
+are, with no `cygpath`; a GnuPG built for Cygwin or MSYS2, if its `gpgconf` comes
+first on `PATH`, needs its `cygpath` there too.
+
+The Flatpak reaches the host's agent through the socket in
+`/run/user/<uid>/gnupg` that its manifest shares, and through nothing else. It
+cannot see `~/.gnupg`, which holds the host's secret keys, so it starts no agent
+of its own: the host's has to be running, or be started by systemd when its
+socket is opened, as some distributions set up. A `gpg` command on the host
+that needs the agent, such as one that signs, decrypts or lists secret keys,
+starts it, and so does `gpgconf --launch gpg-agent`. The directory itself has
+to be there when rPGP starts, since Flatpak shares only what exists at that
+moment: where nothing has run GnuPG since login, and systemd does not listen
+for it, rPGP has to be restarted once something has. An agent serving a GnuPG
+home other than the Flatpak's `GNUPGHOME`, or `~/.gnupg` where that is unset,
+is not reached, because GnuPG gives each such home's socket a directory of its
+own.
 
 Signing, certifying and decrypting all work on a card. Where the agent puts its
 prompt is the agent's business: `sequoia-gpg-agent` builds those options from

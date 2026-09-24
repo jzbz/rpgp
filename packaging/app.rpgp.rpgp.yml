@@ -46,7 +46,14 @@ finish-args:
   # Smartcard support. rPGP never touches the reader: it asks the host's
   # gpg-agent, which owns the card and raises its own PIN prompt, so the secret
   # never leaves the card and rPGP never sees the PIN. That requires reaching
-  # the agent's socket on the host.
+  # the agent's socket on the host, and this shares that and nothing more: not
+  # ~/.gnupg, which holds the secret keys. So rPGP connects to the socket the
+  # runtime's gpgconf names, /run/user/<uid>/gnupg/S.gpg-agent, and starts no
+  # agent of its own for a home it cannot see; the host's has to be running,
+  # or be started by systemd when the socket is opened. The directory is
+  # shared only if it is there when the app starts. ":create" is no remedy:
+  # Flatpak makes the directory mode 0755, and GnuPG, finding it open to
+  # others, puts the agent's socket in ~/.gnupg instead, on the host as well.
   - --filesystem=xdg-run/gnupg
 
   # Note what is *not* here: no --filesystem=home. The user's own files are

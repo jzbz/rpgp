@@ -295,13 +295,14 @@ jobs:
       #
       # No other test reaches a gpg-agent. rpgp-core's agent tests
       # (tests/gpg_agent.rs and tests/agent_connection.rs) start one of their
-      # own in a temporary directory, and skip where GnuPG is not installed.
-      # On Linux, where a step above makes sure it is,
+      # own in a temporary directory, or stand in for one, and skip where
+      # GnuPG is not installed. On Linux, where a step above makes sure it is,
       # RPGP_TEST_REQUIRE_GPG_AGENT makes them fail instead, so that the agent
       # paths cannot quietly stop being tested. macOS runs them only if its
-      # image happens to carry GnuPG, bar the one that stands in for a gpgconf
-      # that never answers, and Windows not at all: their stand-ins for
-      # pinentry and gpgconf are shell scripts.
+      # image happens to carry GnuPG, bar the two that stand in for gpgconf
+      # altogether, one that never answers and one that names a stand-in
+      # agent's socket, and Windows not at all: their stand-ins for pinentry
+      # and gpgconf are shell scripts.
       - name: Test
         env:
           RPGP_TEST_REQUIRE_GPG_AGENT: ${{ runner.os == 'Linux' && '1' || '' }}

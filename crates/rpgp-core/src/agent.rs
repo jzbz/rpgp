@@ -15,12 +15,19 @@
 //! Choosing a key and asking the agent are kept apart: `select_key` and
 //! `decryption_attempts` decide from what the agent listed, without a
 //! connection, so that what they choose can be tested where there is no agent.
+//!
+//! Finding the agent is rPGP's own, in [`gpgconf`], because sequoia-gpg-agent's
+//! way cannot find it on macOS or Windows, or from inside the Flatpak; that
+//! module says why. Only the connection to the socket it finds is
+//! sequoia-gpg-agent's.
+
+mod gpgconf;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock, PoisonError, RwLock};
 
-use sequoia_gpg_agent::{Agent, Context, KeyPair};
+use sequoia_gpg_agent::{Agent, KeyPair};
 use sequoia_ipc::Keygrip;
 use sequoia_openpgp::packet::key::{PublicParts, UnspecifiedRole};
 use sequoia_openpgp::packet::{Key, PKESK};
@@ -49,7 +56,7 @@ pub enum AgentHome {
     /// default home when it is unset.
     User,
     /// The agent serving this GnuPG home directory, started there if none is
-    /// running yet.
+    /// running yet and the directory exists.
     At(PathBuf),
     /// No agent at all. Every question fails at once, as it does on a machine
     /// without GnuPG, and nothing is looked up or started.
@@ -133,44 +140,44 @@ fn runtime() -> Result<&'static Runtime> {
 /// another of each.
 const ENUMERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// What gpgconf said about the agent of one [`AgentHome`], kept from the first
-/// connection through it that worked.
+/// Where the agent of one [`AgentHome`] listens, as gpgconf said, kept from
+/// the first connection to it that worked.
 ///
-/// A context is only paths: GnuPG's home and its sockets, which
-/// sequoia-gpg-agent 0.6.2 finds by running gpgconf twice (`Context::new`).
-/// Every connection used to build a new one, and then run gpgconf twice more,
-/// to create the socket directory and launch an agent that was almost always
-/// running already (`Agent::connect`): four processes before the socket was
-/// tried, and on Windows a `cygpath` for every line gpgconf printed. Every
-/// keypair paid for another connection besides, only to learn the socket's
-/// path. With the context kept, gpgconf runs for the first connection, and
-/// again only once the socket it named does not answer, as when the agent has
-/// been stopped.
+/// Every connection used to learn it afresh, running gpgconf twice through
+/// sequoia-gpg-agent 0.6.2 (`Context::new`), and then twice more, to create
+/// the socket directory and launch an agent that was almost always running
+/// already (`Agent::connect`): four processes before the socket was tried, and
+/// on Windows a `cygpath` for every line gpgconf printed. Every keypair paid
+/// for another connection besides, only to learn the socket's path. With the
+/// socket kept, gpgconf runs for the first connection, once
+/// ([`gpgconf::find`]), and again only once the socket does not answer, as
+/// when the agent has been stopped.
 ///
-/// Only a context an agent has answered through is kept. gpgconf failing, or
-/// naming a home that does not exist, is how a machine looks before GnuPG is
+/// Only a socket an agent has answered on is kept. gpgconf failing, or naming
+/// a home that does not exist, is how a machine looks before GnuPG is
 /// installed or first run, and either can change while the app is open, which
-/// should not need the app restarted. A connection through the kept context
-/// that fails asks gpgconf again before it gives up, and one that gives up, or
-/// runs out of time, drops the context; see [`reach`].
+/// should not need the app restarted. A connection to the kept socket that
+/// fails asks gpgconf again before it gives up, and one that gives up, or runs
+/// out of time, drops the socket; see [`reach`].
 ///
 /// Kept per home, because the tests point the process at agents of their own;
 /// the app asks one home for as long as it runs. Nothing the agent holds is
 /// kept, only where it listens: a card inserted since is in the next listing.
-static KNOWN: Mutex<Option<(AgentHome, Arc<Context>)>> = Mutex::new(None);
+static KNOWN: Mutex<Option<(AgentHome, PathBuf)>> = Mutex::new(None);
 
-/// The context kept for `home`, if one is.
-fn known(home: &AgentHome) -> Option<Arc<Context>> {
+/// The socket kept for `home`, if one is.
+fn known(home: &AgentHome) -> Option<PathBuf> {
     KNOWN
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .as_ref()
         .filter(|(kept_for, _)| kept_for == home)
-        .map(|(_, ctx)| Arc::clone(ctx))
+        .map(|(_, socket)| socket.clone())
 }
 
-fn remember(home: &AgentHome, ctx: &Arc<Context>) {
-    *KNOWN.lock().unwrap_or_else(PoisonError::into_inner) = Some((home.clone(), Arc::clone(ctx)));
+fn remember(home: &AgentHome, socket: &Path) {
+    *KNOWN.lock().unwrap_or_else(PoisonError::into_inner) =
+        Some((home.clone(), socket.to_path_buf()));
 }
 
 fn forget(home: &AgentHome) {
@@ -184,8 +191,8 @@ fn connect() -> Result<Agent> {
     Ok(connected()?.0)
 }
 
-/// A connection to the agent, and the context it was reached through.
-fn connected() -> Result<(Agent, Arc<Context>)> {
+/// A connection to the agent, and the socket it was reached on.
+fn connected() -> Result<(Agent, PathBuf)> {
     #[cfg(test)]
     CONNECTS.with(|count| count.set(count.get() + 1));
 
@@ -225,59 +232,55 @@ fn connected() -> Result<(Agent, Arc<Context>)> {
 /// Connect to the agent of `home`, whose GnuPG home is `dir`, or GnuPG's
 /// default where that is `None`.
 ///
-/// Through the context kept for `home` when there is one. Otherwise, or when
-/// its socket does not answer, as sequoia-gpg-agent's `Agent::connect` would,
-/// in the same steps but in a different order: gpgconf is asked for a context,
-/// its socket is tried, and only if nothing is listening there is gpgconf told
-/// to launch an agent and the socket tried again. `Agent::connect` launches
-/// first, every time, and against an agent that accepts a connection and then
-/// never answers, which is what a hung agent does, gpgconf's launch never
-/// returns: it waits on that agent's greeting through `gpg-connect-agent`. A
-/// socket that is there but silent is left to the timeout instead, which lets
-/// go of it, and launches nothing that would outlive the attempt.
+/// On the socket kept for `home` when there is one. Otherwise, or when that
+/// socket does not answer, in the steps sequoia-gpg-agent's `Agent::connect`
+/// takes, but in a different order: gpgconf is found and asked where the agent
+/// listens ([`gpgconf::find`]), that socket is tried, and only if nothing is
+/// listening there is an agent started and the socket tried again. Not even
+/// then where the home is not there, as inside the Flatpak; see `Never` in
+/// `gpgconf::Route`. `Agent::connect` launches first, every time, and
+/// against an agent that accepts a connection and then never answers, which
+/// is what a hung agent does, gpgconf's launch never returns: it waits on that
+/// agent's greeting through `gpg-connect-agent`. A socket that is there but
+/// silent is left to the timeout instead, which lets go of it, and launches
+/// nothing that would outlive the attempt.
 ///
 /// gpgconf runs on the runtime's blocking pool. `tokio::time::timeout` checks
-/// its deadline only when the future it holds is pending, and gpgconf, which
-/// sequoia-gpg-agent runs with `std::process::Command`, blocks inside the poll
-/// that started it: the timeout could not fire until gpgconf exited, and a
-/// gpgconf that hung held the caller with it. From the blocking pool, the wait
-/// is a pending task like any other. What is left inside the poll is the
-/// socket's own connect, which sequoia-gpg-agent makes blocking before it
-/// awaits the greeting. On Unix that blocks only while the socket's queue of
-/// connections waiting to be accepted is full, as that of an agent stopped
-/// outright can become. On Windows it is a TCP connect to the local port the
-/// socket file names, which the system bounds, and against a GnuPG built for
-/// Cygwin a handshake after it, which nothing does.
+/// its deadline only when the future it holds is pending, and gpgconf, run
+/// with `std::process::Command`, blocks inside the poll that started it: the
+/// timeout could not fire until gpgconf exited, and a gpgconf that hung held
+/// the caller with it. From the blocking pool, the wait is a pending task like
+/// any other. What is left inside the poll is the socket's own connect, which
+/// sequoia-gpg-agent makes blocking before it awaits the greeting. On Unix
+/// that blocks only while the socket's queue of connections waiting to be
+/// accepted is full, as that of an agent stopped outright can become. On
+/// Windows it is a TCP connect to the local port the socket file names, which
+/// the system bounds, and against a GnuPG built for Cygwin a handshake after
+/// it, which nothing does.
 ///
-/// A new context is kept once an agent has answered through it. Nothing is
-/// forgotten here; the caller forgets the kept context if this fails.
+/// A new socket is kept once an agent has answered on it. Nothing is forgotten
+/// here; the caller forgets the kept socket if this fails.
 async fn reach(
     home: &AgentHome,
     dir: Option<PathBuf>,
-) -> std::result::Result<(Agent, Arc<Context>), sequoia_gpg_agent::Error> {
-    if let Some(ctx) = known(home)
-        && let Ok(agent) = Agent::connect_to_agent(ctx.socket("agent")?).await
+) -> std::result::Result<(Agent, PathBuf), sequoia_gpg_agent::Error> {
+    if let Some(socket) = known(home)
+        && let Ok(agent) = Agent::connect_to_agent(&socket).await
     {
-        return Ok((agent, ctx));
+        return Ok((agent, socket));
     }
 
-    let ctx = Arc::new(
-        off_the_poll(move || match dir {
-            None => Context::new(),
-            Some(dir) => Context::with_homedir(dir),
-        })
-        .await?,
-    );
-    let agent = match Agent::connect_to_agent(ctx.socket("agent")?).await {
+    let found = off_the_poll(move || gpgconf::find(dir)).await?;
+    let socket = found.socket.clone();
+    let agent = match Agent::connect_to_agent(&socket).await {
         Ok(agent) => agent,
         Err(_) => {
-            let launching = Arc::clone(&ctx);
-            off_the_poll(move || launching.start("gpg-agent")).await?;
-            Agent::connect_to_agent(ctx.socket("agent")?).await?
+            off_the_poll(move || found.start_agent()).await?;
+            Agent::connect_to_agent(&socket).await?
         }
     };
-    remember(home, &ctx);
-    Ok((agent, ctx))
+    remember(home, &socket);
+    Ok((agent, socket))
 }
 
 /// Run `work`, which runs gpgconf, on the runtime's blocking pool, so that the
@@ -366,17 +369,14 @@ pub fn signer(cert: &Cert, key: &Key<PublicParts, UnspecifiedRole>) -> Result<Ke
     })
 }
 
-/// The agent's socket: that of the context the last connection that worked
-/// went through, or, when there is none, of a new connection's.
+/// The agent's socket: the one the last connection that worked went through,
+/// or, when there is none, a new connection's.
 fn socket() -> Result<PathBuf> {
     let home = HOME.read().unwrap_or_else(PoisonError::into_inner).clone();
-    let ctx = match known(&home) {
-        Some(ctx) => ctx,
-        None => connected()?.1,
-    };
-    ctx.socket("agent")
-        .map(PathBuf::from)
-        .map_err(|e| Error::invalid(format!("no gpg-agent to talk to: {e}")))
+    match known(&home) {
+        Some(socket) => Ok(socket),
+        None => Ok(connected()?.1),
+    }
 }
 
 /// Whether the agent can act for any signing-capable key of `cert`, and if so
