@@ -85,6 +85,11 @@ impl VerifyResult {
 ///
 /// A password-only message is what `gpg -c` produces.
 ///
+/// The signature, when there is one, names each of `recipients` as a
+/// certificate the message was meant for, so that one of them who sends it on
+/// to somebody else cannot pass it off as meant for its new reader. What that
+/// rests on where the message is read is set out on [`Helper`]'s `decrypt`.
+///
 /// `Zeroizing`, to match the decrypt side: [`Helper`] has held its candidate
 /// passwords that way since it was written, and [`crate::keygen::KeyGenRequest`]
 /// its passphrase. This half took a plain `String` and so left the caller's
@@ -149,10 +154,39 @@ fn encrypt_stream(
         .add_passwords(passwords.into_iter().map(|p| Password::from(p.as_str())))
         .build()?;
 
+    // The signature names every certificate the message is encrypted to, in
+    // an Intended Recipient Fingerprint subpacket each, the subpacket RFC 9580
+    // defines for this. Without them the signature binds the signer to the
+    // words and to nothing about whom they were for: a recipient could take
+    // the signed message out of its encryption and send it on under
+    // encryption of their own, and the new reader would be shown a message
+    // signed by the sender and encrypted to them, which is what one the
+    // sender had meant for them looks like. Sequoia's decryptor, which rPGP's
+    // own decrypt runs, checks the list against the certificate `Helper`'s
+    // `decrypt` credits with the key that opened the message, and that
+    // method's doc says how far the check can be relied on.
+    //
+    // The sender is named like anyone else when among the recipients, as a
+    // sender keeping a copy to read is: that copy is checked too, and would
+    // read as bad with the sender left off. A password has no certificate to
+    // name, and a message opened with one is not checked; nor is a signed
+    // message sent on with no encryption at all, which reads as unencrypted
+    // instead (see [`VerifyResult::encrypted`]).
+    //
+    // The list is inside the encryption, where only the recipients can read
+    // it, and adds to what the session-key packets in front of it already
+    // tell anyone only which certificate each key they name belongs to. A
+    // hidden recipient, whose packet names no key, would be unhidden to the
+    // others by being listed, so should rPGP ever write one it has to be left
+    // off.
     let message = match signer {
         Some((cert, password)) => {
             let keypair = signing_keypair(cert, password)?;
-            Signer::new(message, keypair)?.build()?
+            let mut signer = Signer::new(message, keypair)?;
+            for recipient in recipients {
+                signer = signer.add_intended_recipient(recipient);
+            }
+            signer.build()?
         }
         None => message,
     };
@@ -801,6 +835,38 @@ impl Argon2Budget {
 }
 
 impl DecryptionHelper for Helper<'_> {
+    /// Open the message, and answer with the certificate whose key did, or
+    /// with `None` where a password did.
+    ///
+    /// The certificate is not only for [`VerifyResult::decrypted_with`].
+    /// Sequoia's decryptor compares it with the Intended Recipient Fingerprint
+    /// subpackets of every signature in the message, and reports one that
+    /// names recipients but not this certificate as bad. That is what keeps a
+    /// signed message a recipient sent on to someone else from reading as
+    /// meant for them (see [`encrypt_stream`]). It holds only while both ways
+    /// in by key below answer with a certificate rather than `None`, and only
+    /// as far as the certificate they answer with is the reader's.
+    ///
+    /// The key does not settle that, since one key can be carried by several
+    /// certificates, and each way in answers with the first it comes to: the
+    /// local one with the first secret certificate in the order the secrets
+    /// directory lists them, the agent's with the first in the store, which
+    /// lists version 6 fingerprints before version 4 ones and each version in
+    /// hex order (see [`crate::agent::decryption_attempts`]). Binding an
+    /// encryption key to a certificate takes nothing from the key's owner, and
+    /// the store takes in a certificate carrying someone else's key like any
+    /// other. So whoever binds the reader's encryption key to a certificate of
+    /// his own, and gets that into the reader's store ahead of the reader's,
+    /// has every message the agent opens with that key credited to him. A
+    /// message he was sent and sends on to the reader then reads as good, its
+    /// signature naming him. And a message genuinely meant for the reader
+    /// reads as bad, its signature naming the reader and not him; for that he
+    /// need send nothing. The local way is out of his reach, since it goes by
+    /// the secret keys, and his certificate holds none of the reader's. Where
+    /// two of the reader's own certificates carry one encryption key, as when
+    /// a card's keys are added to a new certificate, either way credits a
+    /// message that key opens to whichever comes first, and a signature naming
+    /// the other reads as bad.
     fn decrypt(
         &mut self,
         pkesks: &[PKESK],
@@ -2423,6 +2489,168 @@ mod tests {
         assert!(result.all_good(), "signatures: {:?}", result.signatures);
         assert_eq!(result.signatures[0].signer, "Alice <alice@example.org>");
         assert_eq!(result.decrypted_with, Some(bob.fingerprint().to_hex()));
+    }
+
+    /// `message` as `holder`, one of its recipients, could send it on to `to`:
+    /// the session key that `holder`'s encryption key opens, wrapped again for
+    /// `to`'s, in front of the sender's encrypted container exactly as it was
+    /// written, and every other session-key packet left out.
+    ///
+    /// The cheapest way to send a message on, and the signature inside is not
+    /// so much as rewritten. Taking the signed message out and encrypting it
+    /// afresh looks the same to its new reader, since what the reader's check
+    /// goes by is which certificate's key opened the message.
+    ///
+    /// Version 6 session-key packets only, which is what [`encrypt`] writes to
+    /// any key generated here: both standards advertise the version 2
+    /// container, and that takes version 6 packets.
+    fn forwarded(message: &[u8], holder: &Cert, to: &Cert) -> Vec<u8> {
+        use sequoia_openpgp::packet::SEIP;
+        use sequoia_openpgp::packet::pkesk::PKESK6;
+
+        let policy = policy();
+        let packets: Vec<Packet> = PacketPile::from_bytes(message)
+            .unwrap()
+            .into_children()
+            .collect();
+        // A version 6 packet leaves the cipher to the container, and Sequoia's
+        // decryptor hands it over from there in the same way.
+        let cipher = packets.iter().find_map(|p| match p {
+            Packet::SEIP(SEIP::V2(seip)) => Some(seip.symmetric_algo()),
+            _ => None,
+        });
+        let mut keypair = holder
+            .keys()
+            .secret()
+            .with_policy(&policy, None)
+            .for_transport_encryption()
+            .next()
+            .unwrap()
+            .key()
+            .clone()
+            .into_keypair()
+            .unwrap();
+        let (_, session_key) = packets
+            .iter()
+            .find_map(|p| match p {
+                Packet::PKESK(pkesk @ PKESK::V6(_)) => pkesk.decrypt(&mut keypair, cipher),
+                _ => None,
+            })
+            .expect("the holder's key opens a version 6 packet in the message");
+        let valid = to.with_policy(&policy, None).unwrap();
+        let key = valid
+            .keys()
+            .for_transport_encryption()
+            .next()
+            .unwrap()
+            .key();
+        let rewrapped = PKESK6::for_recipient(&session_key, key).unwrap();
+        let mut sent_on = vec![Packet::from(rewrapped)];
+        sent_on.extend(
+            packets
+                .into_iter()
+                .filter(|p| !matches!(p, Packet::PKESK(_) | Packet::SKESK(_))),
+        );
+        packet_bytes(&sent_on)
+    }
+
+    /// Alice signs and encrypts "You are hired" to Bob, and Bob sends it on to
+    /// Carol. Her signature used to say nothing about whom it was for, so
+    /// Carol was shown a good signature from Alice on a message encrypted to
+    /// her, which is what one Alice had meant for her looks like. It now
+    /// names every certificate the message was encrypted to, and Carol, whose
+    /// key opened a message that does not name her, is told it is not valid.
+    ///
+    /// Everyone it was sent to still reads a good signature: Bob, Alice
+    /// herself, who is among the recipients as a sender keeping a copy is,
+    /// and whoever holds the password it was also sealed with, which has no
+    /// certificate to be named and is not checked. Every pairing of the two
+    /// standards for Alice's key and for the others', since a signature names
+    /// fingerprints of either version whatever its own: where the two differ,
+    /// it names Alice's of one version and Bob's of the other.
+    #[test]
+    fn a_signed_message_sent_on_to_someone_else_is_not_reported_as_meant_for_them() {
+        use crate::keygen::Standard;
+
+        let pairings = Standard::ALL
+            .into_iter()
+            .flat_map(|signing| Standard::ALL.map(|receiving| (signing, receiving)));
+        for (signing, receiving) in pairings {
+            let key = |user_id: &str, standard| {
+                let mut request = KeyGenRequest::new(user_id);
+                request.standard = standard;
+                generate(&request).unwrap().cert
+            };
+            let alice = key("Alice <alice@example.org>", signing);
+            let bob = key("Bob <bob@example.org>", receiving);
+            let carol = key("Carol <carol@example.org>", receiving);
+            let standards = format!("{signing:?} to {receiving:?}");
+            // What each reader holds: their own key, and Alice's certificate
+            // to check her signature with.
+            let reader = |secret: &Cert| {
+                let (dir, store) = scratch_store();
+                store.insert(&alice).unwrap();
+                store.insert_secret(secret).unwrap();
+                (dir, store)
+            };
+
+            let password = Zeroizing::new("staff only".to_string());
+            let mut sent = Vec::new();
+            encrypt(
+                &[alice.clone(), bob.clone()],
+                std::slice::from_ref(&password),
+                Some((&alice, None)),
+                b"You are hired",
+                &mut sent,
+            )
+            .unwrap();
+
+            for recipient in [&alice, &bob] {
+                let (_dir, store) = reader(recipient);
+                let mut plaintext = Vec::new();
+                let opened = decrypt(&store, &sent, &[], &mut plaintext).unwrap();
+                assert_eq!(plaintext, b"You are hired");
+                assert_eq!(
+                    opened.decrypted_with,
+                    Some(recipient.fingerprint().to_hex())
+                );
+                assert!(
+                    opened.all_good(),
+                    "{standards}: {} was sent it: {:?}",
+                    crate::revoke::name_of(recipient),
+                    opened.signatures
+                );
+            }
+            let (_dir, store) = scratch_store();
+            store.insert(&alice).unwrap();
+            let opened = decrypt(&store, &sent, &[password.as_str()], &mut Vec::new()).unwrap();
+            assert!(
+                opened.all_good(),
+                "{standards}: the password was sent it: {:?}",
+                opened.signatures
+            );
+
+            let (_dir, store) = reader(&carol);
+            let mut plaintext = Vec::new();
+            let opened =
+                decrypt(&store, &forwarded(&sent, &bob, &carol), &[], &mut plaintext).unwrap();
+            assert_eq!(plaintext, b"You are hired");
+            assert_eq!(
+                opened.decrypted_with,
+                Some(carol.fingerprint().to_hex()),
+                "premise: Carol's key opened what Bob sent on"
+            );
+            assert!(
+                !opened.all_good(),
+                "{standards}: Bob sent it on to Carol, and Alice's signature still reads \
+                 as meant for her"
+            );
+            assert!(
+                opened.signatures[0].detail.contains("intended recipient"),
+                "{standards}: {:?}",
+                opened.signatures
+            );
+        }
     }
 
     #[test]

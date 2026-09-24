@@ -269,6 +269,32 @@ That is one field doing two jobs on the way in and two on the way out. In Sign
 *anyone* will need are deliberately separate fields, because confusing them
 would hand out the wrong secret.
 
+A message that is signed as well as encrypted names every certificate it was
+encrypted to inside its signature, so that a recipient cannot simply send it on
+to someone else as though the signer had meant it for them: where a signature
+names recipients and the certificate whose key opened the message is not among
+them, rPGP reports the signature as not valid. A password has no certificate
+to name, so a message opened with its password is not checked this way, and
+neither is a signed message sent on with no encryption at all, which rPGP
+shows as not encrypted.
+
+The check goes by which certificate rPGP takes the key that opened the message
+to belong to, and one key can be carried by several: binding someone's
+encryption key to a certificate of your own needs nothing from them. A key only
+gpg-agent holds, a card key for one, is taken to belong to the first
+certificate in your store that carries it, version 6 fingerprints before
+version 4 ones and each version in hex order. So once you have imported a
+certificate that someone has bound your key to, and it comes before yours,
+messages the agent opens with that key are credited to him. A message he was
+sent and sends on to you then reads as meant for you, and signed messages that
+really were meant for you read as not valid, since their signatures name your
+certificate and not his; for that he need send you nothing. A secret key in
+rPGP's own store is out of his reach: a message it opens is credited to the
+certificate that key is kept with. And where two certificates of your own carry
+one encryption key, as when a card's keys are added to a new certificate, a
+message whose signature names one of them can be credited to the other and read
+as not valid.
+
 When a message is for one of your keys that has a passphrase, and none was
 entered or the one entered does not unlock it, the failure says so and names
 the key, rather than that no secret key opens the message. Only for a key the

@@ -493,6 +493,120 @@ fn signs_and_certifies_through_the_agent() {
     assert_eq!(agent_home.prompts(), 0);
 }
 
+/// `message` as `holder`, one of its recipients, could send it on to `to`:
+/// the session key `holder`'s own key opens, wrapped again for `to`'s key, in
+/// front of the sender's encrypted container as it was written. Version 6
+/// packets only, which is what `ops::encrypt` writes to a key generated here.
+fn forwarded(message: &[u8], holder: &Cert, to: &Cert) -> Vec<u8> {
+    use sequoia_openpgp::packet::SEIP;
+    use sequoia_openpgp::packet::pkesk::PKESK6;
+
+    let policy = StandardPolicy::new();
+    let packets: Vec<Packet> = PacketPile::from_bytes(message)
+        .unwrap()
+        .into_children()
+        .collect();
+    let cipher = packets.iter().find_map(|p| match p {
+        Packet::SEIP(SEIP::V2(seip)) => Some(seip.symmetric_algo()),
+        _ => None,
+    });
+    let mut keypair = holder
+        .keys()
+        .secret()
+        .with_policy(&policy, None)
+        .for_transport_encryption()
+        .next()
+        .unwrap()
+        .key()
+        .clone()
+        .into_keypair()
+        .unwrap();
+    let (_, session_key) = packets
+        .iter()
+        .find_map(|p| match p {
+            Packet::PKESK(pkesk @ PKESK::V6(_)) => pkesk.decrypt(&mut keypair, cipher),
+            _ => None,
+        })
+        .expect("the holder's key opens a version 6 packet in the message");
+    let rewrapped = PKESK6::for_recipient(&session_key, &encryption_keys(to)[0]).unwrap();
+    let mut sent_on = Vec::new();
+    Packet::from(rewrapped).serialize(&mut sent_on).unwrap();
+    for packet in packets
+        .iter()
+        .filter(|p| !matches!(p, Packet::PKESK(_) | Packet::SKESK(_)))
+    {
+        packet.serialize(&mut sent_on).unwrap();
+    }
+    sent_on
+}
+
+/// Whether a signature was meant for its reader is settled against the
+/// certificate a decryption credits, and through the agent that is the first
+/// in the store found carrying the key that opened the message. So Alice's
+/// signature, made through the agent on a message she encrypted to Bob,
+/// reads as good where the agent opens it for Bob, and as not valid where
+/// Bob has sent it on to Carol and the agent opens it for her. Each store
+/// here holds one certificate carrying each key, so which comes first does
+/// not arise; `ops::Helper`'s `decrypt` says where it does.
+#[test]
+fn a_signed_message_sent_on_is_found_out_where_the_agent_opens_it() {
+    let Some(agent_home) = Throwaway::start() else {
+        return;
+    };
+    let alice = key("Alice <alice@example.org>", None);
+    let bob = key("Bob <bob@example.org>", None);
+    let carol = key("Carol <carol@example.org>", None);
+    for cert in [&alice, &bob, &carol] {
+        agent_home.give(cert);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let alices = public_store(&dir, &[&alice]);
+    let signer = alices.lookup(&alice.fingerprint().to_hex()).unwrap();
+    let mut sent = Vec::new();
+    ops::encrypt(
+        std::slice::from_ref(&bob),
+        &[],
+        Some((&signer, None)),
+        b"You are hired",
+        &mut sent,
+    )
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let bobs = public_store(&dir, &[&alice, &bob]);
+    let opened = ops::decrypt(&bobs, &sent, &[], &mut Vec::new()).unwrap();
+    assert_eq!(opened.decrypted_with, Some(bob.fingerprint().to_hex()));
+    assert!(opened.all_good(), "{:?}", opened.signatures);
+
+    let dir = tempfile::tempdir().unwrap();
+    let carols = public_store(&dir, &[&alice, &carol]);
+    let mut plaintext = Vec::new();
+    let opened = ops::decrypt(
+        &carols,
+        &forwarded(&sent, &bob, &carol),
+        &[],
+        &mut plaintext,
+    )
+    .unwrap();
+    assert_eq!(plaintext, b"You are hired");
+    assert_eq!(
+        opened.decrypted_with,
+        Some(carol.fingerprint().to_hex()),
+        "premise: the agent opened what Bob sent on with Carol's key"
+    );
+    assert!(
+        !opened.all_good(),
+        "Bob sent it on to Carol, and Alice's signature still reads as meant for her"
+    );
+    assert!(
+        opened.signatures[0].detail.contains("intended recipient"),
+        "{:?}",
+        opened.signatures
+    );
+    assert_eq!(agent_home.prompts(), 0);
+}
+
 /// `cert` with the secret halves of its primary key alone, or of its subkeys
 /// alone, as a card holds them when the primary is kept offline.
 fn with_secrets_of(cert: &Cert, primary: bool) -> Cert {

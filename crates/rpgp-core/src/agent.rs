@@ -641,6 +641,14 @@ fn held_as<'h>(
 pub(crate) struct Attempt<'a> {
     /// The certificate `key` was found on, which a message it opens is
     /// credited to.
+    ///
+    /// It is also what Sequoia checks the intended recipients a signature in
+    /// that message names against, so which certificate this is decides
+    /// whether a signed message reads as meant for its reader, one someone
+    /// sent on and one that was meant for them alike.
+    /// [`decryption_attempts`] takes each key once, on the first certificate
+    /// in the store's order that carries it, and that need not be the
+    /// reader's; see `ops::Helper`'s `decrypt`.
     pub(crate) cert: &'a Cert,
     pub(crate) key: Key<PublicParts, UnspecifiedRole>,
     pub(crate) pkesk: &'a PKESK,
