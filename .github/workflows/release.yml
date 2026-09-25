@@ -149,6 +149,16 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
 
+      # Generated rather than committed: it is 420K, derived entirely from
+      # Cargo.lock, and stale the moment a dependency moves. Generated first,
+      # because it needs only python3 and the lockfile, and it refuses a
+      # package the offline build could not fetch, which is better known now
+      # than after the runtime install. ci.yml runs it on every push to master
+      # and every pull request as well, but a manual run can name a commit CI
+      # never saw.
+      - name: Generate the offline cargo sources
+        run: python3 packaging/cargo-sources.py > packaging/cargo-sources.json
+
       - name: Install flatpak-builder
         timeout-minutes: 20
         run: |
@@ -219,11 +229,6 @@ jobs:
           echo "::error::If this is a 404 while pulling, Flathub is advertising a commit"
           echo "::error::it cannot serve yet; the run needs retrying later, not fixing."
           exit 1
-
-      # Generated rather than committed: it is 420K, derived entirely from
-      # Cargo.lock, and stale the moment a dependency moves.
-      - name: Generate the offline cargo sources
-        run: python3 packaging/cargo-sources.py > packaging/cargo-sources.json
 
       # The manifest in the tree names the released tag. Building the exact
       # commit that was checked out keeps the artifact honest even when the two

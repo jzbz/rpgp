@@ -6,6 +6,12 @@ source up front. Cargo.lock already records the sha256 of each .crate file, so
 this needs nothing but the lockfile — no downloads, and nothing to trust beyond
 what cargo already verifies on every build.
 
+Only crates.io packages are written as sources, and anything else in the
+lockfile is an error naming it: a git dependency, a git [patch] or a crate from
+another registry. Left out, or written as a crates.io archive, any of them
+would fail the offline build much later, in `cargo --offline fetch`, with
+nothing there to say that this script is why.
+
     python3 packaging/cargo-sources.py > packaging/cargo-sources.json
 """
 
@@ -15,6 +21,9 @@ import tomllib
 from pathlib import Path
 
 CRATES_IO = "https://static.crates.io/crates/{name}/{name}-{version}.crate"
+# How Cargo.lock names crates.io, whichever protocol fetched the index. It is
+# the only source the config below redirects to the vendored crates.
+CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 # Where the build expects the vendored registry to appear.
 VENDOR = "cargo/vendor"
 
@@ -25,13 +34,24 @@ def main() -> int:
 
     sources = []
     vendored = {}
+    unsupported = []
     for package in lock["package"]:
-        checksum = package.get("checksum")
-        if checksum is None:
-            # No checksum means a path dependency: the workspace's own crates,
+        name, version = package["name"], package["version"]
+        source = package.get("source")
+        if source is None:
+            # No source means a path dependency: the workspace's own crates,
             # which arrive with the git source rather than from the registry.
             continue
-        name, version = package["name"], package["version"]
+        if source != CRATES_IO_SOURCE:
+            # A git source has no .crate at static.crates.io and no checksum
+            # in the lockfile, and another registry's crates are not what the
+            # config below replaces.
+            unsupported.append(f"  {name} {version}, from {source}")
+            continue
+        checksum = package.get("checksum")
+        if checksum is None:
+            unsupported.append(f"  {name} {version}, from crates.io with no checksum")
+            continue
         sources.append(
             {
                 "type": "archive",
@@ -42,6 +62,18 @@ def main() -> int:
             }
         )
         vendored[f"{name}-{version}"] = {"package": checksum, "files": {}}
+
+    if unsupported:
+        print(
+            "cargo-sources.py: Cargo.lock has packages this cannot vendor for the Flatpak:",
+            *unsupported,
+            "Only crates.io packages are written as sources. A git or other-registry",
+            "source needs a source entry of its own and a [source] replacement in the",
+            "cargo config written here, the way flatpak-cargo-generator writes them.",
+            sep="\n",
+            file=sys.stderr,
+        )
+        return 1
 
     # cargo needs a .cargo-checksum.json beside each vendored crate, and a
     # config telling it to use the directory instead of the network.

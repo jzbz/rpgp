@@ -98,3 +98,16 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 opt-level = 3
 lto = "thin"
 strip = "debuginfo"
+
+# Sequoia protects every secret key it encrypts, v4 and v6 alike, with its
+# default S2K: iterated SHA-256 over 62 MiB. A protected key costs one pass for
+# each of its four key packets when it is generated and one more each time it
+# is unlocked, and with sha2 left at the dev profile's opt-level 0 a pass took
+# about a second, which was most of what the passphrase tests spent. Optimised,
+# it takes a few dozen milliseconds. Nothing else in the hashing path was worth
+# the same: digest and block-buffer at opt-level 3 as well measured no faster.
+# This reaches `cargo test` and `cargo run` alike, since the test profile
+# inherits dev's, changes nothing a release build does, and leaves debug
+# assertions and overflow checks on everywhere, rpgp's own crates included.
+[profile.dev.package.sha2]
+opt-level = 3

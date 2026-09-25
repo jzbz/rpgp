@@ -25,6 +25,18 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Both for the size of what each job caches, all of which has to fit in the
+  # repository's 10 GB. Incremental state only speeds up recompiling this
+  # workspace's own crates against the run that saved it, and it was more than
+  # a gigabyte of a test job's entry. Full debuginfo was most of the rest; line
+  # tables still give RUST_BACKTRACE a file and line for each frame. Built both
+  # ways on x86_64 Linux, the test job's target/ came to 0.7 GB compressed
+  # instead of 2.6 GB, clippy's to 0.3 GB instead of 0.7 GB, and a cold build
+  # took a fifth less time. The price is paid on a warm run, which compiles
+  # rpgp's own crates from scratch: after a one-line change, 57 seconds on that
+  # machine rather than about 20.
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   lint:
@@ -38,6 +50,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      # A dependency the Flatpak cannot build fails the push that adds it,
+      # rather than the next release. packaging/cargo-sources.py lists every
+      # crate for release.yml's offline build and refuses anything in
+      # Cargo.lock that is not from crates.io. First, because it needs nothing
+      # but python3 and the lockfile.
+      - name: Flatpak sources
+        run: python3 packaging/cargo-sources.py > /dev/null
 
       # capnproto is not optional: sequoia-ipc's build script runs the capnp
       # compiler unconditionally. fontconfig is what Slint draws text with on
@@ -134,15 +154,44 @@ jobs:
           echo "::error::apt failed twice; the Ubuntu mirrors are not answering"
           exit 1
 
-      - uses: actions/cache@v6
+      # The compiler's version, for the cache key below: cargo rebuilds what
+      # another rustc compiled rather than reuse it. `shell: bash` is what
+      # brings pipefail, so a rustc that fails stops the job here rather than
+      # leaving the version out of the key.
+      - name: Toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          v=$(rustc -V | tr -cs '[:alnum:].' '-')
+          echo "rustc=${v%-}" >> "$GITHUB_OUTPUT"
+
+      # Restored under its exact key or not at all. With a prefix to fall back
+      # on, a job whose key missed restored an older entry, built beside it and
+      # saved the two together, and nothing ever came out. A dependency moved
+      # in Cargo.lock gives every crate built on it a new file name, so the old
+      # files stay beside the new ones rather than being replaced: moving libc
+      # alone rebuilt 171 of 809 units and grew target/ by nearly 60%. Entries
+      # grew by a gigabyte or more at a time, the six of one run passed the
+      # repository's 10 GB, and GitHub evicted entries that later runs needed.
+      # Sweeping out the stale files instead would take a third-party tool, or
+      # this file knowing how cargo lays out target/.
+      #
+      # So a job whose key misses builds from nothing, once for each new
+      # compiler and each change to Cargo.lock, a manifest or this file. The
+      # key names all four because each changes what cargo builds, this file
+      # through `env` above. An entry restored under its own key is never saved
+      # again, so a key that left one out would restore a tree cargo cannot
+      # use, and every run would rebuild it: on 2026-09-07 a macOS job did,
+      # 560 crates in twelve minutes, after its image moved to Rust 1.98.
+      - uses: actions/cache/restore@v6
+        id: cache
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-lint-
+          key: ${{ runner.os }}-cargo-lint-${{ steps.toolchain.outputs.rustc }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
 
       - name: Versions
         run: cargo --version && cargo clippy --version && cargo fmt --version
@@ -154,6 +203,21 @@ jobs:
       # stays true is if letting one through fails the build.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Only from master, whose entries every branch and pull request can
+      # restore; a pull request's are readable by that pull request alone, and
+      # would only take room from master's. And only when the restore missed:
+      # on a hit the entry is already what this job would save. A miss leaves
+      # `cache-hit` unset rather than false, hence `!= 'true'`.
+      - uses: actions/cache/save@v6
+        if: github.ref == 'refs/heads/master' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   test:
     name: Test (${{ matrix.os }})
@@ -282,7 +346,17 @@ jobs:
         timeout-minutes: 10
         run: brew install capnp
 
-      - uses: actions/cache@v6
+      # The lint job's, and for the same reason.
+      - name: Toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          v=$(rustc -V | tr -cs '[:alnum:].' '-')
+          echo "rustc=${v%-}" >> "$GITHUB_OUTPUT"
+
+      # Restored and saved as the lint job's is, and for the same reasons.
+      - uses: actions/cache/restore@v6
+        id: cache
         with:
           path: |
             ~/.cargo/registry/index
@@ -292,8 +366,7 @@ jobs:
           # runner.arch is part of the key because runner.os is "Linux" for
           # both x86_64 and aarch64: without it the two Linux jobs would share
           # one cache and restore each other's target directory.
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-test-
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-${{ steps.toolchain.outputs.rustc }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
 
       # No display is set up, and none is needed: the GUI tests drive Slint
       # through its testing backend with no event loop.
@@ -320,6 +393,17 @@ jobs:
           RPGP_TEST_REQUIRE_GPG_AGENT: ${{ runner.os == 'Linux' && '1' || '' }}
         run: cargo test --workspace --locked
 
+      # As in the lint job: only from master, and only when the restore missed.
+      - uses: actions/cache/save@v6
+        if: github.ref == 'refs/heads/master' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
   windows-core:
     name: Windows (rpgp-core)
     runs-on: windows-latest
@@ -342,15 +426,25 @@ jobs:
         timeout-minutes: 10
         run: choco install capnproto -y --no-progress
 
-      - uses: actions/cache@v6
+      # The lint job's, and for the same reason. Under Git's bash, which every
+      # Windows image carries, so that it is the same step on every runner.
+      - name: Toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          v=$(rustc -V | tr -cs '[:alnum:].' '-')
+          echo "rustc=${v%-}" >> "$GITHUB_OUTPUT"
+
+      # Restored and saved as the lint job's is, and for the same reasons.
+      - uses: actions/cache/restore@v6
+        id: cache
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-core-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-core-
+          key: ${{ runner.os }}-cargo-core-${{ steps.toolchain.outputs.rustc }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
 
       # The lint job runs on Linux and so never sees the cfg(windows) module.
       - name: Clippy
@@ -358,6 +452,17 @@ jobs:
 
       - name: Test
         run: cargo test -p rpgp-core --locked
+
+      # As in the lint job: only from master, and only when the restore missed.
+      - uses: actions/cache/save@v6
+        if: github.ref == 'refs/heads/master' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   windows-workspace:
     name: Windows workspace
@@ -384,15 +489,35 @@ jobs:
         timeout-minutes: 10
         run: choco install capnproto -y --no-progress
 
-      - uses: actions/cache@v6
+      # The lint job's, under bash as in the job above.
+      - name: Toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          v=$(rustc -V | tr -cs '[:alnum:].' '-')
+          echo "rustc=${v%-}" >> "$GITHUB_OUTPUT"
+
+      # Restored and saved as the lint job's is, and for the same reasons.
+      - uses: actions/cache/restore@v6
+        id: cache
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-build-
+          key: ${{ runner.os }}-cargo-build-${{ steps.toolchain.outputs.rustc }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
 
       - name: Build
         run: cargo build --workspace --locked
+
+      # As in the lint job: only from master, and only when the restore missed.
+      - uses: actions/cache/save@v6
+        if: github.ref == 'refs/heads/master' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
