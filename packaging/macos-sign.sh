@@ -11,9 +11,13 @@
 #
 #   ./packaging/macos-sign.sh rpgp-v0.1.2-macos-universal.zip
 #
-# Takes the unsigned zip CI produced (or an unpacked rPGP.app) and leaves a
-# signed, notarised, stapled zip beside it, verified the way a stranger's Mac
-# will verify it.
+# Takes the unsigned zip CI produced (or an unpacked rPGP.app), signs,
+# notarises and staples the bundle, zips it again, and checks that new zip the
+# way a stranger's Mac will check it. Only once every check has passed does it
+# replace CI's zip, under the same name: the name the draft release, SHA256SUMS
+# and the Homebrew cask all expect. Until then the input is left exactly as it
+# was, so a run that fails can simply be run again. An rPGP.app gives rPGP.zip
+# beside it.
 #
 # One-time setup on this machine — see the block printed by --setup.
 set -eu
@@ -57,6 +61,19 @@ One-time setup on the signing Mac
    You want a line reading "Developer ID Application: <name> (<TEAMID>)".
    "Apple Development" is a different certificate and will notarise-reject.
 
+   Renewing is making a new certificate, from a new CSR, and the old one stays
+   valid until it expires. Leave it to expire: revoking it would stop every
+   copy it signed from launching. Until then this Mac holds two identities
+   under the same name, and the script stops rather than pick one. Choose the
+   newer (Keychain Access shows each certificate's expiry date, and its SHA-1
+   under Fingerprints) and name it by the 40-digit hash that find-identity
+   prints beside it:
+
+       RPGP_SIGN_IDENTITY=<SHA-1> ./packaging/macos-sign.sh <zip>
+
+   RPGP_SIGN_IDENTITY takes that hash or the identity's whole name, and only
+   ever a Developer ID Application identity.
+
 2. An App Store Connect API key, stored as a notarytool profile.
 
    Create it at App Store Connect > Users and Access > Integrations > App Store
@@ -94,23 +111,79 @@ command -v xcrun >/dev/null 2>&1 || die "xcrun not found — this must run on ma
 # that otherwise surface ten minutes into a notarisation wait.
 step "Preflight"
 
-IDENTITY="${RPGP_SIGN_IDENTITY:-}"
-if [ -z "$IDENTITY" ]; then
-    IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
-        | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)
-fi
-[ -n "$IDENTITY" ] || die "no 'Developer ID Application' identity in the keychain.
-  Found instead:
-$(security find-identity -v -p codesigning 2>&1 | sed 's/^/    /')
-  Run '$0 --setup' for what this needs."
+# The identity is picked by its certificate's SHA-1, and codesign is handed
+# that hash, never a name. A Developer ID Application certificate is not
+# renewed in place: the new one comes from a new CSR, the old one stays valid
+# until it expires, and both carry the same name, "Developer ID Application:
+# <name> (<TEAMID>)". codesign refuses a name that matches two identities, and
+# no name can tell those two apart; a hash can. So where more than one would
+# do, this stops and lists them rather than guess, before anything is unpacked.
+#
+# find-identity -v lists the valid identities whose private key is on this
+# Mac, one per line:
+#
+#   1) 0123456789ABCDEF0123456789ABCDEF01234567 "Developer ID Application: ..."
+#
+# The same certificate in two keychains can be listed twice, which codesign
+# treats as harmless. So does this: DEVIDS holds one "HASH NAME" line per
+# distinct certificate, and only Developer ID Application ones, which is what
+# keeps an Apple Development or Apple Distribution certificate out whichever
+# way it is named.
+IDENTITIES=$(security find-identity -v -p codesigning 2>&1) \
+    || die "security find-identity failed:
+$(printf '%s\n' "$IDENTITIES" | sed 's/^/    /')"
+DEVIDS=$(printf '%s\n' "$IDENTITIES" \
+    | sed -n 's/^ *[0-9][0-9]*) \([0-9A-Fa-f]\{40\}\) "\(Developer ID Application: .*\)"$/\1 \2/p' \
+    | awk '{ print toupper(substr($0, 1, 40)) substr($0, 41) }' | sort -u)
 
-case "$IDENTITY" in
-    "Developer ID Application: "*) ;;
-    *) die "'$IDENTITY' is not a Developer ID Application certificate.
+# RPGP_SIGN_IDENTITY narrows the choice: forty hex digits are a SHA-1, as they
+# are to codesign, and anything else has to be an identity's whole name.
+# Keychain Access shows a SHA-1 in pairs, "3E 1F 5A ...", so spaces, and the
+# colons other tools put there, are left out when looking for one.
+WANT="${RPGP_SIGN_IDENTITY:-}"
+HEX=$(printf '%s' "$WANT" | tr -d ' :')
+if [ -z "$WANT" ]; then
+    MATCHES=$DEVIDS
+elif [ ${#HEX} -eq 40 ] && [ -z "$(printf '%s' "$HEX" | tr -d '0-9A-Fa-f')" ]; then
+    WANT=$(printf '%s' "$HEX" | tr 'a-f' 'A-F')
+    MATCHES=$(printf '%s\n' "$DEVIDS" \
+        | WANT="$WANT" awk 'substr($0, 1, 40) == ENVIRON["WANT"]')
+else
+    MATCHES=$(printf '%s\n' "$DEVIDS" \
+        | WANT="$WANT" awk 'substr($0, 42) == ENVIRON["WANT"]')
+fi
+
+case $(printf '%s' "$MATCHES" | awk 'END { print NR }') in
+    1)
+        IDENTITY=${MATCHES%% *}
+        IDENTITY_NAME=${MATCHES#* }
+        ;;
+    0)
+        [ -z "$WANT" ] || die "RPGP_SIGN_IDENTITY names no Developer ID Application identity on this Mac:
+    '$RPGP_SIGN_IDENTITY'
+  It takes the SHA-1, or the whole name, of an identity whose name starts
+  'Developer ID Application: '. Found:
+$(printf '%s\n' "$IDENTITIES" | sed 's/^/    /')
   Apple Development and Apple Distribution certificates are for other purposes
-  and notarisation will reject a bundle signed with one." ;;
+  and notarisation will reject a bundle signed with one."
+        die "no 'Developer ID Application' identity in the keychain.
+  Found instead:
+$(printf '%s\n' "$IDENTITIES" | sed 's/^/    /')
+  Run '$0 --setup' for what this needs."
+        ;;
+    *)
+        die "more than one Developer ID Application identity would do, and this will not
+  guess between them:
+$(printf '%s\n' "$MATCHES" | sed 's/^/    /')
+  A renewed certificate leaves two until the old one expires. Choose the newer
+  (Keychain Access shows each one's expiry date, and its SHA-1 under
+  Fingerprints) and run this again with its hash:
+
+      RPGP_SIGN_IDENTITY=<SHA-1> $0 $INPUT"
+        ;;
 esac
-echo "  identity:  $IDENTITY"
+echo "  identity:  $IDENTITY_NAME"
+echo "             SHA-1 $IDENTITY"
 
 xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1 \
     || die "notarytool profile '$PROFILE' is missing or its credentials are rejected.
@@ -134,7 +207,9 @@ echo "  keychain:  unlocked"
 
 # ------------------------------------------------------------------- unpack
 WORK=$(mktemp -d) || die "could not create a working directory"
-trap 'rm -rf "$WORK"' EXIT
+# PARTIAL is the new zip before it has passed its checks; see Re-packing.
+PARTIAL=
+trap 'rm -rf "$WORK"; [ -z "$PARTIAL" ] || rm -f "$PARTIAL"' EXIT
 
 case "$INPUT" in
     *.zip)
@@ -179,13 +254,23 @@ xattr -cr "$APP"
 # sandboxed. allow-jit, allow-unsigned-executable-memory and
 # disable-library-validation are all cargo-cult here, and the middle one would
 # be a poor thing to put on a program that holds secret keys.
+#
+# The keychain advice on failure is for errSecInternalComponent alone. Given
+# for every failure, it pointed one with another cause, a timestamp server that
+# did not answer or a certificate name that matched two identities, at the
+# command that wants the login password on the command line. codesign's own
+# message is printed either way.
 step "Signing"
-run codesign --sign "$IDENTITY" \
-             --force --timestamp --options runtime \
-             --verbose "$APP" \
-    || die "codesign failed.
+if ! run codesign --sign "$IDENTITY" \
+                  --force --timestamp --options runtime \
+                  --verbose "$APP"; then
+    case "$_out" in
+        *errSecInternalComponent*) ;;
+        *) die "codesign failed; what it said is above." ;;
+    esac
+    die "codesign failed.
 
-  errSecInternalComponent here almost always means codesign could not use the
+  errSecInternalComponent almost always means codesign could not use the
   private key without asking, and could not ask: over SSH there is no way to
   show the keychain's 'allow access' prompt. Two ways round it —
 
@@ -197,6 +282,7 @@ run codesign --sign "$IDENTITY" \
 
            security set-key-partition-list -S apple-tool:,apple:,codesign: \\
              -s -k '<login password>' ~/Library/Keychains/login.keychain-db"
+fi
 
 run codesign --verify --deep --strict --verbose=2 "$APP" \
     || die "the signature did not verify immediately after signing"
@@ -238,25 +324,62 @@ run xcrun stapler staple "$APP" || die "stapling failed"
 
 # The order matters and is the step most often missed: the zip that ships has
 # to be made AFTER stapling. Re-using the submission zip ships an unstapled app.
+#
+# Made under a hidden name beside where it is going, and moved there only
+# once every check below has passed. For CI's zip that place is the input
+# itself, so writing straight to it would destroy the input before anything
+# was known about the result, and leave a rejected zip under the name the
+# release expects. Beside it rather than in $WORK so that the move is a rename
+# within one volume: the zip under the shipping name is only ever the old one
+# or the whole new one.
 step "Re-packing"
-FINAL="$OUTDIR/${BASE%-unsigned}.zip"
-rm -f "$FINAL"
-ditto -c -k --keepParent "$APP" "$FINAL"
+FINAL="$OUTDIR/$BASE.zip"
+PARTIAL="$OUTDIR/.$BASE.zip.partial"
+rm -f "$PARTIAL"
+ditto -c -k --keepParent "$APP" "$PARTIAL" || die "could not write $PARTIAL"
 
 # ------------------------------------------------------------------- verify
 # The checks a stranger's Mac will make, run here so a bad bundle is caught now
-# rather than by the first person to download it.
-step "Verifying"
-echo "  --- stapler validate (is the ticket actually in the bundle?) ---"
-xcrun stapler validate "$APP" 2>&1 | sed 's/^/    /'
-echo "  --- codesign (is the seal intact, including nested content?) ---"
-codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | sed 's/^/    /'
-echo "  --- spctl (what Gatekeeper decides) ---"
-spctl -a -vvv -t exec "$APP" 2>&1 | sed 's/^/    /'
+# rather than by the first person to download it. They run on the zip that
+# will ship, unpacked afresh, not on the bundle it was made from, so a re-pack
+# that lost the ticket or broke the seal is caught too. Each one stops the run
+# through run(), because a check piped straight into sed has its failure
+# swallowed like any other; and when one does, the input has not been touched.
+#
+# spctl's exit status alone is not enough: on a Mac where Gatekeeper
+# assessments have been turned off it accepts anything, with an override where
+# the source would be. So its verdict has to name the source as well,
+# "Notarized Developer ID". Neither says the ticket is in the bundle, since
+# online Gatekeeper fetches it from Apple instead; stapler validate is the
+# check for that, which is why it has to be able to stop the run too.
+step "Verifying the zip that will ship"
+mkdir "$WORK/check"
+ditto -x -k "$PARTIAL" "$WORK/check" || die "could not unpack $PARTIAL"
+SHIP="$WORK/check/$(basename "$APP")"
+[ -d "$SHIP" ] || die "$PARTIAL does not hold $(basename "$APP")"
+KEPT="Nothing was written to $FINAL."
 
-if ! spctl -a -t exec "$APP" >/dev/null 2>&1; then
-    die "Gatekeeper still rejects the bundle — do not ship this"
-fi
+echo "  --- stapler validate (is the ticket actually in the bundle?) ---"
+run xcrun stapler validate "$SHIP" \
+    || die "the zip that would ship has no valid stapled ticket.
+  $KEPT"
+echo "  --- codesign (is the seal intact, including nested content?) ---"
+run codesign --verify --deep --strict --verbose=2 "$SHIP" \
+    || die "the signature in the zip that would ship does not verify.
+  $KEPT"
+echo "  --- spctl (what Gatekeeper decides) ---"
+run spctl -a -vvv -t exec "$SHIP" \
+    || die "Gatekeeper rejects the bundle — do not ship this.
+  $KEPT"
+case "$_out" in
+    *"source=Notarized Developer ID"*) ;;
+    *) die "Gatekeeper let the bundle through, but not as notarised Developer ID;
+  what it said instead is above. Do not ship this.
+  $KEPT" ;;
+esac
+
+mv -f "$PARTIAL" "$FINAL" || die "could not move $PARTIAL to $FINAL"
+PARTIAL=
 
 printf '\n'
 printf 'done: %s\n' "$FINAL"
