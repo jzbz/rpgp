@@ -25,6 +25,15 @@ on:
         description: "Tag whose release assets to hash (e.g. v0.1.2)"
         required: true
 
+# The group release.yml runs in for the same tag, so a hash waits for an
+# upload in flight to finish instead of reading the draft halfway through it,
+# and never cancels that upload. The reverse can happen, and is right: a
+# release run for this tag cancels a hash in progress, because what it was
+# hashing is about to be replaced.
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -44,8 +53,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || {
-            echo "::error::no release for tag $TAG"
+          # One read, into a variable, and any failure of it stops the run.
+          # Piped from gh straight into the condition of the `if` below, a gh
+          # error read as "no signature attached", and the run went on to
+          # replace SHA256SUMS beside a signature over the old one.
+          #
+          # gh's own message is no guide to which failure it was. It looks the
+          # release up two ways at once, as a published release and as a
+          # draft, and one of the two always finds nothing; when the other
+          # fails, gh reports "release not found". So a draft that is there,
+          # read during a passing API error, looks exactly like a missing one,
+          # and the error below says to run this again before believing it.
+          assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name') || {
+            echo "::error::could not read the release for $TAG. gh reports"
+            echo "::error::a failed lookup as \"release not found\" too, so run"
+            echo "::error::this again before concluding that it is missing."
             exit 1
           }
 
@@ -54,8 +77,7 @@ jobs:
           # signature that fails against the file beside it — which reads as
           # tampering rather than as staleness. Refuse, and make the operator
           # decide.
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-               --json assets --jq '.assets[].name' | grep -qx 'SHA256SUMS.asc'; then
+          if grep -qx 'SHA256SUMS.asc' <<<"$assets"; then
             echo "::error::$TAG already has SHA256SUMS.asc. Re-hashing would"
             echo "::error::invalidate it. Delete the signature first if the"
             echo "::error::asset list has genuinely changed:"

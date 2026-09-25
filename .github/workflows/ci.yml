@@ -14,6 +14,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only, and written here rather than left to the repository's default,
+# which is read today but is a setting that can change without this file
+# changing. These jobs run the build scripts of every dependency and all of the
+# test code, and nothing they do needs to write. For the same reason no
+# checkout leaves its credential on disk: nothing after one uses git.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -28,6 +36,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # capnproto is not optional: sequoia-ipc's build script runs the capnp
       # compiler unconditionally. fontconfig is what Slint draws text with on
@@ -161,6 +171,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Same shape, and the same reasoning, as the lint job's copy above. It
       # is duplicated rather than factored into a local composite action
@@ -322,6 +334,8 @@ jobs:
     # bet that the GUI stack builds on Windows.
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Chocolatey's CDN rate-limits, and this call is as unbounded as apt was.
       - name: Install capnproto
@@ -362,6 +376,8 @@ jobs:
     # shipped for Windows on the strength of this.
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Chocolatey's CDN rate-limits, and this call is as unbounded as apt was.
       - name: Install capnproto

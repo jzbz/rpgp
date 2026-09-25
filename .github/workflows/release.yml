@@ -11,6 +11,16 @@
 # same access to the workflow as anything else in it. flatpak-builder comes
 # from apt rather than from an action for the same reason.
 #
+# And each one pinned to a full commit, its version in the comment beside it,
+# rather than to a tag its owner can move. This workflow makes the files people
+# download, and the signature over SHA256SUMS covers whatever CI produced, so
+# signing cannot catch an action that changed under its tag: whatever
+# upload-artifact carries out of a build, download-artifact hands to the one
+# job here holding a token that can write to a release. Moving to a newer
+# version means resolving its tag to the commit it names (`gh api
+# repos/actions/<name>/git/ref/tags/<tag>`, following an annotated tag through
+# git/tags/) and changing the SHA and the comment together.
+#
 # What is deliberately NOT published here is a bare Linux binary. One built on
 # a current distribution needs a glibc newer than Debian, Ubuntu LTS or Fedora
 # ship, and links fontconfig, freetype, sqlite3, png, brotli, bz2 and expat
@@ -28,9 +38,39 @@ on:
         description: "Tag or commit to build"
         required: true
 
-# Read by default; only the job that publishes gets write. The three build
-# jobs compile the build scripts of 800-odd crates, which run as ordinary code
-# on the runner beside the credential the checkout persists to disk.
+# One run per tag at a time. A tag moved and pushed again while its first run
+# is still building starts a second run under the same name, and both would
+# otherwise reach `release` and --clobber the same draft, whichever finished
+# last deciding file by file what it holds. The older run is cancelled
+# instead: what it was building is no longer what the tag names. checksums.yml
+# queues in the same group, so it never hashes a draft while an upload for
+# that tag is under way.
+#
+# The group is named for whatever the ref is, so a second dispatch of the
+# same commit or branch cancels the first as well, and the newer run is the
+# one to wait for. A re-run of an older run joins the group like a new run
+# and cancels a newer one in progress; if the tag has moved, the re-run's
+# Upload then refuses, and the newer run has to be started again.
+concurrency:
+  group: release-${{ inputs.ref || github.ref_name }}
+  cancel-in-progress: true
+
+# Read by default; only the job that publishes gets write. The build jobs
+# compile the build scripts of 800-odd crates, which run as ordinary code on
+# the runner, so no checkout here leaves its credential on disk for them to
+# find: nothing after a checkout needs git credentials. flatpak-builder clones
+# the public URL, and gh is handed its token explicitly.
+#
+# For the same reason no job here restores a cache, unlike ci.yml. A manual
+# run is dispatched on master whatever commit it builds, so it saves into
+# master's cache scope, which every later run can restore, a tag build
+# included. Cargo trusts what it finds there: it links a cached rlib whose
+# fingerprint looks fresh, and unpacks a cached .crate without checking it
+# against Cargo.lock, whose checksums it verifies only on download. A cache
+# would let whatever one manual run compiled decide what a release links. It
+# saved nothing either: no tag build ever restored one, because every release
+# bumps Cargo.lock and CI's larger caches evict the old entry first. What
+# ships is compiled here, from nothing.
 permissions:
   contents: read
 
@@ -43,12 +83,60 @@ env:
   TAG: ${{ inputs.ref || github.ref_name }}
 
 jobs:
+  # The commit every job below builds, resolved once. The build jobs start on
+  # separate runners, sometimes minutes apart, and if each checked out the ref
+  # by name, a tag moved during the run could put Flatpaks from one commit and
+  # an exe from another into the same release. Each checks out this SHA
+  # instead, and the Upload step refuses if the tag has since moved off it.
+  #
+  # actions/checkout still does the resolving, so a branch, a tag and a full
+  # SHA mean here what they meant when every job checked out inputs.ref. A tag
+  # push gives it no ref at all: it then fetches the pushed tag and fails
+  # unless that still names the commit the push event carried. Whether this is
+  # a tag build is read from the checkout rather than from the name:
+  # actions/checkout fetches the tag's ref when it was given a tag, and only
+  # then.
+  resolve:
+    name: Resolve the commit to build
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Resolve
+        id: resolve
+        run: |
+          set -euo pipefail
+          head=$(git rev-parse HEAD)
+          tag=
+          if tagged=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
+            if [ "$tagged" != "$head" ]; then
+              echo "::error::$TAG names $tagged, but the checkout is $head"
+              exit 1
+            fi
+            tag=$TAG
+          fi
+          echo "sha=$head" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "building $head${tag:+ as $tag}"
+
   bundle:
     name: Flatpak (${{ matrix.arch }})
+    needs: resolve
     timeout-minutes: 90
     strategy:
-      # One architecture failing must not hide the other's result: they are
-      # separate downloads and a release with one of them is still useful.
+      # Off so that one architecture failing does not cancel the other: that
+      # leg still finishes, and its bundle and log stay on the run. It does
+      # not make a release with one architecture. `release` needs every leg
+      # to have succeeded and attaches nothing otherwise, so after a failure
+      # "Re-run failed jobs" rebuilds only the broken leg, from the commit
+      # `resolve` already named, and then attaches the full set.
       fail-fast: false
       matrix:
         include:
@@ -56,9 +144,10 @@ jobs:
           - { os: ubuntu-24.04-arm, arch: aarch64 }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - name: Install flatpak-builder
         timeout-minutes: 20
@@ -142,9 +231,9 @@ jobs:
       #
       # `git rev-parse HEAD`, not GITHUB_SHA. On a manual run GITHUB_SHA is the
       # tip of the ref the workflow was *dispatched on* — master — while the
-      # checkout above honours inputs.ref and sits on the tag. HEAD is the
-      # commit being built by construction, on a tag push and a manual run
-      # alike.
+      # checkout above is the commit `resolve` found for inputs.ref. HEAD is
+      # the commit being built by construction, on a tag push and a manual run
+      # alike, and it has to be the one `resolve` named.
       #
       # `tag:` is rewritten with it, because flatpak-builder checks the two
       # against each other and refuses a source where they disagree ("Git
@@ -156,22 +245,20 @@ jobs:
       # right for a tag build and failed every other: a dispatch on an untagged
       # commit went on fetching v0.1.3 and was refused for it.
       #
-      # Whether this is a tag build is read from the checkout rather than from
-      # the name: actions/checkout fetches the tag's ref when it was given a
-      # tag, and only then.
+      # Whether this is a tag build is `resolve`'s answer. This checkout is of
+      # a bare commit and carries no tag to ask.
       - name: Point the manifest at this commit
+        env:
+          BUILD_SHA: ${{ needs.resolve.outputs.sha }}
+          BUILD_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
           head=$(git rev-parse HEAD)
-          tag=
-          if tagged=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
-            if [ "$tagged" != "$head" ]; then
-              echo "::error::$TAG names $tagged, but the checkout is $head"
-              exit 1
-            fi
-            tag=$TAG
+          if [ "$head" != "$BUILD_SHA" ]; then
+            echo "::error::the checkout is $head, but resolve named $BUILD_SHA"
+            exit 1
           fi
-          python3 - "$head" "$tag" <<'PY'
+          python3 - "$head" "$BUILD_TAG" <<'PY'
           import pathlib, re, sys
           sha, tag = sys.argv[1], sys.argv[2]
           p = pathlib.Path("packaging/app.rpgp.rpgp.yml")
@@ -207,7 +294,7 @@ jobs:
           sha256sum "$NAME"
           ls -lh "$NAME"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: flatpak-${{ matrix.arch }}
           path: '*.flatpak'
@@ -223,27 +310,19 @@ jobs:
   # without cutting a release.
   windows:
     name: Windows (x86_64)
+    needs: resolve
     timeout-minutes: 60
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       # Chocolatey's CDN rate-limits, as ci.yml notes.
       - name: Install capnproto
         timeout-minutes: 10
         run: choco install capnproto -y --no-progress
-
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-release-
 
       # Statically linked CRT, so the binary has no dependency outside Windows
       # itself. Without it the only non-system import is VCRUNTIME140.dll — the
@@ -263,7 +342,7 @@ jobs:
           Get-Item $name | Select-Object Name, Length
           (Get-FileHash -Algorithm SHA256 $name).Hash
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-x86_64
           path: '*.exe'
@@ -285,26 +364,23 @@ jobs:
   # need one per arch.
   macos:
     name: macOS (universal, signed by hand)
+    needs: resolve
     timeout-minutes: 60
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
-      - name: Install capnproto
+      # librsvg is for rsvg-convert, which renders the icon when the bundle is
+      # assembled. It is installed here, before the builds rather than after
+      # them, so that a Homebrew failure costs a minute instead of a finished
+      # build, and bounded because Homebrew is the same kind of unbounded
+      # network call ci.yml bounds.
+      - name: Install capnproto and librsvg
         timeout-minutes: 10
-        run: brew install capnp
-
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-release-
+        run: brew install capnp librsvg
 
       - name: Add the Intel target
         run: rustup target add x86_64-apple-darwin
@@ -326,9 +402,6 @@ jobs:
           set -euo pipefail
           cargo build --release --locked -p rpgp-gui --target aarch64-apple-darwin
           cargo build --release --locked -p rpgp-gui --target x86_64-apple-darwin
-
-      - name: Render the icon
-        run: brew install librsvg
 
       - name: Assemble the app bundle
         run: |
@@ -356,6 +429,10 @@ jobs:
           done
           iconutil -c icns rpgp.iconset -o "$APP/Contents/Resources/rpgp.icns"
 
+          # None of the YAML indentation reaches the file: the block scalar
+          # this script lives in strips it before bash runs, so the heredoc
+          # starts at column 0, and its closing PLIST has to stay level with
+          # the lines around it or the heredoc never ends.
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -374,8 +451,6 @@ jobs:
           </dict>
           </plist>
           PLIST
-          # The heredoc above is indented for YAML; strip that back out.
-          sed -i '' 's/^          //' "$APP/Contents/Info.plist"
 
           plutil -lint "$APP/Contents/Info.plist"
           echo "--- architectures ---"
@@ -396,14 +471,14 @@ jobs:
           ls -lh "$NAME"
           shasum -a 256 "$NAME"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-universal
           path: 'rpgp-*-macos-universal.zip'
 
   release:
     name: Attach to the release
-    needs: [bundle, windows]
+    needs: [resolve, bundle, windows]
     if: startsWith(inputs.ref || github.ref_name, 'v')
     timeout-minutes: 15
     runs-on: ubuntu-latest
@@ -411,7 +486,8 @@ jobs:
       contents: write
     steps:
       # Named patterns rather than everything the run produced, and `needs`
-      # lists exactly the jobs those patterns come from. Which jobs publish is
+      # lists exactly the jobs those patterns come from, besides `resolve`,
+      # which says what commit they were built from. Which jobs publish is
       # a decision, not a function of which finished first: collecting `*`
       # while waiting on a subset made publication a race. Adding a platform
       # means naming it twice, in `needs` and here, and that is the point.
@@ -443,12 +519,12 @@ jobs:
       # Trash" and nothing else. That bundle detours through the machine
       # holding the Developer ID key and is uploaded to this draft by hand.
       # See packaging/macos-sign.sh.
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: flatpak-*
           merge-multiple: true
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: windows-*
           merge-multiple: true
@@ -468,6 +544,7 @@ jobs:
       - name: Upload
         env:
           GH_TOKEN: ${{ github.token }}
+          BUILD_SHA: ${{ needs.resolve.outputs.sha }}
         run: |
           set -euo pipefail
 
@@ -480,16 +557,69 @@ jobs:
           fi
           ls -lh "${files[@]}"
 
-          # A tag push creates no release on its own, so make one if it is not
-          # already there. --verify-tag refuses to invent a tag that does not
-          # exist, which would otherwise turn a typo into a published release.
-          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          # The tag has to name the commit these files were built from. Every
+          # build job checked out the one commit `resolve` found, so they agree
+          # with each other; this ties them to the tag. It matters most on a
+          # re-run: "Re-run failed jobs" keeps the first attempt's builds and
+          # the commit it resolved, and the tag may have moved since. Asked
+          # for the bare SHA, which peels an annotated tag to its commit
+          # without GitHub also computing that commit's diff.
+          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" \
+            -H 'Accept: application/vnd.github.sha') || {
+            echo "::error::could not find the commit the tag $TAG names"
+            exit 1
+          }
+          if [ "$tagged" != "$BUILD_SHA" ]; then
+            echo "::error::$TAG names $tagged, but these files were built from $BUILD_SHA."
+            echo "::error::Run the workflow again for the tag as it now stands."
+            exit 1
+          fi
+
+          # Whether there is a release for the tag, whether it is a draft and
+          # what it carries, read so that any gh failure stops the step: taken
+          # for "no release" it would create a second draft beside the first,
+          # and taken for "no signature" it would --clobber assets under one.
+          # From the REST listing, which shows drafts to a token that can push,
+          # rather than from `gh release view`. That looks a release up two
+          # ways at once and answers "release not found" when one lookup says
+          # so and the other fails; for a draft the published-release lookup
+          # always says so, so a passing error in the draft lookup reads
+          # exactly like no release at all.
+          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.tag_name == env.TAG) | .id') || {
+            echo "::error::could not list the releases of $GITHUB_REPOSITORY"
+            exit 1
+          }
+          count=$(grep -c . <<<"$ids" || true)
+          case $count in
+          0)
+            # A tag push creates no release on its own, so make one.
+            # --verify-tag refuses to invent a tag that does not exist, which
+            # would otherwise turn a typo into a published release.
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag --draft \
               --title "rPGP $TAG" \
               --generate-notes
-          fi
+            # Just made, so a draft with nothing attached.
+            state=true
+            ;;
+          1)
+            state=$(gh api "repos/$GITHUB_REPOSITORY/releases/$ids" \
+              --jq '(.draft | tostring), .assets[].name') || {
+              echo "::error::could not read the release for $TAG"
+              exit 1
+            }
+            ;;
+          *)
+            echo "::error::$TAG has $count releases. Which one these files belong"
+            echo "::error::to is not for this workflow to guess; delete the extra"
+            echo "::error::drafts and run it again."
+            exit 1
+            ;;
+          esac
+          draft=$(head -n 1 <<<"$state")
+          assets=$(tail -n +2 <<<"$state")
 
           # Only ever onto a draft, and never under a signature. A re-run, or a
           # dispatch naming a tag released long ago, would otherwise --clobber
@@ -497,16 +627,14 @@ jobs:
           # winget manifest already vouch for — leaving a signature that fails
           # against the file beside it, which reads as tampering rather than as
           # a rebuild. The same refusal checksums.yml makes, for the same
-          # reason: the operator decides, not the workflow.
-          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --json isDraft --jq .isDraft)
+          # reason: the operator decides, not the workflow. A release someone
+          # made by hand and left public is refused too, since a half-attached
+          # release is exactly what the draft exists to keep from strangers.
           if [ "$draft" != true ]; then
             echo "::error::$TAG is already published. Its assets are not replaced"
             echo "::error::after the fact; a changed build needs a new tag."
             exit 1
           fi
-          assets=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --json assets --jq '.assets[].name')
           if grep -qx 'SHA256SUMS.asc' <<<"$assets"; then
             echo "::error::$TAG already has SHA256SUMS.asc. Replacing assets would"
             echo "::error::invalidate it. Delete the signature first if the"
