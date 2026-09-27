@@ -1574,3 +1574,944 @@ fn only_a_key_generated_here_has_its_trust_root_box_locked() {
         "a box reached the toggle while busy"
     );
 }
+
+/// The rail's scope tabs are a tab list, and the current one is announced as
+/// the selected tab, as Slint's own tab widget announces its current tab.
+///
+/// The current tab used to be marked checked, which AccessKit turns into a
+/// toggle: AT-SPI reports a checked page tab and UI Automation a toggle, where
+/// a screen reader looks for the selected tab to call current. Nothing grouped
+/// the three as a tab list either, so there was no set to count them in.
+#[test]
+fn the_scope_tabs_are_a_tab_list_whose_current_tab_is_selected() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementQuery};
+
+    let probe = ScopeTabsProbe::new().unwrap();
+    probe.show().unwrap();
+    let names = ["All certificates", "My keys", "Other people"];
+    let tab = |name: &str| control(&probe, name, AccessibleRole::Tab);
+
+    let lists = ElementQuery::from_root(&probe)
+        .match_accessible_role(AccessibleRole::TabList)
+        .find_all();
+    assert_eq!(lists.len(), 1, "the tabs should make up one tab list");
+    assert_eq!(lists[0].accessible_item_count(), Some(3));
+    for (index, name) in names.into_iter().enumerate() {
+        let listed = lists[0]
+            .query_descendants()
+            .match_accessible_role(AccessibleRole::Tab)
+            .match_predicate(move |element| element.accessible_label().as_deref() == Some(name))
+            .find_first();
+        assert!(listed.is_some(), "{name} should be in the tab list");
+        assert_eq!(tab(name).accessible_item_index(), Some(index));
+        assert_eq!(tab(name).accessible_item_selectable(), Some(true));
+        assert_eq!(
+            (
+                tab(name).accessible_checkable(),
+                tab(name).accessible_checked()
+            ),
+            (None, None),
+            "{name} should be selected or not, not checked or not"
+        );
+    }
+
+    // Distinct answers from one binding, each time the scope moves: a
+    // constant would pass one of these and fail the rest.
+    for scope in [0, 2, 1] {
+        probe.set_scope(scope);
+        for (index, name) in names.into_iter().enumerate() {
+            assert_eq!(
+                tab(name).accessible_item_selected(),
+                Some(index == scope as usize),
+                "with scope {scope}, {name}"
+            );
+        }
+    }
+}
+
+/// The scope tabs take Tab, Space and Enter, and none of them once disabled.
+///
+/// They had a pointer path and an assistive-technology one only, so without a
+/// screen reader the list could not be switched from the keyboard at all.
+#[test]
+fn the_scope_tabs_work_from_the_keyboard_and_not_while_disabled() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::AccessibleRole;
+    use slint::platform::Key;
+
+    let probe = ScopeTabsProbe::new().unwrap();
+    probe.show().unwrap();
+
+    // Tab visits the tabs in order, from the first.
+    press(&probe, Key::Tab);
+    press(&probe, Key::Tab);
+    press(&probe, Key::Space);
+    assert_eq!(
+        (probe.get_scope(), probe.get_changes()),
+        (1, 1),
+        "Space on the second tab should switch to it"
+    );
+    press(&probe, Key::Tab);
+    press(&probe, Key::Return);
+    assert_eq!(
+        (probe.get_scope(), probe.get_changes()),
+        (2, 2),
+        "Enter on the third tab should switch to it"
+    );
+
+    // Disabled, as the window disables them behind a dialog and while an
+    // operation runs, with focus left on the third.
+    probe.set_live(false);
+    press(&probe, Key::Space);
+    press(&probe, Key::Return);
+    control(&probe, "My keys", AccessibleRole::Tab).invoke_accessible_default_action();
+    assert_eq!(
+        (probe.get_scope(), probe.get_changes()),
+        (2, 2),
+        "a disabled tab switched the scope"
+    );
+}
+
+/// A certificate for the list, told apart by its number.
+fn listed(number: usize) -> CertRow {
+    CertRow {
+        primary_user_id: format!("User {number:02} <user{number:02}@example.org>").into(),
+        name: format!("User {number:02}").into(),
+        email: format!("user{number:02}@example.org").into(),
+        key_id: format!("{number:016X}").into(),
+        validity: "valid".into(),
+        authentication: "unverified".into(),
+        ..Default::default()
+    }
+}
+
+/// The certificate list takes focus from Tab, moves its selection with the
+/// arrow keys, Page Up and Down, Home and End, keeps the selected row in view,
+/// and does none of it once disabled.
+///
+/// Its rows had only a pointer path and an assistive-technology one, and the
+/// ListView under them adds no keys, so without a screen reader nothing could
+/// be selected from the keyboard, and with nothing selected, nothing that
+/// acts on a certificate could be reached either.
+#[test]
+fn the_certificate_list_is_worked_from_the_keyboard() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::AccessibleRole;
+    use slint::platform::{Key, PointerEventButton};
+
+    let probe = CertListProbe::new().unwrap();
+    probe.set_certs(slint::ModelRc::new(slint::VecModel::from(
+        (0..30).map(listed).collect::<Vec<_>>(),
+    )));
+    probe.show().unwrap();
+    let row = |number: usize| {
+        control(
+            &probe,
+            &format!("User {number:02} <user{number:02}@example.org>"),
+            AccessibleRole::ListItem,
+        )
+    };
+    // Wholly inside the 400px window, which the list fills.
+    let in_view = |number: usize| {
+        let row = row(number);
+        let top = row.absolute_position().y;
+        top >= 0. && top + row.size().height <= 400.
+    };
+    let at = |expected: i32, what: &str| {
+        assert_eq!(
+            (probe.get_current_row(), probe.get_selected()),
+            (expected, expected),
+            "{what}"
+        );
+    };
+
+    // Named, since it is what assistive technology is told has focus.
+    control(&probe, "Certificates", AccessibleRole::List);
+
+    press(&probe, Key::Tab);
+    press(&probe, Key::DownArrow);
+    at(0, "Down with nothing selected should select the first row");
+    press(&probe, Key::DownArrow);
+    press(&probe, Key::DownArrow);
+    at(2, "Down should move the selection a row");
+    press(&probe, Key::End);
+    at(29, "End should select the last row");
+    assert!(in_view(29), "the last row should be scrolled into view");
+    // Focus leaving and coming back, which is the list's only stop, leaves
+    // the list where it was scrolled to.
+    press(&probe, Key::Tab);
+    assert!(in_view(29), "taking focus again scrolled the list");
+    // Six whole rows fit in the window.
+    press(&probe, Key::PageUp);
+    at(23, "Page Up should move a screenful");
+    assert!(in_view(23));
+    press(&probe, Key::Home);
+    at(0, "Home should select the first row");
+    assert!(
+        in_view(0),
+        "the first row should be scrolled back into view"
+    );
+    let asked = probe.get_selections();
+    press(&probe, Key::UpArrow);
+    at(0, "Up on the first row should stay there");
+    assert_eq!(
+        probe.get_selections(),
+        asked,
+        "a key that moved nowhere asked for the same row again"
+    );
+    press(&probe, Key::PageDown);
+    at(6, "Page Down should move a screenful");
+    assert!(in_view(6));
+
+    // A click focuses the list, so the keys go on from the row clicked.
+    row(3).mock_single_click(PointerEventButton::Left);
+    at(3, "a click should select its row");
+    press(&probe, Key::DownArrow);
+    at(4, "Down after a click should go on from the row clicked");
+
+    // Disabled, as the window disables it behind a dialog and while an
+    // operation runs, with focus left on it.
+    probe.set_live(false);
+    let asked = probe.get_selections();
+    for key in [
+        Key::DownArrow,
+        Key::UpArrow,
+        Key::End,
+        Key::Home,
+        Key::PageDown,
+    ] {
+        press(&probe, key);
+    }
+    row(5).invoke_accessible_default_action();
+    assert_eq!(
+        (probe.get_current_row(), probe.get_selections()),
+        (4, asked),
+        "a disabled list moved its selection"
+    );
+}
+
+/// A copy button in a details row copies with Space and Enter, and nothing
+/// once disabled, however it is reached.
+///
+/// It had a pointer path and an assistive-technology one only, so a keyboard
+/// user with no screen reader could not put a fingerprint on the clipboard,
+/// which is the one thing the row is for.
+#[test]
+fn a_copy_button_copies_from_the_keyboard_and_not_while_disabled() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::AccessibleRole;
+    use slint::platform::{Key, PointerEventButton};
+
+    let probe = CopyProbe::new().unwrap();
+    probe.show().unwrap();
+    let copy = || control(&probe, "Copy Fingerprint", AccessibleRole::Button);
+
+    press(&probe, Key::Tab);
+    press(&probe, Key::Space);
+    assert_eq!(probe.get_copies(), 1, "Space should copy");
+    press(&probe, Key::Return);
+    assert_eq!(probe.get_copies(), 2, "Enter should copy");
+    // The row with nothing to copy is no stop, so Tab comes back here.
+    press(&probe, Key::Tab);
+    press(&probe, Key::Space);
+    assert_eq!(probe.get_copies(), 3);
+
+    // Disabled, as the details pane's rows are behind a dialog.
+    probe.set_live(false);
+    assert_eq!(copy().accessible_enabled(), Some(false));
+    press(&probe, Key::Space);
+    press(&probe, Key::Return);
+    copy().invoke_accessible_default_action();
+    copy().mock_single_click(PointerEventButton::Left);
+    assert_eq!(probe.get_copies(), 3, "a disabled copy button copied");
+
+    // And enabled again, so that the nothing above is the button refusing.
+    probe.set_live(true);
+    copy().invoke_accessible_default_action();
+    copy().mock_single_click(PointerEventButton::Left);
+    assert_eq!(probe.get_copies(), 5);
+}
+
+/// A control disabled while it had focus lets go of it once focus moves on.
+///
+/// Slint's FocusScope ignores being told that focus has left it while it is
+/// disabled, so a control disabled with focus on it went on reporting focus
+/// after focus had moved elsewhere, and drew its ring. The window disables
+/// everything behind an open dialog, the control that opened it included, so
+/// that ring stayed on under the scrim and was still there once the dialog
+/// had closed, beside the ring of whatever had focus by then. A copy button
+/// shows focus by lighting its icon, whose opacity can be read here; a
+/// button, a checkbox, a drop-down, a scope tab and the certificate list draw
+/// a ring only while they have focus, so whether the ring is there at all
+/// says the same.
+#[test]
+fn a_control_disabled_while_it_had_focus_lets_go_of_it() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::ElementHandle;
+    use slint::platform::Key;
+
+    const RINGS: [&str; 3] = ["Btn::ring", "Check::ring", "Select::ring"];
+    // In the probe's Tab order.
+    for (stop, ring) in RINGS.iter().enumerate() {
+        let probe = EnabledProbe::new().unwrap();
+        probe.show().unwrap();
+        let rings = || RINGS.map(|ring| ElementHandle::find_by_element_id(&probe, ring).count());
+        for _ in 0..=stop {
+            press(&probe, Key::Tab);
+        }
+        assert_eq!(
+            ElementHandle::find_by_element_id(&probe, ring).count(),
+            1,
+            "Tab should put {ring} on"
+        );
+        probe.set_live(false);
+        press(&probe, Key::Tab);
+        probe.set_live(true);
+        assert_eq!(
+            rings(),
+            [0; 3],
+            "{ring} was still drawn after focus had left its control"
+        );
+    }
+
+    let tabs = ScopeTabsProbe::new().unwrap();
+    tabs.show().unwrap();
+    let ring = || ElementHandle::find_by_element_id(&tabs, "RailItem::ring").count();
+    press(&tabs, Key::Tab);
+    assert_eq!(ring(), 1, "Tab should put RailItem::ring on");
+    tabs.set_live(false);
+    press(&tabs, Key::Tab);
+    tabs.set_live(true);
+    assert_eq!(
+        ring(),
+        0,
+        "RailItem::ring was still drawn after focus had left its tab"
+    );
+
+    // The list draws its ring round itself with nothing selected, and on the
+    // selected row otherwise.
+    let list = CertListProbe::new().unwrap();
+    list.set_certs(slint::ModelRc::new(slint::VecModel::from(
+        (0..3).map(listed).collect::<Vec<_>>(),
+    )));
+    list.show().unwrap();
+    let rings = || {
+        ["CertList::ring", "CertListRow::ring"]
+            .map(|ring| ElementHandle::find_by_element_id(&list, ring).count())
+    };
+    press(&list, Key::Tab);
+    assert_eq!(rings(), [1, 0], "Tab should put CertList::ring on");
+    press(&list, Key::DownArrow);
+    assert_eq!(rings(), [0, 1], "Down should put the ring on the row");
+    list.set_live(false);
+    press(&list, Key::Tab);
+    list.set_live(true);
+    assert_eq!(
+        rings(),
+        [0, 0],
+        "the list's ring was still drawn after focus had left it"
+    );
+
+    let probe = CopyProbe::new().unwrap();
+    probe.show().unwrap();
+    // After the icon's fade.
+    let lit = || {
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(500));
+        ElementHandle::find_by_element_id(&probe, "FieldRow::icon")
+            .next()
+            .expect("the copyable row draws a copy icon")
+            .computed_opacity()
+            > 0.5
+    };
+
+    assert!(!lit(), "the icon should be dark with nothing on it");
+    press(&probe, Key::Tab);
+    assert!(lit(), "focus on the copy button should light its icon");
+
+    // Disabled with focus on it, as opening a dialog disables what is behind
+    // it, and then focus moves on; there is nowhere else for it to go here.
+    probe.set_live(false);
+    press(&probe, Key::Tab);
+    probe.set_live(true);
+    assert!(
+        !lit(),
+        "the copy button still showed focus after focus had left it"
+    );
+    assert_eq!(probe.get_copies(), 0);
+}
+
+/// In the Details dialog, a user ID's copy button covers its text and no
+/// more, with Revoke beside it rather than inside it, and it copies from the
+/// keyboard.
+///
+/// The button was the whole row, so Revoke user ID was a button inside the
+/// copy button, where some screen readers do not look, and the copy button's
+/// bounds lay over Revoke's. It had no keyboard path either.
+#[test]
+fn a_user_ids_copy_button_is_its_text_alone_and_takes_the_keyboard() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+    use slint::platform::Key;
+
+    const PRIMARY: &str = "Alice <alice@example.org>";
+    const WORK: &str = "Alice <alice@work.example>";
+    let probe = DetailsProbe::new().unwrap();
+    probe.show().unwrap();
+
+    let copies: Vec<_> = ElementHandle::find_by_accessible_label(&probe, "Copy user ID")
+        .filter(|element| element.accessible_role() == Some(AccessibleRole::Button))
+        .collect();
+    assert_eq!(copies.len(), 2, "each user ID should have a copy button");
+    let work = copies
+        .iter()
+        .find(|copy| copy.accessible_description().as_deref() == Some(WORK))
+        .expect("the copy button should say which user ID it copies");
+    let revoke = control(
+        &probe,
+        &format!("Revoke user ID {WORK}"),
+        AccessibleRole::Button,
+    );
+    let inside = work
+        .query_descendants()
+        .match_accessible_role(AccessibleRole::Button)
+        .find_first();
+    assert!(
+        inside.is_none(),
+        "the copy button holds another button: {:?}",
+        inside.and_then(|button| button.accessible_label())
+    );
+    let copy_right = work.absolute_position().x + work.size().width;
+    assert!(
+        copy_right <= revoke.absolute_position().x,
+        "the copy button reaches {copy_right}px, over Revoke at {}px",
+        revoke.absolute_position().x
+    );
+
+    // Tab goes through the dialog in order: the fingerprint's copy button,
+    // Change and Add, then each user ID's copy button and its Revoke.
+    press(&probe, Key::Tab);
+    press(&probe, Key::Space);
+    assert_eq!(
+        probe.get_copied(),
+        "0123456789ABCDEF0123456789ABCDEF01234567",
+        "the fingerprint's copy button should take the keyboard in the dialog too"
+    );
+    press(&probe, Key::Tab);
+    press(&probe, Key::Tab);
+    press(&probe, Key::Tab);
+    press(&probe, Key::Space);
+    assert_eq!(
+        probe.get_copied(),
+        PRIMARY,
+        "Space should copy the first user ID"
+    );
+    press(&probe, Key::Tab);
+    press(&probe, Key::Return);
+    assert_eq!(probe.get_copied(), WORK, "Enter should copy the second");
+    press(&probe, Key::Tab);
+    press(&probe, Key::Space);
+    assert_eq!(
+        (probe.get_revoked().as_str(), probe.get_copies()),
+        (WORK, 3),
+        "Revoke should come next, and copy nothing"
+    );
+
+    // And assistive technology's action on the copy button, which moved with
+    // the role.
+    work.invoke_accessible_default_action();
+    assert_eq!((probe.get_copied().as_str(), probe.get_copies()), (WORK, 4));
+}
+
+/// Each dialog that runs something says in itself why its operation failed,
+/// above its buttons, and announces it; and the three dialogs with a result
+/// line of their own announce that.
+///
+/// A failure used to go to the status line alone, under the dialog's scrim,
+/// where it read at 2.4:1 in the light theme and 1.5:1 in the dark, and was
+/// never announced: the button went from "Certifying…" back to "Certify" and
+/// nothing said why.
+#[test]
+fn a_dialog_says_in_itself_why_its_operation_failed_and_announces_it() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleLiveness, AccessibleRole, ElementHandle, ElementRoot};
+
+    const FAILED: &str = "It failed: the passphrase does not unlock the key.";
+
+    fn said(
+        dialog: &str,
+        root: &impl ElementRoot,
+    ) -> Option<i_slint_backend_testing::ElementHandle> {
+        let mut lines = ElementHandle::find_by_accessible_label(root, FAILED);
+        let line = lines.next();
+        assert!(
+            lines.next().is_none(),
+            "{dialog}: the failure is shown twice"
+        );
+        line
+    }
+
+    fn check(dialog: &str, root: &impl ElementRoot, set: impl Fn(&str), button: &str) {
+        assert!(
+            said(dialog, root).is_none(),
+            "{dialog}: a failure shown before any"
+        );
+        set(FAILED);
+        let line = said(dialog, root)
+            .unwrap_or_else(|| panic!("{dialog} does not show why its operation failed"));
+        assert_eq!(line.accessible_role(), Some(AccessibleRole::Text));
+        assert_eq!(
+            line.accessible_live_region(),
+            Some(AccessibleLiveness::Assertive),
+            "{dialog}: the failure is not announced"
+        );
+        let button = control(root, button, AccessibleRole::Button);
+        let bottom = line.absolute_position().y + line.size().height;
+        assert!(
+            bottom <= button.absolute_position().y,
+            "{dialog}: the failure ends at {bottom}px, below the top of its buttons"
+        );
+        set("");
+        assert!(said(dialog, root).is_none(), "{dialog}: the failure stayed");
+    }
+
+    let probe = KeygenProbe::new().unwrap();
+    probe.show().unwrap();
+    check(
+        "New key pair",
+        &probe,
+        |e| probe.set_error(e.into()),
+        "Create key pair",
+    );
+    let probe = SelectionProbe::new().unwrap();
+    probe.show().unwrap();
+    check(
+        "Sign / Encrypt",
+        &probe,
+        |e| probe.set_error(e.into()),
+        "Run",
+    );
+    let probe = CertifyProbe::new().unwrap();
+    probe.show().unwrap();
+    check("Certify", &probe, |e| probe.set_error(e.into()), "Certify");
+    let probe = RevokeProbe::new().unwrap();
+    probe.show().unwrap();
+    check(
+        "Revoke",
+        &probe,
+        |e| probe.set_error(e.into()),
+        "Revoke key",
+    );
+    let probe = DeleteProbe::new().unwrap();
+    probe.show().unwrap();
+    check(
+        "Delete",
+        &probe,
+        |e| probe.set_error(e.into()),
+        "Delete key",
+    );
+    let probe = ImportRevocationProbe::new().unwrap();
+    probe.show().unwrap();
+    check(
+        "Import revocation",
+        &probe,
+        |e| probe.set_error(e.into()),
+        "Revoke",
+    );
+    let probe = LifecycleProbe::new().unwrap();
+    probe.show().unwrap();
+    check(
+        "Change expiry",
+        &probe,
+        |e| probe.set_error(e.into()),
+        "Set expiry",
+    );
+
+    // The dialogs that say how a run went in a line of their own, failures
+    // included, announce it there, since the status line is not announced
+    // while a dialog covers it.
+    let announced = |dialog: &str, root: &dyn Fn() -> Option<AccessibleLiveness>| {
+        assert_eq!(
+            root(),
+            Some(AccessibleLiveness::Polite),
+            "{dialog}: how the run went is not announced"
+        );
+    };
+    let probe = VerifyBannerProbe::new().unwrap();
+    probe.set_result(FAILED.into());
+    probe.show().unwrap();
+    announced("Decrypt / Verify", &|| {
+        said("Decrypt / Verify", &probe).and_then(|line| line.accessible_live_region())
+    });
+    let probe = NotepadProbe::new().unwrap();
+    probe.set_result(FAILED.into());
+    probe.show().unwrap();
+    announced("the notepad", &|| {
+        said("the notepad", &probe).and_then(|line| line.accessible_live_region())
+    });
+    let probe = LookupProbe::new().unwrap();
+    probe.set_status(FAILED.into());
+    probe.show().unwrap();
+    announced("Lookup", &|| {
+        said("Lookup", &probe).and_then(|line| line.accessible_live_region())
+    });
+}
+
+/// Each dialog that says why its operation failed keeps the failure and its
+/// buttons inside its card in the smallest window the app allows, when the
+/// failure takes three lines; Certify does so for a certificate with several
+/// user IDs.
+///
+/// The failure is drawn above the buttons, and Certify's form did not
+/// scroll, so in that window any failure pushed Cancel and Certify partly out
+/// of the card, and one of three lines pushed them out of the item tree,
+/// where neither the pointer nor the keyboard could reach them. A second user
+/// ID pushed them partly out with no failure at all.
+#[test]
+fn a_long_failure_leaves_each_dialog_its_buttons_in_the_smallest_window() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementRoot};
+
+    const FAILED: &str = "Certification failed: the passphrase does not unlock the key \
+        0123456789ABCDEF, or the key is on a card that is not inserted. Nothing was \
+        written to the store, so the certificate is as it was.";
+    // The main window's minimum height, all of which a dialog's scrim covers.
+    const SMALLEST: f32 = 520.;
+
+    fn fits(dialog: &str, root: &impl ElementRoot, buttons: [&str; 2]) {
+        let card = ElementHandle::find_by_element_id(root, "DialogShell::card")
+            .next()
+            .expect("every dialog draws a card");
+        let bottom = card.absolute_position().y + card.size().height;
+        let line = ElementHandle::find_by_accessible_label(root, FAILED)
+            .next()
+            .unwrap_or_else(|| panic!("{dialog}: the failure is not in the item tree"));
+        assert!(
+            line.size().height > 40.,
+            "{dialog}: the failure takes {}px, less than three lines",
+            line.size().height
+        );
+        let mut shown = vec![("the failure", line)];
+        for label in buttons {
+            let button = ElementHandle::find_by_accessible_label(root, label)
+                .find(|element| element.accessible_role() == Some(AccessibleRole::Button))
+                .unwrap_or_else(|| panic!("{dialog}: {label} is not in the item tree"));
+            shown.push((label, button));
+        }
+        for (what, element) in shown {
+            let end = element.absolute_position().y + element.size().height;
+            assert!(
+                end <= bottom,
+                "{dialog}: {what} ends {end}px down, past the card's bottom at {bottom}px"
+            );
+        }
+    }
+
+    let probe = KeygenProbe::new().unwrap();
+    probe.set_probe_height(SMALLEST);
+    probe.set_error(FAILED.into());
+    probe.show().unwrap();
+    fits("New key pair", &probe, ["Cancel", "Create key pair"]);
+
+    let probe = SelectionProbe::new().unwrap();
+    probe.set_probe_height(SMALLEST);
+    probe.set_error(FAILED.into());
+    probe.show().unwrap();
+    fits("Sign / Encrypt", &probe, ["Cancel", "Run"]);
+
+    let probe = CertifyProbe::new().unwrap();
+    probe.set_probe_height(SMALLEST);
+    probe.set_user_ids(slint::ModelRc::new(slint::VecModel::from(
+        ["Alice", "Alice (work)", "Alice (home)"]
+            .map(|name| UserIdRow {
+                text: format!("{name} <alice@example.org>").into(),
+                selected: true,
+            })
+            .to_vec(),
+    )));
+    probe.set_error(FAILED.into());
+    probe.show().unwrap();
+    fits("Certify", &probe, ["Cancel", "Certify"]);
+
+    let probe = RevokeProbe::new().unwrap();
+    probe.set_probe_height(SMALLEST);
+    probe.set_error(FAILED.into());
+    probe.show().unwrap();
+    fits("Revoke", &probe, ["Cancel", "Revoke key"]);
+
+    let probe = DeleteProbe::new().unwrap();
+    probe.set_probe_height(SMALLEST);
+    probe.set_error(FAILED.into());
+    probe.show().unwrap();
+    fits("Delete", &probe, ["Cancel", "Delete key"]);
+
+    // Already the smallest window's size.
+    let probe = ImportRevocationProbe::new().unwrap();
+    probe.set_error(FAILED.into());
+    probe.show().unwrap();
+    fits("Import revocation", &probe, ["Cancel", "Revoke"]);
+
+    // Revoking a subkey, the tallest of the lifecycle dialogs.
+    let probe = LifecycleProbe::new().unwrap();
+    probe.set_probe_height(SMALLEST);
+    probe.set_mode(4);
+    probe.set_error(FAILED.into());
+    probe.show().unwrap();
+    fits("Revoke a subkey", &probe, ["Cancel", "Revoke subkey"]);
+}
+
+/// Escape and a click on the scrim leave a dialog open while the operation it
+/// started runs, as its Cancel does, and close it otherwise.
+///
+/// Every dialog's Cancel or Close is disabled while its operation runs, since
+/// nothing can call one back, but Escape and the scrim closed the dialog
+/// anyway. That looked like cancelling a delete, a revocation or a publish,
+/// which then went on to happen.
+#[test]
+fn escape_and_the_scrim_leave_a_dialog_open_while_its_operation_runs() {
+    i_slint_backend_testing::init_no_event_loop();
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+
+    let probe = DeleteProbe::new().unwrap();
+    probe.show().unwrap();
+    // Beside the card, on the scrim.
+    let click_scrim = || {
+        let position = slint::LogicalPosition::new(4., 4.);
+        let button = PointerEventButton::Left;
+        probe
+            .window()
+            .dispatch_event(WindowEvent::PointerPressed { position, button });
+        probe
+            .window()
+            .dispatch_event(WindowEvent::PointerReleased { position, button });
+    };
+
+    probe.set_busy(true);
+    press(&probe, Key::Escape);
+    click_scrim();
+    click_scrim();
+    assert_eq!(
+        probe.get_dismissals(),
+        0,
+        "the dialog was closed while its operation ran"
+    );
+
+    probe.set_busy(false);
+    press(&probe, Key::Escape);
+    assert_eq!(
+        probe.get_dismissals(),
+        1,
+        "Escape should close it once done"
+    );
+    click_scrim();
+    assert_eq!(
+        probe.get_dismissals(),
+        2,
+        "the scrim should close it once done"
+    );
+}
+
+/// A key pressed after Tab during an operation reaches no control that shows
+/// no focus, and Tab goes on round the dialog's own controls once the
+/// operation is over.
+///
+/// Everything in a dialog is disabled while its operation runs, so Tab then
+/// found nothing to take it, and Slint left keys going to the control Tab had
+/// left: the button that started the operation, drawn with no ring. When the
+/// operation failed and the button was enabled again, one Enter ran it a
+/// second time. Here a delete is started from the keyboard and fails.
+#[test]
+fn tabbing_while_an_operation_runs_leaves_no_button_taking_keys_unseen() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::AccessibleRole;
+    use slint::platform::Key;
+
+    let probe = DeleteProbe::new().unwrap();
+    probe.show().unwrap();
+    control(&probe, "0123456789ABCDEF", AccessibleRole::TextInput)
+        .set_accessible_value("0123456789ABCDEF");
+    // The confirmation field, Cancel, then Delete key, and Enter on it.
+    let delete_from_the_keyboard = || {
+        for _ in 0..3 {
+            press(&probe, Key::Tab);
+        }
+        press(&probe, Key::Return);
+    };
+    delete_from_the_keyboard();
+    assert_eq!(
+        probe.get_runs(),
+        1,
+        "Tab should reach Delete key, and Enter press it"
+    );
+
+    // What the handler does as the delete starts, and what its failure does
+    // when it lands.
+    probe.set_busy(true);
+    press(&probe, Key::Tab);
+    probe.set_busy(false);
+    probe.set_error("Delete failed: permission denied".into());
+    press(&probe, Key::Return);
+    assert_eq!(
+        probe.get_runs(),
+        1,
+        "Enter after the failure ran the delete again, from a button showing no focus"
+    );
+
+    // Tab goes on from the frame into the dialog, and on the next round the
+    // frame is no stop, since nothing is running.
+    delete_from_the_keyboard();
+    assert_eq!(probe.get_runs(), 2, "Tab should go on into the dialog");
+    delete_from_the_keyboard();
+    assert_eq!(
+        (probe.get_runs(), probe.get_dismissals()),
+        (3, 0),
+        "the frame was a Tab stop with nothing running"
+    );
+}
+
+/// A long status message is shown in full, the bar growing to hold it, up to
+/// a limit past which it elides, as
+/// [`a_message_too_long_for_the_status_bar_is_shown_from_its_beginning`]
+/// says; and the line is announced unless the window says not to.
+///
+/// The bar was one line that elided, and several messages end with what to
+/// do: a publish whose confirmation mail could not be asked for ends "Publish
+/// again to retry", which at the window's usual width was cut off, with no way
+/// to read the rest. Measured at the smallest width the window allows.
+#[test]
+fn a_long_status_message_is_shown_in_full() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleLiveness, ElementHandle};
+
+    // What a publish says when the upload went through and the request for
+    // the confirmation mail did not, with the error reqwest gives.
+    const PUBLISHED: &str = "Published 0123456789ABCDEF0123456789ABCDEF01234567. The key is \
+        uploaded, but asking for the confirmation mail to alice@example.org failed (upload \
+        failed: error sending request for url \
+        (https://keys.openpgp.org/vks/v1/request-verify)); until that succeeds the address is \
+        stored and not served. Publish again to retry.";
+    let probe = StatusProbe::new().unwrap();
+    probe.show().unwrap();
+    let bar = || {
+        ElementHandle::find_by_element_type_name(&probe, "StatusBar")
+            .next()
+            .expect("the probe shows a status bar")
+            .size()
+            .height
+    };
+    let line = |text: &str| {
+        ElementHandle::find_by_accessible_label(&probe, text)
+            .next()
+            .expect("the status bar shows the message")
+    };
+
+    probe.set_text("3 certificate(s), 1 with a secret key".into());
+    let short = bar();
+    assert_eq!(short, 28., "a short message takes one line");
+    assert_eq!(
+        line("3 certificate(s), 1 with a secret key").accessible_live_region(),
+        Some(AccessibleLiveness::Polite)
+    );
+
+    // Three lines at this width. Below the limit means none of it was cut.
+    probe.set_text(PUBLISHED.into());
+    let long = bar();
+    assert!(
+        long >= short + 2. * 12.,
+        "the publish message was given {long}px, less than three lines"
+    );
+    let limit = {
+        probe.set_text(PUBLISHED.repeat(8).into());
+        bar()
+    };
+    assert!(
+        long < limit,
+        "the publish message reached the limit, {limit}px, and was cut"
+    );
+    assert_eq!(
+        line(&PUBLISHED.repeat(8)).size().height,
+        limit - 2. * 5.,
+        "a message longer than the limit should be given all of the bar inside its inset"
+    );
+
+    // While a dialog covers it, the window stops it being announced.
+    probe.set_announce(false);
+    assert_eq!(
+        line(&PUBLISHED.repeat(8)).accessible_live_region(),
+        Some(AccessibleLiveness::Off)
+    );
+}
+
+/// A window that Slint's software renderer draws into memory, for a test that
+/// has to see what is drawn: the testing backend lays text out but draws
+/// nothing. A platform belongs to the thread that sets it, and each test runs
+/// on a thread of its own, so the other tests keep the testing backend.
+struct CanvasPlatform(std::rc::Rc<slint::platform::software_renderer::MinimalSoftwareWindow>);
+
+impl slint::platform::Platform for CanvasPlatform {
+    fn create_window_adapter(
+        &self,
+    ) -> Result<std::rc::Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
+        Ok(self.0.clone())
+    }
+}
+
+/// A message too long for the status bar is shown from its beginning, and
+/// what the bar cuts is its end.
+///
+/// Centred, as a message the bar holds is, a longer one would lose lines off
+/// the top as well as the bottom, which is where Slint drops what does not fit
+/// a centred text: a refused user ID, quoted back as it was typed, would be
+/// shown from somewhere in the middle, without the words that say what was
+/// refused. The accessibility tree has the whole message either way, so this
+/// looks at the pixels.
+#[test]
+fn a_message_too_long_for_the_status_bar_is_shown_from_its_beginning() {
+    use i_slint_backend_testing::ElementHandle;
+    use slint::Rgb8Pixel;
+    use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(CanvasPlatform(window.clone())))
+        .expect("no platform is set on a test's own thread");
+    let probe = StatusProbe::new().unwrap();
+    // The first line is a paragraph of its own and short, which is what tells
+    // it apart: every line after it runs to the width of the bar. Many times
+    // more than the bar holds.
+    probe.set_text(format!("Refused.\n{}", "and a great deal more after it ".repeat(60)).into());
+    probe.show().unwrap();
+    let (width, height) = (860, 200);
+    window.set_size(slint::PhysicalSize::new(width as u32, height as u32));
+    let mut pixels = vec![Rgb8Pixel::default(); width * height];
+    assert!(window.draw_if_needed(|renderer| {
+        renderer.render(&mut pixels, width);
+    }));
+
+    let bar = ElementHandle::find_by_element_type_name(&probe, "StatusBar")
+        .next()
+        .expect("the probe shows a status bar");
+    let top = bar.absolute_position().y as usize;
+    let bottom = top + bar.size().height as usize;
+    // The bar's own colour, from its right margin, which no text reaches.
+    let ground = pixels[(bottom - 2) * width + width - 4];
+    let ink = |x: usize, y: usize| {
+        let pixel = pixels[y * width + x];
+        pixel.r.abs_diff(ground.r) as u32
+            + pixel.g.abs_diff(ground.g) as u32
+            + pixel.b.abs_diff(ground.b) as u32
+            > 150
+    };
+    let rightmost = |y: usize| (0..width).rev().find(|&x| ink(x, y));
+
+    // Below the border along the bar's top edge.
+    let first = (top + 1..bottom)
+        .find(|&y| rightmost(y).is_some())
+        .expect("the status bar draws nothing");
+    // Not as far as a whole line, so as to stay clear of the one below.
+    let reach = (first..first + 8).filter_map(rightmost).max().unwrap();
+    assert!(
+        reach < width / 4,
+        "the first line drawn runs to {reach}px, so it is not \"Refused.\": the \
+         beginning of the message was cut"
+    );
+}

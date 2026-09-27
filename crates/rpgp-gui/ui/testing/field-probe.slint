@@ -2,11 +2,12 @@
 // dialogs, so a Rust test can operate them and inspect what the accessibility
 // tree publishes. Not part of the application.
 import { Field, Btn, Check, Select, FieldRow, TextArea, TrustRootCheck } from "../widgets.slint";
+import { CertList, ScopeTabs, StatusBar } from "../widgets.slint";
 // The rule the details pane draws its Revoke button by, for a test to ask.
 export { RevokeOffer } from "../widgets.slint";
 import { SignEncryptDialog, CertifyDialog, NotepadDialog, DeleteDialog } from "../dialogs.slint";
 import { KeygenDialog, DecryptVerifyDialog, RevokeDialog, LifecycleDialog } from "../dialogs.slint";
-import { ImportRevocationDialog } from "../dialogs.slint";
+import { ImportRevocationDialog, DetailsDialog, LookupDialog } from "../dialogs.slint";
 import { CertRow, RecipientRow, UserIdRow, SignatureRow } from "../types.slint";
 
 // One passphrase Field and one ordinary Field.
@@ -74,11 +75,12 @@ export component ControlProbe inherits Window {
 }
 
 // One of each widget from widgets.slint that has an `enabled`, all switched by
-// one property, and a count of everything any of them did. Disabled has to mean
-// inert however a control is reached — by an assistive-technology action, by a
-// key sent to one that had focus before it was disabled, or through a list it
-// had already opened — and a test reads the counts to see that nothing
-// happened.
+// one property, and a count of everything any of them did. The scope tabs, the
+// certificate list and FieldRow's copy button have probes of their own below.
+// Disabled has to mean inert however a control is reached — by an
+// assistive-technology action, by a key sent to one that had focus before it
+// was disabled, or through a list it had already opened — and a test reads
+// the counts to see that nothing happened.
 export component EnabledProbe inherits Window {
     in-out property <bool> live: true;
     in-out property <int> clicks: 0;
@@ -122,14 +124,16 @@ export component SelectionProbe inherits Window {
     in-out property <[RecipientRow]> recipients;
     in-out property <int> toggled-recipient: -1;
     in-out property <bool> busy: false;
+    in-out property <string> error;
     in-out property <[string]> signers: ["Probe <probe@example.org>"];
     in-out property <int> chosen-recipients: 0;
     in-out property <int> runs: 0;
     in-out property <bool> encrypted;
     in-out property <bool> signed;
+    in-out property <length> probe-height: 720px;
 
     width: 620px;
-    height: 720px;
+    height: root.probe-height;
 
     SignEncryptDialog {
         width: 100%;
@@ -139,6 +143,7 @@ export component SelectionProbe inherits Window {
         signers: root.signers;
         chosen-recipients: root.chosen-recipients;
         busy: root.busy;
+        error: root.error;
         toggle-recipient(index) => { root.toggled-recipient = index; }
         run(encrypt, sign, signer, password, secret) => {
             root.encrypted = encrypt;
@@ -151,15 +156,18 @@ export component SelectionProbe inherits Window {
 export component CertifyProbe inherits Window {
     in-out property <[UserIdRow]> user-ids;
     in-out property <int> toggled-user-id: -1;
+    in-out property <string> error;
+    in-out property <length> probe-height: 720px;
 
     width: 620px;
-    height: 720px;
+    height: root.probe-height;
 
     CertifyDialog {
         width: 100%;
         height: 100%;
         target-name: "Alice";
         user-ids: root.user-ids;
+        error: root.error;
         toggle-user-id(index) => { root.toggled-user-id = index; }
     }
 }
@@ -173,6 +181,7 @@ export component NotepadProbe inherits Window {
     // output, and it refuses typing, so it would fail the passphrase test,
     // which types into every field it finds, if it were there by default.
     in-out property <string> output;
+    in-out property <string> result;
 
     width: 620px;
     height: 720px;
@@ -182,6 +191,8 @@ export component NotepadProbe inherits Window {
         height: 100%;
         recipients: root.recipients;
         output: root.output;
+        result: root.result;
+        result-tone: 3;
         busy: root.busy;
         toggle-recipient(index) => { root.toggled-recipient = index; }
     }
@@ -200,12 +211,14 @@ export component KeygenProbe inherits Window {
     // Settable, as in VerifyBannerProbe, so that a test can hold the dialog
     // to the height the app's smallest window leaves it.
     in-out property <length> probe-height: 720px;
+    in-out property <string> error;
 
     width: 620px;
     height: root.probe-height;
     KeygenDialog {
         width: 100%;
         height: 100%;
+        error: root.error;
         accepted(name, email, password, key-type, expiry, standard) => {
             root.passphrase = password;
             root.runs += 1;
@@ -254,9 +267,11 @@ export component VerifyBannerProbe inherits Window {
 }
 
 export component RevokeProbe inherits Window {
+    in-out property <string> error;
+    in-out property <length> probe-height: 720px;
     width: 620px;
-    height: 720px;
-    RevokeDialog { width: 100%; height: 100%; target-name: "Alice"; }
+    height: root.probe-height;
+    RevokeDialog { width: 100%; height: 100%; target-name: "Alice"; error: root.error; }
 }
 
 // The Revoke dialog as it opens for a key retired earlier, to mark it
@@ -286,6 +301,7 @@ export component RevokeUpgradeProbe inherits Window {
 // smallest size the app allows.
 export component ImportRevocationProbe inherits Window {
     in-out property <int> runs: 0;
+    in-out property <string> error;
 
     width: 860px;
     height: 520px;
@@ -294,6 +310,7 @@ export component ImportRevocationProbe inherits Window {
         width: 100%;
         height: 100%;
         yours: 2;
+        error: root.error;
         revocations: [
             { name: "Me <me@example.org>", reason: "Secret key may be compromised", hard: true, yours: true },
             { name: "Me <me@work.example.org>", reason: "Secret key may be compromised", hard: true, yours: true },
@@ -309,10 +326,13 @@ export component ImportRevocationProbe inherits Window {
 }
 
 export component LifecycleProbe inherits Window {
-    width: 620px;
-    height: 720px;
+    in-out property <string> error;
+    in-out property <length> probe-height: 720px;
     // Every mode but publish carries the passphrase field.
-    LifecycleDialog { width: 100%; height: 100%; mode: 0; target: "Alice"; }
+    in-out property <int> mode: 0;
+    width: 620px;
+    height: root.probe-height;
+    LifecycleDialog { width: 100%; height: 100%; mode: root.mode; target: "Alice"; error: root.error; }
 }
 
 // Publish, the lifecycle mode that cannot be undone, so that a test can ask
@@ -359,13 +379,17 @@ export component OutputProbe inherits Window {
 
 // The dialog in which a disabled button is the whole of the confirmation:
 // until the key ID has been typed, Delete key has to do nothing however it is
-// reached, and the same once a delete is under way.
+// reached, and the same once a delete is under way. It counts the ways it is
+// asked to close as well, since a delete under way cannot be called back.
 export component DeleteProbe inherits Window {
     in-out property <bool> busy: false;
     in-out property <int> runs: 0;
+    in-out property <int> dismissals: 0;
+    in-out property <string> error;
+    in-out property <length> probe-height: 720px;
 
     width: 620px;
-    height: 720px;
+    height: root.probe-height;
 
     DeleteDialog {
         width: 100%;
@@ -375,7 +399,9 @@ export component DeleteProbe inherits Window {
         has-revocation: true;
         confirm-word: "0123456789ABCDEF";
         busy: root.busy;
+        error: root.error;
         run => { root.runs += 1; }
+        dismissed => { root.dismissals += 1; }
     }
 }
 
@@ -395,5 +421,134 @@ export component TrustRootProbe inherits Window {
         cert: root.cert;
         busy: root.busy;
         toggled => { root.toggles += 1; }
+    }
+}
+
+// The rail's scope tabs, as the window has them, switched off by `live` as the
+// window switches them off while a dialog is open or an operation runs.
+export component ScopeTabsProbe inherits Window {
+    in-out property <bool> live: true;
+    in-out property <int> scope: 0;
+    in-out property <int> changes: 0;
+
+    width: 240px;
+    height: 160px;
+
+    ScopeTabs {
+        enabled: root.live;
+        scope <=> root.scope;
+        count-all: 3;
+        count-mine: 1;
+        count-others: 2;
+        scope-changed(index) => { root.changes += 1; }
+    }
+}
+
+// The certificate list, given more rows than it can show at once, keeping
+// which row it last asked Rust to select and how often it asked.
+export component CertListProbe inherits Window {
+    in-out property <[CertRow]> certs;
+    in-out property <int> current-row: -1;
+    in-out property <bool> live: true;
+    in-out property <int> selected: -1;
+    in-out property <int> selections: 0;
+
+    width: 600px;
+    height: 400px;
+
+    CertList {
+        certs: root.certs;
+        enabled: root.live;
+        current-row <=> root.current-row;
+        row-selected(index) => {
+            root.selected = index;
+            root.selections += 1;
+        }
+    }
+}
+
+// A row that can be copied beside one that cannot, as the details pane has
+// them.
+export component CopyProbe inherits Window {
+    in-out property <bool> live: true;
+    in-out property <int> copies: 0;
+
+    width: 400px;
+    height: 120px;
+
+    VerticalLayout {
+        FieldRow {
+            label: "Fingerprint";
+            value: "ABCD 1234";
+            mono: true;
+            copyable: true;
+            enabled: root.live;
+            copy => { root.copies += 1; }
+        }
+        FieldRow { label: "Algorithm"; value: "Ed25519"; }
+    }
+}
+
+// The Details dialog for a key of the user's own with a second user ID, which
+// is the one that carries a Revoke button beside its copy button.
+export component DetailsProbe inherits Window {
+    in-out property <string> copied;
+    in-out property <int> copies: 0;
+    in-out property <string> revoked;
+
+    width: 760px;
+    height: 720px;
+
+    DetailsDialog {
+        width: 100%;
+        height: 100%;
+        owned: true;
+        cert: {
+            primary-user-id: "Alice <alice@example.org>",
+            fingerprint: "0123456789ABCDEF0123456789ABCDEF01234567",
+            fingerprint-pretty: "0123 4567 89AB CDEF 0123  4567 89AB CDEF 0123 4567",
+            key-id: "89ABCDEF01234567",
+            algorithm: "Ed25519",
+        };
+        user-ids: [
+            { text: "Alice <alice@example.org>", is-primary: true, self-signed: "2026-01-01" },
+            { text: "Alice <alice@work.example>", self-signed: "2026-01-01" },
+        ];
+        copy-value(text) => {
+            root.copied = text;
+            root.copies += 1;
+        }
+        revoke-user-id(user-id) => { root.revoked = user-id; }
+    }
+}
+
+// Lookup, whose own line says what a search found or why it failed.
+export component LookupProbe inherits Window {
+    in-out property <string> status;
+
+    width: 620px;
+    height: 720px;
+
+    LookupDialog {
+        width: 100%;
+        height: 100%;
+        status: root.status;
+    }
+}
+
+// The status line at the width of the smallest window the app allows.
+export component StatusProbe inherits Window {
+    in-out property <string> text;
+    in-out property <bool> announce: true;
+
+    width: 860px;
+    height: 200px;
+
+    VerticalLayout {
+        alignment: end;
+        StatusBar {
+            text: root.text;
+            announce: root.announce;
+        }
     }
 }

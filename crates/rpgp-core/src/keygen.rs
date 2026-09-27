@@ -185,8 +185,9 @@ pub fn check_user_id(user_id: &str) -> Result<()> {
     if user_id.contains(['<', '>']) {
         let parsed = UserID::from(user_id);
         if !matches!(parsed.email(), Ok(Some(_))) && !matches!(parsed.uri(), Ok(Some(_))) {
-            // The reason first and the user ID last, because the status line
-            // that shows this cuts off whatever does not fit from the end.
+            // The reason first and the user ID, as long as anyone typed it,
+            // last: the status line that also shows this cuts off whatever
+            // goes past its last line.
             return Err(Error::invalid(format!(
                 "an e-mail address goes between < and >, alone and at the end: {user_id}"
             )));

@@ -55,10 +55,11 @@ pub enum Error {
     /// capitalised label — and a second set of parentheses — into the middle of
     /// it.
     ///
-    /// It says no more than that. The status bar is a single line of elided
-    /// text, so every word after the name and the reason is one that pushes
-    /// them closer to being cut; that a revoked key is not used for anything
-    /// new is what the refusal itself conveys, and the README explains.
+    /// It says no more than that. The status bar holds a few lines and elides
+    /// what goes past them, so every word after the name and the reason is
+    /// one that pushes them closer to being cut; that a revoked key is not
+    /// used for anything new is what the refusal itself conveys, and the
+    /// README explains.
     #[error("{name} has been revoked — {reason}")]
     Revoked { name: String, reason: String },
 
@@ -72,10 +73,10 @@ pub enum Error {
     /// it in the user's language. `name` is whose key the agent was asked
     /// about, as [`Error::Revoked`] names one.
     ///
-    /// The reason comes first because the status bar elides the end of a
-    /// line, and the reason is what the user acts on. It used to be dropped
-    /// altogether, and the decryption reported that no secret key opened the
-    /// message.
+    /// The reason comes first because the status bar elides what goes past
+    /// its last line, and the reason is what the user acts on. It used to be
+    /// dropped altogether, and the decryption reported that no secret key
+    /// opened the message.
     #[error("gpg-agent: {reason} (the key of {name})")]
     AgentRefused { name: String, reason: String },
 

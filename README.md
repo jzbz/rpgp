@@ -31,7 +31,7 @@ Inside `crates/rpgp-gui/ui`:
 | File | Contents |
 | --- | --- |
 | `theme.slint` | Colour, spacing and type tokens, plus the icon paths. |
-| `widgets.slint` | Buttons, fields, pills, dialogs — the app's own controls. |
+| `widgets.slint` | Buttons, fields, pills, the certificate list and its scope tabs, the status line, the dialog frame — the app's own controls. |
 | `dialogs.slint` | New key pair, Sign / Encrypt, Decrypt / Verify, Certify, Revoke, Lifecycle, Lookup, Details, Notepad, About. |
 | `app-window.slint` | The shell that assembles them. |
 | `types.slint` | Structs shared with Rust. |
@@ -398,15 +398,18 @@ a plain public key block that sits beside the key in a backup being restored.
 So when Import is handed a bare revocation certificate, the form rPGP and GnuPG
 write, it asks before storing a revocation of any key whose secret you hold,
 naming the key and saying whether the revocation is hard, and stores nothing if
-you cancel. Someone else's revocation is applied without asking: it is theirs
-to make, and would arrive unasked with their certificate from a keyserver
-refresh. A key is yours when this store holds its secret, or when `gpg-agent`
-does, in its own store or on a card: `gpg --gen-revoke` writes a revocation
-certificate for such a key that reads just like rPGP's own. The agent holds a
-key when it holds any of the keys rPGP would ask it to sign, certify or decrypt
-with. Those are known from the survey that follows each reload of the list, so
-until the agent has answered, and when none answers, a revocation of one of
-them is taken for someone else's.
+you cancel. On Linux and Windows the file dialog leaves the window usable, so
+another dialog can be open by the time a file is chosen; then Import asks
+nothing and stores nothing, and the status line says to close that dialog and
+import the file again. Someone else's revocation is applied without asking: it
+is theirs to make, and would arrive unasked with their certificate from a
+keyserver refresh. A key is yours when this store holds its secret, or when
+`gpg-agent` does, in its own store or on a card: `gpg --gen-revoke` writes a
+revocation certificate for such a key that reads just like rPGP's own. The agent
+holds a key when it holds any of the keys rPGP would ask it to sign, certify or
+decrypt with. Those are known from the survey that follows each reload of the
+list, so until the agent has answered, and when none answers, a revocation of
+one of them is taken for someone else's.
 
 Only a bare revocation certificate is asked about. A certificate that arrives
 with its revocation already attached is merged like any other import, and

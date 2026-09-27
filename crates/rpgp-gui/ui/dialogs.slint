@@ -1,6 +1,6 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Theme, Icons, Icon } from "theme.slint";
-import { Btn, Check, DialogShell, Divider, Field, FieldRow, Monogram, Pill, SectionLabel, Select, TextArea, Tone, Variant } from "widgets.slint";
+import { Btn, Check, DialogError, DialogShell, Divider, Field, FieldRow, Monogram, Pill, SectionLabel, Select, TextArea, Tone, Variant } from "widgets.slint";
 import { CertRow, CertificationRow, LookupRow, PendingRevocationRow, RecipientRow, SignatureRow, SubkeyRow, UserIdDetailRow, UserIdRow } from "types.slint";
 
 // A file slot: label, the chosen path (or a hint), and a Choose button.
@@ -58,7 +58,6 @@ component FilePick inherits VerticalLayout {
 }
 
 export component KeygenDialog inherits DialogShell {
-    in property <bool> busy;
     callback accepted(string, string, string, int, int, int);
 
     title: "New key pair";
@@ -166,6 +165,8 @@ export component KeygenDialog inherits DialogShell {
             }
         }
 
+        if root.error != "": DialogError { text: root.error; }
+
         Divider { }
 
         HorizontalLayout {
@@ -213,7 +214,6 @@ export component SignEncryptDialog inherits DialogShell {
     in property <string> output-sign;
     in property <[RecipientRow]> recipients;
     in property <[string]> signers;
-    in property <bool> busy;
     callback pick-input();
     callback toggle-recipient(int);
     callback run(bool, bool, int, string, string);
@@ -465,6 +465,8 @@ export component SignEncryptDialog inherits DialogShell {
             }
         }
 
+        if root.error != "": DialogError { text: root.error; }
+
         Divider { }
 
         HorizontalLayout {
@@ -506,7 +508,6 @@ export component DecryptVerifyDialog inherits DialogShell {
     in property <string> result;
     // 0 nothing yet, 1 good, 2 mixed, 3 bad
     in property <int> result-tone;
-    in property <bool> busy;
     callback pick-input();
     callback pick-data();
     callback run(string);
@@ -596,6 +597,11 @@ export component DecryptVerifyDialog inherits DialogShell {
                             // Same reason as the detail text below: bind the
                             // width or the reported height is always one line.
                             width: parent.width - 24px;
+                            // How the run went, failures included, is said
+                            // here and nowhere else a screen reader is told
+                            // of it: the status line is not announced while
+                            // a dialog covers it.
+                            accessible-live-region: polite;
                             text: root.result;
                             color: root.result-tone == 1 ? Theme.ok
                                 : root.result-tone == 2 ? Theme.warn
@@ -694,7 +700,6 @@ export component CertifyDialog inherits DialogShell {
     in property <[UserIdRow]> user-ids;
     in property <[string]> certifiers;
     in property <int> chosen-count;
-    in property <bool> busy;
     callback toggle-user-id(int);
     callback run(int, bool, bool, int, string);
 
@@ -714,164 +719,192 @@ export component CertifyDialog inherits DialogShell {
     VerticalLayout {
         spacing: Theme.s4;
 
-        VerticalLayout {
-            spacing: 6px;
+        // The form scrolls and the buttons do not, as in New key pair and
+        // Sign / Encrypt. The card that the window's smallest size (860x520)
+        // leaves is 488px tall, and held the form for a certificate with one
+        // user ID and nothing more. A second user ID, or a failure shown
+        // above the buttons, pushed Cancel and Certify partly out of the
+        // card; a failure of three lines, or of any length with two user IDs,
+        // pushed them out of the item tree, where neither the pointer nor the
+        // keyboard could reach them. min-height and preferred-height do what
+        // they do in New key pair.
+        ScrollView {
+            min-height: 0px;
+            preferred-height: form.preferred-height;
+            vertical-stretch: 1;
+            viewport-width: self.visible-width;
+            viewport-height: max(self.visible-height, form.preferred-height);
 
-            HorizontalLayout {
-                Text {
-                    text: "User IDs";
-                    color: Theme.text-dim;
-                    font-size: Theme.t-sm;
-                    horizontal-stretch: 1;
-                }
-                Text {
-                    text: root.chosen-count == 0 ? "none selected" : "\{root.chosen-count} selected";
-                    color: root.chosen-count == 0 ? Theme.warn : Theme.text-dim;
-                    font-size: Theme.t-sm;
-                }
-            }
+            form := VerticalLayout {
+                // Clear of the scrollbar, which the fluent style draws over
+                // the viewport's right edge, where it covered the end of the
+                // user IDs and the Confidence box.
+                padding-right: Theme.s4;
+                spacing: Theme.s4;
 
-            Rectangle {
-                height: min(140px, max(46px, root.user-ids.length * 34px + 8px));
-                background: Theme.surface-sunken;
-                border-radius: Theme.r-sm;
-                border-width: 1px;
-                border-color: Theme.border;
-                clip: true;
+                VerticalLayout {
+                    spacing: 6px;
 
-                ListView {
-                    for entry[index] in root.user-ids: Rectangle {
-                        height: 34px;
-                        background: pick.has-hover ? Theme.hover : transparent;
+                    HorizontalLayout {
+                        Text {
+                            text: "User IDs";
+                            color: Theme.text-dim;
+                            font-size: Theme.t-sm;
+                            horizontal-stretch: 1;
+                        }
+                        Text {
+                            text: root.chosen-count == 0 ? "none selected" : "\{root.chosen-count} selected";
+                            color: root.chosen-count == 0 ? Theme.warn : Theme.text-dim;
+                            font-size: Theme.t-sm;
+                        }
+                    }
 
-                        // The row draws a tick box but is not one: without these a screen
-                        // reader sees an unlabelled rectangle and cannot tell a chosen
-                        // recipient from an unchosen one. Check declares the same set.
-                        accessible-role: checkbox;
-                        accessible-label: entry.text;
-                        accessible-checkable: true;
-                        accessible-checked: entry.selected;
-                        accessible-action-default => { root.toggle-user-id(index); }
+                    Rectangle {
+                        height: min(140px, max(46px, root.user-ids.length * 34px + 8px));
+                        background: Theme.surface-sunken;
+                        border-radius: Theme.r-sm;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        clip: true;
 
-                        HorizontalLayout {
-                            padding-left: Theme.s3;
-                            padding-right: Theme.s3;
-                            spacing: Theme.s3;
+                        ListView {
+                            for entry[index] in root.user-ids: Rectangle {
+                                height: 34px;
+                                background: pick.has-hover ? Theme.hover : transparent;
 
-                            Rectangle {
-                                width: 17px;
-                                height: 17px;
-                                y: (parent.height - self.height) / 2;
-                                border-radius: 5px;
-                                background: entry.selected ? Theme.accent : Theme.surface;
-                                border-width: 1px;
-                                border-color: entry.selected ? Theme.accent : Theme.border-strong;
-                                if entry.selected: Icon {
-                                    glyph: Icons.check;
-                                    tint: Theme.accent-ink;
-                                    width: 12px;
-                                    height: 12px;
+                                // The row draws a tick box but is not one: without
+                                // these a screen reader sees an unlabelled rectangle
+                                // and cannot tell a chosen recipient from an
+                                // unchosen one. Check declares the same set.
+                                accessible-role: checkbox;
+                                accessible-label: entry.text;
+                                accessible-checkable: true;
+                                accessible-checked: entry.selected;
+                                accessible-action-default => { root.toggle-user-id(index); }
+
+                                HorizontalLayout {
+                                    padding-left: Theme.s3;
+                                    padding-right: Theme.s3;
+                                    spacing: Theme.s3;
+
+                                    Rectangle {
+                                        width: 17px;
+                                        height: 17px;
+                                        y: (parent.height - self.height) / 2;
+                                        border-radius: 5px;
+                                        background: entry.selected ? Theme.accent : Theme.surface;
+                                        border-width: 1px;
+                                        border-color: entry.selected ? Theme.accent : Theme.border-strong;
+                                        if entry.selected: Icon {
+                                            glyph: Icons.check;
+                                            tint: Theme.accent-ink;
+                                            width: 12px;
+                                            height: 12px;
+                                        }
+                                    }
+
+                                    Text {
+                                        text: entry.text;
+                                        color: Theme.text;
+                                        font-size: Theme.t-md;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                }
+
+                                pick := TouchArea {
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => { root.toggle-user-id(index); }
                                 }
                             }
-
-                            Text {
-                                text: entry.text;
-                                color: Theme.text;
-                                font-size: Theme.t-md;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                                overflow: elide;
-                            }
-                        }
-
-                        pick := TouchArea {
-                            mouse-cursor: MouseCursor.pointer;
-                            clicked => { root.toggle-user-id(index); }
                         }
                     }
                 }
-            }
-        }
 
-        HorizontalLayout {
-            spacing: Theme.s3;
+                HorizontalLayout {
+                    spacing: Theme.s3;
 
-            VerticalLayout {
-                spacing: 6px;
-                horizontal-stretch: 1;
-                Text {
-                    text: "Certify with";
-                    color: Theme.text-dim;
-                    font-size: Theme.t-sm;
+                    VerticalLayout {
+                        spacing: 6px;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: "Certify with";
+                            color: Theme.text-dim;
+                            font-size: Theme.t-sm;
+                        }
+                        Select {
+                            label: "Certify with";
+                            model: root.certifiers;
+                            enabled: !root.busy;
+                            current: root.certifier-index;
+                            changed(index) => { root.certifier-index = index; }
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 6px;
+                        width: 150px;
+                        Text {
+                            text: "Confidence";
+                            color: Theme.text-dim;
+                            font-size: Theme.t-sm;
+                        }
+                        Select {
+                            label: "Confidence";
+                            model: ["Full", "Partial"];
+                            enabled: !root.busy;
+                            current: root.confidence;
+                            changed(index) => { root.confidence = index; }
+                        }
+                    }
                 }
-                Select {
-                    label: "Certify with";
-                    model: root.certifiers;
+
+                VerticalLayout {
+                    spacing: Theme.s2;
+
+                    Check {
+                        text: "Publishable — others may see this certification";
+                        checked: root.publishable;
+                        enabled: !root.busy;
+                        toggled => { root.publishable = !root.publishable; }
+                    }
+                    Check {
+                        text: "Treat as a trusted introducer";
+                        checked: root.introducer;
+                        enabled: !root.busy;
+                        toggled => { root.introducer = !root.introducer; }
+                    }
+                    if root.introducer: Text {
+                        text: "Certificates this key certifies will also count as verified here.";
+                        color: Theme.text-faint;
+                        font-size: Theme.t-sm;
+                        wrap: word-wrap;
+                    }
+                }
+
+                Field {
+                    placeholder: "Passphrase for your certifying key (if any)";
+                    secret: true;
                     enabled: !root.busy;
-                    current: root.certifier-index;
-                    changed(index) => { root.certifier-index = index; }
+                    edited(text) => { root.password = text; }
                 }
-            }
 
-            VerticalLayout {
-                spacing: 6px;
-                width: 150px;
-                Text {
-                    text: "Confidence";
-                    color: Theme.text-dim;
+                // The Certify button opens only when some key can certify, and
+                // the list leaves out the certificate being certified, so an
+                // empty list means that certificate is the one key that can: one
+                // of the user's own that only gpg-agent holds, whose row has no
+                // secret key file to disable the button by.
+                if root.certifiers.length == 0: Text {
+                    text: "No other key of yours can certify, and a certificate cannot certify itself.";
+                    color: Theme.warn;
                     font-size: Theme.t-sm;
-                }
-                Select {
-                    label: "Confidence";
-                    model: ["Full", "Partial"];
-                    enabled: !root.busy;
-                    current: root.confidence;
-                    changed(index) => { root.confidence = index; }
+                    wrap: word-wrap;
                 }
             }
         }
 
-        VerticalLayout {
-            spacing: Theme.s2;
-
-            Check {
-                text: "Publishable — others may see this certification";
-                checked: root.publishable;
-                enabled: !root.busy;
-                toggled => { root.publishable = !root.publishable; }
-            }
-            Check {
-                text: "Treat as a trusted introducer";
-                checked: root.introducer;
-                enabled: !root.busy;
-                toggled => { root.introducer = !root.introducer; }
-            }
-            if root.introducer: Text {
-                text: "Certificates this key certifies will also count as verified here.";
-                color: Theme.text-faint;
-                font-size: Theme.t-sm;
-                wrap: word-wrap;
-            }
-        }
-
-        Field {
-            placeholder: "Passphrase for your certifying key (if any)";
-            secret: true;
-            enabled: !root.busy;
-            edited(text) => { root.password = text; }
-        }
-
-        // The Certify button opens only when some key can certify, and the
-        // list leaves out the certificate being certified, so an empty list
-        // means that certificate is the one key that can: one of the user's
-        // own that only gpg-agent holds, whose row has no secret key file to
-        // disable the button by.
-        if root.certifiers.length == 0: Text {
-            text: "No other key of yours can certify, and a certificate cannot certify itself.";
-            color: Theme.warn;
-            font-size: Theme.t-sm;
-            wrap: word-wrap;
-        }
+        if root.error != "": DialogError { text: root.error; }
 
         Divider { }
 
@@ -910,7 +943,6 @@ export component RevokeDialog inherits DialogShell {
     /// The key is already revoked, softly, and this marks it compromised, so
     /// only the two hard reasons are offered.
     in property <bool> upgrade;
-    in property <bool> busy;
     callback run(int, string, string);
 
     property <string> password;
@@ -998,6 +1030,8 @@ export component RevokeDialog inherits DialogShell {
             edited(text) => { root.password = text; }
         }
 
+        if root.error != "": DialogError { text: root.error; }
+
         Divider { }
 
         HorizontalLayout {
@@ -1035,7 +1069,6 @@ export component ImportRevocationDialog inherits DialogShell {
     in property <[PendingRevocationRow]> revocations;
     /// How many of them revoke the user's own keys.
     in property <int> yours: 1;
-    in property <bool> busy;
     callback run();
 
     title: root.yours > 1 ? "Revoke your keys" : "Revoke your key";
@@ -1094,6 +1127,8 @@ export component ImportRevocationDialog inherits DialogShell {
             }
         }
 
+        if root.error != "": DialogError { text: root.error; }
+
         Divider { }
 
         HorizontalLayout {
@@ -1123,7 +1158,6 @@ export component DeleteDialog inherits DialogShell {
     /// operation, deleting your own key is destroying the only copy.
     in property <bool> has-secret;
     in property <bool> has-revocation;
-    in property <bool> busy;
     callback run();
 
     /// Typing the key ID is the confirmation for a secret key. A second button
@@ -1175,6 +1209,8 @@ export component DeleteDialog inherits DialogShell {
             }
         }
 
+        if root.error != "": DialogError { text: root.error; }
+
         Divider { }
 
         HorizontalLayout {
@@ -1205,7 +1241,6 @@ export component NotepadDialog inherits DialogShell {
     in property <[SignatureRow]> signatures;
     in property <string> result;
     in property <int> result-tone;
-    in property <bool> busy;
     callback toggle-recipient(int);
     /// Narrows the list below. The count above stays over every recipient, so
     /// filtering can never look like it deselected someone.
@@ -1399,6 +1434,8 @@ export component NotepadDialog inherits DialogShell {
                     // bound, so an unbound one reports a single line however many
                     // it draws, and the extra lines land outside the box.
                     width: parent.width;
+                    // Announced, as Decrypt / Verify's verdict is.
+                    accessible-live-region: polite;
                     text: root.result;
                     color: root.result-tone == 1 ? Theme.ok
                         : root.result-tone == 2 ? Theme.warn : Theme.danger;
@@ -1591,25 +1628,43 @@ export component DetailsDialog inherits DialogShell {
                 spacing: Theme.s2;
                 property <bool> copied: false;
 
-                // The text column only, not the whole row: the pills and the
-                // revoke button sit beside it and a row-wide target would take
-                // clicks meant for them.
-                accessible-role: button;
-                accessible-label: "Copy user ID";
-                accessible-description: uid.text;
-                accessible-action-default => {
+                // A click, Space or Enter, and assistive technology's action
+                // all copy this way.
+                function copy-now() {
                     root.copy-value(uid.text);
                     uid-row.copied = true;
                     settle.running = true;
                 }
 
+                // The text column only, not the whole row: the pills and the
+                // revoke button sit beside it and a row-wide target would take
+                // clicks meant for them. The button assistive technology is
+                // told of is the same column. It used to be the row, which
+                // made Revoke user ID a button inside the copy button, where
+                // some screen readers do not look, and put the copy button's
+                // bounds over Revoke's.
                 uid-copy := TouchArea {
+                    accessible-role: button;
+                    accessible-label: "Copy user ID";
+                    accessible-description: uid.text;
+                    accessible-action-default => { uid-row.copy-now(); }
                     horizontal-stretch: 1;
                     mouse-cursor: MouseCursor.pointer;
-                    clicked => {
-                        root.copy-value(uid.text);
-                        uid-row.copied = true;
-                        settle.running = true;
+                    clicked => { uid-row.copy-now(); }
+
+                    // Reachable by keyboard, as FieldRow's copy button is and
+                    // for the same reason. Placed at x 0 so that it is not
+                    // counted in the column's size.
+                    key := FocusScope {
+                        x: 0;
+                        width: 0px;
+                        key-pressed(event) => {
+                            if (event.text == " " || event.text == "\n") {
+                                uid-row.copy-now();
+                                return accept;
+                            }
+                            return reject;
+                        }
                     }
 
                     settle := Timer {
@@ -1647,15 +1702,33 @@ export component DetailsDialog inherits DialogShell {
 
                         VerticalLayout {
                             alignment: start;
-                            Icon {
-                                glyph: uid-row.copied ? Icons.check : Icons.file;
-                                tint: uid-row.copied ? Theme.ok : Theme.text-faint;
+                            Rectangle {
                                 width: 14px;
                                 height: 14px;
-                                opacity: uid-row.copied
-                                    ? 1.0
-                                    : (uid-copy.has-hover ? 1.0 : 0.0);
-                                animate opacity { duration: Theme.fast; }
+                                Icon {
+                                    glyph: uid-row.copied ? Icons.check : Icons.file;
+                                    tint: uid-row.copied ? Theme.ok : Theme.text-faint;
+                                    width: 14px;
+                                    height: 14px;
+                                    opacity: uid-row.copied || uid-copy.has-hover || key.has-focus
+                                        ? 1.0
+                                        : 0.0;
+                                    animate opacity { duration: Theme.fast; }
+                                }
+                                // Around the icon, as FieldRow's copy button has
+                                // it: around the whole column the ring ran into
+                                // the user ID's first letter, and it cannot go
+                                // outside the column on the left, where the
+                                // dialog's scrolling body clips it.
+                                if key.has-focus: Rectangle {
+                                    x: -3px;
+                                    y: -3px;
+                                    width: parent.width + 6px;
+                                    height: parent.height + 6px;
+                                    border-width: 2px;
+                                    border-color: Theme.accent;
+                                    border-radius: Theme.r-sm;
+                                }
                             }
                         }
                     }
@@ -1780,7 +1853,6 @@ export component LifecycleDialog inherits DialogShell {
     /// dialog says which key is about to become public.
     in property <string> key-name;
     in property <string> key-id;
-    in property <bool> busy;
     /// mode, expiry-index, value, password, reason-index. The reason is
     /// meaningful for mode 4 (revoke a subkey) only.
     callback run(int, string, string, string, int);
@@ -1883,6 +1955,8 @@ export component LifecycleDialog inherits DialogShell {
             wrap: word-wrap;
         }
 
+        if root.error != "": DialogError { text: root.error; }
+
         Divider { }
 
         HorizontalLayout {
@@ -1914,7 +1988,6 @@ export component LookupDialog inherits DialogShell {
     in property <[LookupRow]> results;
     in property <string> status;
     in property <bool> searched;
-    in property <bool> busy;
     callback search(string);
     callback import-result(int);
 
@@ -1946,11 +2019,14 @@ export component LookupDialog inherits DialogShell {
             }
         }
 
+        // Announced, as Decrypt / Verify's verdict is: it is where a search
+        // says what it found, or why it failed.
         if root.status != "": Text {
             text: root.status;
             color: Theme.text-dim;
             font-size: Theme.t-sm;
             wrap: word-wrap;
+            accessible-live-region: polite;
         }
 
         if root.results.length > 0: VerticalLayout {

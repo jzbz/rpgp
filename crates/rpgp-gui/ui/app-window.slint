@@ -1,8 +1,8 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Theme, Icons, Icon } from "theme.slint";
 import {
-    Btn, Check, Divider, Field, FieldRow, Monogram, Pill, RevokeOffer, SectionLabel, Select,
-    Tone, TrustRootCheck, Variant,
+    Btn, CertList, Check, Divider, Field, FieldRow, Monogram, Pill, RevokeOffer, ScopeTabs,
+    SectionLabel, Select, StatusBar, Tone, TrustRootCheck, Variant,
 } from "widgets.slint";
 import { CertRow, CertificationRow, LookupRow, PendingRevocationRow, RecipientRow, SignatureRow, SubkeyRow, UserIdDetailRow, UserIdRow } from "types.slint";
 import { AboutDialog, CertifyDialog, DecryptVerifyDialog, DetailsDialog, ImportRevocationDialog, KeygenDialog, LifecycleDialog, LookupDialog, NotepadDialog, DeleteDialog, RevokeDialog, SignEncryptDialog } from "dialogs.slint";
@@ -29,198 +29,6 @@ import "fonts/geist-semibold.ttf";
 import "fonts/geist-bold.ttf";
 
 export { CertRow, CertificationRow, LookupRow, RecipientRow, SignatureRow, SubkeyRow, UserIdDetailRow, UserIdRow }
-
-component RailItem inherits Rectangle {
-    in property <bool> enabled: true;
-    in property <string> text;
-    in property <image> glyph;
-    in property <int> count;
-    in property <bool> active;
-    callback clicked();
-
-    // A tab, not a button: these switch which set of certificates the list
-    // shows, and which one is current is the thing worth announcing.
-    accessible-role: tab;
-    accessible-label: root.text;
-    accessible-enabled: root.enabled;
-    accessible-checkable: true;
-    accessible-checked: root.active;
-    // Gated for the reasons Btn gives. The window's handler sets `scope`
-    // before Rust is asked, and Rust declines while an operation is in
-    // flight, so a switch that got through would leave this tab lit over a
-    // list it does not describe.
-    accessible-action-default => {
-        if (root.enabled) {
-            root.clicked();
-        }
-    }
-
-    height: 34px;
-    border-radius: Theme.r-sm;
-    background: root.active ? Theme.selected : (touch.has-hover ? Theme.hover : transparent);
-    animate background { duration: Theme.fast; }
-
-    HorizontalLayout {
-        padding-left: Theme.s2;
-        padding-right: Theme.s2;
-        spacing: Theme.s2;
-
-        Icon {
-            glyph: root.glyph;
-            tint: root.active ? Theme.accent : Theme.text-dim;
-            y: (parent.height - self.height) / 2;
-        }
-
-        Text {
-            text: root.text;
-            color: root.active ? Theme.accent : Theme.text;
-            font-size: Theme.t-md;
-            font-weight: root.active ? Theme.w-medium : Theme.w-regular;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-            overflow: elide;
-        }
-
-        Text {
-            text: "\{root.count}";
-            color: Theme.text-faint;
-            font-size: Theme.t-sm;
-            vertical-alignment: center;
-        }
-    }
-
-    touch := TouchArea {
-        enabled: root.enabled;
-        mouse-cursor: MouseCursor.pointer;
-        clicked => { root.clicked(); }
-    }
-}
-
-component CertListRow inherits Rectangle {
-    in property <CertRow> cert;
-    in property <bool> selected;
-    in property <bool> enabled: true;
-    callback clicked();
-
-    // The row announces who it is and whether it is the selected one. The
-    // description carries the fingerprint, which is what someone listening
-    // rather than looking actually needs to tell two keys apart.
-    accessible-role: list-item;
-    accessible-label: root.cert.primary-user-id;
-    accessible-description: "Key " + root.cert.key-id;
-    accessible-enabled: root.enabled;
-    accessible-item-selectable: true;
-    accessible-item-selected: root.selected;
-    // Gated for the reasons Btn gives. As with RailItem, the window's handler
-    // sets `current-row` before Rust declines, which would leave the highlight
-    // on one certificate and the details pane on another, and some actions
-    // take their certificate from the one and some from the other.
-    accessible-action-default => {
-        if (root.enabled) {
-            root.clicked();
-        }
-    }
-
-    height: 62px;
-    background: root.selected ? Theme.selected : (touch.has-hover ? Theme.hover : transparent);
-    animate background { duration: Theme.fast; }
-
-    // Accent spine on the selected row.
-    Rectangle {
-        x: 0;
-        width: 3px;
-        height: parent.height;
-        background: root.selected ? Theme.accent : transparent;
-    }
-
-    HorizontalLayout {
-        padding-left: Theme.s4;
-        padding-right: Theme.s4;
-        spacing: Theme.s3;
-
-        Monogram {
-            initials: root.cert.initials;
-            tint: Theme.monograms[root.cert.tint-index];
-            size: 38px;
-            y: (parent.height - self.height) / 2;
-        }
-
-        VerticalLayout {
-            alignment: center;
-            spacing: 2px;
-            horizontal-stretch: 1;
-
-            Text {
-                text: root.cert.name == "" ? root.cert.primary-user-id : root.cert.name;
-                color: Theme.text;
-                font-size: Theme.t-lg;
-                font-weight: Theme.w-medium;
-                overflow: elide;
-            }
-
-            Text {
-                text: root.cert.email == "" ? root.cert.key-id : root.cert.email;
-                color: Theme.text-dim;
-                font-size: Theme.t-sm;
-                overflow: elide;
-            }
-        }
-
-        VerticalLayout {
-            alignment: center;
-            spacing: 4px;
-            horizontal-stretch: 0;
-
-            HorizontalLayout {
-                spacing: 6px;
-                alignment: end;
-
-                // Only shown once there is something to say. An "unverified"
-                // badge on every stranger in the list would be noise, and the
-                // details pane spells it out anyway.
-                if root.cert.authentication != "unverified": Pill {
-                    text: root.cert.authentication;
-                    tone: root.cert.authentication == "verified" ? Tone.ok : Tone.warn;
-                    glyph: Icons.certify;
-                }
-
-                if root.cert.card-serial != "": Pill {
-                    text: "smartcard";
-                    tone: Tone.accent;
-                    glyph: Icons.key;
-                }
-
-                if root.cert.has-secret && root.cert.card-serial == "": Pill {
-                    text: "secret key";
-                    tone: Tone.accent;
-                    glyph: Icons.key;
-                }
-
-                Pill {
-                    text: root.cert.validity;
-                    tone: root.cert.validity == "valid" ? Tone.ok
-                        : root.cert.validity == "expired" ? Tone.warn
-                        : Tone.danger;
-                }
-            }
-
-            Text {
-                text: root.cert.expires == ""
-                    ? root.cert.capabilities + " · never expires"
-                    : root.cert.capabilities + " · until " + root.cert.expires;
-                color: Theme.text-faint;
-                font-size: Theme.t-xs;
-                horizontal-alignment: right;
-            }
-        }
-    }
-
-    touch := TouchArea {
-        enabled: root.enabled;
-        mouse-cursor: MouseCursor.pointer;
-        clicked => { root.clicked(); }
-    }
-}
 
 export component AppWindow inherits Window {
     title: "rPGP";
@@ -270,6 +78,55 @@ export component AppWindow inherits Window {
     in-out property <int> sort-by: 0;
     in property <string> status: "";
     in property <bool> busy: false;
+
+    // Whether a dialog is open, and with it whether the controls behind its
+    // scrim take any input.
+    //
+    // The dialogs are children of the window, not popups, and Slint's Tab
+    // goes to any control that is on screen, covered or not, and wraps around
+    // the whole window. So Tab walked out of a dialog to the rail, the toolbar
+    // and the details pane, and Space pressed there acted behind the scrim:
+    // tabbing past the notepad's last button to the rail's Sign / Encrypt
+    // opened that dialog underneath it and replaced the notepad's ticked
+    // recipients with its own, and Shift+Tab reached the details pane's Trust
+    // root and SHA-1 boxes, each a write to the store on one key. Assistive
+    // technology could activate any of them as well. Every control behind a
+    // dialog is therefore disabled while one is open: a disabled control
+    // takes no focus, so Tab goes round the dialog's own controls and no
+    // others, and the app's widgets refuse assistive technology's actions
+    // while disabled. They are drawn disabled too, under the scrim.
+    //
+    // That holds only while no dialog opens over another, since the one
+    // under it is not disabled. None does from here: every opener is behind
+    // the scrim, and the Details dialog closes as it opens the next. Rust
+    // reads this before the one dialog it opens with no control pressed,
+    // the question Import puts about a revocation certificate, which
+    // Import's file dialog can bring on with another dialog open.
+    out property <bool> dialog-open: root.keygen-open || root.signenc-open || root.verify-open
+        || root.certify-open || root.delete-open || root.revoke-open
+        || root.import-revocation-open || root.notepad-open || root.details-open
+        || root.lifecycle-open || root.lookup-open || root.about-open;
+    // What the controls behind the dialogs are enabled by: neither an
+    // operation in flight nor a dialog over them.
+    property <bool> live: !root.busy && !root.dialog-open;
+
+    /// Why the operation the open dialog started has failed, which the dialog
+    /// shows and announces; see DialogError. Rust sets it on a failure, along
+    /// with the status line, and it is cleared here whenever a dialog opens
+    /// or closes and whenever an operation starts, so that it never describes
+    /// an earlier attempt or another dialog. That needs a dialog to open with
+    /// no other open, or `dialog-open` would not change as it did. Rust opens
+    /// none over another, and the Details dialog, which closes as it opens the
+    /// next, runs nothing that could have failed. Bound only to the dialogs
+    /// that have no result line of their own: Decrypt / Verify, the notepad
+    /// and Lookup already say how a run went, failures included.
+    in-out property <string> dialog-error: "";
+    changed dialog-open => { root.dialog-error = ""; }
+    changed busy => {
+        if (root.busy) {
+            root.dialog-error = "";
+        }
+    }
 
     callback refresh();
     callback import-file();
@@ -479,29 +336,13 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                RailItem {
-                    enabled: !root.busy;
-                    text: "All certificates";
-                    glyph: Icons.shield;
-                    count: root.count-all;
-                    active: root.scope == 0;
-                    clicked => { root.scope = 0; root.scope-changed(0); }
-                }
-                RailItem {
-                    enabled: !root.busy;
-                    text: "My keys";
-                    glyph: Icons.key;
-                    count: root.count-mine;
-                    active: root.scope == 1;
-                    clicked => { root.scope = 1; root.scope-changed(1); }
-                }
-                RailItem {
-                    enabled: !root.busy;
-                    text: "Other people";
-                    glyph: Icons.users;
-                    count: root.count-others;
-                    active: root.scope == 2;
-                    clicked => { root.scope = 2; root.scope-changed(2); }
+                ScopeTabs {
+                    enabled: root.live;
+                    scope <=> root.scope;
+                    count-all: root.count-all;
+                    count-mine: root.count-mine;
+                    count-others: root.count-others;
+                    scope-changed(index) => { root.scope-changed(index); }
                 }
 
                 Rectangle { vertical-stretch: 1; }
@@ -519,7 +360,7 @@ export component AppWindow inherits Window {
                     glyph: Icons.lock;
                     variant: Variant.ghost;
                     wide: true;
-                    enabled: !root.busy;
+                    enabled: root.live;
                     clicked => { root.open-sign-encrypt(); }
                 }
                 Btn {
@@ -527,7 +368,7 @@ export component AppWindow inherits Window {
                     glyph: Icons.unlock;
                     variant: Variant.ghost;
                     wide: true;
-                    enabled: !root.busy;
+                    enabled: root.live;
                     clicked => { root.open-decrypt-verify(); }
                 }
                 Btn {
@@ -535,7 +376,7 @@ export component AppWindow inherits Window {
                     glyph: Icons.pen-line;
                     variant: Variant.ghost;
                     wide: true;
-                    enabled: !root.busy;
+                    enabled: root.live;
                     clicked => { root.open-notepad(); }
                 }
                 Btn {
@@ -543,6 +384,8 @@ export component AppWindow inherits Window {
                     glyph: Icons.shield;
                     variant: Variant.ghost;
                     wide: true;
+                    // Starts nothing, so an operation in flight leaves it be.
+                    enabled: !root.dialog-open;
                     clicked => { root.about-open = true; }
                 }
             }
@@ -587,7 +430,7 @@ export component AppWindow inherits Window {
                         min-width: 140px;
                         max-width: 300px;
                         horizontal-stretch: 1;
-                        enabled: !root.busy;
+                        enabled: root.live;
                         y: (parent.height - self.height) / 2;
                         edited(text) => { root.filter-changed(text); }
                     }
@@ -596,7 +439,7 @@ export component AppWindow inherits Window {
                         label: "Sort by";
                         model: ["Mine first", "Name", "Newest", "Expiring soonest"];
                         width: 150px;
-                        enabled: !root.busy;
+                        enabled: root.live;
                         current: root.sort-by;
                         y: (parent.height - self.height) / 2;
                         changed(index) => { root.sort-by = index; root.sort-changed(index); }
@@ -608,7 +451,7 @@ export component AppWindow inherits Window {
                         text: "Import";
                         compact: root.toolbar-compact;
                         glyph: Icons.arrow-in;
-                        enabled: !root.busy;
+                        enabled: root.live;
                         y: (parent.height - self.height) / 2;
                         clicked => { root.import-file(); }
                     }
@@ -616,7 +459,7 @@ export component AppWindow inherits Window {
                         text: "Look up";
                         compact: root.toolbar-compact;
                         glyph: Icons.search;
-                        enabled: !root.busy;
+                        enabled: root.live;
                         y: (parent.height - self.height) / 2;
                         clicked => { root.open-lookup(); }
                     }
@@ -624,7 +467,7 @@ export component AppWindow inherits Window {
                         text: "Export";
                         compact: root.toolbar-compact;
                         glyph: Icons.arrow-out;
-                        enabled: root.has-selection && !root.busy;
+                        enabled: root.has-selection && root.live;
                         y: (parent.height - self.height) / 2;
                         clicked => { root.export-selected(); }
                     }
@@ -633,7 +476,7 @@ export component AppWindow inherits Window {
                         // Icon-only, so it carries its own name.
                         label: "Refresh the certificate list";
                         variant: Variant.ghost;
-                        enabled: !root.busy;
+                        enabled: root.live;
                         y: (parent.height - self.height) / 2;
                         clicked => { root.refresh(); }
                     }
@@ -641,7 +484,7 @@ export component AppWindow inherits Window {
                         text: "New key pair";
                         glyph: Icons.plus;
                         variant: Variant.primary;
-                        enabled: !root.busy;
+                        enabled: root.live;
                         y: (parent.height - self.height) / 2;
                         clicked => { root.keygen-open = true; }
                     }
@@ -686,16 +529,11 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    if root.certs.length > 0: ListView {
-                        for cert[index] in root.certs: CertListRow {
-                            cert: cert;
-                            enabled: !root.busy;
-                            selected: index == root.current-row;
-                            clicked => {
-                                root.current-row = index;
-                                root.row-selected(index);
-                            }
-                        }
+                    if root.certs.length > 0: CertList {
+                        certs: root.certs;
+                        enabled: root.live;
+                        current-row <=> root.current-row;
+                        row-selected(index) => { root.row-selected(index); }
                     }
                 }
 
@@ -872,7 +710,7 @@ export component AppWindow inherits Window {
                                 Check {
                                     text: "Accept SHA-1 from this certificate";
                                     checked: root.detail.sha1-accepted;
-                                    enabled: !root.busy;
+                                    enabled: root.live;
                                     toggled => { root.toggle-sha1-accepted(); }
                                 }
 
@@ -892,11 +730,14 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             spacing: Theme.s3;
 
+                            // Copying starts no operation, so only a dialog
+                            // over them turns these off.
                             FieldRow {
                                 label: "Fingerprint";
                                 value: root.detail.fingerprint-pretty;
                                 mono: true;
                                 copyable: true;
+                                enabled: !root.dialog-open;
                                 copy => { root.copy-value(root.detail.fingerprint); }
                             }
                             FieldRow {
@@ -904,6 +745,7 @@ export component AppWindow inherits Window {
                                 value: root.detail.key-id;
                                 mono: true;
                                 copyable: true;
+                                enabled: !root.dialog-open;
                                 copy => { root.copy-value(self.value); }
                             }
                             FieldRow {
@@ -927,6 +769,7 @@ export component AppWindow inherits Window {
                                 value: root.detail.user-ids;
                                 mono: true;
                                 copyable: true;
+                                enabled: !root.dialog-open;
                                 copy => { root.copy-value(self.value); }
                             }
                         }
@@ -948,7 +791,9 @@ export component AppWindow inherits Window {
 
                         TrustRootCheck {
                             cert: root.detail;
-                            busy: root.busy;
+                            // Held, as for an operation in flight, while a
+                            // dialog is over it too.
+                            busy: !root.live;
                             toggled => { root.toggle-trust-root(); }
                         }
 
@@ -1000,7 +845,7 @@ export component AppWindow inherits Window {
                                 glyph: Icons.certify;
                                 variant: Variant.primary;
                                 wide: true;
-                                enabled: !root.busy && root.can-certify && !root.detail.has-secret;
+                                enabled: root.live && root.can-certify && !root.detail.has-secret;
                                 clicked => { root.open-certify(); }
                             }
 
@@ -1009,7 +854,7 @@ export component AppWindow inherits Window {
                                 glyph: Icons.revoke;
                                 variant: Variant.ghost;
                                 wide: true;
-                                enabled: !root.busy;
+                                enabled: root.live;
                                 clicked => { root.open-withdraw(); }
                             }
 
@@ -1018,7 +863,7 @@ export component AppWindow inherits Window {
                                 glyph: Icons.arrow-out;
                                 variant: Variant.ghost;
                                 wide: true;
-                                enabled: !root.busy && root.detail.has-secret;
+                                enabled: root.live && root.detail.has-secret;
                                 clicked => { root.open-publish(); }
                             }
 
@@ -1027,7 +872,7 @@ export component AppWindow inherits Window {
                                 glyph: Icons.arrow-out;
                                 variant: Variant.ghost;
                                 wide: true;
-                                enabled: !root.busy;
+                                enabled: root.live;
                                 clicked => { root.save-revocation-cert(); }
                             }
 
@@ -1036,7 +881,7 @@ export component AppWindow inherits Window {
                                 glyph: Icons.revoke;
                                 variant: Variant.danger;
                                 wide: true;
-                                enabled: !root.busy;
+                                enabled: root.live;
                                 clicked => { root.open-revoke(); }
                             }
 
@@ -1045,7 +890,7 @@ export component AppWindow inherits Window {
                                     glyph: Icons.trash;
                                     variant: Variant.danger;
                                     wide: true;
-                                    enabled: !root.busy;
+                                    enabled: root.live;
                                     clicked => { root.open-delete(); }
                                 }
 
@@ -1054,7 +899,7 @@ export component AppWindow inherits Window {
                                     glyph: Icons.file;
                                     variant: Variant.ghost;
                                     wide: true;
-                                    enabled: !root.busy;
+                                    enabled: root.live;
                                     clicked => { root.open-details(); }
                                 }
 
@@ -1063,13 +908,13 @@ export component AppWindow inherits Window {
                                 Btn {
                                     text: "Export…";
                                     glyph: Icons.arrow-out;
-                                    enabled: !root.busy;
+                                    enabled: root.live;
                                     clicked => { root.export-selected(); }
                                 }
                                 Btn {
                                     text: "Encrypt to…";
                                     glyph: Icons.lock;
-                                    enabled: !root.busy;
+                                    enabled: root.live;
                                     clicked => { root.open-sign-encrypt(); }
                                 }
                             }
@@ -1082,45 +927,16 @@ export component AppWindow inherits Window {
     }
 
         // Status bar, spanning the rail as well as the content column.
-        Rectangle {
-            height: 28px;
-            background: Theme.surface-sunken;
-
-            Rectangle {
-                y: 0;
-                height: 1px;
-                width: parent.width;
-                background: Theme.border;
-            }
-
-            HorizontalLayout {
-                padding-left: Theme.s4;
-                padding-right: Theme.s4;
-                spacing: Theme.s2;
-
-                if root.busy: Rectangle {
-                    width: 7px;
-                    height: 7px;
-                    border-radius: 4px;
-                    background: Theme.accent;
-                    y: (parent.height - self.height) / 2;
-                    opacity: 0.4;
-                    animate opacity { duration: 700ms; iteration-count: -1; direction: alternate; }
-                }
-
-                Text {
-                    text: root.status;
-                    color: Theme.text-dim;
-                    font-size: Theme.t-sm;
-                    vertical-alignment: center;
-                    overflow: elide;
-                }
-            }
+        StatusBar {
+            text: root.status;
+            busy: root.busy;
+            announce: !root.dialog-open;
         }
     }
 
     if root.keygen-open: KeygenDialog {
         busy: root.busy;
+        error: root.dialog-error;
         dismissed => { root.keygen-open = false; }
         accepted(name, email, password, key-type, expiry, standard) => {
             root.generate-key(name, email, password, key-type, expiry, standard);
@@ -1129,6 +945,7 @@ export component AppWindow inherits Window {
 
     if root.signenc-open: SignEncryptDialog {
         busy: root.busy;
+        error: root.dialog-error;
         input-path: root.se-input;
         choose-output: root.choose-outputs;
         output-encrypt: root.se-output-encrypt;
@@ -1170,6 +987,7 @@ export component AppWindow inherits Window {
 
     if root.lifecycle-open: LifecycleDialog {
         busy: root.busy;
+        error: root.dialog-error;
         mode: root.lifecycle-mode;
         target: root.lifecycle-target;
         key-name: root.lifecycle-key-name;
@@ -1207,6 +1025,7 @@ export component AppWindow inherits Window {
 
     if root.certify-open: CertifyDialog {
         busy: root.busy;
+        error: root.dialog-error;
         target-name: root.certify-target;
         user-ids: root.certify-user-ids;
         certifiers: root.certify-certifiers;
@@ -1220,6 +1039,7 @@ export component AppWindow inherits Window {
 
     if root.delete-open: DeleteDialog {
         busy: root.busy;
+        error: root.dialog-error;
         target-name: root.delete-target;
         has-secret: root.delete-has-secret;
         has-revocation: root.delete-has-revocation;
@@ -1230,6 +1050,7 @@ export component AppWindow inherits Window {
 
     if root.revoke-open: RevokeDialog {
         busy: root.busy;
+        error: root.dialog-error;
         target-name: root.revoke-target;
         certification: root.revoke-is-certification;
         upgrade: root.revoke-upgrade;
@@ -1239,6 +1060,7 @@ export component AppWindow inherits Window {
 
     if root.import-revocation-open: ImportRevocationDialog {
         busy: root.busy;
+        error: root.dialog-error;
         revocations: root.import-revocations;
         yours: root.import-revocation-yours;
         dismissed => { root.import-revocation-open = false; }

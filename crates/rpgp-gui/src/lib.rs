@@ -258,21 +258,39 @@ const APP_ID: &str = "app.rpgp.rpgp";
 /// return could not. It deliberately does nothing on the normal path: the
 /// completion closure is the one that should clear the flag, and say what
 /// happened while doing so.
-struct BusyGuard(slint::Weak<AppWindow>);
+///
+/// The second field is where the operation says that it failed, and a panic
+/// is said there as well: in the dialog that started it, through
+/// [`report_in_dialog`] or the line of its own that Decrypt / Verify, the
+/// notepad and Lookup keep, or on the status line alone for an import, which
+/// no dialog starts. Saying it in whichever dialog happened to be open would
+/// put an import's panic into a dialog opened while Import's file dialog was
+/// still up, as the answer to an operation that dialog never started.
+struct BusyGuard(slint::Weak<AppWindow>, fn(&AppWindow, String));
 
 impl Drop for BusyGuard {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             return;
         }
-        let ui_weak = self.0.clone();
+        let (ui_weak, report) = (self.0.clone(), self.1);
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = ui_weak.upgrade() {
-                ui.set_busy(false);
-                ui.set_status("That operation failed unexpectedly. Nothing was changed.".into());
+                after_a_panic(&ui, report);
             }
         });
     }
+}
+
+/// The event-loop half of [`BusyGuard`]. Split out so that a test can reach
+/// it: without an event loop the testing backend drops what another thread
+/// sends, and it gives an event loop to one test per process.
+fn after_a_panic(ui: &AppWindow, report: fn(&AppWindow, String)) {
+    ui.set_busy(false);
+    report(
+        ui,
+        "That operation failed unexpectedly. Nothing was changed.".to_string(),
+    );
 }
 
 /// Whether an operation is already in flight, in which case the caller
@@ -738,7 +756,9 @@ fn import_chosen_file(ui: &AppWindow, state: &Shared, path: PathBuf) {
     ui.set_status("Importing…".into());
     let (ui_weak, state) = (ui.as_weak(), state.clone());
     std::thread::spawn(move || {
-        let _busy = BusyGuard(ui_weak.clone());
+        // No dialog starts an import, so its failures, a panic among them, go
+        // to the status line alone.
+        let _busy = BusyGuard(ui_weak.clone(), |ui, message| ui.set_status(message.into()));
         let outcome = run_import(&state, &path);
 
         let _ = slint::invoke_from_event_loop(move || {
@@ -957,7 +977,8 @@ fn store_revocations(
                 .join(", ")
         ),
     };
-    // Most pressing first, since the status line elides what does not fit.
+    // Most pressing first. The status line holds a few lines and elides what
+    // goes past them, and a file revoking many keys can run longer than that.
     if !behind.is_empty() {
         message.push_str(&format!(", but {}", behind.join("; ")));
     }
@@ -984,9 +1005,11 @@ fn store_revocations(
 ///
 /// The file is kept as it was read: the dialog lists it, and its Revoke button
 /// stores exactly that, the way Delete acts on what its dialog named. Written
-/// afresh whenever Import reads one, which is the only way to open the dialog,
-/// and dropped once its revocations are stored, so it never answers for an
-/// earlier file.
+/// afresh each time the dialog opens, which only Import does, and dropped once
+/// its revocations are stored, so it never answers for an earlier file.
+///
+/// Not asked while another dialog is open, when nothing is stored and the user
+/// is told to import the file again.
 fn ask_to_store_revocations(ui: &AppWindow, state: &Shared, file: revoke::RevocationFile) {
     let rows: Vec<PendingRevocationRow> = file
         .revocations
@@ -999,14 +1022,33 @@ fn ask_to_store_revocations(ui: &AppWindow, state: &Shared, file: revoke::Revoca
         })
         .collect();
     let yours = rows.iter().filter(|row| row.yours).count();
+    let keys = if yours > 1 { "keys" } else { "key" };
+    // Import's file dialog is not modal, so another dialog can have been
+    // opened while it was up, and still be open when it answers. The window
+    // keeps Tab and assistive technology inside an open dialog by disabling
+    // what is behind it, and a dialog this one opened over would not be: its
+    // controls, Delete key and Create key pair among them, could be reached
+    // from this one, and Decrypt / Verify, which is drawn above this one,
+    // would hide it while it held focus. So it is not asked over another
+    // dialog. Nothing has been stored, and the user is told to import the
+    // file again, as when another operation was running.
+    if ui.get_dialog_open() {
+        ui.set_status(
+            format!(
+                "Nothing was revoked: the file is a revocation certificate for your own \
+                 {keys}, and another dialog is open. Close it and import the file again."
+            )
+            .into(),
+        );
+        return;
+    }
     lock(state).import_revocations = Some(file);
     ui.set_import_revocations(ModelRc::new(VecModel::from(rows)));
     ui.set_import_revocation_yours(yours as i32);
     ui.set_import_revocation_open(true);
     ui.set_status(
         format!(
-            "Nothing is revoked yet: the file is a revocation certificate for your own {}.",
-            if yours > 1 { "keys" } else { "key" }
+            "Nothing is revoked yet: the file is a revocation certificate for your own {keys}."
         )
         .into(),
     );
@@ -1031,7 +1073,7 @@ fn wire_keygen(ui: &AppWindow, state: &Shared) {
             let user_id = match keygen::user_id(&name, &email) {
                 Ok(user_id) => user_id,
                 Err(e) => {
-                    ui.set_status(format!("Key generation failed: {e}").into());
+                    report_in_dialog(&ui, format!("Key generation failed: {e}"));
                     return;
                 }
             };
@@ -1059,7 +1101,7 @@ fn wire_keygen(ui: &AppWindow, state: &Shared) {
             // every other worker here does.
             let (ui_weak, state) = (ui_weak.clone(), state.clone());
             std::thread::spawn(move || {
-                let _busy = BusyGuard(ui_weak.clone());
+                let _busy = BusyGuard(ui_weak.clone(), report_in_dialog);
                 let store = lock(&state).store.clone();
                 let outcome = keygen::generate(&request).and_then(|key| {
                     let fingerprint = key.cert.fingerprint().to_hex();
@@ -1097,13 +1139,13 @@ fn finish_keygen(
     ui.set_busy(false);
     let status = match outcome {
         Ok((fingerprint, keygen::Saved::Whole)) => format!("Created {fingerprint}"),
-        // What went wrong ahead of the fingerprint, since the status line
-        // elides its tail.
+        // What went wrong ahead of the fingerprint, which is the part a
+        // reader needs least.
         Ok((fingerprint, keygen::Saved::WithoutRevocation(e))) => format!(
             "Key created, but its revocation certificate could not be saved ({e}): {fingerprint}"
         ),
         Err(e) => {
-            ui.set_status(format!("Key generation failed: {e}").into());
+            report_in_dialog(ui, format!("Key generation failed: {e}"));
             return;
         }
     };
@@ -1322,7 +1364,7 @@ fn wire_sign_encrypt(ui: &AppWindow, state: &Shared) {
                     );
                     let ui_weak = ui.as_weak();
                     std::thread::spawn(move || {
-                        let _busy = BusyGuard(ui_weak.clone());
+                        let _busy = BusyGuard(ui_weak.clone(), report_in_dialog);
                         let outcome = run_sign_encrypt(
                             &state,
                             encrypt,
@@ -1342,7 +1384,7 @@ fn wire_sign_encrypt(ui: &AppWindow, state: &Shared) {
                                     ui.set_signenc_open(false);
                                     ui.set_status(format!("Wrote {}", output.display()).into());
                                 }
-                                Err(message) => ui.set_status(message.into()),
+                                Err(message) => report_in_dialog(&ui, message),
                             }
                         });
                     });
@@ -1651,7 +1693,7 @@ fn wire_decrypt_verify(ui: &AppWindow, state: &Shared) {
                     ui.set_status("Working…".into());
                     let ui_weak = ui.as_weak();
                     std::thread::spawn(move || {
-                        let _busy = BusyGuard(ui_weak.clone());
+                        let _busy = BusyGuard(ui_weak.clone(), report_in_decrypt_verify);
                         let (read, outcome) = run_decrypt_verify(&state, &password, chosen);
                         let _ = slint::invoke_from_event_loop(move || {
                             let Some(ui) = ui_weak.upgrade() else {
@@ -1775,14 +1817,14 @@ fn clear_dv_verdict(ui: &AppWindow) {
 /// Linux and Windows the file dialog has no parent window and the main window
 /// stays live behind it, but [`choose_dv_input`] and [`choose_dv_data`] refuse
 /// what it brings while the run is in flight. This check does not depend on
-/// those refusals: the dialog can still be closed while a run goes on, and its
-/// opener does not ask whether one is. Painted beside the new files, a verdict
-/// about the old ones reads as "Signature verified" next to a file nothing
-/// checked. It still goes on the status line, because a decrypt has already
-/// written its output by the time it gets here and hiding that would hide a
-/// plaintext file. There it says first that it is not about the files now
-/// chosen, because the status line elides and the tail is what goes, and then
-/// names the files it is about.
+/// those refusals, nor on the dialog staying open until the run is done, as
+/// Close, Escape and the scrim now leave it; its opener does not ask whether
+/// a run is in flight. Painted beside the new files, a verdict about the old
+/// ones reads as "Signature verified" next to a file nothing checked. It
+/// still goes on the status line, because a decrypt has already written its
+/// output by the time it gets here and hiding that would hide a plaintext
+/// file. There it says first that it is not about the files now chosen,
+/// which is the part not to miss, and then names the files it is about.
 fn show_decrypt_verify(ui: &AppWindow, state: &Shared, read: DvRead, outcome: DvOutcome) {
     if lock(state).dv_generation != read.generation {
         let message = match outcome {
@@ -1806,13 +1848,23 @@ fn show_decrypt_verify(ui: &AppWindow, state: &Shared, read: DvRead, outcome: Dv
             ui.set_dv_tone(tone);
             ui.set_status(summary.into());
         }
-        Err(message) => {
-            ui.set_dv_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
-            ui.set_dv_result(message.clone().into());
-            ui.set_dv_tone(3);
-            ui.set_status(message.into());
-        }
+        Err(message) => report_in_decrypt_verify(ui, message),
     }
+}
+
+/// Say why a Decrypt / Verify run failed, in the dialog's result line, which
+/// is announced, and on the status line, which is not while a dialog covers
+/// it.
+///
+/// A worker's panic comes here too, through [`BusyGuard`], rather than
+/// leaving the line with the verdict of the run before. The files cannot have
+/// changed since the run began, as the pickers refuse what they bring while
+/// it is in flight, so the check in [`show_decrypt_verify`] is not needed.
+fn report_in_decrypt_verify(ui: &AppWindow, message: String) {
+    ui.set_dv_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
+    ui.set_dv_result(message.as_str().into());
+    ui.set_dv_tone(3);
+    ui.set_status(message.into());
 }
 
 /// The blocking half of Decrypt / Verify. Returns which choice of files it
@@ -2069,7 +2121,7 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
             // Wiped when the worker is done with it, as in Sign / Encrypt.
             let password = Zeroizing::new(password.to_string());
             std::thread::spawn(move || {
-                let _busy = BusyGuard(ui_weak.clone());
+                let _busy = BusyGuard(ui_weak.clone(), report_in_dialog);
                 let outcome = run_certify(
                     &state,
                     certifier_index,
@@ -2095,7 +2147,7 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
                                 },
                             );
                         }
-                        Err(message) => ui.set_status(message.into()),
+                        Err(message) => report_in_dialog(&ui, message),
                     }
                 });
             });
@@ -2408,6 +2460,17 @@ fn reselect(ui: &AppWindow, state: &Shared, fingerprint: &str) {
 
 // --------------------------------------------------------------------- lookup
 
+/// Say why a search failed, in Lookup's own line, which is announced, in
+/// place of the results.
+///
+/// Not on the status line, which a search has never used. A worker's panic
+/// comes here too, through [`BusyGuard`], rather than leaving "Searching…"
+/// there for good.
+fn report_in_lookup(ui: &AppWindow, message: String) {
+    ui.set_lookup_results(ModelRc::new(VecModel::from(Vec::<LookupRow>::new())));
+    ui.set_lookup_status(message.into());
+}
+
 fn wire_lookup(ui: &AppWindow, state: &Shared) {
     ui.on_open_lookup({
         let (ui_weak, state) = (ui.as_weak(), state.clone());
@@ -2438,7 +2501,7 @@ fn wire_lookup(ui: &AppWindow, state: &Shared) {
             let (ui_weak, state) = (ui_weak.clone(), state.clone());
             let query = query.to_string();
             std::thread::spawn(move || {
-                let _busy = BusyGuard(ui_weak.clone());
+                let _busy = BusyGuard(ui_weak.clone(), report_in_lookup);
                 // Off the UI thread: this is a network round trip that can sit
                 // on a DNS timeout for seconds.
                 let outcome = rpgp_core::keyserver::lookup(&query);
@@ -2484,12 +2547,7 @@ fn wire_lookup(ui: &AppWindow, state: &Shared) {
                                 .into(),
                             );
                         }
-                        Err(e) => {
-                            ui.set_lookup_results(ModelRc::new(VecModel::from(
-                                Vec::<LookupRow>::new(),
-                            )));
-                            ui.set_lookup_status(format!("Lookup failed: {e}").into());
-                        }
+                        Err(e) => report_in_lookup(&ui, format!("Lookup failed: {e}")),
                     }
                 });
             });
@@ -2544,25 +2602,25 @@ fn wire_lifecycle(ui: &AppWindow, state: &Shared) {
     // The certificate a lifecycle action works on is fixed here, when the
     // dialog opens, from the one the details pane is showing — the same moment
     // the user ID or subkey a revoke mode acts on is handed over, so for as
-    // long as this dialog is open the two belong together. They can already
-    // disagree when it opens: the Details dialog's lists, which the user ID or
-    // subkey was picked from, were filled when that dialog opened, and an
-    // assistive-technology activation of a list row can move the pane behind
-    // its scrim in between. Keeping focus and activation inside an open
-    // dialog is what closes that, and it is not done here.
+    // long as this dialog is open the two belong together. They could
+    // disagree when it opened: the Details dialog's lists, which the user ID
+    // or subkey was picked from, were filled when that dialog opened, and an
+    // assistive-technology activation of a list row could move the pane
+    // behind its scrim in between. The window now disables every control
+    // behind an open dialog, the list's rows among them, and a disabled row
+    // refuses that activation, which closes it.
     //
     // The run used to read the pane again when its button was pressed, and a
     // reload landing behind the scrim put the selection back wherever it had
     // been asked to. An expiry or a new user ID could then go to another of
     // the user's keys, and Publish could upload a certificate the dialog was
     // never opened for, which cannot be taken back. Reloads now defer to a row
-    // the user has picked, but what the dialog acts on must not depend on
-    // nothing else moving the pane. The scrim stops only the pointer: an
-    // assistive-technology activation of a list row still reaches
-    // row_selected, and a reload can still be asked to select a row read from
-    // a highlight that has drifted away from the pane. The name the dialog
-    // shows comes from the same read, rather than being bound to the pane,
-    // for the same reason.
+    // the user has picked, and nothing behind a dialog takes input, but what
+    // the dialog acts on must not depend on nothing else moving the pane: a
+    // reload can still be asked to select a row read from a highlight that
+    // has drifted away from the pane. The name the dialog shows comes from
+    // the same read, rather than being bound to the pane, for the same
+    // reason.
     let open = |ui: &AppWindow, state: &Shared, mode: i32, target: SharedString| {
         let detail = ui.get_detail();
         if detail.fingerprint.is_empty() {
@@ -2637,7 +2695,7 @@ fn wire_lifecycle(ui: &AppWindow, state: &Shared) {
             // it never answers for an earlier dialog.
             let fingerprint = lock(&state).lifecycle_fingerprint.clone();
             let Some(fingerprint) = fingerprint else {
-                ui.set_status("No certificate selected".into());
+                report_in_dialog(&ui, "No certificate selected".to_string());
                 return;
             };
             let target = ui.get_lifecycle_target().to_string();
@@ -2655,7 +2713,7 @@ fn wire_lifecycle(ui: &AppWindow, state: &Shared) {
                 reason,
             };
             std::thread::spawn(move || {
-                let _busy = BusyGuard(ui_weak.clone());
+                let _busy = BusyGuard(ui_weak.clone(), report_in_dialog);
                 let outcome = run_lifecycle(&state, &input);
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(ui) = ui_weak.upgrade() else {
@@ -2686,7 +2744,7 @@ fn wire_lifecycle(ui: &AppWindow, state: &Shared) {
                         // A change is two writes, the secret key's and then the
                         // public certificate's, and a failure can come after
                         // the first. The dialog stays open for another try.
-                        Err(message) => report_and_reload(&ui, &state, message),
+                        Err(message) => report_in_dialog_and_reload(&ui, &state, message),
                     }
                 });
             });
@@ -3015,7 +3073,7 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
                 Zeroizing::new(secret.to_string()),
             );
             std::thread::spawn(move || {
-                let _busy = BusyGuard(ui_weak.clone());
+                let _busy = BusyGuard(ui_weak.clone(), report_in_notepad);
                 let outcome = run_notepad(&state, action, &text, signer_index, &password, &secret);
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(ui) = ui_weak.upgrade() else {
@@ -3044,10 +3102,12 @@ type NpOutcome = Result<(String, String, i32, Vec<rpgp_core::ops::SignatureRepor
 
 /// Show what became of a notepad run, on the event loop.
 ///
-/// Escape and a click on the scrim close the notepad while a run is still in
-/// flight, a decrypt waiting at a card's PIN prompt, say. A result that lands
-/// after that is not put back into the window, where closing has just emptied
-/// it, and nothing would show it; the status line still says how it went.
+/// Escape and a click on the scrim used to close the notepad while a run was
+/// still in flight, a decrypt waiting at a card's PIN prompt, say. Now they
+/// wait for it, as Close does, but should a result land with the notepad
+/// closed all the same, it is not put back into the window, where closing has
+/// emptied it, and nothing would show it; the status line still says how it
+/// went.
 fn finish_notepad(ui: &AppWindow, state: &Shared, outcome: NpOutcome) {
     ui.set_busy(false);
     if !ui.get_notepad_open() {
@@ -3067,20 +3127,27 @@ fn finish_notepad(ui: &AppWindow, state: &Shared, outcome: NpOutcome) {
             ui.set_np_tone(tone);
             ui.set_status(summary.into());
         }
-        Err(message) => {
-            // Clear the previous run's verdict and output, as the
-            // Decrypt/Verify worker does on this branch. Both last for as
-            // long as the dialog is open, so a failed run left the last
-            // message's "good signature — Alice (verified)" row and her
-            // plaintext on screen under a red banner describing a different
-            // message.
-            ui.set_np_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
-            ui.set_np_output(SharedString::new());
-            ui.set_np_result(message.clone().into());
-            ui.set_np_tone(3);
-            ui.set_status(message.into());
-        }
+        Err(message) => report_in_notepad(ui, message),
     }
+}
+
+/// Say why a notepad run failed, in the notepad's result line, which is
+/// announced, and on the status line; or on the status line alone once the
+/// notepad has closed, for the reason [`finish_notepad`] gives. A worker's
+/// panic comes here too, through [`BusyGuard`].
+fn report_in_notepad(ui: &AppWindow, message: String) {
+    if ui.get_notepad_open() {
+        // Clear the previous run's verdict and output, as a failed Decrypt /
+        // Verify run does. Both last for as long as the dialog is open, so a
+        // failed run left the last message's "good signature — Alice
+        // (verified)" row and her plaintext on screen under a red banner
+        // describing a different message.
+        ui.set_np_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
+        ui.set_np_output(SharedString::new());
+        ui.set_np_result(message.as_str().into());
+        ui.set_np_tone(3);
+    }
+    ui.set_status(message.into());
 }
 
 /// The blocking half of the notepad.
@@ -3328,10 +3395,9 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
                 // was pressed, and a reload landing behind the scrim put the
                 // selection back wherever it had been asked to, so the dialog
                 // went on naming one certificate while the delete removed
-                // another. Reloads now defer to a row the user has picked, but
-                // the delete must not depend on nothing else moving the pane:
-                // the scrim stops only the pointer, so an assistive-technology
-                // activation of a list row still reaches row_selected, and a
+                // another. Reloads now defer to a row the user has picked, and
+                // the controls behind an open dialog take no input, but the
+                // delete must not depend on nothing else moving the pane: a
                 // reload can still be asked to select a row read from a
                 // highlight that has drifted away from the pane. Written afresh
                 // every time the dialog opens, which is the only way to reach
@@ -3362,7 +3428,7 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
             // it opened, not whatever the pane shows now.
             let target = lock(&state).delete_target.clone();
             let Some((fingerprint, confirmed_secret)) = target else {
-                ui.set_status("No certificate selected".into());
+                report_in_dialog(&ui, "No certificate selected".to_string());
                 return;
             };
             ui.set_busy(true);
@@ -3370,7 +3436,7 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
 
             let (ui_weak, state) = (ui_weak.clone(), state.clone());
             std::thread::spawn(move || {
-                let _busy = BusyGuard(ui_weak.clone());
+                let _busy = BusyGuard(ui_weak.clone(), report_in_dialog);
                 let outcome = run_delete(&state, &fingerprint, confirmed_secret);
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(ui) = ui_weak.upgrade() else {
@@ -3398,7 +3464,7 @@ fn wire_delete(ui: &AppWindow, state: &Shared) {
                         // The certificate's trust-root and SHA-1 entries go
                         // before anything is unlinked, so a delete that fails
                         // can already have changed the badges on its row.
-                        Err(message) => report_and_reload(&ui, &state, message),
+                        Err(message) => report_in_dialog_and_reload(&ui, &state, message),
                     }
                 });
             });
@@ -3444,11 +3510,10 @@ fn run_delete(state: &Shared, fingerprint: &str, confirmed_secret: bool) -> Resu
     // describes a confirmation the user was never offered. So say what is true
     // of the store. The target is the one the dialog named when it opened, so
     // this is a secret key written since then by some other writer, and which
-    // one is not something this can know. What to do comes first, because the
-    // status line elides and the tail is what goes; it names the buttons that
-    // are on screen, since a failed delete leaves the dialog open and
-    // dismissing it is what makes reopening re-read the store and put the
-    // warning back. The state is read here rather than before the call so that
+    // one is not something this can know. What to do comes first, and it names
+    // the buttons it is shown beside, in the dialog a failed delete leaves
+    // open: dismissing that is what makes reopening re-read the store and put
+    // the warning back. The state is read here rather than before the call so that
     // a failure past the guard, with the certificate's trust-root and SHA-1
     // entries already removed, is not reported as having deleted nothing.
     store.delete(fingerprint, confirmed_secret).map_err(|e| {
@@ -3508,7 +3573,7 @@ fn wire_revoke(ui: &AppWindow, state: &Shared) {
             // goes into the revocation for anyone to read.
             let (message, password) = (message.to_string(), Zeroizing::new(password.to_string()));
             std::thread::spawn(move || {
-                let _busy = BusyGuard(ui_weak.clone());
+                let _busy = BusyGuard(ui_weak.clone(), report_in_dialog);
                 let outcome = run_revoke(&state, reason, &message, &password);
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(ui) = ui_weak.upgrade() else {
@@ -3531,7 +3596,7 @@ fn wire_revoke(ui: &AppWindow, state: &Shared) {
                         // then to the secret key, and a withdrawal from several
                         // keys stops at the first that fails, with those before
                         // it made.
-                        Err(message) => report_and_reload(&ui, &state, message),
+                        Err(message) => report_in_dialog_and_reload(&ui, &state, message),
                     }
                 });
             });
@@ -3554,7 +3619,10 @@ fn wire_revoke(ui: &AppWindow, state: &Shared) {
                 (guard.store.clone(), guard.import_revocations.clone())
             };
             let Some(file) = file else {
-                ui.set_status("No revocation certificate is waiting to be applied".into());
+                report_in_dialog(
+                    &ui,
+                    "No revocation certificate is waiting to be applied".to_string(),
+                );
                 return;
             };
             ui.set_busy(true);
@@ -3562,7 +3630,7 @@ fn wire_revoke(ui: &AppWindow, state: &Shared) {
 
             let (ui_weak, state) = (ui_weak.clone(), state.clone());
             std::thread::spawn(move || {
-                let _busy = BusyGuard(ui_weak.clone());
+                let _busy = BusyGuard(ui_weak.clone(), report_in_dialog);
                 let outcome = store_revocations(&store, &file);
                 let _ = slint::invoke_from_event_loop(move || {
                     let Some(ui) = ui_weak.upgrade() else {
@@ -3577,7 +3645,11 @@ fn wire_revoke(ui: &AppWindow, state: &Shared) {
                         }
                         // Nothing was stored; the dialog stays open to try
                         // again or to cancel.
-                        Err(e) => report_and_reload(&ui, &state, format!("Revocation failed: {e}")),
+                        Err(e) => report_in_dialog_and_reload(
+                            &ui,
+                            &state,
+                            format!("Revocation failed: {e}"),
+                        ),
                     }
                 });
             });
@@ -3910,6 +3982,32 @@ fn reload_after(ui: &AppWindow, state: &Shared, after: AfterReload) {
             survey_agent_and_secrets(&ui, &state, store);
         });
     });
+}
+
+/// Report a failure of the operation the open dialog started, in that dialog
+/// as well as on the status line.
+///
+/// A dialog stays open when its operation fails, so that what was wrong can be
+/// put right and the button pressed again, and the reason used to go to the
+/// status line alone: under the dialog's scrim, where it could hardly be read,
+/// and never announced. The dialog now shows it and announces it; see
+/// `DialogError` in widgets.slint. The window takes it out of the dialog again
+/// when a dialog opens or closes and when an operation starts, so it never
+/// answers for an earlier attempt. A worker's panic is reported here as well;
+/// see [`BusyGuard`]. Decrypt / Verify, the notepad and Lookup do not come
+/// here: each says how its run went, failures and panics included, in a line
+/// of its own; see [`report_in_decrypt_verify`], [`report_in_notepad`] and
+/// [`report_in_lookup`].
+fn report_in_dialog(ui: &AppWindow, message: String) {
+    ui.set_dialog_error(message.as_str().into());
+    ui.set_status(message.into());
+}
+
+/// [`report_in_dialog`], for an operation whose failure also reloads the
+/// store; see [`report_and_reload`].
+fn report_in_dialog_and_reload(ui: &AppWindow, state: &Shared, message: String) {
+    ui.set_dialog_error(message.as_str().into());
+    report_and_reload(ui, state, message);
 }
 
 /// Report a failure, and read the store again behind the message.
@@ -7143,8 +7241,10 @@ mod tests {
     /// properties rather than the dialog's, and closing only closed the
     /// dialog, so the last decrypted message stayed referenced from the window
     /// for as long as rPGP ran, or until the notepad was opened again. Escape
-    /// and a click on the scrim close it with a run in flight, and that run's
-    /// result used to land in the same properties afterwards.
+    /// and a click on the scrim used to close it with a run in flight, and that
+    /// run's result then landed in the same properties. They no longer close it
+    /// until the run is done, so the run is made to land here on a notepad
+    /// closed before it started.
     #[test]
     fn closing_the_notepad_takes_what_it_showed_out_of_the_window() {
         use slint::Model;
@@ -7203,7 +7303,7 @@ mod tests {
             "closing the notepad left what it showed in the window"
         );
 
-        // Closed while a run was in flight, which then lands.
+        // A run that lands on the closed notepad.
         ui.set_busy(true);
         finish_notepad(&ui, &state, decrypted());
         assert_eq!(
@@ -7216,6 +7316,488 @@ mod tests {
             ui.get_status(),
             "Decrypted. Good signature.",
             "the status line should still say how the run went"
+        );
+    }
+
+    /// Send a key to whatever has focus in the window, as the windowing
+    /// backend does.
+    fn press(ui: &AppWindow, key: impl Into<SharedString>) {
+        let text = key.into();
+        let window = ui.window();
+        window.dispatch_event(slint::platform::WindowEvent::KeyPressed { text: text.clone() });
+        window.dispatch_event(slint::platform::WindowEvent::KeyReleased { text });
+    }
+
+    /// Opens or closes one of the window's dialogs.
+    type Open = fn(&AppWindow, bool);
+    /// Whether one of the window's dialogs is open.
+    type IsOpen = fn(&AppWindow) -> bool;
+
+    /// Point at the top-left corner of the window, beside any dialog's card,
+    /// and click there if asked. Moving the pointer is also what has Slint
+    /// build a dialog opened since the last event, and run its `init`, which
+    /// gives it focus.
+    fn at_the_corner(ui: &AppWindow, click: bool) {
+        use slint::platform::{PointerEventButton, WindowEvent};
+        let position = slint::LogicalPosition::new(4.0, 4.0);
+        let button = PointerEventButton::Left;
+        let window = ui.window();
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        if click {
+            window.dispatch_event(WindowEvent::PointerPressed { position, button });
+            window.dispatch_event(WindowEvent::PointerReleased { position, button });
+        }
+    }
+
+    /// Tab and Shift+Tab stay among an open dialog's own controls, and no key
+    /// pressed in it reaches anything behind its scrim.
+    ///
+    /// The dialogs are children of the window rather than popups, and Slint's
+    /// Tab goes to any control on screen, covered or not, wrapping around the
+    /// whole window. So Tab walked out of the notepad to the rail, where Enter
+    /// on Sign / Encrypt opened that dialog underneath and replaced the
+    /// notepad's recipients, and Shift+Tab reached the details pane's Trust
+    /// root and SHA-1 boxes, each a write to the store.
+    ///
+    /// The window is not wired to Rust here. The callbacks of the controls
+    /// behind the notepad are counted, and no callback does anything else,
+    /// the notepad's own Close included, which leaves the notepad open for
+    /// the whole walk. Enter is pressed at every stop, which every control
+    /// behind the notepad answers to.
+    #[test]
+    fn keys_pressed_in_an_open_dialog_reach_nothing_behind_it() {
+        use slint::platform::Key;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("the window builds on the testing backend");
+        ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
+
+        // A selection whose details pane shows every control it can: the
+        // SHA-1 box, Trust root, Certify, Withdraw, Save revocation, Delete,
+        // All details, Export and Encrypt to, and three copy buttons.
+        let someone = CertRow {
+            fingerprint: "AAAA".into(),
+            primary_user_id: "Bob <bob@example.org>".into(),
+            validity: "unusable".into(),
+            authentication: "unverified".into(),
+            sha1_blocked: true,
+            ..Default::default()
+        };
+        ui.set_certs(ModelRc::new(VecModel::from(vec![
+            someone.clone(),
+            CertRow {
+                fingerprint: "BBBB".into(),
+                primary_user_id: "Carol <carol@example.org>".into(),
+                ..someone.clone()
+            },
+        ])));
+        ui.set_current_row(0);
+        ui.set_has_selection(true);
+        ui.set_detail(someone);
+        ui.set_can_certify(true);
+        ui.set_can_withdraw(true);
+        ui.set_has_revocation_cert(true);
+
+        let reached = Rc::new(RefCell::new(Vec::<&str>::new()));
+        let hit = |what: &'static str| {
+            let reached = reached.clone();
+            move || reached.borrow_mut().push(what)
+        };
+        ui.on_open_sign_encrypt(hit("Sign / Encrypt"));
+        ui.on_open_decrypt_verify(hit("Decrypt / Verify"));
+        ui.on_open_notepad(hit("Notepad"));
+        ui.on_import_file(hit("Import"));
+        ui.on_open_lookup(hit("Look up"));
+        ui.on_export_selected(hit("Export"));
+        ui.on_refresh(hit("Refresh"));
+        ui.on_open_certify(hit("Certify"));
+        ui.on_open_withdraw(hit("Withdraw"));
+        ui.on_open_publish(hit("Publish"));
+        ui.on_save_revocation_cert(hit("Save revocation certificate"));
+        ui.on_open_revoke(hit("Revoke"));
+        ui.on_open_delete(hit("Delete"));
+        ui.on_open_details(hit("All details"));
+        ui.on_toggle_trust_root(hit("Trust root"));
+        ui.on_toggle_sha1_accepted(hit("Accept SHA-1"));
+        ui.on_filter_changed({
+            let hit = hit("the search field");
+            move |_| hit()
+        });
+        ui.on_scope_changed({
+            let hit = hit("a scope tab");
+            move |_| hit()
+        });
+        ui.on_sort_changed({
+            let hit = hit("Sort by");
+            move |_| hit()
+        });
+        ui.on_row_selected({
+            let hit = hit("the certificate list");
+            move |_| hit()
+        });
+        ui.on_copy_value({
+            let hit = hit("a copy button");
+            move |_| hit()
+        });
+        ui.show().unwrap();
+
+        // With no dialog open the same keys reach the rail's first tab, so
+        // that nothing reached below means the dialog held them.
+        press(&ui, Key::Tab);
+        press(&ui, Key::Return);
+        assert_eq!(*reached.borrow(), ["a scope tab"]);
+        reached.borrow_mut().clear();
+
+        ui.set_notepad_open(true);
+        at_the_corner(&ui, false);
+        for key in [Key::Tab, Key::Backtab] {
+            for _ in 0..40 {
+                press(&ui, key);
+                press(&ui, Key::Return);
+            }
+        }
+        assert!(
+            reached.borrow().is_empty(),
+            "keys pressed in the notepad reached {:?} behind it",
+            reached.borrow()
+        );
+        assert!(ui.get_notepad_open());
+        assert!(
+            !ui.get_keygen_open() && !ui.get_about_open(),
+            "a second dialog opened behind the notepad"
+        );
+    }
+
+    /// Escape and a click on the scrim leave each dialog open while its
+    /// operation runs, as its Cancel or Close does, and close it once the
+    /// operation is done.
+    ///
+    /// They used to close it whatever was running. A delete, a revocation or
+    /// a publish then looked cancelled, and went on to happen. The window
+    /// hands `busy` to every dialog that runs something, which is what is
+    /// checked here, one dialog at a time.
+    #[test]
+    fn escape_and_the_scrim_leave_every_dialog_open_while_its_operation_runs() {
+        use slint::platform::Key;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = AppWindow::new().expect("the window builds on the testing backend");
+        ui.window().set_size(slint::LogicalSize::new(1180.0, 760.0));
+        // The notepad asks Rust to close it, which empties it first.
+        ui.on_close_notepad({
+            let ui = ui.as_weak();
+            move || ui.unwrap().set_notepad_open(false)
+        });
+        ui.show().unwrap();
+
+        let dialogs: [(&str, Open, IsOpen); 10] = [
+            (
+                "New key pair",
+                AppWindow::set_keygen_open,
+                AppWindow::get_keygen_open,
+            ),
+            (
+                "Sign / Encrypt",
+                AppWindow::set_signenc_open,
+                AppWindow::get_signenc_open,
+            ),
+            (
+                "Decrypt / Verify",
+                AppWindow::set_verify_open,
+                AppWindow::get_verify_open,
+            ),
+            (
+                "Certify",
+                AppWindow::set_certify_open,
+                AppWindow::get_certify_open,
+            ),
+            (
+                "Delete",
+                AppWindow::set_delete_open,
+                AppWindow::get_delete_open,
+            ),
+            (
+                "Revoke",
+                AppWindow::set_revoke_open,
+                AppWindow::get_revoke_open,
+            ),
+            (
+                "Import revocation",
+                AppWindow::set_import_revocation_open,
+                AppWindow::get_import_revocation_open,
+            ),
+            (
+                "Notepad",
+                AppWindow::set_notepad_open,
+                AppWindow::get_notepad_open,
+            ),
+            (
+                "Lifecycle",
+                AppWindow::set_lifecycle_open,
+                AppWindow::get_lifecycle_open,
+            ),
+            (
+                "Look up",
+                AppWindow::set_lookup_open,
+                AppWindow::get_lookup_open,
+            ),
+        ];
+        for (dialog, open, is_open) in dialogs {
+            ui.set_busy(true);
+            open(&ui, true);
+            at_the_corner(&ui, false);
+            press(&ui, Key::Escape);
+            at_the_corner(&ui, true);
+            at_the_corner(&ui, true);
+            assert!(is_open(&ui), "{dialog} was closed while its operation ran");
+
+            ui.set_busy(false);
+            press(&ui, Key::Escape);
+            assert!(
+                !is_open(&ui),
+                "Escape should close {dialog} once it is done"
+            );
+            open(&ui, true);
+            at_the_corner(&ui, false);
+            at_the_corner(&ui, true);
+            assert!(
+                !is_open(&ui),
+                "the scrim should close {dialog} once it is done"
+            );
+        }
+    }
+
+    /// Why an operation started from a dialog failed is put in that dialog as
+    /// well as on the status line, and taken out again once an operation
+    /// starts or the dialog closes.
+    ///
+    /// It went on the status line alone, which the dialog's scrim covers,
+    /// where it read at 1.5:1 in the dark theme and was never announced. The
+    /// failures reached here are the ones that come before a worker starts,
+    /// and key generation's, whose worker hands its outcome to a function a
+    /// test can call; the other workers' failures go through the same two
+    /// functions.
+    #[test]
+    fn a_failure_is_reported_in_its_dialog_until_the_user_moves_on() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+        // Where Slint runs `changed` handlers, which are what clear the line.
+        let settle = slint::platform::update_timers_and_animations;
+        let reported = |what: &str| {
+            let error = ui.get_dialog_error();
+            assert!(
+                error.contains(what),
+                "the dialog should say {what:?}, not {error:?}"
+            );
+            assert_eq!(
+                ui.get_status(),
+                error,
+                "the status line should say it as well"
+            );
+        };
+
+        // Refused before anything starts.
+        ui.set_keygen_open(true);
+        settle();
+        ui.invoke_generate_key(" ".into(), "  ".into(), SharedString::new(), 0, 0, 0);
+        reported("Key generation failed");
+        // Cleared once an operation starts, so that a retry is not shown the
+        // last attempt's reason.
+        ui.set_busy(true);
+        settle();
+        assert_eq!(
+            ui.get_dialog_error(),
+            "",
+            "starting again left the old failure"
+        );
+        // A generation that failed on its worker.
+        finish_keygen(
+            &ui,
+            &state,
+            Err(rpgp_core::Error::invalid("no space left on device")),
+        );
+        reported("no space left on device");
+        assert!(
+            ui.get_keygen_open(),
+            "a failure should leave the dialog open"
+        );
+        // Cleared when the dialog closes, so that the next one opens clean.
+        ui.set_keygen_open(false);
+        settle();
+        assert_eq!(ui.get_dialog_error(), "", "closing left the failure behind");
+
+        // The other dialogs' refusals before a worker starts: nothing opened
+        // them, so each has nothing to act on.
+        let refusals: [(&str, Open, &dyn Fn()); 3] = [
+            ("Delete", AppWindow::set_delete_open, &|| {
+                ui.invoke_delete_run()
+            }),
+            ("Lifecycle", AppWindow::set_lifecycle_open, &|| {
+                ui.invoke_lifecycle_run(
+                    1,
+                    "0".into(),
+                    "Jo <jo@example.org>".into(),
+                    SharedString::new(),
+                    0,
+                )
+            }),
+            (
+                "Import revocation",
+                AppWindow::set_import_revocation_open,
+                &|| ui.invoke_import_revocation_run(),
+            ),
+        ];
+        for (dialog, open, run) in refusals {
+            open(&ui, true);
+            settle();
+            run();
+            assert!(
+                ui.get_dialog_error().starts_with("No "),
+                "{dialog} refused without saying why in the dialog: {:?}",
+                ui.get_dialog_error()
+            );
+            open(&ui, false);
+            settle();
+            assert_eq!(ui.get_dialog_error(), "");
+        }
+    }
+
+    /// A worker that panics clears `busy` and says so where its operation says
+    /// that it failed: in the dialog's error line for the seven dialogs that
+    /// have one, and in the line of their own that Decrypt / Verify, the
+    /// notepad and Lookup keep.
+    ///
+    /// Every panic went to the window's `dialog-error`, which those three do
+    /// not show, and to the status line, which is not announced while a
+    /// dialog covers it. So Lookup went on saying "Searching…", and Decrypt /
+    /// Verify showed the verdict of the run before. No test makes a worker
+    /// panic: this calls what [`BusyGuard`] hands the event loop, with the
+    /// reporter each of those workers' guards names.
+    #[test]
+    fn a_worker_that_panics_says_so_where_its_operation_says_it_failed() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+        const PANICKED: &str = "That operation failed unexpectedly. Nothing was changed.";
+        let panicked = |report: fn(&AppWindow, String)| {
+            ui.set_busy(true);
+            after_a_panic(&ui, report);
+            assert!(!ui.get_busy(), "a panic left the window busy");
+        };
+
+        // Over the verdict of the run before.
+        ui.invoke_open_decrypt_verify();
+        ui.set_dv_result("Signature verified".into());
+        ui.set_dv_tone(1);
+        panicked(report_in_decrypt_verify);
+        assert_eq!(
+            (ui.get_dv_result().as_str(), ui.get_dv_tone()),
+            (PANICKED, 3),
+            "Decrypt / Verify did not say that its run failed"
+        );
+        ui.set_verify_open(false);
+
+        ui.invoke_open_notepad();
+        ui.set_np_result("Signed".into());
+        panicked(report_in_notepad);
+        assert_eq!(
+            (ui.get_np_result().as_str(), ui.get_np_tone()),
+            (PANICKED, 3),
+            "the notepad did not say that its run failed"
+        );
+        ui.invoke_close_notepad();
+
+        ui.invoke_open_lookup();
+        ui.set_lookup_status("Searching…".into());
+        panicked(report_in_lookup);
+        assert_eq!(
+            ui.get_lookup_status(),
+            PANICKED,
+            "Lookup did not say that its search failed"
+        );
+        ui.set_lookup_open(false);
+
+        ui.set_certify_open(true);
+        panicked(report_in_dialog);
+        assert_eq!(ui.get_dialog_error(), PANICKED);
+        assert_eq!(
+            ui.get_status(),
+            PANICKED,
+            "the status line should say it as well"
+        );
+    }
+
+    /// A revocation certificate for the user's own key is not asked about
+    /// over another dialog, and nothing of it is stored.
+    ///
+    /// Import's file dialog is not modal, so another dialog can have been
+    /// opened while it was up, and the question opened over that one when it
+    /// answered. The window keeps Tab and assistive technology inside an open
+    /// dialog by disabling what is behind it, and the dialog under the
+    /// question was not disabled: its controls, Delete key and Create key pair
+    /// among them, could be reached from the question, and Decrypt / Verify,
+    /// which is drawn above the question, hid it while it held focus. The
+    /// question itself can be open, when a second Import's file dialog
+    /// answers. With nothing else open, the file is asked about as before.
+    #[test]
+    fn a_revocation_certificate_for_your_own_key_is_not_asked_about_over_another_dialog() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let mine = generated("Me <me@example.org>");
+        let fingerprint = mine.cert.fingerprint().to_hex();
+        store.insert_secret(&mine.cert).unwrap();
+        store
+            .save_revocation(&fingerprint, &revoke::armor(&mine.revocation).unwrap())
+            .unwrap();
+        let path = store.revocation_path(&fingerprint);
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let store = lock(&state).store.clone();
+
+        let dialogs: [(&str, Open); 3] = [
+            ("New key pair", AppWindow::set_keygen_open),
+            ("Decrypt / Verify", AppWindow::set_verify_open),
+            ("the question itself", AppWindow::set_import_revocation_open),
+        ];
+        for (dialog, open) in dialogs {
+            open(&ui, true);
+            let asking = ui.get_import_revocation_open();
+            finish_import(&ui, &state, run_import(&state, &path));
+            // Looked at with the dialog still open, since closing the question
+            // would hide a second one put over it. Over the question, the
+            // window has only the one to show, and what gives a second away is
+            // the import it leaves waiting: this test opened the question by
+            // hand, with nothing waiting.
+            assert!(
+                ui.get_import_revocation_open() == asking
+                    && lock(&state).import_revocations.is_none(),
+                "the question was put over {dialog}"
+            );
+            assert_eq!(
+                ui.get_status(),
+                "Nothing was revoked: the file is a revocation certificate for your own key, \
+                 and another dialog is open. Close it and import the file again.",
+                "over {dialog}"
+            );
+            assert!(
+                !revoked(&store, &fingerprint),
+                "the key was revoked over {dialog}"
+            );
+            open(&ui, false);
+        }
+
+        finish_import(&ui, &state, run_import(&state, &path));
+        assert!(
+            ui.get_import_revocation_open(),
+            "with no other dialog open, the import should ask"
         );
     }
 

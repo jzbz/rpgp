@@ -1,4 +1,4 @@
-import { ScrollView } from "std-widgets.slint";
+import { ListView, ScrollView } from "std-widgets.slint";
 import { Theme, Icons, Icon } from "theme.slint";
 import { CertRow } from "types.slint";
 
@@ -86,11 +86,12 @@ export component Btn inherits Rectangle {
     // assistive-technology activation straight to this handler, and of the
     // AccessKit adapters only the Windows one refuses a control published as
     // disabled, so on Linux and macOS a screen reader could press a greyed-out
-    // button. The FocusScope's own `enabled` only keeps it from gaining focus:
-    // one that had focus before the button was disabled goes on receiving
-    // every key. The TouchArea is the one part that enforces `enabled` by
-    // itself. Check, Select and the window's list rows and tabs follow the
-    // same rule for the same reasons.
+    // button. Keeping the FocusScope below from gaining focus does nothing
+    // about one that had focus before the button was disabled: it goes on
+    // receiving every key. The TouchArea is the one part that enforces
+    // `enabled` by itself. Check, Select, FieldRow's copy button, the
+    // certificate list and its scope tabs follow the same rule for the same
+    // reasons.
     accessible-action-default => {
         if (root.enabled) {
             root.clicked();
@@ -168,9 +169,20 @@ export component Btn inherits Rectangle {
     // button is expected to answer to, and the ring is what tells a sighted
     // keyboard user where they are — without it, tabbing moves an invisible
     // cursor around the window.
+    //
+    // A disabled button takes no focus from Tab, nor from assistive
+    // technology's Focus action, which arrives as a click. The scope itself is
+    // never disabled: a disabled FocusScope ignores being told that focus has
+    // left it, so one disabled while it had focus kept `has-focus`, and drew
+    // its ring, after focus had moved on. Opening a dialog does that to the
+    // button that opened it, since the window disables everything behind an
+    // open dialog, and the ring then stayed on it, and was still there when
+    // the dialog closed. Check, Select, FieldRow's copy button, the
+    // certificate list and its scope tabs do the same.
     key := FocusScope {
         width: 0px;
-        enabled: root.enabled;
+        focus-on-tab-navigation: root.enabled;
+        focus-on-click: root.enabled;
         key-pressed(event) => {
             // Rejected rather than swallowed, so a disabled button is as if it
             // were not there. Nothing above it handles Space or Enter today.
@@ -185,7 +197,7 @@ export component Btn inherits Rectangle {
         }
     }
 
-    if key.has-focus: Rectangle {
+    if key.has-focus: ring := Rectangle {
         border-width: 2px;
         border-color: Theme.accent;
         border-radius: root.border-radius + 1px;
@@ -401,7 +413,8 @@ export component Check inherits Rectangle {
 
     key := FocusScope {
         width: 0px;
-        enabled: root.enabled;
+        focus-on-tab-navigation: root.enabled;
+        focus-on-click: root.enabled;
         key-pressed(event) => {
             if (!root.enabled) {
                 return reject;
@@ -414,7 +427,7 @@ export component Check inherits Rectangle {
         }
     }
 
-    if key.has-focus: Rectangle {
+    if key.has-focus: ring := Rectangle {
         border-width: 2px;
         border-color: Theme.accent;
         border-radius: 6px;
@@ -550,7 +563,8 @@ export component Select inherits Rectangle {
 
     key := FocusScope {
         width: 0px;
-        enabled: root.enabled;
+        focus-on-tab-navigation: root.enabled;
+        focus-on-click: root.enabled;
         key-pressed(event) => {
             if (!root.enabled) {
                 return reject;
@@ -575,7 +589,7 @@ export component Select inherits Rectangle {
         }
     }
 
-    if key.has-focus: Rectangle {
+    if key.has-focus: ring := Rectangle {
         border-width: 2px;
         border-color: Theme.accent;
         border-radius: root.border-radius + 1px;
@@ -681,11 +695,28 @@ export component FieldRow inherits Rectangle {
     /// "Algorithm" or "Created" row does not need one, and a button on every
     /// row would be a column of them down the details pane.
     in property <bool> copyable: false;
+    /// Off while a dialog covers the row. The copy button takes keyboard
+    /// focus, and behind a dialog's scrim it would be a Tab stop outside the
+    /// dialog.
+    in property <bool> enabled: true;
     callback copy();
 
     /// Owned here rather than by the caller, so a row confirms itself and no
     /// usage site has to hold state for it.
     property <bool> copied: false;
+
+    // Every way of copying comes here: a click anywhere on the row, Space or
+    // Enter on the copy button, and assistive technology's action on it.
+    // Checked here, for the reasons Btn gives, since only the click is kept
+    // out by the TouchArea's own `enabled`.
+    function copy-now() {
+        if (!root.copyable || !root.enabled) {
+            return;
+        }
+        root.copy();
+        root.copied = true;
+        settle.running = true;
+    }
 
     // A Rectangle tells its parent layout nothing about what is inside it, so
     // the row has to republish the inner layout's own sizing or every dialog
@@ -703,13 +734,9 @@ export component FieldRow inherits Rectangle {
     // copying the whole of it in one click is what people actually do with a
     // fingerprint.
     touch := TouchArea {
-        enabled: root.copyable;
-        mouse-cursor: root.copyable ? MouseCursor.pointer : MouseCursor.default;
-        clicked => {
-            root.copy();
-            root.copied = true;
-            settle.running = true;
-        }
+        enabled: root.copyable && root.enabled;
+        mouse-cursor: self.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.copy-now(); }
 
         settle := Timer {
             interval: 1600ms;
@@ -759,39 +786,639 @@ export component FieldRow inherits Rectangle {
                 accessible-role: button;
                 accessible-label: "Copy " + root.label;
                 accessible-description: root.value;
-                accessible-action-default => {
-                    root.copy();
-                    root.copied = true;
-                    settle.running = true;
-                }
+                accessible-enabled: root.enabled;
+                accessible-action-default => { root.copy-now(); }
                 width: 16px;
-                Icon {
+                icon := Icon {
                     glyph: root.copied ? Icons.check : Icons.file;
                     tint: root.copied ? Theme.ok : Theme.text-faint;
                     width: 14px;
                     height: 14px;
                     y: 2px;
                     // Kept lit while `copied` so the confirmation is not
-                    // dismissed by the pointer moving away after the click.
-                    opacity: root.copied ? 1.0 : (touch.has-hover ? 1.0 : 0.0);
+                    // dismissed by the pointer moving away after the click,
+                    // and while the keyboard is on it, which has no hover.
+                    opacity: root.copied || touch.has-hover || key.has-focus ? 1.0 : 0.0;
                     animate opacity { duration: Theme.fast; }
+                }
+
+                // Reachable by keyboard, as Btn is. The row had a pointer path
+                // and an assistive-technology one, so a keyboard user with no
+                // screen reader could not copy a fingerprint at all, which is
+                // what the row is for. Inside the button rather than beside
+                // it, so that a row with nothing to copy is no Tab stop, and
+                // so that assistive technology's own Focus action on the
+                // button lands here rather than on the next control along.
+                key := FocusScope {
+                    width: 0px;
+                    focus-on-tab-navigation: root.enabled;
+                    focus-on-click: root.enabled;
+                    key-pressed(event) => {
+                        if (!root.enabled) {
+                            return reject;
+                        }
+                        if (event.text == " " || event.text == "\n") {
+                            root.copy-now();
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+
+                // Around the icon, which is what the button is announced as,
+                // rather than the whole row.
+                if key.has-focus: Rectangle {
+                    x: icon.x - 3px;
+                    y: icon.y - 3px;
+                    width: icon.width + 6px;
+                    height: icon.height + 6px;
+                    border-width: 2px;
+                    border-color: Theme.accent;
+                    border-radius: Theme.r-sm;
                 }
             }
         }
     }
 }
 
+// The window's rail tabs, its certificate list and its status line are here
+// rather than in app-window.slint so that tests/accessibility.rs can reach
+// them, as it reaches TrustRootCheck: the window is compiled without the debug
+// information the testing backend needs to find an element.
+
+// One of the rail's scope tabs.
+component RailItem inherits Rectangle {
+    in property <bool> enabled: true;
+    in property <string> text;
+    in property <image> glyph;
+    in property <int> count;
+    in property <bool> active;
+    /// Its place among the tabs, from 0.
+    in property <int> index;
+    callback clicked();
+
+    // A tab, not a button: these switch which set of certificates the list
+    // shows, and which one is current is the thing worth announcing. Marked
+    // selected, as Slint's own TabWidget marks its current tab, rather than
+    // checked: AccessKit turns a checked tab into a toggle, which AT-SPI
+    // reports as a checked page tab and UI Automation as a toggle, where a
+    // screen reader looks for the selected tab to call current. The index,
+    // with the count on ScopeTabs, is what lets it say "2 of 3".
+    accessible-role: tab;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.active;
+    accessible-item-index: root.index;
+    // Gated for the reasons Btn gives. The window's handler sets `scope`
+    // before Rust is asked, and Rust declines while an operation is in
+    // flight, so a switch that got through would leave this tab lit over a
+    // list it does not describe.
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
+
+    height: 34px;
+    border-radius: Theme.r-sm;
+    background: root.active ? Theme.selected : (touch.has-hover ? Theme.hover : transparent);
+    animate background { duration: Theme.fast; }
+
+    HorizontalLayout {
+        padding-left: Theme.s2;
+        padding-right: Theme.s2;
+        spacing: Theme.s2;
+
+        Icon {
+            glyph: root.glyph;
+            tint: root.active ? Theme.accent : Theme.text-dim;
+            y: (parent.height - self.height) / 2;
+        }
+
+        Text {
+            text: root.text;
+            color: root.active ? Theme.accent : Theme.text;
+            font-size: Theme.t-md;
+            font-weight: root.active ? Theme.w-medium : Theme.w-regular;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+
+        Text {
+            text: "\{root.count}";
+            color: Theme.text-faint;
+            font-size: Theme.t-sm;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.clicked(); }
+    }
+
+    // Reachable by keyboard, as Btn is. The tabs had only a pointer path and
+    // an assistive-technology one, so without a screen reader the list could
+    // not be switched from the keyboard at all.
+    key := FocusScope {
+        width: 0px;
+        focus-on-tab-navigation: root.enabled;
+        focus-on-click: root.enabled;
+        key-pressed(event) => {
+            if (!root.enabled) {
+                return reject;
+            }
+            if (event.text == " " || event.text == "\n") {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    if key.has-focus: ring := Rectangle {
+        border-width: 2px;
+        border-color: Theme.accent;
+        border-radius: root.border-radius + 1px;
+        x: -2px;
+        y: -2px;
+        width: root.width + 4px;
+        height: root.height + 4px;
+    }
+}
+
+// The rail's three scope tabs, which choose the certificates the list shows.
+export component ScopeTabs inherits VerticalLayout {
+    in property <bool> enabled: true;
+    in-out property <int> scope: 0;
+    in property <int> count-all: 0;
+    in property <int> count-mine: 0;
+    in property <int> count-others: 0;
+    callback scope-changed(int);
+
+    // The rail's own spacing, so the tabs sit where they did as its direct
+    // children.
+    spacing: Theme.s2;
+
+    // The three tabs, and only they, make up the tab list: the rail around
+    // them also holds the wordmark and the operation buttons, which are no
+    // tabs. Without a tab list a screen reader has no set to count them in.
+    accessible-role: tab-list;
+    accessible-item-count: 3;
+    accessible-orientation: vertical;
+
+    RailItem {
+        index: 0;
+        enabled: root.enabled;
+        text: "All certificates";
+        glyph: Icons.shield;
+        count: root.count-all;
+        active: root.scope == 0;
+        clicked => { root.scope = 0; root.scope-changed(0); }
+    }
+    RailItem {
+        index: 1;
+        enabled: root.enabled;
+        text: "My keys";
+        glyph: Icons.key;
+        count: root.count-mine;
+        active: root.scope == 1;
+        clicked => { root.scope = 1; root.scope-changed(1); }
+    }
+    RailItem {
+        index: 2;
+        enabled: root.enabled;
+        text: "Other people";
+        glyph: Icons.users;
+        count: root.count-others;
+        active: root.scope == 2;
+        clicked => { root.scope = 2; root.scope-changed(2); }
+    }
+}
+
+component CertListRow inherits Rectangle {
+    in property <CertRow> cert;
+    in property <bool> selected;
+    in property <bool> enabled: true;
+    /// Draw the keyboard's focus ring on this row.
+    in property <bool> focused;
+    callback clicked();
+
+    // The row announces who it is and whether it is the selected one. The
+    // description carries the fingerprint, which is what someone listening
+    // rather than looking actually needs to tell two keys apart.
+    accessible-role: list-item;
+    accessible-label: root.cert.primary-user-id;
+    accessible-description: "Key " + root.cert.key-id;
+    accessible-enabled: root.enabled;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.selected;
+    // Gated for the reasons Btn gives. As with RailItem, the window's handler
+    // sets `current-row` before Rust declines, which would leave the highlight
+    // on one certificate and the details pane on another, and some actions
+    // take their certificate from the one and some from the other.
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
+
+    height: 62px;
+    background: root.selected ? Theme.selected : (touch.has-hover ? Theme.hover : transparent);
+    animate background { duration: Theme.fast; }
+
+    // Accent spine on the selected row.
+    Rectangle {
+        x: 0;
+        width: 3px;
+        height: parent.height;
+        background: root.selected ? Theme.accent : transparent;
+    }
+
+    HorizontalLayout {
+        padding-left: Theme.s4;
+        padding-right: Theme.s4;
+        spacing: Theme.s3;
+
+        Monogram {
+            initials: root.cert.initials;
+            tint: Theme.monograms[root.cert.tint-index];
+            size: 38px;
+            y: (parent.height - self.height) / 2;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 1;
+
+            Text {
+                text: root.cert.name == "" ? root.cert.primary-user-id : root.cert.name;
+                color: Theme.text;
+                font-size: Theme.t-lg;
+                font-weight: Theme.w-medium;
+                overflow: elide;
+            }
+
+            Text {
+                text: root.cert.email == "" ? root.cert.key-id : root.cert.email;
+                color: Theme.text-dim;
+                font-size: Theme.t-sm;
+                overflow: elide;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 4px;
+            horizontal-stretch: 0;
+
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: end;
+
+                // Only shown once there is something to say. An "unverified"
+                // badge on every stranger in the list would be noise, and the
+                // details pane spells it out anyway.
+                if root.cert.authentication != "unverified": Pill {
+                    text: root.cert.authentication;
+                    tone: root.cert.authentication == "verified" ? Tone.ok : Tone.warn;
+                    glyph: Icons.certify;
+                }
+
+                if root.cert.card-serial != "": Pill {
+                    text: "smartcard";
+                    tone: Tone.accent;
+                    glyph: Icons.key;
+                }
+
+                if root.cert.has-secret && root.cert.card-serial == "": Pill {
+                    text: "secret key";
+                    tone: Tone.accent;
+                    glyph: Icons.key;
+                }
+
+                Pill {
+                    text: root.cert.validity;
+                    tone: root.cert.validity == "valid" ? Tone.ok
+                        : root.cert.validity == "expired" ? Tone.warn
+                        : Tone.danger;
+                }
+            }
+
+            Text {
+                text: root.cert.expires == ""
+                    ? root.cert.capabilities + " · never expires"
+                    : root.cert.capabilities + " · until " + root.cert.expires;
+                color: Theme.text-faint;
+                font-size: Theme.t-xs;
+                horizontal-alignment: right;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.clicked(); }
+    }
+
+    // Inside the row rather than around it, since the list clips what is
+    // drawn past its edges.
+    if root.focused: ring := Rectangle {
+        x: 2px;
+        y: 2px;
+        width: root.width - 4px;
+        height: root.height - 4px;
+        border-width: 2px;
+        border-color: Theme.accent;
+        border-radius: Theme.r-sm;
+    }
+}
+
+// CertList's rows. A component of their own because Slint lets a ListView
+// hold one `for` and nothing else, and CertList has to put its FocusScope
+// inside the list too; a component derived from ListView may add to it, which
+// is how Slint's own StandardListView does the same.
+component CertRows inherits ListView {
+    in property <[CertRow]> certs;
+    /// The rows' `enabled`. Not the list's own, which ScrollView already has
+    /// for its scrollbars, and which stays on: a list behind a dialog or an
+    /// operation can still be scrolled to read it.
+    in property <bool> rows-enabled: true;
+    in property <int> current-row: -1;
+    /// Draw the focus ring on the current row.
+    in property <bool> ring: false;
+    callback clicked(int);
+
+    for cert[index] in root.certs: CertListRow {
+        cert: cert;
+        enabled: root.rows-enabled;
+        selected: index == root.current-row;
+        focused: root.ring && index == root.current-row;
+        clicked => { root.clicked(index); }
+    }
+}
+
+// The certificate list, which the keyboard works as well as the pointer.
+//
+// Its rows had only a pointer path and an assistive-technology one, and
+// std-widgets' ListView adds no keys, so without a screen reader nothing could
+// be selected from the keyboard, and everything that acts on a selection was
+// out of reach. Now Tab stops at the list, and Up and Down move the selection
+// a row, Page Up and Page Down a screenful, and Home and End to either end,
+// each as a click on that row would, scrolling it into view.
+//
+// One FocusScope for the whole list, as Slint's own StandardListView has it,
+// rather than one for each row: every scope is a Tab stop, and a keyring can
+// hold thousands of certificates. It sits inside the list, as that one's
+// does, so that the list is what assistive technology is told has focus. The
+// list builds rows only for what is on screen, so the keys ask nothing of
+// them; every row is the same height, and where one is follows from its
+// index.
+export component CertList inherits Rectangle {
+    in property <[CertRow]> certs;
+    in property <bool> enabled: true;
+    in-out property <int> current-row: -1;
+    callback row-selected(int);
+
+    property <length> row-height: 62px;
+    // Whole rows in view, which Page Up and Page Down move by.
+    property <int> page: max(1, floor(list.visible-height / root.row-height));
+    // Whether focus came from the keyboard, which is when the ring is drawn.
+    // A click focuses the list as well, so that the arrow keys go on from
+    // the row clicked, and a ring on every clicked row would only repeat
+    // what its highlight already says.
+    property <bool> keyboard: false;
+
+    // Select the row at `index`, clamped to the list, as a click on it would,
+    // and scroll it into view. A key that moves nowhere selects nothing, so
+    // one held at either end does not go on asking Rust for the same row.
+    function move-to(index: int) {
+        let row = max(0, min(root.certs.length - 1, index));
+        root.reveal(row);
+        if (row != root.current-row) {
+            root.current-row = row;
+            root.row-selected(row);
+        }
+    }
+
+    // Scroll the list as little as brings `row` wholly into view.
+    //
+    // Except that a jump down of more than a screen goes to a whole row.
+    // ListView lays out a long jump afresh from the row at the top edge,
+    // rounding where the list is scrolled to down to a whole row, so End,
+    // scrolled to just show the last row, came to rest with that row cut off
+    // by the bottom edge. A whole row comes through the rounding as it is,
+    // and one past the end of the list ListView brings back to the end,
+    // which shows the last row whole. A jump up already goes to a whole row.
+    function reveal(row: int) {
+        let top = row * root.row-height;
+        let wanted = top < -list.viewport-y ? -top
+            : top + root.row-height > list.visible-height - list.viewport-y
+                ? list.visible-height - top - root.row-height
+                : list.viewport-y;
+        if (wanted < list.viewport-y - list.visible-height) {
+            list.viewport-y = -ceil((top + root.row-height - list.visible-height) / root.row-height)
+                * root.row-height;
+        } else {
+            list.viewport-y = wanted;
+        }
+    }
+
+    list := CertRows {
+        certs: root.certs;
+        rows-enabled: root.enabled;
+        current-row: root.current-row;
+        ring: key.has-focus && root.keyboard;
+        accessible-label: "Certificates";
+        clicked(index) => {
+            root.keyboard = false;
+            key.focus();
+            root.current-row = index;
+            root.row-selected(index);
+        }
+
+        key := FocusScope {
+            x: 0;
+            y: 0;
+            width: 0px;
+            height: 0px;
+            // Not `enabled`, for the reason Btn gives.
+            focus-on-tab-navigation: root.enabled;
+            focus-on-click: root.enabled;
+            focus-gained(reason) => {
+                if (reason == FocusReason.tab-navigation) {
+                    root.keyboard = true;
+                }
+            }
+            key-pressed(event) => {
+                // Rejected while disabled, for the reasons Btn gives. The
+                // window's handler for a row declines while an operation is
+                // in flight, and a highlight moved here would then sit on a
+                // row the details pane is not showing.
+                if (!root.enabled || root.certs.length == 0) {
+                    return reject;
+                }
+                // With nothing selected, Up and Down both start at the top.
+                if (event.text == Key.DownArrow) {
+                    root.move-to(root.current-row + 1);
+                } else if (event.text == Key.UpArrow) {
+                    root.move-to(max(0, root.current-row - 1));
+                } else if (event.text == Key.PageDown) {
+                    root.move-to(root.current-row + root.page);
+                } else if (event.text == Key.PageUp) {
+                    root.move-to(root.current-row - root.page);
+                } else if (event.text == Key.Home) {
+                    root.move-to(0);
+                } else if (event.text == Key.End) {
+                    root.move-to(root.certs.length - 1);
+                } else {
+                    return reject;
+                }
+                root.keyboard = true;
+                return accept;
+            }
+        }
+    }
+
+    // With nothing selected there is no row to draw the ring on, so it goes
+    // around the list.
+    if key.has-focus && root.keyboard && root.current-row < 0: ring := Rectangle {
+        x: 1px;
+        y: 1px;
+        width: root.width - 2px;
+        height: root.height - 2px;
+        border-width: 2px;
+        border-color: Theme.accent;
+        border-radius: Theme.r-sm;
+    }
+}
+
+// The line along the foot of the window: what is under way, and how the last
+// operation went.
+//
+// It wraps rather than elides. Some of what it says ends with what to do, and
+// one line cut that off with no way to read the rest: a publish whose
+// confirmation mail could not be asked for ends "Publish again to retry",
+// about 1750px of text at 12px, against the 1148px the line had at the
+// window's usual width. The bar grows to hold a message up to `tallest`, and
+// shows the beginning of a longer one, eliding the rest; assistive technology
+// is given the whole of it whatever is shown.
+export component StatusBar inherits Rectangle {
+    in property <string> text;
+    in property <bool> busy: false;
+    /// Whether a change is announced to assistive technology. The window turns
+    /// this off while a dialog is open: the dialog is where the user is, and it
+    /// says for itself how its own operation went, so the same words would
+    /// otherwise be read twice.
+    in property <bool> announce: true;
+
+    // The bar's height with one line in it, which is all most messages take.
+    property <length> line-height: 28px;
+    // Above the first line and below the last.
+    property <length> inset: 5px;
+    // The most a long message may take: five lines of its 12px text. The
+    // smallest window the app allows leaves the bar 91px below the rail, and
+    // what goes past the window's edge is not drawn, so a taller bar would
+    // lose its last line there, and with it the ellipsis that says the message
+    // goes on. The publish above takes three lines at that width. Revoking
+    // several keys at once, or refusing a user ID and quoting it back, can
+    // take more, and those messages say what matters first. A length rather
+    // than a share of the window, because the bar's height is part of what
+    // sizes the window, and a share would be a binding loop.
+    property <length> tallest: 88px;
+    height: max(root.line-height, min(root.tallest, message.preferred-height + 2 * root.inset));
+    background: Theme.surface-sunken;
+
+    Rectangle {
+        y: 0;
+        height: 1px;
+        width: parent.width;
+        background: Theme.border;
+    }
+
+    if root.busy: Rectangle {
+        x: Theme.s4;
+        // Level with the first line, however many there are.
+        y: (root.line-height - self.height) / 2;
+        width: 7px;
+        height: 7px;
+        border-radius: 4px;
+        background: Theme.accent;
+        opacity: 0.4;
+        animate opacity { duration: 700ms; iteration-count: -1; direction: alternate; }
+    }
+
+    // Positioned rather than laid out, and its width bound, for the reason the
+    // result banners in dialogs.slint give: only a wrapping text whose width
+    // is already settled reports the height of the lines it wraps to.
+    message := Text {
+        x: root.busy ? Theme.s4 + 7px + Theme.s2 : Theme.s4;
+        y: root.inset;
+        width: root.width - self.x - Theme.s4;
+        height: root.height - 2 * root.inset;
+        text: root.text;
+        color: Theme.text-dim;
+        font-size: Theme.t-sm;
+        // Centred while the bar holds the message, which puts a single line
+        // in the middle of the bar. A longer one starts at the top. Slint
+        // drops the lines that do not fit from the edges the alignment pushes
+        // them past, so centred it would drop as many off the top as off the
+        // bottom, and the top is where a message says what happened.
+        vertical-alignment: self.preferred-height > self.height ? top : center;
+        wrap: word-wrap;
+        overflow: elide;
+        accessible-live-region: root.announce ? AccessibleLiveness.polite : AccessibleLiveness.off;
+    }
+}
+
+// Why an operation a dialog started has failed, for the dialog to show above
+// its buttons.
+//
+// A dialog stays open when its operation fails, so that what was wrong can be
+// put right and the button pressed again, and the reason used to go to the
+// status line alone. That lies under the dialog's scrim, which takes its
+// small grey text down to 2.4:1 in the light theme and 1.5:1 in the dark,
+// and nothing announced it: the button went from "Certifying…" back to
+// "Certify" with no reason anyone could read. Assertive, because the user
+// has just pressed the button that failed and is waiting on its answer.
+export component DialogError inherits Text {
+    color: Theme.danger;
+    font-size: Theme.t-sm;
+    wrap: word-wrap;
+    accessible-live-region: assertive;
+}
+
 export component DialogShell inherits Rectangle {
     in property <string> title;
     in property <string> subtitle: "";
     in property <length> card-width: 460px;
+    /// An operation this dialog started is in flight. Every dialog's Cancel or
+    /// Close is disabled then, since nothing can call the operation back, and
+    /// Escape and a click on the scrim leave the dialog open as well. They used
+    /// to close it, which looked like cancelling a delete, a revocation or a
+    /// publish that went on to happen regardless.
+    in property <bool> busy: false;
+    /// Why the operation this dialog started failed, or nothing. Declared here
+    /// so that every dialog that runs something takes it the same way; each
+    /// draws it above its buttons as a DialogError.
+    in property <string> error: "";
     callback dismissed();
 
     background: Theme.scrim;
 
-    // Swallow clicks so the list behind stays inert, and close on Escape.
+    // Swallow clicks so the list behind stays inert, and close on Escape,
+    // unless an operation is in flight.
     TouchArea {
-        clicked => { root.dismissed(); }
+        clicked => {
+            if (!root.busy) {
+                root.dismissed();
+            }
+        }
     }
 
     // The scope wraps the card rather than sitting beside it. Slint delivers a
@@ -804,15 +1431,35 @@ export component DialogShell inherits Rectangle {
     focus := FocusScope {
         width: 100%;
         height: 100%;
+        // Focus is put here when the dialog opens, and Tab passes over it
+        // unless an operation is in flight: it draws nothing, and as a stop
+        // it was an invisible one on every round of the dialog's controls.
+        // Tab stays among those controls because the window disables
+        // everything behind the scrim while a dialog is open, and opens no
+        // dialog over another; see `dialog-open` in app-window.slint.
+        //
+        // While an operation runs, the dialog's own controls are disabled
+        // as well, and Tab needs somewhere to land. When nothing takes it,
+        // Slint leaves keys going to the control Tab left, which is the
+        // button that started the operation: it has been told that focus
+        // left it, so it draws no ring, but it still receives every key.
+        // Once a failure enabled it again, one Enter ran the operation a
+        // second time with nothing on screen to show where the key had gone.
+        // Here Tab lands on the frame, which answers nothing but Escape.
+        focus-on-tab-navigation: root.busy;
         key-pressed(event) => {
+            // Taken either way, so that Escape goes no further while the
+            // dialog stays.
             if (event.text == Key.Escape) {
-                root.dismissed();
+                if (!root.busy) {
+                    root.dismissed();
+                }
                 return accept;
             }
             return reject;
         }
 
-        Rectangle {
+        card := Rectangle {
             width: root.card-width;
             // min() rather than max-height: setting both height and max-height is
             // a Slint warning, and the card must never outgrow the window.
