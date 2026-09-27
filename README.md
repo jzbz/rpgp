@@ -45,10 +45,20 @@ style, so the only platform character left is the window frame, the UI font
 and the scrollbars.
 
 Everything else is drawn by the design system in `theme.slint` and
-`widgets.slint`. Only `ListView` comes from std-widgets, for virtualised
-scrolling. Icons are [Lucide](https://lucide.dev/) SVGs, vendored under
+`widgets.slint`. Only the scrolling comes from std-widgets: `ListView`, which
+is virtualised, for lists, and `ScrollView` for whatever else can outgrow the
+window. Icons are [Lucide](https://lucide.dev/) SVGs, vendored under
 `ui/icons` and recoloured through `Image`'s `colorize`, so one file serves
 every tone in both themes.
+
+The labels on filled buttons, and text in the `text` and `text-dim` inks, are
+drawn at 4.5:1 or more against what is behind them, in both themes, as WCAG
+asks of text this small. `text-faint` falls short of that, and is kept for what
+the eye may pass over, such as placeholders, counts and section headings.
+`tests/accessibility.rs` holds the theme to this, and looks at the pixels of
+the lines that used to be faint. Pill labels are not held to it yet: drawn in a
+status colour on a wash of the same colour, several fall short of it, down to
+about 4:1 on a selected row of the list.
 
 Long operations run on a worker thread and report back through the event loop,
 so generating an RSA-4096 key does not freeze the window.

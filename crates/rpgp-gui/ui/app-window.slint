@@ -570,7 +570,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Pick a certificate to see its fingerprint, "
                                 + "user IDs and what it can be used for.";
-                            color: Theme.text-faint;
+                            color: Theme.text-dim;
                             font-size: Theme.t-sm;
                             horizontal-alignment: center;
                             wrap: word-wrap;
@@ -704,7 +704,7 @@ export component AppWindow inherits Window {
 
                                 Text {
                                     text: "Applies to checking signatures and nothing else. This certificate can still never be verified through the web of trust, act as a trust root, or vouch for anyone else — and rPGP will not encrypt to it.";
-                                    color: Theme.text-faint;
+                                    color: Theme.text-dim;
                                     font-size: Theme.t-sm;
                                     wrap: word-wrap;
                                 }
@@ -795,7 +795,7 @@ export component AppWindow inherits Window {
 
                         if root.detail-certifications.length == 0: Text {
                             text: "No certifications.";
-                            color: Theme.text-faint;
+                            color: Theme.text-dim;
                             font-size: Theme.t-sm;
                         }
 
@@ -824,7 +824,7 @@ export component AppWindow inherits Window {
                                 }
                                 Text {
                                     text: entry.detail;
-                                    color: Theme.text-faint;
+                                    color: Theme.text-dim;
                                     font-size: Theme.t-xs;
                                     wrap: word-wrap;
                                 }

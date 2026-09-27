@@ -2875,3 +2875,675 @@ fn a_user_id_is_shown_written_out_and_revoked_as_the_certificate_has_it() {
     .invoke_accessible_default_action();
     assert_eq!(probe.get_revoked(), STORED);
 }
+
+/// The relative luminance WCAG weighs a colour by.
+fn luminance(colour: slint::Color) -> f64 {
+    let channel = |value: u8| {
+        let value = f64::from(value) / 255.;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(colour.red())
+        + 0.7152 * channel(colour.green())
+        + 0.0722 * channel(colour.blue())
+}
+
+/// The WCAG contrast ratio between two opaque colours, from 1 to 21.
+fn contrast(a: slint::Color, b: slint::Color) -> f64 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// `top` drawn over the opaque `base`, as a translucent surface is.
+fn over(top: slint::Color, base: slint::Color) -> slint::Color {
+    let alpha = f32::from(top.alpha()) / 255.;
+    let mix =
+        |top: u8, base: u8| (f32::from(top) * alpha + f32::from(base) * (1. - alpha)).round() as u8;
+    slint::Color::from_rgb_u8(
+        mix(top.red(), base.red()),
+        mix(top.green(), base.green()),
+        mix(top.blue(), base.blue()),
+    )
+}
+
+/// The label of a filled button, and text in `text` or `text-dim`, reach 4.5:1
+/// against what they are drawn on, in the light theme and the dark: a button
+/// at rest, under the pointer and pressed, and the inks on every surface, a
+/// hovered or selected row and the warn-soft banner over it included.
+///
+/// WCAG asks 4.5:1 of text under 18px, and a button's label is 13px. The dark
+/// theme's fills are light, and its white labels came to 3.0:1 on a primary
+/// button, 2.5:1 on one under the pointer and 2.4:1 on Delete key. text-faint
+/// is left out on purpose: it is under 4.5:1 everywhere and kept for what
+/// need not be read, which is why the lines it used to carry are text-dim.
+/// Nor are pill labels checked: several fall short, as README.md says.
+#[test]
+fn text_and_the_labels_on_filled_buttons_reach_four_and_a_half_to_one_in_both_themes() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let probe = ThemeProbe::new().unwrap();
+    let mut faint = Vec::new();
+    for dark in [false, true] {
+        probe.invoke_use_dark(dark);
+        let theme = if dark { "dark" } else { "light" };
+        let mut check = |what: String, ink: slint::Color, ground: slint::Color| {
+            let ratio = contrast(ink, ground);
+            if ratio < 4.5 {
+                faint.push(format!("{theme}: {what} is {ratio:.2}:1"));
+            }
+        };
+
+        let label = probe.get_accent_ink().color();
+        for (fill, colour) in [
+            ("accent", probe.get_accent()),
+            ("accent-hover", probe.get_accent_hover()),
+            ("danger", probe.get_danger()),
+            ("danger-hover", probe.get_danger_hover()),
+        ] {
+            check(format!("accent-ink on {fill}"), label, colour.color());
+        }
+
+        let (hover, selected) = (probe.get_hover().color(), probe.get_selected().color());
+        let mut surfaces = Vec::new();
+        for (name, base) in [
+            ("bg", probe.get_bg().color()),
+            ("surface", probe.get_surface().color()),
+            ("surface-sunken", probe.get_surface_sunken().color()),
+        ] {
+            surfaces.push((name.to_string(), base));
+            surfaces.push((format!("hover over {name}"), over(hover, base)));
+            surfaces.push((format!("selected over {name}"), over(selected, base)));
+        }
+        surfaces.push((
+            "warn-soft over surface".to_string(),
+            over(probe.get_warn_soft().color(), probe.get_surface().color()),
+        ));
+        for (ink, colour) in [
+            ("text", probe.get_text()),
+            ("text-dim", probe.get_text_dim()),
+        ] {
+            for (surface, ground) in &surfaces {
+                check(format!("{ink} on {surface}"), colour.color(), *ground);
+            }
+        }
+    }
+    assert!(faint.is_empty(), "too faint to read:\n{}", faint.join("\n"));
+}
+
+/// A danger button stays red under the pointer and while it is pressed, and a
+/// primary one still takes accent-hover.
+///
+/// Every filled button took accent-hover, so Delete key, Revoke key and
+/// Publish permanently turned blue under the pointer, and lost the red that
+/// says they cannot be undone at the moment they were pressed.
+#[test]
+fn a_danger_button_stays_red_under_the_pointer_and_while_pressed() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::AccessibleRole;
+    use slint::platform::{PointerEventButton, WindowEvent};
+
+    let probe = ThemeProbe::new().unwrap();
+    probe.show().unwrap();
+    // Past the fill's animation.
+    let settle =
+        || i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(500));
+    let centre = |label: &str| {
+        let button = control(&probe, label, AccessibleRole::Button);
+        let (at, size) = (button.absolute_position(), button.size());
+        slint::LogicalPosition::new(at.x + size.width / 2., at.y + size.height / 2.)
+    };
+    let away = slint::LogicalPosition::new(290., 110.);
+    let button = PointerEventButton::Left;
+
+    for dark in [false, true] {
+        probe.invoke_use_dark(dark);
+        let theme = if dark { "dark" } else { "light" };
+        let window = probe.window();
+
+        window.dispatch_event(WindowEvent::PointerMoved { position: away });
+        settle();
+        assert_eq!(
+            probe.get_danger_fill().color(),
+            probe.get_danger().color(),
+            "{theme}: Delete key at rest"
+        );
+
+        let position = centre("Delete key");
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        settle();
+        let hovered = probe.get_danger_fill().color();
+        window.dispatch_event(WindowEvent::PointerPressed { position, button });
+        settle();
+        let pressed = probe.get_danger_fill().color();
+        window.dispatch_event(WindowEvent::PointerReleased { position, button });
+        for (state, fill) in [("under the pointer", hovered), ("pressed", pressed)] {
+            assert_eq!(
+                fill,
+                probe.get_danger_hover().color(),
+                "{theme}: Delete key {state} is filled {fill:?}, not danger-hover (accent-hover is \
+                 {:?})",
+                probe.get_accent_hover().color()
+            );
+        }
+
+        let position = centre("Certify");
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        settle();
+        assert_eq!(
+            probe.get_primary_fill().color(),
+            probe.get_accent_hover().color(),
+            "{theme}: Certify under the pointer"
+        );
+    }
+}
+
+/// The status bar's dot pulses while an operation runs.
+///
+/// Its opacity carried an endless animation, but on a constant, and Slint
+/// compiles a constant binding to a plain value and drops its animation: the
+/// dot sat at 40% for as long as the app was busy, and nothing on screen moved.
+#[test]
+fn the_busy_dot_pulses_while_an_operation_runs() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::ElementHandle;
+
+    let probe = StatusProbe::new().unwrap();
+    probe.set_text("Generating a key pair…".into());
+    probe.set_busy(true);
+    probe.show().unwrap();
+    let dot = ElementHandle::find_by_element_id(&probe, "StatusBar::dot")
+        .next()
+        .expect("a busy status bar draws its dot");
+
+    // Eight looks, evenly over one pulse, 1.4s.
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        seen.push(dot.computed_opacity());
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(175));
+    }
+    let low = seen.iter().copied().fold(f32::MAX, f32::min);
+    let high = seen.iter().copied().fold(f32::MIN, f32::max);
+    assert!(
+        high - low >= 0.5,
+        "over a pulse the dot's opacity went only from {low} to {high}: {seen:?}"
+    );
+}
+
+/// A lookup result shows the whole of its fingerprint: on one line where it
+/// fits, as a v4 one does, and wrapped where it does not, as a v6 one does,
+/// with its second line inside the list rather than below it.
+///
+/// Each row put the fingerprint beside a pill naming where it was found and
+/// the Import button, and elided it once those had taken their share: as much
+/// as the last eight digits of a v4 fingerprint and half of a v6 one, under a
+/// line asking the user to check the fingerprint against its owner.
+#[test]
+fn a_lookup_result_shows_the_whole_of_its_fingerprint() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::ElementHandle;
+
+    const V4: &str = "0D76 F9AE 2567 80A2 AFC5 8A6A 3D82 7887 1C1A F2DB";
+    const V6: &str = "26E9 A366 5CEB 35DD DF5E 24A9 7EBE E2F5 FE05 6B93 1257 209F 4D40 C5A2 \
+        BE8B 16D1";
+    let found = |user_id: &str, fingerprint: &str, source: &str| LookupRow {
+        primary_user_id: user_id.into(),
+        fingerprint_pretty: fingerprint.into(),
+        source: source.into(),
+        initials: "A".into(),
+        ..Default::default()
+    };
+    let probe = LookupProbe::new().unwrap();
+    probe.set_results(slint::ModelRc::new(slint::VecModel::from(vec![
+        found("Bob <bob@example.org>", V4, "web key directory"),
+        found("Alice <alice@example.org>", V6, "keyserver"),
+    ])));
+    probe.set_measured(V4.into());
+    probe.show().unwrap();
+
+    let shown = |fingerprint: &str| {
+        ElementHandle::find_by_accessible_label(&probe, fingerprint)
+            .next()
+            .unwrap_or_else(|| panic!("the results should show {fingerprint}"))
+    };
+    let (v4, v6) = (shown(V4), shown(V6));
+    assert!(
+        v4.size().width >= probe.get_one_line(),
+        "the v4 fingerprint was given {}px of the {}px it takes on one line",
+        v4.size().width,
+        probe.get_one_line()
+    );
+    assert!(
+        v6.size().height >= 2. * v4.size().height,
+        "the v6 fingerprint was given {}px, not the two lines of {}px it takes",
+        v6.size().height,
+        v4.size().height
+    );
+    let bottom = |element: &ElementHandle| element.absolute_position().y + element.size().height;
+    let list = ElementHandle::find_by_element_id(&probe, "LookupDialog::found")
+        .next()
+        .expect("the results are listed");
+    assert!(
+        bottom(&v6) <= bottom(&list),
+        "the v6 fingerprint ends {}px down, below the list, which ends at {}px",
+        bottom(&v6),
+        bottom(&list)
+    );
+}
+
+/// The notepad after a run, and Lookup with more results than fit, keep their
+/// buttons inside the card in the smallest window the app allows, as the
+/// dialogs with a long failure above do.
+///
+/// Neither scrolled. A run adds its verdict and its output to the notepad,
+/// which then asked for 748px, more than even the default window leaves the
+/// card, and in the smallest one the buttons were out of the item tree, where
+/// neither the pointer nor the keyboard reaches. Lookup lists however many
+/// certificates a search returns, and lost Close the same way at eight.
+#[test]
+fn the_notepad_after_a_run_and_a_long_lookup_keep_their_buttons_in_the_smallest_window() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementRoot};
+
+    // The main window's minimum height, all of which a dialog's scrim covers.
+    const SMALLEST: f32 = 520.;
+
+    fn inside(dialog: &str, root: &impl ElementRoot, buttons: &[&str]) {
+        let card = ElementHandle::find_by_element_id(root, "DialogShell::card")
+            .next()
+            .expect("every dialog draws a card");
+        let bottom = card.absolute_position().y + card.size().height;
+        for label in buttons {
+            let button = ElementHandle::find_by_accessible_label(root, label)
+                .find(|element| element.accessible_role() == Some(AccessibleRole::Button))
+                .unwrap_or_else(|| panic!("{dialog}: {label} is not in the item tree"));
+            let end = button.absolute_position().y + button.size().height;
+            assert!(
+                end <= bottom,
+                "{dialog}: {label} ends {end}px down, past the card's bottom at {bottom}px"
+            );
+        }
+    }
+
+    let probe = NotepadProbe::new().unwrap();
+    probe.set_probe_height(SMALLEST);
+    probe.set_signers(slint::ModelRc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("Alice <alice@example.org>"),
+    ])));
+    probe.set_result("Decrypted. The message was signed.".into());
+    probe.set_signatures(slint::ModelRc::new(slint::VecModel::from(vec![
+        SignatureRow {
+            good: true,
+            signer: "Bob <bob@example.org>".into(),
+            authentication: "unverified".into(),
+            ..Default::default()
+        },
+    ])));
+    probe.set_output("The meeting is at noon.\n".repeat(12).into());
+    probe.show().unwrap();
+    inside(
+        "the notepad",
+        &probe,
+        &[
+            "Close",
+            "Decrypt / Verify",
+            "Sign",
+            "Encrypt",
+            "Sign & Encrypt",
+        ],
+    );
+
+    let probe = LookupProbe::new().unwrap();
+    probe.set_probe_height(SMALLEST);
+    probe.set_status(
+        "8 certificate(s) found. Check the fingerprint against the owner before trusting it."
+            .into(),
+    );
+    probe.set_results(slint::ModelRc::new(slint::VecModel::from(
+        (1..=8)
+            .map(|number| LookupRow {
+                primary_user_id: format!("Bob {number} <bob@example.org>").into(),
+                fingerprint_pretty: "0D76 F9AE 2567 80A2 AFC5 8A6A 3D82 7887 1C1A F2DB".into(),
+                source: "keyserver".into(),
+                initials: "B".into(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    )));
+    probe.show().unwrap();
+    inside("Lookup", &probe, &["Close"]);
+}
+
+/// Where `x`, `y` within LongSelectProbe's open list is in the window. An
+/// option reports where it is within the list, which opens 4px under the
+/// Select, as `an_open_list_takes_no_choice_once_its_select_is_disabled` has
+/// it.
+fn in_long_list(probe: &LongSelectProbe, x: f32, y: f32) -> slint::LogicalPosition {
+    let select = control(
+        probe,
+        "Sign as",
+        i_slint_backend_testing::AccessibleRole::Combobox,
+    );
+    let (at, size) = (select.absolute_position(), select.size());
+    slint::LogicalPosition::new(at.x + x, at.y + size.height + 4. + y)
+}
+
+/// Click the option called `label` in LongSelectProbe's open list.
+fn click_in_long_list(probe: &LongSelectProbe, label: &str) {
+    use slint::platform::{PointerEventButton, WindowEvent};
+    let option = i_slint_backend_testing::ElementHandle::find_by_accessible_label(probe, label)
+        .next()
+        .unwrap_or_else(|| panic!("the open list does not show {label} where it can be clicked"));
+    let (at, size) = (option.absolute_position(), option.size());
+    let position = in_long_list(probe, at.x + size.width / 2., at.y + size.height / 2.);
+    let button = PointerEventButton::Left;
+    let window = probe.window();
+    window.dispatch_event(WindowEvent::PointerMoved { position });
+    window.dispatch_event(WindowEvent::PointerPressed { position, button });
+    window.dispatch_event(WindowEvent::PointerReleased { position, button });
+}
+
+/// How many times `label` is on screen in LongSelectProbe: once more than the
+/// Select shows for an option in view in the open list. An option scrolled out
+/// of view is not counted.
+fn times_shown(probe: &LongSelectProbe, label: &str) -> usize {
+    i_slint_backend_testing::ElementHandle::find_by_accessible_label(probe, label).count()
+}
+
+/// A list longer than its popup scrolls to its later options, and opens at
+/// the chosen one, so that every option can be chosen with the pointer.
+///
+/// The popup is 240px tall, and its options were a plain column, so from the
+/// ninth on they were drawn below it, where a click counts as outside the
+/// popup and closes the list without choosing. The lists of keys to sign and
+/// certify with hold every key that can, however many there are.
+#[test]
+fn a_long_list_scrolls_to_its_later_options_and_opens_at_the_chosen_one() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::AccessibleRole;
+    use slint::platform::WindowEvent;
+
+    // Opened at the first option, scrolled down with the wheel, and the last
+    // one clicked.
+    let probe = LongSelectProbe::new().unwrap();
+    probe.show().unwrap();
+    control(&probe, "Sign as", AccessibleRole::Combobox).invoke_accessible_default_action();
+    assert_eq!(
+        times_shown(&probe, "Key 1"),
+        2,
+        "the list should open at its first option"
+    );
+    probe.window().dispatch_event(WindowEvent::PointerScrolled {
+        position: in_long_list(&probe, 40., 100.),
+        delta_x: 0.,
+        delta_y: -400.,
+    });
+    click_in_long_list(&probe, "Key 12");
+    assert_eq!(
+        (probe.get_current(), probe.get_changes()),
+        (11, 1),
+        "clicking the twelfth option, scrolled to, should choose it"
+    );
+    assert_eq!(
+        times_shown(&probe, "Key 12"),
+        1,
+        "choosing an option should close the list"
+    );
+
+    // Opened with the last option chosen: far enough down to show it, and the
+    // options just above it with it.
+    let probe = LongSelectProbe::new().unwrap();
+    probe.set_current(11);
+    probe.show().unwrap();
+    control(&probe, "Sign as", AccessibleRole::Combobox).invoke_accessible_default_action();
+    click_in_long_list(&probe, "Key 10");
+    assert_eq!(
+        (probe.get_current(), probe.get_changes()),
+        (9, 1),
+        "the list should open at the twelfth option, chosen, with the tenth in reach"
+    );
+
+    // Opened with a choice past the end of the list, as one left over from a
+    // longer list would be: at the end, and not scrolled past it to nothing.
+    let probe = LongSelectProbe::new().unwrap();
+    probe.set_current(20);
+    probe.show().unwrap();
+    control(&probe, "Sign as", AccessibleRole::Combobox).invoke_accessible_default_action();
+    assert_eq!(
+        times_shown(&probe, "Key 12"),
+        1,
+        "a choice past the end should open the list at its last option"
+    );
+}
+
+/// Dragging an open list's scrollbar scrolls the list and leaves it open.
+///
+/// A popup closes by default on a click that ends inside it as well as on one
+/// outside, so the list went away as its scrollbar was let go, having chosen
+/// nothing. It now closes on a click outside it, or once an option is chosen.
+#[test]
+fn dragging_an_open_lists_scrollbar_scrolls_it_and_leaves_it_open() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::AccessibleRole;
+    use slint::platform::{PointerEventButton, WindowEvent};
+
+    let probe = LongSelectProbe::new().unwrap();
+    probe.show().unwrap();
+    let select = control(&probe, "Sign as", AccessibleRole::Combobox);
+    select.invoke_accessible_default_action();
+
+    // std-widgets' scrollbar lies along the right edge of the scrolling area,
+    // 14px wide; the area is inset 4px in the popup, which is as wide as the
+    // Select. Pressed near its top, and let go well inside the popup, which is
+    // 240px tall: a click inside that chooses nothing.
+    let x = select.size().width - 4. - 7.;
+    let button = PointerEventButton::Left;
+    let window = probe.window();
+    let position = in_long_list(&probe, x, 30.);
+    window.dispatch_event(WindowEvent::PointerMoved { position });
+    window.dispatch_event(WindowEvent::PointerPressed { position, button });
+    let position = in_long_list(&probe, x, 200.);
+    window.dispatch_event(WindowEvent::PointerMoved { position });
+    window.dispatch_event(WindowEvent::PointerReleased { position, button });
+
+    let options_shown: usize = (1..=12)
+        .map(|number| times_shown(&probe, &format!("Key {number}")))
+        .sum();
+    assert!(
+        options_shown > 1,
+        "letting go of the scrollbar closed the list"
+    );
+    assert_eq!(
+        (times_shown(&probe, "Key 1"), times_shown(&probe, "Key 12")),
+        (1, 1),
+        "the drag should have scrolled the list from its first option to its last"
+    );
+    click_in_long_list(&probe, "Key 12");
+    assert_eq!(
+        (probe.get_current(), probe.get_changes()),
+        (11, 1),
+        "the last option, dragged to, should be chosen by a click"
+    );
+}
+
+/// Each line that says something, rather than naming a section or counting,
+/// is drawn at 4.5:1 or more against what is behind it.
+///
+/// Explanations, details and identifiers were drawn in text-faint, which comes
+/// to 2.4 to 3.1:1 in the light theme: the line under Trust root, the names of
+/// the details pane's fields, the capabilities and expiry of each certificate
+/// in the list, the self-signature date of a user ID, the key IDs and
+/// addresses that tell recipients and signers apart, and the fingerprint
+/// Lookup asks the user to check. The theme test holds text-dim to 4.5:1; this
+/// looks at the pixels, so that a line put back in text-faint is caught too.
+/// Drawn at three times the size, so that a glyph's stems cover whole pixels
+/// and its inkiest pixel is its ink rather than a blend of ink and ground. The
+/// probes are in the light theme, where text-faint falls short everywhere.
+#[test]
+fn lines_that_say_something_are_drawn_at_four_and_a_half_to_one() {
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementRoot};
+    use slint::platform::WindowEvent;
+    use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+    use slint::{ComponentHandle, Rgb8Pixel};
+
+    const SCALE: f32 = 3.;
+
+    /// Draw `probe`, `width` by `height` as it declares itself, and give the
+    /// contrast of each of `lines` against the colour most of its box is.
+    fn measure(
+        window: &MinimalSoftwareWindow,
+        probe: &(impl ComponentHandle + ElementRoot),
+        (width, height): (f32, f32),
+        lines: &[&str],
+    ) -> Vec<(String, f64)> {
+        probe.show().unwrap();
+        let (across, down) = ((width * SCALE) as usize, (height * SCALE) as usize);
+        window.set_size(slint::PhysicalSize::new(across as u32, down as u32));
+        let mut pixels = vec![Rgb8Pixel::default(); across * down];
+        window.request_redraw();
+        assert!(window.draw_if_needed(|renderer| {
+            renderer.render(&mut pixels, across);
+        }));
+        let colour = |x: usize, y: usize| {
+            let pixel = pixels[y * across + x];
+            slint::Color::from_rgb_u8(pixel.r, pixel.g, pixel.b)
+        };
+
+        let measured = lines
+            .iter()
+            .map(|line| {
+                let text = ElementHandle::find_by_accessible_label(probe, line)
+                    .find(|element| element.accessible_role() == Some(AccessibleRole::Text))
+                    .unwrap_or_else(|| panic!("nothing shows {line:?}"));
+                let (at, size) = (text.absolute_position(), text.size());
+                let xs =
+                    (at.x * SCALE) as usize..(((at.x + size.width) * SCALE) as usize).min(across);
+                let ys =
+                    (at.y * SCALE) as usize..(((at.y + size.height) * SCALE) as usize).min(down);
+                let mut counts = std::collections::HashMap::new();
+                for y in ys.clone() {
+                    for x in xs.clone() {
+                        let c = colour(x, y);
+                        *counts.entry((c.red(), c.green(), c.blue())).or_insert(0) += 1;
+                    }
+                }
+                let ((r, g, b), _) = counts
+                    .into_iter()
+                    .max_by_key(|&(_, count)| count)
+                    .unwrap_or_else(|| panic!("{line:?} has no box to draw in"));
+                let ground = slint::Color::from_rgb_u8(r, g, b);
+                let ink = ys
+                    .flat_map(|y| xs.clone().map(move |x| (x, y)))
+                    .map(|(x, y)| contrast(colour(x, y), ground))
+                    .fold(1., f64::max);
+                (line.to_string(), ink)
+            })
+            .collect();
+        probe.hide().unwrap();
+        measured
+    }
+
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(CanvasPlatform(window.clone())))
+        .expect("no platform is set on a test's own thread");
+    window.dispatch_event(WindowEvent::ScaleFactorChanged {
+        scale_factor: SCALE,
+    });
+    let mut measured = Vec::new();
+
+    let probe = TrustRootProbe::new().unwrap();
+    measured.extend(measure(
+        &window,
+        &probe,
+        (360., 160.),
+        &["Certifications made by this key count as evidence."],
+    ));
+
+    let probe = CopyProbe::new().unwrap();
+    measured.extend(measure(
+        &window,
+        &probe,
+        (400., 120.),
+        &["Fingerprint", "Algorithm"],
+    ));
+
+    // The first row selected, the second not.
+    let probe = CertListProbe::new().unwrap();
+    probe.set_certs(slint::ModelRc::new(slint::VecModel::from(vec![
+        CertRow {
+            capabilities: "CSE".into(),
+            ..listed(1)
+        },
+        CertRow {
+            capabilities: "CS".into(),
+            expires: "2028-03-14".into(),
+            ..listed(2)
+        },
+    ])));
+    probe.set_current_row(0);
+    measured.extend(measure(
+        &window,
+        &probe,
+        (600., 400.),
+        &["CSE · never expires", "CS · until 2028-03-14"],
+    ));
+
+    let probe = DetailsProbe::new().unwrap();
+    measured.extend(measure(
+        &window,
+        &probe,
+        (760., 720.),
+        &["self-signed 2026-01-01"],
+    ));
+
+    let probe = LookupProbe::new().unwrap();
+    probe.set_results(slint::ModelRc::new(slint::VecModel::from(vec![
+        LookupRow {
+            primary_user_id: "Bob <bob@example.org>".into(),
+            fingerprint_pretty: "0D76 F9AE 2567 80A2 AFC5 8A6A 3D82 7887 1C1A F2DB".into(),
+            source: "keyserver".into(),
+            initials: "B".into(),
+            ..Default::default()
+        },
+    ])));
+    measured.extend(measure(
+        &window,
+        &probe,
+        (620., 720.),
+        &["0D76 F9AE 2567 80A2 AFC5 8A6A 3D82 7887 1C1A F2DB"],
+    ));
+
+    // A recipient's address and key ID, and the signer's key ID.
+    let probe = SelectionProbe::new().unwrap();
+    probe.set_recipients(slint::ModelRc::new(slint::VecModel::from(vec![
+        RecipientRow {
+            label: "Bob".into(),
+            sublabel: "bob@example.org".into(),
+            key_id: "0123456789ABCDEF".into(),
+            initials: "B".into(),
+            ..Default::default()
+        },
+    ])));
+    probe.set_signer_key_ids(slint::ModelRc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("FEDCBA9876543210"),
+    ])));
+    measured.extend(measure(
+        &window,
+        &probe,
+        (620., 720.),
+        &["bob@example.org", "0123456789ABCDEF", "FEDCBA9876543210"],
+    ));
+
+    let faint: Vec<_> = measured
+        .iter()
+        .filter(|(_, ratio)| *ratio < 4.5)
+        .map(|(line, ratio)| format!("{line:?} at {ratio:.2}:1"))
+        .collect();
+    assert!(
+        faint.is_empty(),
+        "drawn too faint to read:\n{}",
+        faint.join("\n")
+    );
+}

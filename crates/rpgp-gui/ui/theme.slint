@@ -24,13 +24,26 @@ export global Theme {
 
     // Ink.
     out property <brush> text: dark ? #e8eaef : #161a21;
+    // The faintest ink for anything that has to be read: at least 4.7:1 on
+    // every surface above, with a selected or hovered row or the warn-soft
+    // banner laid over it, in either theme. WCAG asks 4.5:1 of text this
+    // small, and the tests hold the theme to it.
     out property <brush> text-dim: dark ? #99a1b0 : #5c6470;
+    // Under 4.5:1 on every surface, 2.4 to 3.8:1, so only for what the eye
+    // may pass over: a placeholder, a count, a section heading, the text of
+    // something a pill beside it says is revoked, and glyphs. Explanations
+    // and details belong in text-dim. This used to carry them as well, the
+    // limits of the SHA-1 opt-in among them, at under 3:1 in the light theme.
     out property <brush> text-faint: dark ? #6b7385 : #8b93a0;
 
     // Accent.
     out property <brush> accent: dark ? #6f8dff : #3457dc;
     out property <brush> accent-hover: dark ? #86a0ff : #2a48c0;
-    out property <brush> accent-ink: #ffffff;
+    // The label on a filled button, and the tick or selected text on an accent
+    // fill. White on the light theme's deep fills. The dark theme's fills are
+    // light, and white came to 2.4 to 3.0:1 on them, the red of Delete key the
+    // least; the dark background's own colour comes to 6.0 to 8.8:1.
+    out property <brush> accent-ink: dark ? #131519 : #ffffff;
     out property <brush> accent-soft: dark ? #6f8dff26 : #3457dc14;
 
     // Status. Each has a soft companion for pill backgrounds.
@@ -39,6 +52,10 @@ export global Theme {
     out property <brush> warn: dark ? #f0b264 : #9a5c08;
     out property <brush> warn-soft: dark ? #f0b2641f : #9a5c0814;
     out property <brush> danger: dark ? #ff8098 : #c22a46;
+    // A danger button under the pointer: the step from `danger` that
+    // accent-hover takes from `accent`, so that a destructive button is still
+    // red while it is being pressed.
+    out property <brush> danger-hover: dark ? #ff94a8 : #a5243c;
     out property <brush> danger-soft: dark ? #ff80981f : #c22a4614;
 
     // Monogram tints, indexed by a hash of the fingerprint so a certificate

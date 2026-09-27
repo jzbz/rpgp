@@ -157,7 +157,7 @@ export component KeygenDialog inherits DialogShell {
                               + "software cannot encrypt to this key or check its signatures."
                             : "Works with GnuPG 2.4 and everything older, using its weaker "
                               + "encryption.";
-                        color: Theme.text-faint;
+                        color: Theme.text-dim;
                         font-size: Theme.t-sm;
                         wrap: word-wrap;
                     }
@@ -307,7 +307,7 @@ export component SignEncryptDialog inherits DialogShell {
 
             if root.signers.length == 0: Text {
                 text: "No key of yours here can sign, so this can only encrypt.";
-                color: Theme.text-faint;
+                color: Theme.text-dim;
                 font-size: Theme.t-sm;
                 wrap: word-wrap;
             }
@@ -341,7 +341,7 @@ export component SignEncryptDialog inherits DialogShell {
 
                     if root.recipients.length == 0: Text {
                         text: "No certificate in the store can receive encrypted mail.";
-                        color: Theme.text-faint;
+                        color: Theme.text-dim;
                         font-size: Theme.t-sm;
                         horizontal-alignment: center;
                         vertical-alignment: center;
@@ -417,7 +417,7 @@ export component SignEncryptDialog inherits DialogShell {
                                     // would hold the name above the middle.
                                     if entry.sublabel != "": Text {
                                         text: entry.sublabel;
-                                        color: Theme.text-faint;
+                                        color: Theme.text-dim;
                                         font-size: Theme.t-xs;
                                         overflow: elide;
                                     }
@@ -430,7 +430,7 @@ export component SignEncryptDialog inherits DialogShell {
                                 // gives way to it.
                                 Text {
                                     text: entry.key-id;
-                                    color: Theme.text-faint;
+                                    color: Theme.text-dim;
                                     font-size: Theme.t-xs;
                                     font-family: "Source Code Pro";
                                     vertical-alignment: center;
@@ -481,7 +481,7 @@ export component SignEncryptDialog inherits DialogShell {
             if root.input-path != "": Text {
                 text: (root.choose-output ? "Asks where to save " : "Writes ")
                     + (root.want-encrypt ? root.output-encrypt : root.output-sign);
-                color: Theme.text-faint;
+                color: Theme.text-dim;
                 font-size: Theme.t-sm;
                 overflow: elide;
             }
@@ -579,7 +579,7 @@ export component DecryptVerifyDialog inherits DialogShell {
 
         if root.output-path != "" && !root.needs-data: Text {
             text: (root.choose-output ? "Asks where to save " : "Writes ") + root.output-path;
-            color: Theme.text-faint;
+            color: Theme.text-dim;
             font-size: Theme.t-sm;
             overflow: elide;
         }
@@ -903,7 +903,7 @@ export component CertifyDialog inherits DialogShell {
                     }
                     if root.introducer: Text {
                         text: "Certificates this key certifies will also count as verified here.";
-                        color: Theme.text-faint;
+                        color: Theme.text-dim;
                         font-size: Theme.t-sm;
                         wrap: word-wrap;
                     }
@@ -1297,248 +1297,283 @@ export component NotepadDialog inherits DialogShell {
     VerticalLayout {
         spacing: Theme.s3;
 
-        HorizontalLayout {
-            spacing: Theme.s3;
+        // Everything above the buttons scrolls, as in Sign / Encrypt. A run
+        // adds its verdict and its output to what is already here, and each
+        // part is a fixed height, the 200px input and the 150px output among
+        // them: after a decrypt with one signature the notepad asked for
+        // 748px, more than the 728px that even the default 760px window leaves
+        // the card. The recipient list was what gave way, and beside the fixed
+        // input it could give 40px, so a shorter window cut the buttons off,
+        // partly below about 715px and wholly below about 685px, where neither
+        // the pointer nor the keyboard could reach them.
+        ScrollView {
+            min-height: 0px;
+            preferred-height: form.preferred-height;
+            vertical-stretch: 1;
+            viewport-width: self.visible-width;
+            viewport-height: max(self.visible-height, form.preferred-height);
 
-            VerticalLayout {
-                spacing: 6px;
-                horizontal-stretch: 1;
-                Text {
-                    text: "Input";
-                    color: Theme.text-dim;
-                    font-size: Theme.t-sm;
-                }
-                editor := TextArea {
-                    height: 200px;
-                    placeholder: "Type, or paste an OpenPGP message…";
-                    enabled: !root.busy;
-                }
-            }
+            form := VerticalLayout {
+                // Bound to the scroller's width, as the details pane's
+                // contents are, rather than left to the viewport's. The
+                // viewport widens to the form's minimum width, and the
+                // banner's lines bind theirs to the form's so as to wrap:
+                // left unbound, the two make a loop, which Slint refuses.
+                width: parent.visible-width;
+                // Clear of the scrollbar, as in Certify.
+                padding-right: Theme.s4;
+                spacing: Theme.s3;
 
-            VerticalLayout {
-                spacing: 6px;
-                width: 260px;
                 HorizontalLayout {
-                    Text {
-                        text: "Recipients";
-                        color: Theme.text-dim;
-                        font-size: Theme.t-sm;
+                    spacing: Theme.s3;
+
+                    VerticalLayout {
+                        spacing: 6px;
                         horizontal-stretch: 1;
+                        Text {
+                            text: "Input";
+                            color: Theme.text-dim;
+                            font-size: Theme.t-sm;
+                        }
+                        editor := TextArea {
+                            height: 200px;
+                            placeholder: "Type, or paste an OpenPGP message…";
+                            enabled: !root.busy;
+                        }
                     }
-                    Text {
-                        text: root.chosen-recipients == 0
-                            ? "none" : "\{root.chosen-recipients}";
-                        color: Theme.text-faint;
-                        font-size: Theme.t-sm;
-                    }
-                }
-                Field {
-                    placeholder: "Filter by name, e-mail or fingerprint";
-                    glyph: Icons.search;
-                    edited(text) => { root.filter-recipients(text); }
-                }
 
-                Rectangle {
-                    // Flexible rather than a fixed 200px: the card is clamped
-                    // to the window, so a list that cannot give ground pushes
-                    // the buttons off the bottom on a short screen. It shrinks
-                    // to 110px before anything else has to.
-                    min-height: 110px;
-                    preferred-height: 200px;
-                    vertical-stretch: 1;
-                    background: Theme.surface-sunken;
-                    border-radius: Theme.r-sm;
-                    border-width: 1px;
-                    border-color: Theme.border;
-                    clip: true;
-                    if root.recipients.length == 0: Text {
-                        text: "No one matches that.";
-                        color: Theme.text-faint;
-                        font-size: Theme.t-sm;
-                        x: Theme.s3;
-                        y: Theme.s3;
-                    }
-                    ListView {
-                        for entry[index] in root.recipients: Rectangle {
-                            height: 34px;
-                            background: pick.has-hover ? Theme.hover : transparent;
-
-                            // The row draws a tick box but is not one: without these a screen
-                            // reader sees an unlabelled rectangle and cannot tell a chosen
-                            // recipient from an unchosen one. Check declares the same set.
-                            accessible-role: checkbox;
-                            accessible-label: entry.label
-                                + (entry.sublabel == "" ? "" : ", " + entry.sublabel)
-                                + ", key ID " + entry.key-id;
-                            accessible-checkable: true;
-                            accessible-checked: entry.selected;
-                            // Inert while a run is in flight, as in Sign / Encrypt, whose
-                            // recipients these are too.
-                            accessible-enabled: !root.busy;
-                            accessible-action-default => {
-                                if (!root.busy) {
-                                    root.toggle-recipient(index);
-                                }
+                    VerticalLayout {
+                        spacing: 6px;
+                        width: 260px;
+                        HorizontalLayout {
+                            Text {
+                                text: "Recipients";
+                                color: Theme.text-dim;
+                                font-size: Theme.t-sm;
+                                horizontal-stretch: 1;
                             }
-                            HorizontalLayout {
-                                padding-left: Theme.s2;
-                                padding-right: Theme.s2;
-                                spacing: Theme.s2;
-                                Rectangle {
-                                    width: 15px;
-                                    height: 15px;
-                                    y: (parent.height - self.height) / 2;
-                                    border-radius: 4px;
-                                    background: entry.selected ? Theme.accent : Theme.surface;
-                                    border-width: 1px;
-                                    border-color: entry.selected ? Theme.accent : Theme.border-strong;
-                                    if entry.selected: Icon {
-                                        glyph: Icons.check;
-                                        tint: Theme.accent-ink;
-                                        width: 11px;
-                                        height: 11px;
+                            Text {
+                                text: root.chosen-recipients == 0
+                                    ? "none" : "\{root.chosen-recipients}";
+                                color: Theme.text-faint;
+                                font-size: Theme.t-sm;
+                            }
+                        }
+                        Field {
+                            placeholder: "Filter by name, e-mail or fingerprint";
+                            glyph: Icons.search;
+                            edited(text) => { root.filter-recipients(text); }
+                        }
+
+                        Rectangle {
+                            // As low as the input beside it reaches, with the
+                            // filter above it. It asked for 200px, and gave way
+                            // to a short window as far as this; any taller, it
+                            // only pushed the input down, away from its label.
+                            height: 160px;
+                            background: Theme.surface-sunken;
+                            border-radius: Theme.r-sm;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            clip: true;
+                            if root.recipients.length == 0: Text {
+                                text: "No one matches that.";
+                                color: Theme.text-dim;
+                                font-size: Theme.t-sm;
+                                x: Theme.s3;
+                                y: Theme.s3;
+                            }
+                            ListView {
+                                for entry[index] in root.recipients: Rectangle {
+                                    height: 34px;
+                                    background: pick.has-hover ? Theme.hover : transparent;
+
+                                    // The row draws a tick box but is not one:
+                                    // without these a screen reader sees an
+                                    // unlabelled rectangle and cannot tell a
+                                    // chosen recipient from an unchosen one.
+                                    // Check declares the same set.
+                                    accessible-role: checkbox;
+                                    accessible-label: entry.label
+                                        + (entry.sublabel == "" ? "" : ", " + entry.sublabel)
+                                        + ", key ID " + entry.key-id;
+                                    accessible-checkable: true;
+                                    accessible-checked: entry.selected;
+                                    // Inert while a run is in flight, as in
+                                    // Sign / Encrypt, whose recipients these
+                                    // are too.
+                                    accessible-enabled: !root.busy;
+                                    accessible-action-default => {
+                                        if (!root.busy) {
+                                            root.toggle-recipient(index);
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        padding-left: Theme.s2;
+                                        padding-right: Theme.s2;
+                                        spacing: Theme.s2;
+                                        Rectangle {
+                                            width: 15px;
+                                            height: 15px;
+                                            y: (parent.height - self.height) / 2;
+                                            border-radius: 4px;
+                                            background: entry.selected ? Theme.accent : Theme.surface;
+                                            border-width: 1px;
+                                            border-color: entry.selected ? Theme.accent : Theme.border-strong;
+                                            if entry.selected: Icon {
+                                                glyph: Icons.check;
+                                                tint: Theme.accent-ink;
+                                                width: 11px;
+                                                height: 11px;
+                                            }
+                                        }
+                                        Text {
+                                            text: entry.label;
+                                            color: Theme.text;
+                                            font-size: Theme.t-sm;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                        // The address, beside the name rather
+                                        // than under it: these rows are 34px
+                                        // and a second line would halve how
+                                        // many fit. It stretches, so it is the
+                                        // first to give way when the row is
+                                        // short of room.
+                                        Text {
+                                            text: entry.sublabel;
+                                            color: Theme.text-dim;
+                                            font-size: Theme.t-xs;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                            horizontal-stretch: 1;
+                                        }
+                                        // The key ID never gives way: it, and
+                                        // not the address, is what tells a
+                                        // person's old and new key apart, since
+                                        // both usually carry the same one.
+                                        Text {
+                                            text: entry.key-id;
+                                            color: Theme.text-dim;
+                                            font-size: Theme.t-xs;
+                                            font-family: "Source Code Pro";
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    pick := TouchArea {
+                                        enabled: !root.busy;
+                                        mouse-cursor: MouseCursor.pointer;
+                                        clicked => { root.toggle-recipient(index); }
                                     }
                                 }
-                                Text {
-                                    text: entry.label;
-                                    color: Theme.text;
-                                    font-size: Theme.t-sm;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                }
-                                // The address, beside the name rather than
-                                // under it: these rows are 34px and a second
-                                // line would halve how many fit. It stretches,
-                                // so it is the first to give way when the row
-                                // is short of room.
-                                Text {
-                                    text: entry.sublabel;
-                                    color: Theme.text-faint;
-                                    font-size: Theme.t-xs;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                    horizontal-stretch: 1;
-                                }
-                                // The key ID never gives way: it, and not the
-                                // address, is what tells a person's old and
-                                // new key apart, since both usually carry the
-                                // same one.
-                                Text {
-                                    text: entry.key-id;
-                                    color: Theme.text-faint;
-                                    font-size: Theme.t-xs;
-                                    font-family: "Source Code Pro";
-                                    vertical-alignment: center;
-                                }
-                            }
-                            pick := TouchArea {
-                                enabled: !root.busy;
-                                mouse-cursor: MouseCursor.pointer;
-                                clicked => { root.toggle-recipient(index); }
                             }
                         }
                     }
                 }
-            }
-        }
 
-        HorizontalLayout {
-            spacing: Theme.s2;
-            if root.signers.length > 0: Select {
-                label: "Sign as";
-                model: root.signers;
-                key-ids: root.signer-key-ids;
-                enabled: !root.busy;
-                current: root.signer-index;
-                changed(index) => { root.signer-index = index; }
-            }
-            Field {
-                placeholder: "Key passphrase";
-                secret: true;
-                enabled: !root.busy;
-                edited(text) => { root.password = text; }
-            }
-            Field {
-                placeholder: "Or a password";
-                secret: true;
-                enabled: !root.busy;
-                edited(text) => { root.secret = text; }
-            }
-        }
+                HorizontalLayout {
+                    spacing: Theme.s2;
+                    if root.signers.length > 0: Select {
+                        label: "Sign as";
+                        model: root.signers;
+                        key-ids: root.signer-key-ids;
+                        enabled: !root.busy;
+                        current: root.signer-index;
+                        changed(index) => { root.signer-index = index; }
+                    }
+                    Field {
+                        placeholder: "Key passphrase";
+                        secret: true;
+                        enabled: !root.busy;
+                        edited(text) => { root.password = text; }
+                    }
+                    Field {
+                        placeholder: "Or a password";
+                        secret: true;
+                        enabled: !root.busy;
+                        edited(text) => { root.secret = text; }
+                    }
+                }
 
-        if root.result != "": Rectangle {
-            background: root.result-tone == 1 ? Theme.ok-soft
-                : root.result-tone == 2 ? Theme.warn-soft : Theme.danger-soft;
-            border-radius: Theme.r-md;
-            height: banner.preferred-height;
-            banner := VerticalLayout {
-                padding: Theme.s3;
-                spacing: Theme.s1;
-                Text {
-                    // Bound, not inherited. Slint sizes a wrapping text's preferred
-                    // height at its natural width unless the width is already
-                    // bound, so an unbound one reports a single line however many
-                    // it draws, and the extra lines land outside the box.
-                    width: parent.width;
-                    // Announced, as Decrypt / Verify's verdict is.
-                    accessible-live-region: polite;
-                    text: root.result;
-                    color: root.result-tone == 1 ? Theme.ok
-                        : root.result-tone == 2 ? Theme.warn : Theme.danger;
-                    font-size: Theme.t-md;
-                    font-weight: Theme.w-medium;
-                    wrap: word-wrap;
+                if root.result != "": Rectangle {
+                    background: root.result-tone == 1 ? Theme.ok-soft
+                        : root.result-tone == 2 ? Theme.warn-soft : Theme.danger-soft;
+                    border-radius: Theme.r-md;
+                    height: banner.preferred-height;
+                    banner := VerticalLayout {
+                        padding: Theme.s3;
+                        spacing: Theme.s1;
+                        Text {
+                            // Bound, not inherited. Slint sizes a wrapping
+                            // text's preferred height at its natural width
+                            // unless the width is already bound, so an unbound
+                            // one reports a single line however many it draws,
+                            // and the extra lines land outside the box.
+                            width: parent.width;
+                            // Announced, as Decrypt / Verify's verdict is.
+                            accessible-live-region: polite;
+                            text: root.result;
+                            color: root.result-tone == 1 ? Theme.ok
+                                : root.result-tone == 2 ? Theme.warn : Theme.danger;
+                            font-size: Theme.t-md;
+                            font-weight: Theme.w-medium;
+                            wrap: word-wrap;
+                        }
+                        for signature in root.signatures: Text {
+                            width: parent.width;
+                            // The notepad's banner is text rather than pills,
+                            // so the SHA-1 caveat rides in the parenthesis
+                            // beside the authentication verdict rather than as
+                            // a badge of its own.
+                            //
+                            // The verdict comes before the signer's name, and
+                            // nothing of the app's after it. The name is the
+                            // signer's own choice, and followed by the verdict,
+                            // a user ID ending in "(verified)" put a verdict of
+                            // its own where the app's belonged, and pushed the
+                            // real one to after it.
+                            text: signature.good
+                                ? "good signature (" + signature.authentication
+                                    + (signature.sha1 ? ", SHA-1" : "") + ") — " + signature.signer
+                                : "BAD — " + signature.detail;
+                            color: Theme.text;
+                            font-size: Theme.t-sm;
+                            wrap: word-wrap;
+                        }
+                    }
                 }
-                for signature in root.signatures: Text {
-                    width: parent.width;
-                    // The notepad's banner is text rather than pills, so the
-                    // SHA-1 caveat rides in the parenthesis beside the
-                    // authentication verdict rather than as a badge of its own.
-                    //
-                    // The verdict comes before the signer's name, and nothing
-                    // of the app's after it. The name is the signer's own
-                    // choice, and followed by the verdict, a user ID ending
-                    // in "(verified)" put a verdict of its own where the
-                    // app's belonged, and pushed the real one to after it.
-                    text: signature.good
-                        ? "good signature (" + signature.authentication
-                            + (signature.sha1 ? ", SHA-1" : "") + ") — " + signature.signer
-                        : "BAD — " + signature.detail;
-                    color: Theme.text;
-                    font-size: Theme.t-sm;
-                    wrap: word-wrap;
-                }
-            }
-        }
 
-        if root.output != "": VerticalLayout {
-            spacing: 6px;
-            HorizontalLayout {
-                Text {
-                    text: "Output";
-                    color: Theme.text-dim;
-                    font-size: Theme.t-sm;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
+                if root.output != "": VerticalLayout {
+                    spacing: 6px;
+                    HorizontalLayout {
+                        Text {
+                            text: "Output";
+                            color: Theme.text-dim;
+                            font-size: Theme.t-sm;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        // A button rather than click-to-copy: clicking text
+                        // should place a cursor or start a selection, not fire
+                        // a side effect with no affordance and no confirmation.
+                        Btn {
+                            text: root.copied ? "Copied" : "Copy";
+                            glyph: root.copied ? Icons.check : Icons.file;
+                            variant: Variant.ghost;
+                            clicked => { root.copy-output(); }
+                        }
+                    }
+                    // Kept separate from the input rather than replacing it:
+                    // pasting ciphertext and having it overwritten by the
+                    // plaintext loses the thing you might still need. Read-only
+                    // rather than disabled, so that part of it can still be
+                    // selected.
+                    TextArea {
+                        height: 150px;
+                        text: root.output;
+                        read-only: true;
+                    }
                 }
-                // A button rather than click-to-copy: clicking text should
-                // place a cursor or start a selection, not fire a side effect
-                // with no affordance and no confirmation.
-                Btn {
-                    text: root.copied ? "Copied" : "Copy";
-                    glyph: root.copied ? Icons.check : Icons.file;
-                    variant: Variant.ghost;
-                    clicked => { root.copy-output(); }
-                }
-            }
-            // Kept separate from the input rather than replacing it: pasting
-            // ciphertext and having it overwritten by the plaintext loses the
-            // thing you might still need. Read-only rather than disabled, so
-            // that part of it can still be selected.
-            TextArea {
-                height: 150px;
-                text: root.output;
-                read-only: true;
             }
         }
 
@@ -1746,7 +1781,7 @@ export component DetailsDialog inherits DialogShell {
                                 text: uid.self-signed == ""
                                     ? "no self-signature"
                                     : "self-signed " + uid.self-signed;
-                                color: Theme.text-faint;
+                                color: uid.revoked ? Theme.text-faint : Theme.text-dim;
                                 font-size: Theme.t-xs;
                             }
                         }
@@ -1805,7 +1840,7 @@ export component DetailsDialog inherits DialogShell {
         SectionLabel { text: "SUBKEYS"; }
         if root.subkeys.length == 0: Text {
             text: "This certificate has no subkeys.";
-            color: Theme.text-faint;
+            color: Theme.text-dim;
             font-size: Theme.t-sm;
         }
         VerticalLayout {
@@ -1826,7 +1861,7 @@ export component DetailsDialog inherits DialogShell {
                         text: key.algorithm + " · " + key.capabilities + " · created "
                             + key.created
                             + (key.expires == "" ? "" : " · until " + key.expires);
-                        color: Theme.text-faint;
+                        color: key.revoked ? Theme.text-faint : Theme.text-dim;
                         font-size: Theme.t-xs;
                     }
                 }
@@ -1846,7 +1881,7 @@ export component DetailsDialog inherits DialogShell {
         SectionLabel { text: "CERTIFICATIONS"; }
         if root.certifications.length == 0: Text {
             text: "Nobody has certified this identity.";
-            color: Theme.text-faint;
+            color: Theme.text-dim;
             font-size: Theme.t-sm;
         }
         VerticalLayout {
@@ -1873,7 +1908,7 @@ export component DetailsDialog inherits DialogShell {
                     }
                     Text {
                         text: entry.detail;
-                        color: Theme.text-faint;
+                        color: Theme.text-dim;
                         font-size: Theme.t-xs;
                         wrap: word-wrap;
                     }
@@ -2084,49 +2119,97 @@ export component LookupDialog inherits DialogShell {
             accessible-live-region: polite;
         }
 
-        if root.results.length > 0: VerticalLayout {
-            spacing: Theme.s2;
-            for entry[index] in root.results: HorizontalLayout {
-                spacing: Theme.s3;
+        // The results scroll and Close does not, as in Sign / Encrypt. Nothing
+        // caps how many a search returns, and in the smallest window the app
+        // allows, a seventh result pushed Close partly out of the card and an
+        // eighth out of reach.
+        if root.results.length > 0: ScrollView {
+            min-height: 0px;
+            preferred-height: found.preferred-height;
+            vertical-stretch: 1;
+            viewport-width: self.visible-width;
+            viewport-height: max(self.visible-height, found.preferred-height);
 
-                Monogram {
-                    initials: entry.initials;
-                    tint: Theme.monograms[entry.tint-index];
-                    size: 32px;
-                    y: (parent.height - self.height) / 2;
-                }
+            found := VerticalLayout {
+                // Clear of the scrollbar, as in Certify.
+                padding-right: Theme.s4;
+                spacing: Theme.s2;
 
-                VerticalLayout {
-                    spacing: 1px;
-                    horizontal-stretch: 1;
-                    alignment: center;
-                    Text {
-                        text: entry.primary-user-id;
-                        color: Theme.text;
-                        font-size: Theme.t-md;
-                        overflow: elide;
+                for entry[index] in root.results: HorizontalLayout {
+                    spacing: Theme.s3;
+
+                    Monogram {
+                        initials: entry.initials;
+                        tint: Theme.monograms[entry.tint-index];
+                        size: 32px;
+                        y: (parent.height - self.height) / 2;
                     }
-                    Text {
-                        text: entry.fingerprint-pretty;
-                        color: Theme.text-faint;
-                        font-size: Theme.t-xs;
-                        font-family: "Source Code Pro";
-                        overflow: elide;
+
+                    VerticalLayout {
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        alignment: center;
+
+                        // The source beside the user ID rather than in the row,
+                        // which leaves the fingerprint the whole of this
+                        // column: the row less the monogram and the button.
+                        HorizontalLayout {
+                            spacing: Theme.s2;
+                            Text {
+                                text: entry.primary-user-id;
+                                color: Theme.text;
+                                font-size: Theme.t-md;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            Pill {
+                                text: entry.source;
+                                tone: entry.source == "web key directory" ? Tone.ok : Tone.neutral;
+                                y: (parent.height - self.height) / 2;
+                            }
+                        }
+
+                        // Whole, and wrapped between groups where it is too
+                        // long for one line, as a v6 fingerprint is. This is
+                        // what the status line asks the user to check against
+                        // the owner, and it used to be cut short once the pill
+                        // and the button had taken their share of the row: as
+                        // much as the last eight digits of a v4 fingerprint,
+                        // half the key ID people compare, and half of a v6 one.
+                        //
+                        // In a Rectangle that passes on the height of the row
+                        // inside it, as FieldRow does. Slint measures the
+                        // height of a layout nested in another at the width
+                        // that layout would like, not the width it is given,
+                        // and a v6 fingerprint would like all of itself on one
+                        // line: laid out in this column directly, it is given
+                        // one line's height, and its second line falls below
+                        // the row, where the list cuts it off.
+                        Rectangle {
+                            min-height: fingerprint.min-height;
+                            preferred-height: fingerprint.preferred-height;
+
+                            fingerprint := HorizontalLayout {
+                                Text {
+                                    text: entry.fingerprint-pretty;
+                                    color: Theme.text-dim;
+                                    font-size: Theme.t-xs;
+                                    font-family: "Source Code Pro";
+                                    horizontal-stretch: 1;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
                     }
-                }
 
-                Pill {
-                    text: entry.source;
-                    tone: entry.source == "web key directory" ? Tone.ok : Tone.neutral;
-                    y: (parent.height - self.height) / 2;
-                }
-
-                Btn {
-                    text: entry.already-known ? "Update" : "Import";
-                    variant: Variant.secondary;
-                    enabled: !root.busy;
-                    y: (parent.height - self.height) / 2;
-                    clicked => { root.import-result(index); }
+                    Btn {
+                        text: entry.already-known ? "Update" : "Import";
+                        variant: Variant.secondary;
+                        enabled: !root.busy;
+                        y: (parent.height - self.height) / 2;
+                        clicked => { root.import-result(index); }
+                    }
                 }
             }
         }

@@ -1,14 +1,16 @@
 // Test-only harness: small windows built from the app's own widgets and
 // dialogs, so a Rust test can operate them and inspect what the accessibility
 // tree publishes. Not part of the application.
-import { Field, Btn, Check, Select, FieldRow, TextArea, TrustRootCheck } from "../widgets.slint";
+import { Palette } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { Field, Btn, Check, Select, FieldRow, TextArea, TrustRootCheck, Variant } from "../widgets.slint";
 import { CertList, RevocationBanner, ScopeTabs, StatusBar } from "../widgets.slint";
 // The rule the details pane draws its Revoke button by, for a test to ask.
 export { RevokeOffer } from "../widgets.slint";
 import { SignEncryptDialog, CertifyDialog, NotepadDialog, DeleteDialog } from "../dialogs.slint";
 import { KeygenDialog, DecryptVerifyDialog, RevokeDialog, LifecycleDialog } from "../dialogs.slint";
 import { ImportRevocationDialog, DetailsDialog, LookupDialog } from "../dialogs.slint";
-import { CertRow, PendingRevocationRow, RecipientRow, UserIdDetailRow, UserIdRow, SignatureRow } from "../types.slint";
+import { CertRow, LookupRow, PendingRevocationRow, RecipientRow, UserIdDetailRow, UserIdRow, SignatureRow } from "../types.slint";
 
 // One passphrase Field and one ordinary Field.
 export component FieldProbe inherits Window {
@@ -193,9 +195,13 @@ export component NotepadProbe inherits Window {
     // which types into every field it finds, if it were there by default.
     in-out property <string> output;
     in-out property <string> result;
+    // Settable, as in VerifyBannerProbe, so that a test can hold the notepad
+    // to the height the app's smallest window leaves it. As wide as that
+    // window too: the notepad's card is 820px.
+    in-out property <length> probe-height: 720px;
 
-    width: 620px;
-    height: 720px;
+    width: 860px;
+    height: root.probe-height;
 
     NotepadDialog {
         width: 100%;
@@ -547,17 +553,33 @@ export component DetailsProbe inherits Window {
     }
 }
 
-// Lookup, whose own line says what a search found or why it failed.
+// Lookup, whose own line says what a search found or why it failed, and the
+// rows it found.
 export component LookupProbe inherits Window {
     in-out property <string> status;
+    in-out property <[LookupRow]> results;
+    in-out property <length> probe-height: 720px;
+    /// A text for `one-line` to measure.
+    in-out property <string> measured;
+    /// How wide `measured` is on one line, in the face and size the rows draw
+    /// a fingerprint in, for a test to compare a row's fingerprint with.
+    out property <length> one-line: reference.preferred-width;
 
     width: 620px;
-    height: 720px;
+    height: root.probe-height;
 
     LookupDialog {
         width: 100%;
         height: 100%;
         status: root.status;
+        results: root.results;
+    }
+
+    reference := Text {
+        visible: false;
+        text: root.measured;
+        font-size: Theme.t-xs;
+        font-family: "Source Code Pro";
     }
 }
 
@@ -565,6 +587,7 @@ export component LookupProbe inherits Window {
 export component StatusProbe inherits Window {
     in-out property <string> text;
     in-out property <bool> announce: true;
+    in-out property <bool> busy: false;
 
     width: 860px;
     height: 200px;
@@ -574,6 +597,7 @@ export component StatusProbe inherits Window {
         StatusBar {
             text: root.text;
             announce: root.announce;
+            busy: root.busy;
         }
     }
 }
@@ -591,6 +615,67 @@ export component RevocationBannerProbe inherits Window {
         RevocationBanner {
             reason: root.reason;
             note: root.note;
+        }
+    }
+}
+
+// The theme's colours in either scheme, for a test to work out how readable
+// each ink is on each surface, with a filled button of each kind whose fill a
+// test can read as the pointer moves onto it and presses it.
+export component ThemeProbe inherits Window {
+    public function use-dark(dark: bool) {
+        Palette.color-scheme = dark ? ColorScheme.dark : ColorScheme.light;
+    }
+
+    out property <brush> bg: Theme.bg;
+    out property <brush> surface: Theme.surface;
+    out property <brush> surface-sunken: Theme.surface-sunken;
+    out property <brush> hover: Theme.hover;
+    out property <brush> selected: Theme.selected;
+    out property <brush> warn-soft: Theme.warn-soft;
+    out property <brush> text: Theme.text;
+    out property <brush> text-dim: Theme.text-dim;
+    out property <brush> accent: Theme.accent;
+    out property <brush> accent-hover: Theme.accent-hover;
+    out property <brush> accent-ink: Theme.accent-ink;
+    out property <brush> danger: Theme.danger;
+    out property <brush> danger-hover: Theme.danger-hover;
+
+    out property <brush> primary-fill: primary.background;
+    out property <brush> danger-fill: danger.background;
+
+    width: 300px;
+    height: 120px;
+
+    VerticalLayout {
+        alignment: start;
+        spacing: 16px;
+        padding: 16px;
+        primary := Btn { text: "Certify"; variant: Variant.primary; }
+        danger := Btn { text: "Delete key"; variant: Variant.danger; }
+    }
+}
+
+// A Select with more options than its list shows at once, as the lists of
+// keys to sign or certify with are for someone who holds many.
+export component LongSelectProbe inherits Window {
+    in-out property <int> current: 0;
+    in-out property <int> changes: 0;
+
+    width: 400px;
+    height: 480px;
+
+    VerticalLayout {
+        alignment: start;
+        padding: 20px;
+        Select {
+            label: "Sign as";
+            model: [
+                "Key 1", "Key 2", "Key 3", "Key 4", "Key 5", "Key 6",
+                "Key 7", "Key 8", "Key 9", "Key 10", "Key 11", "Key 12",
+            ];
+            current <=> root.current;
+            changed(index) => { root.changes += 1; }
         }
     }
 }
