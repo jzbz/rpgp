@@ -62,6 +62,9 @@ export component AppWindow inherits Window {
     preferred-height: 760px;
     min-width: 860px;
     min-height: 520px;
+    // The test probes in testing/field-probe.slint import the same fonts and
+    // set the same two defaults, so that the tests measure text as this
+    // window lays it out. Change them together.
     default-font-family: "Geist";
     default-font-size: Theme.t-md;
     background: Theme.bg;

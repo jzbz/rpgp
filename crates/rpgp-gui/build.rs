@@ -6,7 +6,9 @@ fn main() {
     let config = slint_build::CompilerConfiguration::new().with_style("fluent".into());
     // A test-only harness for tests/accessibility.rs. Compiled unconditionally
     // because a build script cannot tell that it is building for `cargo test`;
-    // it is one small component and nothing in the binary refers to it.
+    // nothing in the binary refers to it, so its windows stay out of the
+    // binary, and so does the second copy of the bundled fonts they embed to
+    // lay text out as the app does.
     //
     // Compiled *before* the app, because each call overwrites the variable
     // that slint::include_modules!() reads: the last one compiled is the one

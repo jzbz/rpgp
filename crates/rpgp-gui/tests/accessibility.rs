@@ -2200,6 +2200,7 @@ fn a_long_failure_leaves_each_dialog_its_buttons_in_the_smallest_window() {
         let line = ElementHandle::find_by_accessible_label(root, FAILED)
             .next()
             .unwrap_or_else(|| panic!("{dialog}: the failure is not in the item tree"));
+        // Three lines of its 12px Geist are 47px, and two are 32px.
         assert!(
             line.size().height > 40.,
             "{dialog}: the failure takes {}px, less than three lines",
@@ -2427,7 +2428,9 @@ fn a_long_status_message_is_shown_in_full() {
         Some(AccessibleLiveness::Polite)
     );
 
-    // Three lines at this width. Below the limit means none of it was cut.
+    // Three lines at this width, which in the bar's 12px Geist make it 57px
+    // tall, where two would make it 42px. Below the limit means none of it
+    // was cut.
     probe.set_text(PUBLISHED.into());
     let long = bar();
     assert!(
@@ -2454,6 +2457,73 @@ fn a_long_status_message_is_shown_in_full() {
         line(&PUBLISHED.repeat(8)).accessible_live_region(),
         Some(AccessibleLiveness::Off)
     );
+}
+
+/// The probes lay text out as the window does: in the fonts the app bundles,
+/// with AppWindow's default family and size.
+///
+/// The tests here that measure text depend on it. Laid out in the platform's
+/// sans-serif instead, three lines of a dialog's failure were 50px tall on
+/// Linux and 36px on macOS, where two of those tests failed alone. A probe
+/// that slips back to the platform's font passes every test on Linux and
+/// Windows, so this reads the sources: the probes import every font the
+/// window imports, their base Probe sets the window's two defaults, and every
+/// probe is built on it.
+#[test]
+fn the_probes_lay_text_out_as_the_window_does() {
+    let read = |file: &str| {
+        std::fs::read_to_string(format!("{}/{file}", env!("CARGO_MANIFEST_DIR")))
+            .unwrap_or_else(|e| panic!("reading {file}: {e}"))
+    };
+    let window = read("ui/app-window.slint");
+    let probes = read("ui/testing/field-probe.slint");
+
+    let fonts: Vec<&str> = window
+        .lines()
+        .filter_map(|line| line.strip_prefix("import \"fonts/")?.strip_suffix("\";"))
+        .collect();
+    assert!(
+        !fonts.is_empty(),
+        "no font import found in app-window.slint, so this test no longer reads it right"
+    );
+    for font in fonts {
+        assert!(
+            probes.contains(&format!("import \"../fonts/{font}\";")),
+            "field-probe.slint does not import {font}, which app-window.slint does"
+        );
+    }
+
+    // What the component declared by `head` sets its two defaults to.
+    let defaults = |source: &str, head: &str| -> [String; 2] {
+        let start = source
+            .find(head)
+            .unwrap_or_else(|| panic!("`{head}` not found"));
+        let open = start + source[start..].find('{').expect("a component has a body");
+        let body = &source[open..block_end(source, open)];
+        ["default-font-family:", "default-font-size:"].map(|property| {
+            body.split_once(property)
+                .and_then(|(_, after)| after.split(';').next())
+                .unwrap_or_else(|| panic!("`{head}` sets no {property}"))
+                .trim()
+                .to_string()
+        })
+    };
+    assert_eq!(
+        defaults(&probes, "component Probe inherits Window"),
+        defaults(&window, "export component AppWindow inherits Window"),
+        "Probe's default font family and size, left, are not AppWindow's, right"
+    );
+
+    for line in probes
+        .lines()
+        .filter(|line| line.starts_with("export component "))
+    {
+        assert!(
+            line.contains(" inherits Probe "),
+            "field-probe.slint: `{line}` is not built on Probe, so it lays its text out in \
+             the platform's font"
+        );
+    }
 }
 
 /// A window that Slint's software renderer draws into memory, for a test that

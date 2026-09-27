@@ -12,8 +12,33 @@ import { KeygenDialog, DecryptVerifyDialog, RevokeDialog, LifecycleDialog } from
 import { ImportRevocationDialog, DetailsDialog, LookupDialog } from "../dialogs.slint";
 import { CertRow, LookupRow, PendingRevocationRow, RecipientRow, UserIdDetailRow, UserIdRow, SignatureRow } from "../types.slint";
 
+// The fonts the app bundles, imported as app-window.slint imports them. Slint
+// registers the fonts imported by the file it compiles and by everything that
+// file imports, and this one does not import app-window.slint.
+import "../fonts/geo.ttf";
+import "../fonts/source-code-pro.ttf";
+import "../fonts/geist-regular.ttf";
+import "../fonts/geist-semibold.ttf";
+import "../fonts/geist-bold.ttf";
+
+// What every probe is built on: the family and size AppWindow gives the text
+// that names none of its own, which is most of it. Without them a probe laid
+// its text out in the platform's sans-serif, at Slint's own 12px where the
+// text sets no size, so the tests measured text the app never shows, and
+// measured it differently on each platform: Noto Sans on the Linux machine
+// they were written on, Arial on Windows, Helvetica on macOS. Those set their
+// lines different distances apart, and Helvetica its 12px lines only 12px
+// apart, so the three lines of a dialog's failure were 50px tall on Linux and
+// 36px on macOS, and the tests that tell three lines from two by their height
+// failed on macOS alone. Keep the two as AppWindow has them, which
+// the_probes_lay_text_out_as_the_window_does in tests/accessibility.rs checks.
+component Probe inherits Window {
+    default-font-family: "Geist";
+    default-font-size: Theme.t-md;
+}
+
 // One passphrase Field and one ordinary Field.
-export component FieldProbe inherits Window {
+export component FieldProbe inherits Probe {
     in-out property <string> secret-text <=> pass-field.text;
     in-out property <string> plain-text <=> plain-field.text;
 
@@ -33,7 +58,7 @@ export component FieldProbe inherits Window {
 
 // The interactive controls, so a test can ask what assistive technology would
 // be told about each and whether it can operate them.
-export component ControlProbe inherits Window {
+export component ControlProbe inherits Probe {
     in-out property <int> clicks: 0;
     in-out property <int> toggles: 0;
     in-out property <int> copies: 0;
@@ -83,7 +108,7 @@ export component ControlProbe inherits Window {
 // assistive-technology action, by a key sent to one that had focus before it
 // was disabled, or through a list it had already opened — and a test reads
 // the counts to see that nothing happened.
-export component EnabledProbe inherits Window {
+export component EnabledProbe inherits Probe {
     in-out property <bool> live: true;
     in-out property <int> clicks: 0;
     in-out property <int> toggles: 0;
@@ -122,7 +147,7 @@ export component EnabledProbe inherits Window {
 // store holding one of the user's own keys: the signing passphrase field is
 // there only then, and the passphrase test has to reach it. What Run is asked
 // to do is kept, as the window's handler would receive it.
-export component SelectionProbe inherits Window {
+export component SelectionProbe inherits Probe {
     in-out property <[RecipientRow]> recipients;
     in-out property <int> toggled-recipient: -1;
     in-out property <bool> busy: false;
@@ -157,7 +182,7 @@ export component SelectionProbe inherits Window {
     }
 }
 
-export component CertifyProbe inherits Window {
+export component CertifyProbe inherits Probe {
     in-out property <[UserIdRow]> user-ids;
     in-out property <[string]> certifiers;
     in-out property <[string]> certifier-key-ids;
@@ -181,7 +206,7 @@ export component CertifyProbe inherits Window {
 }
 
 // The notepad carries a third copy of the recipient row, behind its own filter.
-export component NotepadProbe inherits Window {
+export component NotepadProbe inherits Probe {
     in-out property <[RecipientRow]> recipients;
     // Empty unless a test sets them, so that the other tests find the notepad
     // as they always have: with no key to sign with, and no verdict.
@@ -225,7 +250,7 @@ export component NotepadProbe inherits Window {
 // The first two keep what their button hands over, and how often it was
 // pressed, so that a test can tell a button that did nothing from one that
 // was never reached.
-export component KeygenProbe inherits Window {
+export component KeygenProbe inherits Probe {
     in-out property <int> runs: 0;
     in-out property <string> passphrase;
     // Settable, as in VerifyBannerProbe, so that a test can hold the dialog
@@ -246,7 +271,7 @@ export component KeygenProbe inherits Window {
     }
 }
 
-export component DecryptProbe inherits Window {
+export component DecryptProbe inherits Probe {
     // The passphrase field is conditional on a file having been chosen.
     in-out property <string> input-path: "/tmp/message.txt";
     in-out property <int> runs: 0;
@@ -269,7 +294,7 @@ export component DecryptProbe inherits Window {
 // be pointed at a failure long enough to wrap. The window height is settable
 // because the card is capped at the window height, and a card that has hit that
 // cap is laid out differently from one that has not.
-export component VerifyBannerProbe inherits Window {
+export component VerifyBannerProbe inherits Probe {
     in-out property <string> result;
     in-out property <[SignatureRow]> signatures;
     in-out property <length> probe-height: 720px;
@@ -286,7 +311,7 @@ export component VerifyBannerProbe inherits Window {
     }
 }
 
-export component RevokeProbe inherits Window {
+export component RevokeProbe inherits Probe {
     in-out property <string> error;
     in-out property <length> probe-height: 720px;
     width: 620px;
@@ -297,7 +322,7 @@ export component RevokeProbe inherits Window {
 // The Revoke dialog as it opens for a key retired earlier, to mark it
 // compromised, reporting the reason it hands back: an index into Reason::ALL,
 // which is what run_revoke reads it as.
-export component RevokeUpgradeProbe inherits Window {
+export component RevokeUpgradeProbe inherits Probe {
     in-out property <int> runs: 0;
     in-out property <int> reason: -1;
 
@@ -319,7 +344,7 @@ export component RevokeUpgradeProbe inherits Window {
 // The dialog that asks before a revocation certificate for the user's own
 // keys is stored, holding more revocations than fit in the window at the
 // smallest size the app allows unless a test gives it others.
-export component ImportRevocationProbe inherits Window {
+export component ImportRevocationProbe inherits Probe {
     in-out property <int> runs: 0;
     in-out property <string> error;
     in-out property <[PendingRevocationRow]> revocations: [
@@ -346,7 +371,7 @@ export component ImportRevocationProbe inherits Window {
     }
 }
 
-export component LifecycleProbe inherits Window {
+export component LifecycleProbe inherits Probe {
     in-out property <string> error;
     in-out property <length> probe-height: 720px;
     // Every mode but publish carries the passphrase field.
@@ -358,7 +383,7 @@ export component LifecycleProbe inherits Window {
 
 // Publish, the lifecycle mode that cannot be undone, so that a test can ask
 // what its warning says about which key is going.
-export component PublishProbe inherits Window {
+export component PublishProbe inherits Probe {
     width: 620px;
     height: 720px;
     LifecycleDialog {
@@ -374,7 +399,7 @@ export component PublishProbe inherits Window {
 // goes, which inside a Flatpak says instead that Run will ask. Both dialogs
 // take the flag and the names from Rust, so a test sets them here the way
 // Rust does.
-export component OutputProbe inherits Window {
+export component OutputProbe inherits Probe {
     in-out property <bool> choose-output: false;
     in-out property <string> encrypted;
     in-out property <string> decrypted;
@@ -402,7 +427,7 @@ export component OutputProbe inherits Window {
 // until the key ID has been typed, Delete key has to do nothing however it is
 // reached, and the same once a delete is under way. It counts the ways it is
 // asked to close as well, since a delete under way cannot be called back.
-export component DeleteProbe inherits Window {
+export component DeleteProbe inherits Probe {
     in-out property <bool> busy: false;
     in-out property <int> runs: 0;
     in-out property <int> dismissals: 0;
@@ -430,7 +455,7 @@ export component DeleteProbe inherits Window {
 // window gives it `detail`. The pane itself lives in the window, which has no
 // debug information to find it by, so this is the shipped component rather
 // than a copy of its markup.
-export component TrustRootProbe inherits Window {
+export component TrustRootProbe inherits Probe {
     in-out property <CertRow> cert;
     in-out property <bool> busy: false;
     in-out property <int> toggles: 0;
@@ -447,7 +472,7 @@ export component TrustRootProbe inherits Window {
 
 // The rail's scope tabs, as the window has them, switched off by `live` as the
 // window switches them off while a dialog is open or an operation runs.
-export component ScopeTabsProbe inherits Window {
+export component ScopeTabsProbe inherits Probe {
     in-out property <bool> live: true;
     in-out property <int> scope: 0;
     in-out property <int> changes: 0;
@@ -467,7 +492,7 @@ export component ScopeTabsProbe inherits Window {
 
 // The certificate list, given more rows than it can show at once, keeping
 // which row it last asked Rust to select and how often it asked.
-export component CertListProbe inherits Window {
+export component CertListProbe inherits Probe {
     in-out property <[CertRow]> certs;
     in-out property <int> current-row: -1;
     in-out property <bool> live: true;
@@ -490,7 +515,7 @@ export component CertListProbe inherits Window {
 
 // A row that can be copied beside one that cannot, as the details pane has
 // them.
-export component CopyProbe inherits Window {
+export component CopyProbe inherits Probe {
     in-out property <bool> live: true;
     in-out property <int> copies: 0;
 
@@ -512,7 +537,7 @@ export component CopyProbe inherits Window {
 
 // The Details dialog for a key of the user's own with a second user ID, which
 // is the one that carries a Revoke button beside its copy button.
-export component DetailsProbe inherits Window {
+export component DetailsProbe inherits Probe {
     in-out property <string> copied;
     in-out property <int> copies: 0;
     in-out property <string> revoked;
@@ -555,7 +580,7 @@ export component DetailsProbe inherits Window {
 
 // Lookup, whose own line says what a search found or why it failed, and the
 // rows it found.
-export component LookupProbe inherits Window {
+export component LookupProbe inherits Probe {
     in-out property <string> status;
     in-out property <[LookupRow]> results;
     in-out property <length> probe-height: 720px;
@@ -584,7 +609,7 @@ export component LookupProbe inherits Window {
 }
 
 // The status line at the width of the smallest window the app allows.
-export component StatusProbe inherits Window {
+export component StatusProbe inherits Probe {
     in-out property <string> text;
     in-out property <bool> announce: true;
     in-out property <bool> busy: false;
@@ -603,7 +628,7 @@ export component StatusProbe inherits Window {
 }
 
 // The details pane's revocation notice, at the width the pane gives it.
-export component RevocationBannerProbe inherits Window {
+export component RevocationBannerProbe inherits Probe {
     in-out property <string> reason: "Replaced by a newer key";
     in-out property <string> note;
 
@@ -622,7 +647,7 @@ export component RevocationBannerProbe inherits Window {
 // The theme's colours in either scheme, for a test to work out how readable
 // each ink is on each surface, with a filled button of each kind whose fill a
 // test can read as the pointer moves onto it and presses it.
-export component ThemeProbe inherits Window {
+export component ThemeProbe inherits Probe {
     public function use-dark(dark: bool) {
         Palette.color-scheme = dark ? ColorScheme.dark : ColorScheme.light;
     }
@@ -658,7 +683,7 @@ export component ThemeProbe inherits Window {
 
 // A Select with more options than its list shows at once, as the lists of
 // keys to sign or certify with are for someone who holds many.
-export component LongSelectProbe inherits Window {
+export component LongSelectProbe inherits Probe {
     in-out property <int> current: 0;
     in-out property <int> changes: 0;
 
