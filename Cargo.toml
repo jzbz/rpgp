@@ -111,3 +111,14 @@ strip = "debuginfo"
 # assertions and overflow checks on everywhere, rpgp's own crates included.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# The same for SHA-1, which is what GnuPG protects an exported secret key with:
+# iterated over 62 MiB, as much as OpenPGP can encode. Sequoia's SHA-1 is
+# sha1collisiondetection, and at opt-level 0 a pass took about 1.4 seconds.
+# The tests of GnuPG's exports pay it twice for every unlock, since a secret
+# sequoia refuses is decrypted a second time (see `secret::unlock`), and twice
+# for every wrong passphrase: over 40 seconds for tests/gnupg_protected.rs,
+# where they take about 3 optimised. Like sha2's, this changes nothing a
+# release build does.
+[profile.dev.package.sha1collisiondetection]
+opt-level = 3

@@ -372,13 +372,18 @@ pub fn decrypt_stream<R: std::io::Read + Send + Sync>(
 ///
 /// The helper answers Sequoia in `anyhow::Error`, and Sequoia hands its error
 /// back unchanged, so one of this crate's own comes back wrapped. Left in
-/// [`Error::OpenPgp`], a refusal from gpg-agent or a key left locked read
-/// "OpenPGP operation failed:" before saying what happened, which the GUI puts
-/// after its own "Decryption failed:". Only those two are taken out, so that
-/// every other failure reads as it did.
+/// [`Error::OpenPgp`], a refusal from gpg-agent, a key left locked or a key
+/// that opened and could not be used read "OpenPGP operation failed:" before
+/// saying what happened, which the GUI puts after its own "Decryption
+/// failed:". Only those three are taken out, so that every other failure reads
+/// as it did.
 fn as_made(error: anyhow::Error) -> Error {
     match error.downcast::<Error>() {
-        Ok(error @ (Error::AgentRefused { .. } | Error::KeyLocked { .. })) => error,
+        Ok(
+            error @ (Error::AgentRefused { .. }
+            | Error::KeyLocked { .. }
+            | Error::KeyUnusable { .. }),
+        ) => error,
         Ok(other) => Error::OpenPgp(other.into()),
         Err(error) => Error::OpenPgp(error),
     }
@@ -881,12 +886,15 @@ impl DecryptionHelper for Helper<'_> {
         // A real message carries one session-key packet per recipient plus one
         // per password — single digits. Every loop below is O(packets × keys)
         // with a key derivation inside: the local path runs our S2K once per
-        // protected key, and the symmetric path runs the *sender's* S2K once
-        // per (packet × password). Nothing in sequoia bounds the count, so a
-        // padded message is a decrypt-side amplifier: 128 wildcard packets in a
-        // 14 KB file pinned a core for ~9s, and the message still decrypted, so
-        // nothing looked wrong. 256 is a chosen ceiling, not a constant of
-        // nature: it is far above any real recipient list.
+        // protected key and passphrase, and a second time where a passphrase
+        // does not open a version 4 key protected as GnuPG protects one, with
+        // CFB under an iterated S2K (see [`crate::secret::unlock`]), and the
+        // symmetric path runs the *sender's* S2K once per (packet ×
+        // password). Nothing in sequoia bounds the count, so a padded message
+        // is a decrypt-side amplifier: 128 wildcard packets in a 14 KB file
+        // pinned a core for ~9s, and the message still decrypted, so nothing
+        // looked wrong. 256 is a chosen ceiling, not a constant of nature: it
+        // is far above any real recipient list.
         //
         // What it bounds is how many derivations run, not what each one costs.
         // On the symmetric path those are two different questions, because the
@@ -945,6 +953,12 @@ impl DecryptionHelper for Helper<'_> {
         // when what was missing was its passphrase.
         let mut locked: Option<String> = None;
 
+        // The first key here that a packet names, that a passphrase offered
+        // did open, and that then could not be used. Kept for the error at the
+        // end as well, since reporting it as locked told the user that a
+        // passphrase that was right did not unlock it.
+        let mut unusable: Option<Error> = None;
+
         // Keys outside, packets inside. The other way round re-derived every
         // protected key's passphrase once per packet, so the cost was
         // (packets × keys) key derivations rather than (keys) — which is what
@@ -985,31 +999,52 @@ impl DecryptionHelper for Helper<'_> {
                 // might be addressed to, so one that will not open is a
                 // reason to try the next rather than to fail the decrypt.
                 // `None` first, which is what opens a key with no
-                // passphrase, then each secret the caller offered.
-                let Some(key) = std::iter::once(None)
+                // passphrase, then each secret the caller offered, as far as
+                // the first that opens the key or finds it cannot be used.
+                let unlocked = std::iter::once(None)
                     .chain(self.passwords.iter().map(|p| Some(p.as_str())))
-                    .find_map(|p| crate::secret::try_unlock(ka.key().clone(), p))
-                else {
-                    // Only a key a packet names. One that names no key could
-                    // be for anybody, and asking for the passphrase of every
-                    // protected key here on account of a message meant for
-                    // someone else would ask for one that can never work. Nor
-                    // a GnuPG stub, which is encrypted as far as Sequoia can
-                    // tell but has no passphrase, being where a card key's
-                    // secret is not; the agent below is how that one opens.
-                    let secret = ka.key().secret();
-                    if locked.is_none()
-                        && secret.is_encrypted()
-                        && crate::secret::is_usable(secret)
-                        && pkesks.iter().any(|pkesk| {
-                            pkesk
-                                .recipient()
-                                .is_some_and(|handle| handle.aliases(ka.key().key_handle()))
-                        })
-                    {
-                        locked = Some(crate::revoke::name_of(cert));
+                    .map(|p| crate::secret::try_unlock(ka.key().clone(), p))
+                    .find(|tried| !matches!(tried, Ok(None)))
+                    .unwrap_or(Ok(None));
+                // Only a key a packet names is reported, locked or unusable.
+                // One that names no key could be for anybody, and asking for
+                // the passphrase of every protected key here on account of a
+                // message meant for someone else would ask for one that can
+                // never work, as sending the user to restore a key from a
+                // backup would do nothing for a message that was never for it.
+                let named = || {
+                    pkesks.iter().any(|pkesk| {
+                        pkesk
+                            .recipient()
+                            .is_some_and(|handle| handle.aliases(ka.key().key_handle()))
+                    })
+                };
+                let key = match unlocked {
+                    Ok(Some(key)) => key,
+                    Err(why) => {
+                        if unusable.is_none() && named() {
+                            unusable = Some(Error::KeyUnusable {
+                                name: crate::revoke::name_of(cert),
+                                why,
+                            });
+                        }
+                        continue;
                     }
-                    continue;
+                    Ok(None) => {
+                        // Nor a GnuPG stub, which is encrypted as far as
+                        // Sequoia can tell but has no passphrase, being where
+                        // a card key's secret is not; the agent below is how
+                        // that one opens.
+                        let secret = ka.key().secret();
+                        if locked.is_none()
+                            && secret.is_encrypted()
+                            && crate::secret::is_usable(secret)
+                            && named()
+                        {
+                            locked = Some(crate::revoke::name_of(cert));
+                        }
+                        continue;
+                    }
                 };
                 let Ok(mut pair) = key.into_keypair() else {
                     continue;
@@ -1099,6 +1134,15 @@ impl DecryptionHelper for Helper<'_> {
                 // the certificate that opened the message.
                 return Ok(Some(cert.clone()));
             }
+        }
+
+        // A key the message names that a passphrase entered did open, and
+        // that cannot be used, comes before one left locked: what was entered
+        // is that key's passphrase, so it is the key the user meant, and
+        // saying that what was entered does not unlock some other key would
+        // send them back to a passphrase that is right.
+        if let Some(error) = unusable {
+            return Err(error.into());
         }
 
         // A key the message names, here and locked, comes first: its

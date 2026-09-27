@@ -333,7 +333,9 @@ message names: one sent to hidden recipients could be for anybody, and asking
 for your passphrase then would ask for one that may never work. Where the
 message is for a password as well, the failure says that the key's passphrase
 or the message's password would open it, or that what was entered is neither,
-since the one field is tried as both.
+since the one field is tried as both. Where what was entered does unlock the
+key and the key then turns out to be damaged, the failure says that instead,
+rather than sending you back to a passphrase that is right.
 
 Reading such a message costs whatever its sender decided it should. The packet
 names the password-hashing parameters, and Argon2's are a memory size and a
@@ -845,7 +847,7 @@ Import both with the Import button. Public certificates land in cert-d and
 secret keys in the secrets directory; a file containing both is handled in one
 pass.
 
-Three caveats:
+Four caveats:
 
 - **This copies secret key material.** The keys then exist twice, under two
   different protections: gpg-agent's, and rPGP's weaker on-disk one. Delete
@@ -855,6 +857,20 @@ Three caveats:
   a key that lives on a YubiKey. Those need the gpg-agent route below.
 - **Ownertrust does not come across.** rPGP has no trust model yet, so
   `--export-ownertrust` has nowhere to go.
+- **Elliptic-curve keys are read the long way.** GnuPG 2.3 and later, exporting
+  a key with a passphrase, write an elliptic-curve secret with a length that
+  counts its leading zero bits, and Sequoia, the library rPGP is built on,
+  refuses that: every Curve25519 encryption subkey, about half of the Ed25519,
+  NIST P-256 and P-384 keys, and more of the P-521 and Brainpool ones. rPGP
+  decrypts such a secret a second time and takes it once the checksum GnuPG
+  wrote under the encryption holds and the secret proves to belong to the key's
+  public half. One that passes the checksum and fails that test is reported as
+  damaged, not as a wrong passphrase. The file in the secrets directory stays as
+  GnuPG wrote it, so this happens at every unlock, and the second decryption
+  leaves a whole copy of the secret in memory that is freed without being
+  cleared, where the ordinary one leaves at most its last few bytes. A key on a
+  Brainpool curve still cannot be used: this build has no support for those
+  curves.
 
 Reading `~/.gnupg` in place is possible but not built:
 

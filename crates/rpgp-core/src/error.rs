@@ -100,6 +100,24 @@ pub enum Error {
         or_password: bool,
     },
 
+    /// A passphrase-protected secret key that the passphrase given does
+    /// open, and that then cannot be used, for the reason `why` gives.
+    ///
+    /// A variant of its own because the passphrase is right, and every
+    /// failure to unlock used to be reported as one that was not: sequoia
+    /// refuses a secret it cannot parse with the same kind of error a wrong
+    /// passphrase mostly gets, so a key whose secret was damaged, or written
+    /// in a form sequoia will not read, sent its owner to retype a passphrase
+    /// that was correct. [`crate::secret::unlock`] says how the two are told
+    /// apart.
+    ///
+    /// `name` is the key's fingerprint where [`crate::secret::unlock`]
+    /// reports it, and the certificate's name, as [`Error::KeyLocked`] gives
+    /// it, where a decryption does, since a message does not say whose key it
+    /// is for.
+    #[error("{}", key_unusable(.name, .why))]
+    KeyUnusable { name: String, why: Unusable },
+
     /// A secret key was written, and its public certificate then could not
     /// be.
     ///
@@ -149,6 +167,37 @@ pub enum Error {
 
     #[error("{0}")]
     Invalid(String),
+}
+
+/// Why a secret key that its passphrase opened cannot be used. See
+/// [`Error::KeyUnusable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unusable {
+    /// What the passphrase opened is not a secret rPGP can read as this key's,
+    /// or is one and does not belong to the key's public half.
+    Damaged,
+
+    /// The key is on the curve named here, which this build has no
+    /// implementation of, so its secret could not be checked against the
+    /// public key, nor used had it been.
+    Unsupported(String),
+}
+
+/// How [`Error::KeyUnusable`] reads: what to do comes before the name, as the
+/// reason does in [`Error::AgentRefused`], because the status bar elides what
+/// goes past its last line.
+fn key_unusable(name: &str, why: &Unusable) -> String {
+    match why {
+        Unusable::Damaged => format!(
+            "the passphrase is right, but the secret key it unlocks is damaged, or in a form \
+             rPGP cannot read: import the key again from a backup, or export it again from \
+             the program that made it ({name})"
+        ),
+        Unusable::Unsupported(curve) => format!(
+            "the passphrase is right, but the secret key it unlocks is on {curve}, which this \
+             build of rPGP cannot use: use the key with GnuPG instead ({name})"
+        ),
+    }
 }
 
 /// How [`Error::ImportStopped`] reads: with the count only where there is one
