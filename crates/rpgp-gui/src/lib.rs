@@ -1024,9 +1024,20 @@ fn wire_keygen(ui: &AppWindow, state: &Shared) {
             if refuse_while_busy(&ui) {
                 return;
             }
+            // Refused here, before anything starts and with the dialog left
+            // open, as well as by keygen::generate. The dialog cannot do it:
+            // Slint has no trim, so a field of spaces looks filled in there,
+            // and this used to format two of them into the user ID "<>".
+            let user_id = match keygen::user_id(&name, &email) {
+                Ok(user_id) => user_id,
+                Err(e) => {
+                    ui.set_status(format!("Key generation failed: {e}").into());
+                    return;
+                }
+            };
 
             let request = KeyGenRequest {
-                user_ids: vec![format!("{} <{}>", name.trim(), email.trim())],
+                user_ids: vec![user_id],
                 key_type: KeyType::ALL
                     .get(key_type.max(0) as usize)
                     .copied()
@@ -1564,9 +1575,7 @@ fn wire_decrypt_verify(ui: &AppWindow, state: &Shared) {
             // A fresh dialog is a fresh choice of files, so a run still in
             // flight from before it was closed has nothing to show in it.
             guard.dv_generation += 1;
-            ui.set_dv_result(SharedString::new());
-            ui.set_dv_tone(0);
-            ui.set_dv_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
+            clear_dv_verdict(&ui);
             push_decrypt_verify(&ui, &guard);
             ui.set_verify_open(true);
         }
@@ -1727,23 +1736,36 @@ fn choose_dv_input(ui: &AppWindow, state: &Shared, path: PathBuf, kind: InputKin
     // the previous files should still be going; if one ever is, this is what
     // keeps its result out of the dialog.
     guard.dv_generation += 1;
-    ui.set_dv_result(SharedString::new());
-    ui.set_dv_tone(0);
+    clear_dv_verdict(ui);
     push_decrypt_verify(ui, &guard);
 }
 
 /// Take a newly chosen signed file, as the data picker does once the file
 /// dialog answers.
 fn choose_dv_data(ui: &AppWindow, state: &Shared, path: PathBuf) {
-    // Refused while busy, and a new generation otherwise, for the reasons
-    // given for the input.
+    // Refused while busy, and a new generation and no verdict otherwise, for
+    // the reasons given for the input. The verdict used to stay: after a good
+    // verify, choosing another signed file left "Signature verified" and its
+    // pills beside a file nothing had checked, with nothing on screen to say
+    // which file they were about.
     if refuse_while_busy(ui) {
         return;
     }
     let mut guard = lock(state);
     guard.dv_data = Some(path);
     guard.dv_generation += 1;
+    clear_dv_verdict(ui);
     push_decrypt_verify(ui, &guard);
+}
+
+/// Take the last run's verdict out of the Decrypt / Verify dialog: the banner,
+/// its tone and the signature rows, all of which are about the files that run
+/// read. One function for the opener and both pickers, which used to clear
+/// different parts of it each, and the signed-file picker none.
+fn clear_dv_verdict(ui: &AppWindow) {
+    ui.set_dv_result(SharedString::new());
+    ui.set_dv_tone(0);
+    ui.set_dv_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
 }
 
 /// The event-loop half of Decrypt / Verify: show what a run found.
@@ -6431,6 +6453,108 @@ mod tests {
         ui.invoke_open_decrypt_verify();
         show_decrypt_verify(&ui, &state, read, outcome);
         not_shown(&ui, "a reopened dialog");
+    }
+
+    /// Choosing another signed file takes the last verdict out of the dialog,
+    /// and so does choosing another signature, signature rows and all.
+    ///
+    /// The signed-file picker used to change the path and nothing else. After
+    /// a good verify, "Signature verified" and its good and verified pills
+    /// stayed up beside a file nothing had checked, one that fails when it is
+    /// checked, as this test goes on to show.
+    #[test]
+    fn choosing_another_file_takes_the_last_verdict_away() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let alice = generated("Alice <alice@example.org>").cert;
+        store.insert_secret(&alice).unwrap();
+
+        let (release, other) = (dir.path().join("a.tar"), dir.path().join("b.tar"));
+        std::fs::write(&release, b"the release").unwrap();
+        std::fs::write(&other, b"something else entirely").unwrap();
+        let signature = dir.path().join("a.tar.sig");
+        ops::sign_detached_file(&alice, None, &release, &signature, Existing::Refuse).unwrap();
+        let kind = ops::classify_file(&signature);
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let verify = |ui: &AppWindow| {
+            let (read, outcome) = run_decrypt_verify(&state, "", None);
+            show_decrypt_verify(ui, &state, read, outcome);
+        };
+        let verdict = |ui: &AppWindow| {
+            (
+                ui.get_dv_result().to_string(),
+                ui.get_dv_tone(),
+                slint::Model::row_count(&ui.get_dv_signatures()),
+            )
+        };
+        let verified = || ("Signature verified".to_string(), 1, 1);
+        let none = || (String::new(), 0, 0);
+
+        ui.invoke_open_decrypt_verify();
+        choose_dv_input(&ui, &state, signature.clone(), kind);
+        choose_dv_data(&ui, &state, release.clone());
+        verify(&ui);
+        assert_eq!(verdict(&ui), verified());
+
+        choose_dv_data(&ui, &state, other.clone());
+        assert_eq!(
+            verdict(&ui),
+            none(),
+            "the verdict on a.tar stayed up beside b.tar"
+        );
+        verify(&ui);
+        assert_eq!(
+            verdict(&ui).0,
+            "Signature is NOT valid",
+            "b.tar is not what was signed"
+        );
+
+        choose_dv_data(&ui, &state, release.clone());
+        verify(&ui);
+        assert_eq!(verdict(&ui), verified());
+        choose_dv_input(&ui, &state, signature.clone(), kind);
+        assert_eq!(
+            verdict(&ui),
+            none(),
+            "choosing the signature again left something of its verdict"
+        );
+    }
+
+    /// Create key pair refuses fields that make no user ID, before anything
+    /// starts, and the status line says why.
+    ///
+    /// The dialog's button can only ask whether the fields hold text, since
+    /// Slint has no trim, and the handler used to format both into `{} <{}>`
+    /// whatever they held: spaces in both made a key whose only user ID was
+    /// `<>`, and a word in the e-mail field made `Alice <alice>`.
+    #[test]
+    fn create_key_pair_refuses_fields_that_make_no_user_id() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+
+        for (name, email, why) in [
+            (" ", "  ", "a name or an e-mail address"),
+            ("Alice", "alice", "alice is not an e-mail address"),
+            ("Alice <>", "", "between < and >"),
+        ] {
+            ui.set_status(SharedString::new());
+            ui.invoke_generate_key(name.into(), email.into(), SharedString::new(), 0, 0, 0);
+            let status = ui.get_status();
+            assert!(
+                status.starts_with("Key generation failed") && status.contains(why),
+                "{name:?} and {email:?} should be refused ({why}): {status}"
+            );
+            assert!(
+                !ui.get_busy(),
+                "{name:?} and {email:?} started a generation"
+            );
+        }
     }
 
     /// While an operation is in flight no handler starts another, however it

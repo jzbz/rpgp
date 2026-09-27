@@ -113,10 +113,20 @@ export component EnabledProbe inherits Window {
 // passing after the shipped rows lost their accessibility again. `busy` is
 // the window's, so a test can check that a recipient row takes no toggle
 // while a run is in flight.
+//
+// There is a key to sign with unless a test takes it away, as there is in a
+// store holding one of the user's own keys: the signing passphrase field is
+// there only then, and the passphrase test has to reach it. What Run is asked
+// to do is kept, as the window's handler would receive it.
 export component SelectionProbe inherits Window {
     in-out property <[RecipientRow]> recipients;
     in-out property <int> toggled-recipient: -1;
     in-out property <bool> busy: false;
+    in-out property <[string]> signers: ["Probe <probe@example.org>"];
+    in-out property <int> chosen-recipients: 0;
+    in-out property <int> runs: 0;
+    in-out property <bool> encrypted;
+    in-out property <bool> signed;
 
     width: 620px;
     height: 720px;
@@ -126,8 +136,15 @@ export component SelectionProbe inherits Window {
         height: 100%;
         input-path: "/tmp/message.txt";
         recipients: root.recipients;
+        signers: root.signers;
+        chosen-recipients: root.chosen-recipients;
         busy: root.busy;
         toggle-recipient(index) => { root.toggled-recipient = index; }
+        run(encrypt, sign, signer, password, secret) => {
+            root.encrypted = encrypt;
+            root.signed = sign;
+            root.runs += 1;
+        }
     }
 }
 
@@ -173,17 +190,46 @@ export component NotepadProbe inherits Window {
 // The four passphrase-bearing dialogs the probes above do not reach. The other
 // five passphrase fields live in SignEncryptDialog, CertifyDialog and
 // NotepadDialog, which the selection probes already instantiate.
+//
+// The first two keep what their button hands over, and how often it was
+// pressed, so that a test can tell a button that did nothing from one that
+// was never reached.
 export component KeygenProbe inherits Window {
+    in-out property <int> runs: 0;
+    in-out property <string> passphrase;
+    // Settable, as in VerifyBannerProbe, so that a test can hold the dialog
+    // to the height the app's smallest window leaves it.
+    in-out property <length> probe-height: 720px;
+
     width: 620px;
-    height: 720px;
-    KeygenDialog { width: 100%; height: 100%; }
+    height: root.probe-height;
+    KeygenDialog {
+        width: 100%;
+        height: 100%;
+        accepted(name, email, password, key-type, expiry, standard) => {
+            root.passphrase = password;
+            root.runs += 1;
+        }
+    }
 }
 
 export component DecryptProbe inherits Window {
+    // The passphrase field is conditional on a file having been chosen.
+    in-out property <string> input-path: "/tmp/message.txt";
+    in-out property <int> runs: 0;
+    in-out property <string> sent;
+
     width: 620px;
     height: 720px;
-    // The passphrase field is conditional on a file having been chosen.
-    DecryptVerifyDialog { width: 100%; height: 100%; input-path: "/tmp/message.txt"; }
+    DecryptVerifyDialog {
+        width: 100%;
+        height: 100%;
+        input-path: root.input-path;
+        run(password) => {
+            root.sent = password;
+            root.runs += 1;
+        }
+    }
 }
 
 // The Decrypt / Verify result banner, driven from Rust so a real renderer can

@@ -68,64 +68,101 @@ export component KeygenDialog inherits DialogShell {
     VerticalLayout {
         spacing: Theme.s3;
 
-        name-input := Field { placeholder: "Name"; enabled: !root.busy; }
-        email-input := Field { placeholder: "name@example.org"; enabled: !root.busy; }
-        pass-input := Field { placeholder: "Passphrase (optional)"; secret: true; enabled: !root.busy; }
+        // The form scrolls and the buttons do not, as in Sign / Encrypt. With
+        // the passphrase asked for twice the dialog is taller than the 488px
+        // card that the window's own minimum size (860x520) leaves it, the
+        // more so while the note below the passphrases is shown, and Slint
+        // does not shrink fixed-height rows: without the scrolling, Cancel and
+        // Create key pair would be pushed off the bottom of the card. min-height
+        // 0 lets the card take height from the form rather than from the
+        // buttons, and preferred-height keeps the dialog its natural size
+        // whenever the window is tall enough.
+        ScrollView {
+            min-height: 0px;
+            preferred-height: form.preferred-height;
+            vertical-stretch: 1;
+            viewport-width: self.visible-width;
+            viewport-height: max(self.visible-height, form.preferred-height);
 
-        HorizontalLayout {
-            spacing: Theme.s3;
+            form := VerticalLayout {
+                spacing: Theme.s3;
 
-            VerticalLayout {
-                spacing: 6px;
-                Text {
-                    text: "Key type";
-                    color: Theme.text-dim;
+                name-input := Field { placeholder: "Name"; enabled: !root.busy; }
+                email-input := Field { placeholder: "name@example.org"; enabled: !root.busy; }
+                pass-input := Field { placeholder: "Passphrase (optional)"; secret: true; enabled: !root.busy; }
+                // Asked for twice, because a passphrase mistyped here cannot
+                // be put right: the field shows nothing of what was typed,
+                // the key is stored encrypted under whatever it was, and
+                // changing a passphrase would need the one that was mistyped.
+                // Always shown, rather than only once the first field has
+                // text: a field inside an `if` cannot be read from the button
+                // below, so its text would be held in a property of the
+                // dialog, and that property would keep what had been typed
+                // after the field went away with the first one emptied,
+                // holding Create back with nothing on screen to say why.
+                repeat-input := Field { placeholder: "Repeat the passphrase"; secret: true; enabled: !root.busy; }
+                if repeat-input.text != "" && repeat-input.text != pass-input.text: Text {
+                    text: "The passphrases do not match.";
+                    color: Theme.warn;
                     font-size: Theme.t-sm;
                 }
-                key-type := Select {
-                    label: "Key type";
-                    model: ["Curve 25519 (recommended)", "RSA 3072", "RSA 4096"];
-                    enabled: !root.busy;
-                }
-            }
 
-            VerticalLayout {
-                spacing: 6px;
-                width: 130px;
-                Text {
-                    text: "Expires";
-                    color: Theme.text-dim;
-                    font-size: Theme.t-sm;
-                }
-                expiry := Select {
-                    label: "Expires";
-                    model: ["in 2 years", "in 1 year", "in 5 years", "never"];
-                    enabled: !root.busy;
-                }
-            }
-        }
+                HorizontalLayout {
+                    spacing: Theme.s3;
 
-        VerticalLayout {
-            spacing: 6px;
-            Text {
-                text: "Standard";
-                color: Theme.text-dim;
-                font-size: Theme.t-sm;
-            }
-            standard := Select {
-                label: "Standard";
-                model: ["Modern (RFC 9580)", "Compatible (RFC 4880)"];
-                enabled: !root.busy;
-            }
-            Text {
-                text: standard.current == 0
-                    ? "Stronger encryption. GnuPG 2.5 and later, and Sequoia. Older "
-                      + "software cannot encrypt to this key or check its signatures."
-                    : "Works with GnuPG 2.4 and everything older, using its weaker "
-                      + "encryption.";
-                color: Theme.text-faint;
-                font-size: Theme.t-sm;
-                wrap: word-wrap;
+                    VerticalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: "Key type";
+                            color: Theme.text-dim;
+                            font-size: Theme.t-sm;
+                        }
+                        key-type := Select {
+                            label: "Key type";
+                            model: ["Curve 25519 (recommended)", "RSA 3072", "RSA 4096"];
+                            enabled: !root.busy;
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 6px;
+                        width: 130px;
+                        Text {
+                            text: "Expires";
+                            color: Theme.text-dim;
+                            font-size: Theme.t-sm;
+                        }
+                        expiry := Select {
+                            label: "Expires";
+                            model: ["in 2 years", "in 1 year", "in 5 years", "never"];
+                            enabled: !root.busy;
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: "Standard";
+                        color: Theme.text-dim;
+                        font-size: Theme.t-sm;
+                    }
+                    standard := Select {
+                        label: "Standard";
+                        model: ["Modern (RFC 9580)", "Compatible (RFC 4880)"];
+                        enabled: !root.busy;
+                    }
+                    Text {
+                        text: standard.current == 0
+                            ? "Stronger encryption. GnuPG 2.5 and later, and Sequoia. Older "
+                              + "software cannot encrypt to this key or check its signatures."
+                            : "Works with GnuPG 2.4 and everything older, using its weaker "
+                              + "encryption.";
+                        color: Theme.text-faint;
+                        font-size: Theme.t-sm;
+                        wrap: word-wrap;
+                    }
+                }
             }
         }
 
@@ -144,7 +181,14 @@ export component KeygenDialog inherits DialogShell {
             Btn {
                 text: root.busy ? "Generating…" : "Create key pair";
                 variant: Variant.primary;
-                enabled: !root.busy && name-input.text != "" && email-input.text != "";
+                // A name alone or an address alone makes a user ID, as it does
+                // in GnuPG. Slint has no trim, so a field of spaces passes
+                // here, and the handler in Rust refuses it along with anything
+                // else that makes no user ID. The two passphrase fields have
+                // to agree, which two empty ones do, for a key with none.
+                enabled: !root.busy
+                    && (name-input.text != "" || email-input.text != "")
+                    && pass-input.text == repeat-input.text;
                 clicked => {
                     root.accepted(
                         name-input.text,
@@ -187,11 +231,15 @@ export component SignEncryptDialog inherits DialogShell {
 
     property <bool> want-encrypt: true;
     property <bool> want-sign: true;
+    // Whether Run signs: what the Sign box asks for, where some key can. With
+    // no key that can sign, the box is disabled and so could not be unticked,
+    // and Run, which wanted `want-sign` off or a signer, stayed disabled for
+    // good: nobody without a signing key could encrypt a file here at all.
+    property <bool> signing: root.want-sign && root.signers.length > 0;
     property <bool> can-run:
         root.input-path != ""
-        && (root.want-encrypt || root.want-sign)
-        && (!root.want-encrypt || root.chosen-recipients > 0 || root.secret != "")
-        && (!root.want-sign || root.signers.length > 0);
+        && (root.want-encrypt || root.signing)
+        && (!root.want-encrypt || root.chosen-recipients > 0 || root.secret != "");
 
     title: "Sign / Encrypt file";
     card-width: 540px;
@@ -246,13 +294,20 @@ export component SignEncryptDialog inherits DialogShell {
                 }
                 Check {
                     text: "Sign";
-                    checked: root.want-sign;
+                    checked: root.signing;
                     enabled: !root.busy && root.signers.length > 0;
                     toggled => {
                         root.want-sign = !root.want-sign;
                         if !root.want-sign { root.password = ""; }
                     }
                 }
+            }
+
+            if root.signers.length == 0: Text {
+                text: "No key of yours here can sign, so this can only encrypt.";
+                color: Theme.text-faint;
+                font-size: Theme.t-sm;
+                wrap: word-wrap;
             }
 
             if root.want-encrypt: VerticalLayout {
@@ -377,7 +432,7 @@ export component SignEncryptDialog inherits DialogShell {
                 edited(text) => { root.secret = text; }
             }
 
-            if root.want-sign && root.signers.length > 0: VerticalLayout {
+            if root.signing: VerticalLayout {
                 spacing: 6px;
                 Text {
                     text: "Sign as";
@@ -393,7 +448,7 @@ export component SignEncryptDialog inherits DialogShell {
                 }
             }
 
-            if root.want-sign: Field {
+            if root.signing: Field {
                 placeholder: "Passphrase for the signing key (if any)";
                 secret: true;
                 enabled: !root.busy;
@@ -428,7 +483,7 @@ export component SignEncryptDialog inherits DialogShell {
                 clicked => {
                     root.run(
                         root.want-encrypt,
-                        root.want-sign,
+                        root.signing,
                         root.signer-index,
                         root.password,
                         root.secret,
@@ -457,10 +512,15 @@ export component DecryptVerifyDialog inherits DialogShell {
     callback run(string);
 
     property <string> password;
-    // A passphrase belongs to the file it was typed for. Choosing another
-    // input destroys and recreates the passphrase field, empty — but not the
-    // property behind it, so a passphrase from the last file would be sent
-    // with the next one from a field showing nothing.
+    // A passphrase belongs to the file it was typed for, so choosing another
+    // input clears it, and the field is bound to this property both ways so
+    // that the field is cleared with it. Going from one message to the next
+    // keeps the field's condition true, and Slint keeps the field it has
+    // rather than making a new one: when the field only wrote its text out as
+    // it was edited, it went on showing the last file's passphrase while
+    // Decrypt sent nothing, and a key typed after it sent the old passphrase
+    // with that key on the end. A field made later, after a detached
+    // signature, starts from the cleared property.
     changed input-path => { root.password = ""; }
     property <bool> can-run:
         root.input-path != "" && (!root.needs-data || root.data-path != "");
@@ -490,7 +550,7 @@ export component DecryptVerifyDialog inherits DialogShell {
             placeholder: "Passphrase for the secret key (if any)";
             secret: true;
             enabled: !root.busy;
-            edited(text) => { root.password = text; }
+            text <=> root.password;
         }
 
         if root.output-path != "" && !root.needs-data: Text {

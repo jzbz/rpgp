@@ -1036,6 +1036,258 @@ fn the_notepad_output_can_be_selected_but_not_rewritten_by_assistive_technology(
     );
 }
 
+/// Create key pair does nothing, however it is reached, until the passphrase
+/// has been typed twice alike, and says so when the two differ.
+///
+/// A passphrase mistyped behind the mask used to become the key's, with no
+/// way in the app to learn what it was or to set another, so the key was
+/// locked for good. A key with no passphrase needs nothing repeated.
+#[test]
+fn a_new_key_waits_for_its_passphrase_to_be_typed_twice_alike() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+
+    let probe = KeygenProbe::new().unwrap();
+    probe.show().unwrap();
+    let field = |label: &str| control(&probe, label, AccessibleRole::TextInput);
+    let create = || control(&probe, "Create key pair", AccessibleRole::Button);
+    let differ = || {
+        ElementHandle::find_by_accessible_label(&probe, "The passphrases do not match.")
+            .next()
+            .is_some()
+    };
+
+    field("Name").set_accessible_value("Alice");
+    field("name@example.org").set_accessible_value("alice@example.org");
+    assert_eq!(
+        create().accessible_enabled(),
+        Some(true),
+        "a key with no passphrase has nothing to repeat"
+    );
+
+    field("Passphrase (optional)").set_accessible_value(PASSPHRASE);
+    assert_eq!(
+        create().accessible_enabled(),
+        Some(false),
+        "Create key pair was offered with the passphrase typed once"
+    );
+    assert!(!differ(), "nothing has been typed twice yet to disagree");
+
+    field("Repeat the passphrase").set_accessible_value("correct horse battery stapel");
+    assert!(differ(), "two passphrases that differ should say so");
+    assert_eq!(create().accessible_enabled(), Some(false));
+    create().invoke_accessible_default_action();
+    assert_eq!(
+        probe.get_runs(),
+        0,
+        "a key was made with two passphrases that differ"
+    );
+
+    field("Repeat the passphrase").set_accessible_value(PASSPHRASE);
+    assert!(!differ());
+    assert_eq!(create().accessible_enabled(), Some(true));
+    create().invoke_accessible_default_action();
+    assert_eq!(
+        (probe.get_runs(), probe.get_passphrase().as_str()),
+        (1, PASSPHRASE),
+        "with both alike the key should be made, with that passphrase"
+    );
+}
+
+/// The new-key dialog keeps its buttons inside the smallest window the app
+/// allows, the note under the passphrases included.
+///
+/// Asking for the passphrase twice makes the dialog taller than the card that
+/// window leaves it, and unless the form scrolls, Cancel and Create key pair
+/// are pushed off the bottom of the card.
+#[test]
+fn the_new_key_dialog_keeps_its_buttons_in_the_smallest_window() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+
+    let probe = KeygenProbe::new().unwrap();
+    // The main window's minimum height, all of which the dialog's scrim covers.
+    probe.set_probe_height(520.);
+    probe.show().unwrap();
+    control(&probe, "Passphrase (optional)", AccessibleRole::TextInput)
+        .set_accessible_value(PASSPHRASE);
+    control(&probe, "Repeat the passphrase", AccessibleRole::TextInput).set_accessible_value("x");
+    assert!(
+        ElementHandle::find_by_accessible_label(&probe, "The passphrases do not match.")
+            .next()
+            .is_some()
+    );
+
+    let window = probe.window();
+    let height = window.size().to_logical(window.scale_factor()).height;
+    assert_eq!(height, 520.);
+    for label in ["Cancel", "Create key pair"] {
+        let button = control(&probe, label, AccessibleRole::Button);
+        let bottom = button.absolute_position().y + button.size().height;
+        assert!(
+            bottom <= height,
+            "{label} ends {bottom}px down a window {height}px tall"
+        );
+    }
+}
+
+/// Create key pair is offered for a name alone or an address alone, as GnuPG
+/// makes keys for either, and not for neither.
+///
+/// The dialog used to want both. Slint has no trim, so a field of spaces
+/// still counts as filled in here; the handler in Rust refuses that.
+#[test]
+fn a_name_alone_or_an_address_alone_is_enough_for_a_new_key() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::AccessibleRole;
+
+    let probe = KeygenProbe::new().unwrap();
+    probe.show().unwrap();
+    let name = || control(&probe, "Name", AccessibleRole::TextInput);
+    let address = || control(&probe, "name@example.org", AccessibleRole::TextInput);
+    let offered = || {
+        control(&probe, "Create key pair", AccessibleRole::Button).accessible_enabled()
+            == Some(true)
+    };
+
+    assert!(!offered(), "offered with neither a name nor an address");
+    name().set_accessible_value("Alice");
+    assert!(offered(), "a name alone should make a key");
+    name().set_accessible_value("");
+    address().set_accessible_value("alice@example.org");
+    assert!(offered(), "an address alone should make a key");
+    address().set_accessible_value("");
+    assert!(!offered(), "offered once both were emptied again");
+}
+
+/// With no key here that can sign, Sign / Encrypt still encrypts, and says
+/// that it can only encrypt.
+///
+/// Sign started ticked and was disabled when no key could sign, so it could
+/// not be unticked, and Run needed it unticked or a key to sign with. Run
+/// stayed disabled whatever recipients were chosen: anyone who had only other
+/// people's certificates could not encrypt a file at all.
+#[test]
+fn sign_encrypt_encrypts_alone_when_no_key_here_can_sign() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+
+    let probe = SelectionProbe::new().unwrap();
+    probe.set_signers(slint::ModelRc::new(slint::VecModel::from(Vec::<
+        slint::SharedString,
+    >::new())));
+    probe.set_recipients(slint::ModelRc::new(slint::VecModel::from(vec![
+        RecipientRow {
+            fingerprint: "AAAA".into(),
+            label: "Alice".into(),
+            sublabel: "alice@example.org".into(),
+            initials: "A".into(),
+            tint_index: 0,
+            selected: true,
+        },
+    ])));
+    probe.set_chosen_recipients(1);
+    probe.show().unwrap();
+    let sign = || control(&probe, "Sign", AccessibleRole::Checkbox);
+    let run = || control(&probe, "Run", AccessibleRole::Button);
+    let says = |line: &str| {
+        ElementHandle::find_by_accessible_label(&probe, line)
+            .next()
+            .is_some()
+    };
+    const ONLY_ENCRYPT: &str = "No key of yours here can sign, so this can only encrypt.";
+    const SIGNING_PASSPHRASE: &str = "Passphrase for the signing key (if any)";
+
+    assert_eq!(
+        (sign().accessible_checked(), sign().accessible_enabled()),
+        (Some(false), Some(false)),
+        "Sign should show that it is off, with no key to sign with"
+    );
+    assert!(says(ONLY_ENCRYPT));
+    assert!(
+        !says(SIGNING_PASSPHRASE),
+        "a passphrase was asked for a key there is not"
+    );
+    assert_eq!(
+        run().accessible_enabled(),
+        Some(true),
+        "Run stayed disabled with a recipient chosen"
+    );
+    run().invoke_accessible_default_action();
+    assert_eq!(
+        (probe.get_runs(), probe.get_encrypted(), probe.get_signed()),
+        (1, true, false),
+        "Run should encrypt, and not ask to sign"
+    );
+
+    // With a key that can sign, Sign is ticked, as it always was, and Run
+    // signs as well.
+    probe.set_signers(slint::ModelRc::new(slint::VecModel::from(vec![
+        slint::SharedString::from("Me <me@example.org>"),
+    ])));
+    assert_eq!(
+        (sign().accessible_checked(), sign().accessible_enabled()),
+        (Some(true), Some(true))
+    );
+    assert!(!says(ONLY_ENCRYPT));
+    assert!(says(SIGNING_PASSPHRASE));
+    run().invoke_accessible_default_action();
+    assert_eq!(
+        (probe.get_runs(), probe.get_encrypted(), probe.get_signed()),
+        (2, true, true)
+    );
+}
+
+/// A passphrase typed for one message is not kept for the next: choosing
+/// another input empties the field, as well as what Decrypt sends.
+///
+/// Going from one message to another leaves the field's condition true, so
+/// Slint keeps the field it has. Only the property behind it was cleared, so
+/// the field went on showing the last passphrase, masked, while Decrypt sent
+/// nothing, and a key typed into it then sent the old passphrase with that
+/// key on the end.
+#[test]
+fn choosing_another_message_empties_the_passphrase_field() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+    use slint::platform::PointerEventButton;
+
+    const LABEL: &str = "Passphrase for the secret key (if any)";
+    let probe = DecryptProbe::new().unwrap();
+    probe.show().unwrap();
+    let field = || control(&probe, LABEL, AccessibleRole::TextInput);
+    // The field's placeholder is a Text of the same name, drawn only while
+    // the field is empty; a secret field's value is published as nothing
+    // either way, so this is how an empty one is told from a full one.
+    let looks_empty = || ElementHandle::find_by_accessible_label(&probe, LABEL).count() == 2;
+    let decrypt = || {
+        control(&probe, "Decrypt", AccessibleRole::Button).invoke_accessible_default_action();
+        probe.get_sent()
+    };
+
+    field().set_accessible_value(PASSPHRASE);
+    assert!(!looks_empty());
+    assert_eq!(decrypt(), PASSPHRASE);
+
+    probe.set_input_path("/tmp/other.pgp".into());
+    // Where Slint runs `changed` handlers.
+    slint::platform::update_timers_and_animations();
+    assert!(
+        looks_empty(),
+        "the field went on showing the last message's passphrase"
+    );
+    assert_eq!(decrypt(), "");
+
+    field().mock_single_click(PointerEventButton::Left);
+    press(&probe, "x");
+    assert_eq!(
+        decrypt(),
+        "x",
+        "what was typed for the next message should be all that is sent"
+    );
+    assert_eq!(probe.get_runs(), 3);
+}
+
 /// The suppression has two halves: the binding inside `Field`, which the two
 /// tests at the top cover, and the `secret: true` at each call site, which they
 /// do not — they exercise the probe's own copy of a passphrase field, so every

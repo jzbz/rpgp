@@ -445,6 +445,16 @@ A user ID you retire can be brought back: adding the same name again binds it
 anew, and the newer binding supersedes the retirement. Anyone holding a copy of
 the key from between the two still sees it retired.
 
+A user ID is checked before it is bound, to a new key or to one you hold: it
+needs a name or an address, it cannot hold a control character, as text pasted
+with a tab or a carriage return in it would, and what stands between `<` and
+`>` has to be an e-mail address, or a URI, so `<>` and `Alice <alice>` are
+refused. A name alone, an address alone and a comment in parentheses before the
+address are all accepted, since keys made with GnuPG commonly carry each of
+them; GnuPG itself checks less, and makes a key for `<>`. A name the key
+already carries is not checked when it is added back, so one made elsewhere and
+retired here comes back as it was.
+
 ## Smartcards and YubiKeys
 
 Card keys are reached **through the user's `gpg-agent`**, not by talking to the

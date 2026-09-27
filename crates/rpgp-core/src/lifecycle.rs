@@ -228,7 +228,8 @@ pub fn set_expiry(
 /// retirement being quietly undone.
 ///
 /// A name already on the key is refused, unless its owner has retired it: then
-/// it is bound again, which is how a retirement is taken back.
+/// it is bound again, which is how a retirement is taken back. Any other name
+/// has to pass [`crate::keygen::check_user_id`].
 ///
 /// A revoked certificate is refused, as in [`set_expiry`] and for the same
 /// reason, and so is one the standard policy cannot evaluate: the key's own
@@ -278,6 +279,15 @@ pub fn add_user_id(
         })
     {
         return Err(Error::invalid(format!("{user_id} is already on this key")));
+    }
+
+    // Held to the rules a new key's user IDs are, with one exception: a name
+    // the key already carries, which after the refusal above is one its owner
+    // has retired. Binding it again is the way back from retiring the wrong
+    // one, and a name made elsewhere under looser rules, as GnuPG's are, has
+    // to be able to come back as it was.
+    if !merged.userids().any(|ua| ua.userid() == &userid) {
+        crate::keygen::check_user_id(user_id)?;
     }
 
     // Both signatures below are dated together, by [`crate::signature_time`],
@@ -1554,6 +1564,76 @@ mod tests {
             .map_err(|e| e.to_string())
             .expect("a name retired elsewhere must be possible to bind again");
         assert_eq!(live(&store.lookup(&fingerprint).unwrap()), [true]);
+    }
+
+    /// A new user ID is held to the rules a new key's are, and nothing is
+    /// bound when it fails them; a retired one comes back as it was, whatever
+    /// it reads.
+    ///
+    /// Adding a user ID used to refuse only a blank one, so `<>`, a name with
+    /// no address in its brackets and pasted text holding a carriage return
+    /// were all bound to the key and published with it. The key here was made
+    /// elsewhere with a user ID in a shape the check refuses in anything new,
+    /// its comment after the address, and retiring it must not leave it
+    /// beyond reach.
+    #[test]
+    fn a_new_user_id_is_checked_and_a_retired_one_comes_back_as_it_was() {
+        use sequoia_openpgp::cert::CertBuilder;
+        const OLD: &str = "Alice <alice@example.org> (work)";
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let (cert, _) = CertBuilder::new()
+            .add_userid("Alice <alice@example.org>")
+            .add_userid(OLD)
+            .generate()
+            .unwrap();
+        store.insert_secret(&cert).unwrap();
+        let fingerprint = cert.fingerprint().to_hex();
+        let names = || -> Vec<(String, bool)> {
+            cert::user_ids(&store.lookup(&fingerprint).unwrap())
+                .into_iter()
+                .map(|u| (u.text, u.revoked))
+                .collect()
+        };
+        let before = names();
+        assert_eq!(before.len(), 2);
+
+        for meaningless in [
+            "<>",
+            "Bob <>",
+            "Bob <bob>",
+            "Bob <bob@example.org> (home)",
+            "Bo\rb <bob@example.org>",
+            "Bob\t(home)",
+        ] {
+            let refusal = add_user_id(&store, &fingerprint, meaningless, None)
+                .err()
+                .unwrap_or_else(|| panic!("{meaningless:?} was bound"))
+                .to_string();
+            assert!(
+                refusal.contains("< and >") || refusal.contains("control character"),
+                "{meaningless:?} was refused for another reason: {refusal}"
+            );
+        }
+        assert_eq!(names(), before, "a refused user ID left something behind");
+
+        // The same names in the usual shapes go through.
+        for usual in ["Bob (home) <bob@example.org>", "Bob", "<bob@example.net>"] {
+            add_user_id(&store, &fingerprint, usual, None)
+                .unwrap_or_else(|e| panic!("{usual:?} was refused: {e}"));
+        }
+
+        revoke_user_id(&store, &fingerprint, OLD, "wrong row", None).unwrap();
+        assert!(names().contains(&(OLD.to_string(), true)));
+        add_user_id(&store, &fingerprint, OLD, None)
+            .map_err(|e| e.to_string())
+            .expect("a retired name must come back as it was");
+        assert!(
+            names().contains(&(OLD.to_string(), false)),
+            "the name should be live again: {:?}",
+            names()
+        );
     }
 
     /// The new name's binding is copied from the primary user ID's, and it is
