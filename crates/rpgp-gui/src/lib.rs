@@ -168,6 +168,20 @@ struct State {
     /// for and checked when its worker comes back, so two mutations in quick
     /// succession cannot have the slower read put an older keyring back.
     reload_generation: u64,
+    /// The confirmation the newest reload is to show when it lands, from
+    /// [`AfterReload::status`].
+    ///
+    /// Held here rather than by the reload that carried it, because that
+    /// reload can be overtaken. A mutation asks for its reload once its worker
+    /// is done, when nothing is busy any more, so Refresh, or Trust root ticked
+    /// on another row, can ask for another while the first read is in flight.
+    /// The overtaken reload rightly shows nothing of what it read, and its
+    /// confirmation used to go with it: "Key revoked. Publish or send the
+    /// certificate so others stop using it." gave way to the newer read's
+    /// count before anyone saw it. A newer confirmation replaces one still
+    /// waiting, as it would have replaced it on the status line had the older
+    /// read landed first.
+    pending_status: Option<String>,
     /// Bumped every time the user picks a row, so a reload can tell whether
     /// they have moved since it was asked for. One that carries a row of its
     /// own to select only gets to select it if they have not.
@@ -497,6 +511,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         all: Vec::new(),
         shown: Vec::new(),
         reload_generation: 0,
+        pending_status: None,
         selection_generation: 0,
         filter: String::new(),
         scope: Scope::All,
@@ -3927,8 +3942,22 @@ struct AfterReload {
     select: Option<String>,
     /// The confirmation the mutation wants shown — "Imported 3 certificates".
     /// Set by the caller after `apply_filter` has had its say, exactly as it
-    /// was before.
+    /// was before. Shown when the newest reload lands, which is this one
+    /// unless another is asked for before it does; see
+    /// [`State::pending_status`].
     status: Option<String>,
+}
+
+/// A reload as it was asked for: what its landing holds against how things
+/// stand by the time the read comes back.
+struct AskedReload {
+    store: Arc<Store>,
+    /// [`State::reload_generation`] as this reload set it.
+    generation: u64,
+    /// [`State::selection_generation`] when it was asked for.
+    selection: u64,
+    /// [`AfterReload::select`].
+    select: Option<String>,
 }
 
 /// Everything a reload reads, with nothing in it that touches the window.
@@ -3963,13 +3992,38 @@ fn reload(ui: &AppWindow, state: &Shared) {
 
 /// [`reload`], with something to do when it lands.
 fn reload_after(ui: &AppWindow, state: &Shared, after: AfterReload) {
-    let (store, generation, selection, first) = {
+    let asked = ask_for_reload(ui, state, after);
+    let (ui_weak, state) = (ui.as_weak(), state.clone());
+    std::thread::spawn(move || {
+        let loaded = read_store(&asked.store);
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                land_reload(&ui, &state, asked, loaded);
+            }
+        });
+    });
+}
+
+/// What [`reload_after`] does on the event loop before its read starts: make
+/// this the newest reload, and leave its confirmation for the newest reload to
+/// show when it lands.
+///
+/// Split from the read and the landing so that a test can ask for reloads and
+/// land them in an order of its choosing, as a race between two reads would.
+fn ask_for_reload(ui: &AppWindow, state: &Shared, after: AfterReload) -> AskedReload {
+    let (asked, first) = {
         let mut guard = lock(state);
         guard.reload_generation += 1;
+        if let Some(status) = after.status {
+            guard.pending_status = Some(status);
+        }
         (
-            guard.store.clone(),
-            guard.reload_generation,
-            guard.selection_generation,
+            AskedReload {
+                store: guard.store.clone(),
+                generation: guard.reload_generation,
+                selection: guard.selection_generation,
+                select: after.select,
+            },
             guard.all.is_empty(),
         )
     };
@@ -3980,61 +4034,71 @@ fn reload_after(ui: &AppWindow, state: &Shared, after: AfterReload) {
     if first {
         ui.set_status("Reading the certificate store…".into());
     }
+    asked
+}
 
-    let (ui_weak, state) = (ui.as_weak(), state.clone());
-    std::thread::spawn(move || {
-        let loaded = read_store(&store);
-        let _ = slint::invoke_from_event_loop(move || {
-            let Some(ui) = ui_weak.upgrade() else {
-                return;
-            };
-            // A read that a newer one has already overtaken says nothing at
-            // all — not even its error, which would otherwise sit on the status
-            // line describing a store the newer read is about to succeed at.
-            // Without this the list could also go backwards: delete then
-            // import, and if the delete's read finishes second it puts the
-            // deleted certificate back on screen until something forces
-            // another reload.
-            if lock(&state).reload_generation != generation {
-                return;
-            }
+/// What [`reload_after`] does on the event loop once its read is back: put
+/// what [`read_store`] came back with on screen, unless a newer reload has
+/// been asked for since, and start the survey that follows.
+fn land_reload(
+    ui: &AppWindow,
+    state: &Shared,
+    asked: AskedReload,
+    loaded: std::result::Result<Loaded, String>,
+) {
+    // A read that a newer one has already overtaken says nothing at all — not
+    // even its error, which would otherwise sit on the status line describing
+    // a store the newer read is about to succeed at. Without this the list
+    // could also go backwards: delete then import, and if the delete's read
+    // finishes second it puts the deleted certificate back on screen until
+    // something forces another reload.
+    //
+    // Its confirmation is not lost with it: that waits in pending_status for
+    // the newest reload, which takes it here. Taken whether or not the read
+    // worked, since a failed one puts its own error on the line instead, and a
+    // confirmation left waiting would turn up on some later reload, long after
+    // what it confirms.
+    let status = {
+        let mut guard = lock(state);
+        if guard.reload_generation != asked.generation {
+            return;
+        }
+        guard.pending_status.take()
+    };
 
-            let loaded = match loaded {
-                Ok(loaded) => loaded,
-                Err(e) => {
-                    ui.set_status(format!("Cannot read the certificate store: {e}").into());
-                    return;
-                }
-            };
-            lock(&state).all = loaded.all;
+    let loaded = match loaded {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            ui.set_status(format!("Cannot read the certificate store: {e}").into());
+            return;
+        }
+    };
+    lock(state).all = loaded.all;
 
-            // Read before apply_filter, which clears it. The caller's row is
-            // honoured only while the user is where they were when the reload
-            // was asked for. Put back regardless, it took the details pane off
-            // a row the user had moved to in the meantime — and off the
-            // certificate a dialog they had opened since then was naming,
-            // behind that dialog's back.
-            let moved = lock(&state).selection_generation != selection;
-            let select = after.select.filter(|_| !moved).or_else(|| {
-                ui.get_has_selection()
-                    .then(|| ui.get_detail().fingerprint.to_string())
-            });
-
-            apply_filter(&ui, &state);
-            if let Some(fingerprint) = &select {
-                reselect(&ui, &state, fingerprint);
-            }
-
-            // After apply_filter, never before: that sets the status line
-            // itself, so a message written earlier would be overwritten by the
-            // ordinary count and the reader would never see it.
-            if let Some(status) = landed_status(after.status, loaded.degraded) {
-                ui.set_status(status.into());
-            }
-
-            survey_agent_and_secrets(&ui, &state, store);
-        });
+    // Read before apply_filter, which clears it. The caller's row is honoured
+    // only while the user is where they were when the reload was asked for.
+    // Put back regardless, it took the details pane off a row the user had
+    // moved to in the meantime — and off the certificate a dialog they had
+    // opened since then was naming, behind that dialog's back.
+    let moved = lock(state).selection_generation != asked.selection;
+    let select = asked.select.filter(|_| !moved).or_else(|| {
+        ui.get_has_selection()
+            .then(|| ui.get_detail().fingerprint.to_string())
     });
+
+    apply_filter(ui, state);
+    if let Some(fingerprint) = &select {
+        reselect(ui, state, fingerprint);
+    }
+
+    // After apply_filter, never before: that sets the status line itself, so
+    // a message written earlier would be overwritten by the ordinary count and
+    // the reader would never see it.
+    if let Some(status) = landed_status(status, loaded.degraded) {
+        ui.set_status(status.into());
+    }
+
+    survey_agent_and_secrets(ui, state, asked.store, asked.generation);
 }
 
 /// What the status line says once a reload has landed, in place of the count
@@ -4044,8 +4108,8 @@ fn reload_after(ui: &AppWindow, state: &Shared, after: AfterReload) {
 ///
 /// The caller's own confirmation wins over the degraded notice, which is the
 /// order these two arrived in when the caller set its status on the line after
-/// `reload`. Split from [`reload_after`], whose landing only an event loop
-/// runs, so that a test can read the line without one.
+/// `reload`. Kept apart from [`land_reload`], which needs a window and a read
+/// of the store, so that a test can read the line with neither.
 fn landed_status(status: Option<String>, mut degraded: Vec<&'static str>) -> Option<String> {
     if let Some(status) = status {
         return Some(display::text(&status));
@@ -4318,7 +4382,15 @@ fn signature_verdict(known: &[CertSummary], result: &ops::VerifyResult) -> (Stri
 /// because naming their type would put a `sequoia_openpgp` type in this crate
 /// and the GUI is deliberately free of them. The extra read is the cost of
 /// that boundary, and it is paid on a worker thread where nothing waits for it.
-fn survey_agent_and_secrets(ui: &AppWindow, state: &Shared, store: std::sync::Arc<Store>) {
+///
+/// `generation` is that of the reload this follows, which [`land_survey`]
+/// holds against the newest.
+fn survey_agent_and_secrets(
+    ui: &AppWindow,
+    state: &Shared,
+    store: std::sync::Arc<Store>,
+    generation: u64,
+) {
     let (ui_weak, state) = (ui.as_weak(), state.clone());
     std::thread::spawn(move || {
         let certs = store.certs().unwrap_or_default();
@@ -4335,7 +4407,7 @@ fn survey_agent_and_secrets(ui: &AppWindow, state: &Shared, store: std::sync::Ar
 
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = ui_weak.upgrade() {
-                land_survey(&ui, &state, &agent_keys, &damaged);
+                land_survey(&ui, &state, generation, &agent_keys, &damaged);
             }
         });
     });
@@ -4343,13 +4415,15 @@ fn survey_agent_and_secrets(ui: &AppWindow, state: &Shared, store: std::sync::Ar
 
 /// Put what [`survey_agent_and_secrets`] found on screen: `agent_keys`, what
 /// the agent holds of each certificate by fingerprint, and `damaged`, the
-/// secret key files that would not parse.
+/// secret key files that would not parse, for the survey that followed the
+/// reload `generation`.
 ///
 /// Split from the survey, which asks the agent, so that a test can land what a
 /// survey would find without one.
 fn land_survey(
     ui: &AppWindow,
     state: &Shared,
+    generation: u64,
     agent_keys: &std::collections::HashMap<String, rpgp_core::agent::AgentHolds>,
     damaged: &[String],
 ) {
@@ -4409,21 +4483,35 @@ fn land_survey(
         }
     }
 
-    // Last, so it survives: apply_filter above always overwrites the status
-    // with its own count. A secret key file that will not parse is skipped
-    // rather than allowed to hide every other key, but skipping silently
-    // would turn "my key is gone" into a mystery.
-    if !damaged.is_empty() {
-        ui.set_status(
-            format!(
+    // A secret key file that will not parse is skipped rather than allowed to
+    // hide every other key, but skipping silently would turn "my key is gone"
+    // into a mystery, so the status line names it.
+    //
+    // Added to what the line says rather than written over it. That is most
+    // often the confirmation of the operation that caused the reload, which
+    // this used to replace a few milliseconds after it went up: "Key revoked.
+    // Publish or send the certificate so others stop using it.", or Import's
+    // word that a revoked key's secret key file, the very file that will not
+    // parse, could not be updated to match. When the agent's timeouts kept the
+    // survey waiting, it replaced whatever had been written there since.
+    //
+    // And said only by the survey of the newest reload. One whose reload has
+    // been overtaken would add it to the line the newer reload leaves, whose
+    // own survey adds it again, or to that reload's error; the newer survey
+    // finds the damaged files as they are by then.
+    if !damaged.is_empty() && lock(state).reload_generation == generation {
+        let mut status = ui.get_status().to_string();
+        append_sentence(
+            &mut status,
+            &format!(
                 "{} secret key file{} could not be read and {} skipped: {}",
                 damaged.len(),
                 if damaged.len() == 1 { "" } else { "s" },
                 if damaged.len() == 1 { "was" } else { "were" },
                 damaged.join(", ")
-            )
-            .into(),
+            ),
         );
+        ui.set_status(status.into());
     }
 }
 
@@ -5054,6 +5142,7 @@ mod tests {
             all: Vec::new(),
             shown: Vec::new(),
             reload_generation: 0,
+            pending_status: None,
             selection_generation: 0,
             filter: String::new(),
             scope: Scope::All,
@@ -6265,6 +6354,17 @@ mod tests {
         std::collections::HashMap::from([(fingerprint.to_string(), holds)])
     }
 
+    /// Land what the survey after the newest reload found in the agent, with
+    /// every secret key file reading.
+    fn land_agent_survey(
+        ui: &AppWindow,
+        state: &Shared,
+        agent_keys: &std::collections::HashMap<String, rpgp_core::agent::AgentHolds>,
+    ) {
+        let generation = lock(state).reload_generation;
+        land_survey(ui, state, generation, agent_keys, &[]);
+    }
+
     /// The certifiers the dialog lists once opened on `fingerprint`'s row.
     fn certifiers_for(ui: &AppWindow, state: &Shared, fingerprint: &str) -> Vec<(String, String)> {
         click_row(ui, state, fingerprint);
@@ -6312,7 +6412,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        land_survey(&ui, &state, &survey, &[]);
+        land_agent_survey(&ui, &state, &survey);
         assert!(
             ui.get_can_certify(),
             "the survey found a primary in the agent and left Certify closed"
@@ -6350,7 +6450,7 @@ mod tests {
             decrypt: agent_key(Some("D2760001240100000006")),
             certify: None,
         };
-        land_survey(&ui, &state, &found(&card_fp, subkeys_only.clone()), &[]);
+        land_agent_survey(&ui, &state, &found(&card_fp, subkeys_only.clone()));
         assert!(
             !ui.get_can_certify(),
             "a card without the primary key opened Certify"
@@ -6364,7 +6464,7 @@ mod tests {
         store.insert_secret(&local).unwrap();
         lock(&state).all = read_store(&store).expect("a healthy store reads").all;
         apply_filter(&ui, &state);
-        land_survey(&ui, &state, &found(&card_fp, subkeys_only), &[]);
+        land_agent_survey(&ui, &state, &found(&card_fp, subkeys_only));
         assert!(ui.get_can_certify(), "premise: the local key can certify");
         assert_eq!(
             certifiers_for(&ui, &state, &bob_fp),
@@ -6407,7 +6507,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        land_survey(&ui, &state, &survey, &[]);
+        land_agent_survey(&ui, &state, &survey);
         assert!(ui.get_can_certify());
 
         assert!(
@@ -6471,7 +6571,7 @@ mod tests {
                 },
             ),
         ]);
-        land_survey(&ui, &state, &survey, &[]);
+        land_agent_survey(&ui, &state, &survey);
 
         let mut listed = certifiers_for(&ui, &state, &bob_fp);
         listed.sort();
@@ -7256,10 +7356,11 @@ mod tests {
     /// Left where they are, they read the confirmation beside another
     /// certificate, which is why it has to name the one it was about.
     ///
-    /// The one test here that runs an event loop, because a reload's result
-    /// only lands through one. The testing backend gives an event loop to a
-    /// single thread per process, and a second test setting one up would
-    /// panic, so the others drive the two halves of an operation directly.
+    /// The one test here that runs an event loop, which is how a reload's
+    /// result reaches the window. The testing backend gives an event loop to
+    /// a single thread per process, and a second test setting one up would
+    /// panic, so the others drive the two halves of an operation directly,
+    /// and land a reload by hand, with `land_reload`, where they need one.
     ///
     /// A reload that lands starts the agent survey on a thread of its own. It
     /// used to ask whichever agent `GNUPGHOME` named, the developer's own when
@@ -7313,6 +7414,167 @@ mod tests {
         assert!(
             status.starts_with("SHA-1 accepted for Alice <alice@example.org>."),
             "the confirmation, shown beside Bob, should say it was about Alice: {status}"
+        );
+    }
+
+    /// A reload overtaken by a newer one hands the confirmation it carries to
+    /// that one, which shows it when it lands. A newer confirmation replaces
+    /// one still waiting, and a read that fails shows its error and drops the
+    /// confirmation rather than leave it for some later reload.
+    ///
+    /// A mutation asks for its reload once its worker is done and the window
+    /// is no longer busy, so Refresh can be pressed while that read is in
+    /// flight. The overtaken reload showed nothing, its confirmation included,
+    /// and the newer read's count replaced "Key revoked. Publish or send the
+    /// certificate so others stop using it." before it was ever shown. The
+    /// reads land here by hand, in the order a race between them gives.
+    #[test]
+    fn a_reload_overtaken_by_another_hands_its_confirmation_on() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        store
+            .insert_secret(&generated("Me <me@example.org>").cert)
+            .unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let count = ui.get_status();
+        assert_eq!(count, "1 certificate(s), 1 with a secret key", "premise");
+
+        const REVOKED: &str =
+            "Key revoked. Publish or send the certificate so others stop using it.";
+        const DELETED: &str = "Key and secret key deleted. The revocation certificate was kept.";
+        const IMPORTED: &str = "Imported 1 certificate(s)";
+        let confirming = |status: &str| AfterReload {
+            status: Some(status.to_string()),
+            ..Default::default()
+        };
+        let land = |asked: AskedReload| {
+            let loaded = read_store(&asked.store);
+            land_reload(&ui, &state, asked, loaded);
+        };
+
+        // The revocation's reload, overtaken by Refresh's.
+        let revoked = ask_for_reload(&ui, &state, confirming(REVOKED));
+        let refreshed = ask_for_reload(&ui, &state, AfterReload::default());
+        land(revoked);
+        assert_eq!(
+            ui.get_status(),
+            count,
+            "a reload that was overtaken wrote to the status line"
+        );
+        land(refreshed);
+        assert_eq!(
+            ui.get_status(),
+            REVOKED,
+            "the confirmation of the reload that was overtaken was dropped"
+        );
+
+        // A delete's, overtaken by an import's.
+        let deleted = ask_for_reload(&ui, &state, confirming(DELETED));
+        let imported = ask_for_reload(&ui, &state, confirming(IMPORTED));
+        land(deleted);
+        land(imported);
+        assert_eq!(
+            ui.get_status(),
+            IMPORTED,
+            "the newer confirmation should replace the one still waiting"
+        );
+
+        // A revocation's, whose read fails.
+        let failed = ask_for_reload(&ui, &state, confirming(REVOKED));
+        land_reload(&ui, &state, failed, Err("the disk went away".to_string()));
+        assert_eq!(
+            ui.get_status(),
+            "Cannot read the certificate store: the disk went away"
+        );
+        land(ask_for_reload(&ui, &state, AfterReload::default()));
+        assert_eq!(
+            ui.get_status(),
+            count,
+            "a confirmation whose read failed turned up on a later reload"
+        );
+    }
+
+    /// A secret key file that will not parse is named on the status line
+    /// after the confirmation of the operation that caused the reload, rather
+    /// than in its place, and only by the survey of the newest reload.
+    ///
+    /// The survey's notice replaced the confirmation a few milliseconds after
+    /// it went up. That hit hardest in the emergency a revocation certificate
+    /// is kept for, where the key's own secret key file no longer reads: the
+    /// status line said the key was revoked, that its secret key file could
+    /// not be updated to match and that the certificate should be published,
+    /// and the next moment only that a file had been skipped.
+    #[test]
+    fn a_damaged_secret_key_file_is_named_after_the_confirmation_not_over_it() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let key = generated("Me <me@example.org>");
+        store.insert_secret(&key.cert).unwrap();
+        let revocation = dir.path().join("me.rev");
+        std::fs::write(&revocation, revoke::armor(&key.revocation).unwrap()).unwrap();
+        // Cut short, as rpgp-core's own test of this case cuts it.
+        let name = format!("{}.pgp", key.cert.fingerprint().to_hex());
+        let secret = dir.path().join("secrets").join(&name);
+        let whole = std::fs::read(&secret).unwrap();
+        std::fs::write(&secret, &whole[..40]).unwrap();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let store = lock(&state).store.clone();
+        assert_eq!(
+            store.damaged_secret_files(),
+            [secret],
+            "premise: the survey finds the file damaged"
+        );
+        // Named as the survey names it.
+        let damaged = [name.clone()];
+        let notice = format!("1 secret key file could not be read and was skipped: {name}");
+        let nothing_in_the_agent = std::collections::HashMap::new();
+
+        // Import asks first, the key being the user's, and the answer stores
+        // the revocation and asks for a reload.
+        let file = match import_into(&store, &revocation, &HashSet::new()) {
+            Ok(Imported::Confirm(file)) => file,
+            other => panic!("expected to be asked about the user's own key: {other:?}"),
+        };
+        let asked = ask_for_reload(&ui, &state, store_revocations(&store, &file).unwrap());
+        let imported = asked.generation;
+        land_reload(&ui, &state, asked, read_store(&store));
+        let confirmation = ui.get_status();
+        assert!(
+            confirmation.contains("could not be updated to match")
+                && confirmation
+                    .ends_with("Publish or send the certificate so others stop using it."),
+            "premise: {confirmation}"
+        );
+        land_survey(&ui, &state, imported, &nothing_in_the_agent, &damaged);
+        assert_eq!(
+            ui.get_status(),
+            format!("{confirmation} {notice}"),
+            "the damaged file should be named after the confirmation"
+        );
+
+        // Refresh, and the import's survey landing only after it was pressed.
+        let refreshed = ask_for_reload(&ui, &state, AfterReload::default());
+        let newest = refreshed.generation;
+        let before = ui.get_status();
+        land_survey(&ui, &state, imported, &nothing_in_the_agent, &damaged);
+        assert_eq!(
+            ui.get_status(),
+            before,
+            "the survey of a reload that was overtaken wrote to the status line"
+        );
+        land_reload(&ui, &state, refreshed, read_store(&store));
+        let count = ui.get_status();
+        land_survey(&ui, &state, newest, &nothing_in_the_agent, &damaged);
+        land_survey(&ui, &state, imported, &nothing_in_the_agent, &damaged);
+        assert_eq!(
+            ui.get_status(),
+            format!("{count}. {notice}"),
+            "the damaged file should be named once, after the count"
         );
     }
 
@@ -8684,7 +8946,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        land_survey(&ui, &state, &survey, &[]);
+        land_agent_survey(&ui, &state, &survey);
         assert_eq!(row_for(&state, &card).card_serial, "0006 18132963");
     }
 }
