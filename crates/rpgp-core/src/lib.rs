@@ -18,7 +18,7 @@ pub mod sha1;
 pub mod store;
 pub mod wot;
 
-pub use cert::{CertSummary, Validity};
+pub use cert::{CertSummary, Needle, Validity};
 pub use error::{Error, Result};
 pub use sha1::Sha1Policy;
 pub use store::Store;

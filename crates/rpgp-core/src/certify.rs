@@ -819,7 +819,7 @@ pub fn certifications(store: &Store, cert: &Cert) -> Result<Vec<Certification>> 
                 // packet anyone could write earned a real identity in the list
                 // and a "(you)" badge with a withdraw affordance beside it.
                 let resolved = certifiers.entry(handle.clone()).or_insert_with(|| {
-                    let certifier = store.lookup(&handle).ok()?;
+                    let certifier = store.lookup_ref(&handle).ok()?;
                     let policy = policy();
                     let subkeys = certifier
                         .with_policy(&policy, None)
@@ -926,7 +926,7 @@ pub fn certifications(store: &Store, cert: &Cert) -> Result<Vec<Certification>> 
     }
     for (fingerprint, indices) in judged {
         let mut verdicts: Vec<(&Signature, Standing)> = Vec::new();
-        if let Ok(certifier) = store.lookup(&fingerprint) {
+        if let Ok(certifier) = store.lookup_ref(&fingerprint) {
             let mut uas: Vec<usize> = indices.iter().map(|&i| sources[i].0).collect();
             uas.sort_unstable();
             uas.dedup();

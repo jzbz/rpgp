@@ -69,7 +69,7 @@ fn time<T>(samples: usize, mut f: impl FnMut() -> T) -> Timing {
 fn report(label: &str, n: usize, t: Timing) {
     let per = t.min.as_secs_f64() * 1e6 / n as f64;
     println!(
-        "  {label:<26} min {:>9.2?}   median {:>9.2?}   {per:>8.1} us/cert",
+        "  {label:<30} min {:>9.2?}   median {:>9.2?}   {per:>8.1} us/cert",
         t.min, t.median
     );
 }
@@ -126,25 +126,28 @@ fn main() {
             certs.len()
         );
 
-        // The cold pass: a fresh handle with an empty cache, which is what
-        // startup actually pays. Separate from store.certs() below, which
-        // measures the warm cache the rest of the session sees, checked file
-        // by file against the disk.
+        // The cold pass: a fresh handle on the fixture's own directories, with
+        // an empty cache, which is what startup and every delete-then-reopen
+        // pay. Separate from store.certs() below, which measures the warm
+        // cache the rest of the session sees, checked file by file against
+        // the disk.
         //
-        // Added to settle a review claim that Store::open should call cert-d's
-        // prefetch_all to parallelise this. Measured at n=1000 and n=3000 over
-        // 25 samples, it is consistently a shade slower, not faster: cert-d
-        // already reads the files in parallel, and the canonicalisation left
-        // over is ~1.5 us per certificate. Do not add it back without a
-        // measurement that says otherwise on this line.
+        // Through reopen, so that it cannot drift from the fixture's paths.
+        // It used to open a certs.d beside the fixture's pgp.cert.d, which
+        // Store::open created empty, so it timed opening an empty store: a
+        // fixed cost that fell per certificate as n grew. The conclusion once
+        // drawn from it, that cert-d's prefetch_all made this no faster,
+        // compared two runs that loaded nothing. Checked once here, untimed,
+        // so that an empty store cannot be measured again unnoticed.
+        assert_eq!(
+            store.reopen().unwrap().certs().unwrap().len(),
+            certs.len(),
+            "the cold pass must read the fixture's store"
+        );
         report(
             "cold open + certs()",
             n,
-            time(samples, || {
-                let fresh =
-                    Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
-                fresh.certs().unwrap()
-            }),
+            time(samples, || store.reopen().unwrap().certs().unwrap()),
         );
         report("store.certs()", n, time(samples, || store.certs().unwrap()));
         report(
@@ -176,9 +179,11 @@ fn main() {
         );
 
         // The sequence reload actually performs, so the parts can be weighed
-        // against the whole rather than only against each other.
+        // against the whole rather than only against each other. It reads the
+        // warm cache, as a reload does except after startup or a delete, so it
+        // covers the lines after the cold pass and not that pass itself.
         report(
-            "= reload core (all above)",
+            "= reload core (all after cold)",
             n,
             time(samples, || {
                 let certs = store.certs().unwrap();

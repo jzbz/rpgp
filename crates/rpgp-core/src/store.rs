@@ -58,7 +58,7 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use sequoia_cert_store::store::StoreError;
@@ -92,13 +92,17 @@ pub struct Store {
     /// sharing those — which two secrets directories in one parent do — share
     /// the lock too.
     lock_path: PathBuf,
+    /// Whether [`Store::certs`] has had cert-d parse the whole store on its
+    /// threads yet, which it does once per handle; see there.
+    prefetched: AtomicBool,
 }
 
 /// A certificate in the store, borrowed rather than copied.
 ///
 /// Behaves as a `&Cert` through [`Deref`](std::ops::Deref): every method a
 /// caller used on the owned `Cert` still resolves. It exists so [`Store::certs`]
-/// can hand back the whole keyring without deep-copying it.
+/// can hand back the whole keyring without deep-copying it, and
+/// [`Store::lookup_ref`] one certificate.
 #[derive(Clone)]
 pub struct CertRef(Arc<LazyCert<'static>>);
 
@@ -106,12 +110,13 @@ impl std::ops::Deref for CertRef {
     type Target = Cert;
 
     fn deref(&self) -> &Cert {
-        // Infallible here: `Store::certs` resolves every LazyCert before
-        // wrapping it, and `to_cert` memoises that result, so the only way to
-        // hold a CertRef is to have already parsed successfully.
+        // Infallible here: `Store::certs` and `Store::lookup_ref` resolve
+        // every LazyCert before wrapping it, and `to_cert` memoises that
+        // result, so the only way to hold a CertRef is to have already parsed
+        // successfully.
         self.0
             .to_cert()
-            .expect("CertRef holds a LazyCert that Store::certs already resolved")
+            .expect("CertRef holds a LazyCert that the store already resolved")
     }
 }
 
@@ -255,6 +260,7 @@ impl Store {
             sha1_path: secrets_dir.with_file_name("sha1-accepted"),
             revocations_dir,
             lock_path,
+            prefetched: AtomicBool::new(false),
         })
     }
 
@@ -449,7 +455,7 @@ impl Store {
     pub fn sha1_policy(&self) -> Result<crate::Sha1Policy> {
         let mut policy = crate::Sha1Policy::strict();
         for fingerprint in self.sha1_accepted()? {
-            if let Ok(cert) = self.lookup(&fingerprint)
+            if let Ok(cert) = self.lookup_ref(&fingerprint)
                 && cert
                     .fingerprint()
                     .to_hex()
@@ -650,11 +656,35 @@ impl Store {
     /// differ, and drops the copy when the file has gone. That costs an open
     /// and a stat per certificate: on Linux, `benches/reload.rs` puts it at
     /// about a microsecond and a half each, 7ms at five thousand certificates
-    /// against the 127ms the whole of a reload's core takes there. It is what
+    /// against the 100ms the whole of a reload's core takes there. It is what
     /// makes a reload a read of the disk rather than of this handle's memory,
     /// without the full parse of every certificate that reopening the store
     /// would cost.
+    ///
+    /// That full parse is still paid once per handle: at startup, and after
+    /// every delete, which swaps in [`Store::reopen`]'s handle. cert-d's own
+    /// listing reads the files on its threads but leaves each one unparsed,
+    /// and the `to_cert` below then parsed them here, one after another. So
+    /// the first listing of a handle asks cert-d to parse them all on its
+    /// threads first. Measured by `benches/reload.rs` on thirty-two cores, a
+    /// first listing of five thousand certificates took 174 to 185ms parsed
+    /// here and takes 96 to 97ms parsed there; of a thousand, 37 to 41ms and
+    /// 21ms.
+    ///
+    /// The web of trust and the summaries still verify signatures one at a
+    /// time, since sequoia verifies them only when a policy is applied, not
+    /// when it parses.
+    ///
+    /// Only the first, because asking walks the whole directory again even
+    /// when every certificate is already parsed, which would add a second
+    /// walk to every later reload for nothing. A certificate that changes on
+    /// disk after that is parsed here again, alone, as before. One whose file
+    /// does not parse is passed over by the prefetch, and fails this call
+    /// below as it did without it.
     pub fn certs(&self) -> Result<Vec<CertRef>> {
+        if !self.prefetched.swap(true, Ordering::Relaxed) {
+            self.certs.prefetch_all();
+        }
         let mut out = Vec::new();
         for listed in self.certs.certs() {
             let lazy = match self.certs.lookup_by_cert_fpr(&listed.fingerprint()) {
@@ -681,7 +711,24 @@ impl Store {
     }
 
     /// Look a certificate up by full fingerprint or key ID, as typed by a user.
+    ///
+    /// A copy of the store's, for a caller that goes on to change it or has to
+    /// own it. One that only reads it wants [`Store::lookup_ref`].
     pub fn lookup(&self, handle: &str) -> Result<Cert> {
+        Ok((*self.lookup_ref(handle)?).clone())
+    }
+
+    /// [`Store::lookup`], borrowed rather than copied, as [`Store::certs`]
+    /// hands certificates out.
+    ///
+    /// The copy is of every signature the certificate carries, and the
+    /// certifications in the details pane look up every certifier twice, once
+    /// to verify and once to judge what verified. Copied, a certifier others
+    /// had certified a hundred times was a hundred signatures copied and
+    /// thrown away, twice over. Listing a key certified by three hundred
+    /// others in the store, each certified forty times itself, took 25ms with
+    /// the copies and 11ms without; at 150 times each, 49ms and 12ms.
+    pub fn lookup_ref(&self, handle: &str) -> Result<CertRef> {
         let handle: sequoia_openpgp::KeyHandle = handle
             .parse()
             .map_err(|_| Error::invalid(format!("{handle} is not a fingerprint or key ID")))?;
@@ -708,7 +755,10 @@ impl Store {
             .cloned()
             .or_else(|| found.into_iter().next())
             .ok_or_else(|| Error::NoSuchCert(handle.to_string()))?;
-        Ok(chosen.to_cert()?.clone())
+        // Resolved before it is wrapped, which is what makes CertRef's Deref
+        // infallible.
+        chosen.to_cert()?;
+        Ok(CertRef(chosen))
     }
 
     /// Every certificate in the store that carries the key a handle names.

@@ -440,18 +440,76 @@ impl CertSummary {
         out
     }
 
-    /// True when `needle` (lowercased by the caller) appears in any field a
-    /// user would plausibly search by.
-    pub fn matches(&self, needle: &str) -> bool {
-        if needle.is_empty() {
-            return true;
-        }
-        self.fingerprint.to_lowercase().contains(needle)
-            || self.key_id.to_lowercase().contains(needle)
-            || self
-                .user_ids
-                .iter()
-                .any(|u| u.to_lowercase().contains(needle))
+    /// True when `needle` appears in any field a user would plausibly search
+    /// by.
+    pub fn matches(&self, needle: &Needle) -> bool {
+        needle.is_empty()
+            || needle.in_hex(&self.fingerprint)
+            || needle.in_hex(&self.key_id)
+            || self.user_ids.iter().any(|u| needle.in_text(u))
+    }
+}
+
+/// What was typed into a search box, made ready once to be matched against
+/// every certificate.
+///
+/// A fingerprint is searched for the way people have one to hand: grouped in
+/// fours, as the details pane and `gpg --fingerprint` print it, with gpg's
+/// double space halfway, or a key ID with `0x` in front. Both used to find
+/// nothing, since the fingerprints searched are one unbroken run of hex, and
+/// the list said "Nothing matches this search" of a certificate that was in
+/// it. Made once per search rather than per certificate, since every
+/// keystroke matches the whole keyring.
+#[derive(Debug, Clone)]
+pub struct Needle {
+    /// What was typed, trimmed and lowercased, which is how every field is
+    /// compared: a pasted fingerprint or address often brings a space or a
+    /// line break with it.
+    text: String,
+    /// The same without its spaces and the `0x`, where what was typed is hex
+    /// with `0x` in front, or hex in groups of four or more but for the last
+    /// group, which can be shorter, so that a fingerprint typed a group at a
+    /// time goes on finding its certificate between one group and the next.
+    /// Not for smaller groups: "a b" or "be ef" is more likely the start of a
+    /// name than a piece of a fingerprint, and would otherwise match every
+    /// fingerprint holding "ab" or "beef" as well. Nothing where there was no
+    /// space and no `0x` to take out, since `text` is then the same.
+    hex: Option<String>,
+}
+
+impl Needle {
+    /// `typed`, exactly as it stands in the search box.
+    pub fn new(typed: &str) -> Self {
+        let text = typed.trim().to_lowercase();
+        let unprefixed = text.strip_prefix("0x");
+        let groups: Vec<&str> = unprefixed.unwrap_or(&text).split_whitespace().collect();
+        let grouped = groups.split_last().is_some_and(|(_, before)| {
+            (unprefixed.is_some() || !before.is_empty())
+                && before.iter().all(|group| group.len() >= 4)
+                && groups
+                    .iter()
+                    .all(|group| group.chars().all(|c| c.is_ascii_hexdigit()))
+        });
+        let hex = grouped.then(|| groups.concat());
+        Needle { text, hex }
+    }
+
+    /// Whether nothing was typed, which matches everything.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// Whether this is part of `text`, a user ID or a part of one, in any
+    /// case.
+    pub fn in_text(&self, text: &str) -> bool {
+        text.to_lowercase().contains(&self.text)
+    }
+
+    /// Whether this is part of `hex`, a fingerprint or key ID, in any case,
+    /// whether it was typed grouped or not.
+    pub fn in_hex(&self, hex: &str) -> bool {
+        let hex = hex.to_lowercase();
+        hex.contains(&self.text) || self.hex.as_ref().is_some_and(|h| hex.contains(h))
     }
 }
 
@@ -791,12 +849,12 @@ mod tests {
             "Old Maintainer <maint@example.org>"
         );
         assert!(
-            summary.matches("maint") && summary.matches("example.org"),
+            summary.matches(&Needle::new("maint")) && summary.matches(&Needle::new("example.org")),
             "the row has to be findable by the name it shows: {:?}",
             summary.user_ids
         );
         assert!(
-            !summary.matches("mallory"),
+            !summary.matches(&Needle::new("mallory")),
             "and a name the key never signed is not the key's: {:?}",
             summary.user_ids
         );
@@ -813,5 +871,56 @@ mod tests {
         assert_eq!(summary.validity, Validity::Unusable);
         assert_eq!(summary.user_ids.len(), 2);
         assert_ne!(summary.primary_user_id, "(no user ID)");
+    }
+
+    /// A fingerprint found the way the app and gpg print it, grouped in fours,
+    /// finds its certificate, as does a key ID written with `0x` and anything
+    /// pasted with a line break after it.
+    ///
+    /// Each was compared as typed against a fingerprint held as one unbroken
+    /// run of hex, and so matched nothing: the list said "Nothing matches
+    /// this search" beside a certificate that was in it.
+    #[test]
+    fn a_fingerprint_is_found_grouped_as_the_app_and_gpg_print_it() {
+        let cert = generate(&KeyGenRequest::new("Alice <alice@example.org>"))
+            .unwrap()
+            .cert;
+        let summary = CertSummary::from_cert(&cert);
+        let grouped = summary.fingerprint_pretty();
+        // `gpg --fingerprint`, which leaves a double space halfway.
+        let groups: Vec<&str> = grouped.split(' ').collect();
+        let (front, back) = groups.split_at(groups.len() / 2);
+        let gpg = format!("{}  {}", front.join(" "), back.join(" "));
+
+        for typed in [
+            grouped.clone(),
+            gpg,
+            grouped.to_lowercase(),
+            groups[..2].join(" "),
+            // Part of the way through typing it, a group at a time.
+            format!("{} {}", groups[0], &groups[1][..1]),
+            format!("0x{}", summary.key_id),
+            format!("0x{}", &summary.key_id[..4]),
+            format!("{}\n", summary.fingerprint),
+            "  alice@example.org ".to_string(),
+        ] {
+            assert!(
+                summary.matches(&Needle::new(&typed)),
+                "{typed:?} should find {}",
+                summary.fingerprint
+            );
+        }
+
+        // Groups too short to be taken for a fingerprint's, and no piece of
+        // the name.
+        let short = format!(
+            "{} {}",
+            &summary.fingerprint[..1],
+            &summary.fingerprint[1..2]
+        );
+        assert!(
+            !summary.matches(&Needle::new(&short)),
+            "{short:?} is two characters apart, not a fingerprint"
+        );
     }
 }

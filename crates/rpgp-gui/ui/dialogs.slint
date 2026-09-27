@@ -1268,7 +1268,10 @@ export component NotepadDialog inherits DialogShell {
     /// Each signer's key ID, drawn beside it.
     in property <[string]> signer-key-ids;
     in property <int> chosen-recipients;
+    /// What the output box shows, which for a long output is only its start.
     in property <string> output;
+    /// Why the output box shows less than Copy copies, when it does.
+    in property <string> output-note;
     in property <[SignatureRow]> signatures;
     in property <string> result;
     in property <int> result-tone;
@@ -1573,6 +1576,14 @@ export component NotepadDialog inherits DialogShell {
                         text: root.output;
                         read-only: true;
                     }
+                    if root.output-note != "": Text {
+                        // Bound, as the banner's lines are, so that it wraps.
+                        width: parent.width;
+                        text: root.output-note;
+                        color: Theme.text-dim;
+                        font-size: Theme.t-sm;
+                        wrap: word-wrap;
+                    }
                 }
             }
         }
@@ -1624,6 +1635,8 @@ export component DetailsDialog inherits DialogShell {
     in property <[UserIdDetailRow]> user-ids;
     in property <[SubkeyRow]> subkeys;
     in property <[CertificationRow]> certifications;
+    /// Those are still being read; see the window's property of that name.
+    in property <bool> certifications-pending: false;
     /// Our own key, so the lifecycle actions apply.
     in property <bool> owned: false;
     callback change-expiry();
@@ -1880,7 +1893,8 @@ export component DetailsDialog inherits DialogShell {
 
         SectionLabel { text: "CERTIFICATIONS"; }
         if root.certifications.length == 0: Text {
-            text: "Nobody has certified this identity.";
+            text: root.certifications-pending
+                ? "Reading certifications…" : "Nobody has certified this identity.";
             color: Theme.text-dim;
             font-size: Theme.t-sm;
         }

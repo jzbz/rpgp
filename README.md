@@ -280,10 +280,12 @@ signing — it simply does not vouch for anyone until you say so. Restoring your
 own backup is the same story: tick Trust root once, and it stays.
 
 The graph is rebuilt on every store reload rather than cached. At five thousand
-certificates that rebuild is about 53ms of a 127ms read — a caching layer would
-have to be invalidated by every certification, revocation and trust-root change,
-and taking the read off the event loop was the cheaper answer to the same
-complaint. A keyring well past that size will still want the cache.
+certificates that rebuild is about 24ms of a 100ms read; a certificate that is
+not a root and that nobody has certified is not searched for a path, since none
+can reach it. A caching layer would have to be invalidated by every
+certification, revocation and trust-root change, and taking the read off the
+event loop was the cheaper answer to the same complaint. A keyring well past
+that size will still want the cache.
 
 ## Encrypting with a password
 
@@ -822,7 +824,9 @@ The mark is a request, and it has limits:
 - Text selected in the notepad's output and copied with Ctrl+C goes through
   Slint's own clipboard, which marks nothing, and on Linux selecting it with
   the mouse puts it in the primary selection as well. The Copy button is the
-  way to copy a decrypted message.
+  way to copy a decrypted message, and the only way to copy all of a long one:
+  the output box shows the first 8 KiB or 500 lines, less on a screen scaled
+  above 100%, and says so when there is more.
 - Nothing clears the clipboard after a while. A clipboard manager records a
   copy the moment it is made, so a timer would not keep a message out of its
   history; the mark is what does that.

@@ -178,6 +178,9 @@ export component AppWindow inherits Window {
 
     // --- Certify / trust --------------------------------------------------
     in property <[CertificationRow]> detail-certifications;
+    /// The selected row's certifications are still being read, on a worker,
+    /// so an empty list says nothing yet.
+    in property <bool> certifications-pending: false;
     in property <bool> can-certify: false;
     in-out property <bool> certify-open: false;
     in property <string> certify-target: "";
@@ -218,7 +221,14 @@ export component AppWindow inherits Window {
     // Reuses the Sign / Encrypt recipient and signer models rather than
     // duplicating them; both are built from the same store contents.
     in-out property <bool> notepad-open: false;
+    /// The whole of a run's output, which is what Copy copies. Not shown:
+    /// see np-output-shown.
     in property <string> np-output: "";
+    /// As much of np-output as the output box is given to lay out, which is
+    /// all of it unless it is long; `show_np_output` in lib.rs says why.
+    in property <string> np-output-shown: "";
+    /// Said under the output box when it shows only the start.
+    in property <string> np-output-note: "";
     in property <[SignatureRow]> np-signatures;
     in property <string> np-result: "";
     in property <int> np-tone: 0;
@@ -794,7 +804,8 @@ export component AppWindow inherits Window {
                         }
 
                         if root.detail-certifications.length == 0: Text {
-                            text: "No certifications.";
+                            text: root.certifications-pending
+                                ? "Reading certifications…" : "No certifications.";
                             color: Theme.text-dim;
                             font-size: Theme.t-sm;
                         }
@@ -963,6 +974,7 @@ export component AppWindow inherits Window {
         user-ids: root.detail-user-ids;
         subkeys: root.detail-subkeys;
         certifications: root.detail-certifications;
+        certifications-pending: root.certifications-pending;
         owned: root.detail.has-secret;
         dismissed => { root.details-open = false; }
         change-expiry => { root.details-open = false; root.open-expiry(); }
@@ -1008,7 +1020,8 @@ export component AppWindow inherits Window {
         signers: root.se-signers;
         signer-key-ids: root.se-signer-key-ids;
         chosen-recipients: root.se-selected-count;
-        output: root.np-output;
+        output: root.np-output-shown;
+        output-note: root.np-output-note;
         signatures: root.np-signatures;
         result: root.np-result;
         result-tone: root.np-tone;

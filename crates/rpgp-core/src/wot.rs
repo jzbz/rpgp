@@ -50,9 +50,16 @@ impl Authentication {
 
 /// Authenticate every certificate in `certs` against `roots`.
 ///
-/// Returns the best result across each certificate's user IDs, keyed by
-/// uppercase fingerprint. The network is built once for the whole set because
-/// that is the expensive part; asking it about one more binding is cheap.
+/// Returns a verdict for each binding a path could reach, keyed by uppercase
+/// fingerprint and user ID; see [`for_user_id`], which answers Unknown for
+/// every other.
+///
+/// Building the network is the cheap part: it indexes the certificates and
+/// computes nothing. The work is in asking it about each binding, which
+/// validates the certificate under the policy and summarises it several times
+/// over before the search can even find that nothing certifies it. This used
+/// to say the opposite, and asked about every binding in the store; see the
+/// loop below for the ones it now leaves out.
 ///
 /// A failure to build the network is reported as "nothing is authenticated"
 /// rather than as an error: an unusable trust graph should grey out the
@@ -92,6 +99,33 @@ where
     let mut result: HashMap<(String, String), Authentication> = HashMap::new();
     for cert in certs {
         let fingerprint = cert.fingerprint();
+        // Not asked about at all, a certificate that is not a root and that
+        // nobody else has certified on any of its user IDs. A path to one of
+        // its bindings has to start at a root and reach the certificate
+        // through someone else's certification of it, and sequoia-wot finds
+        // those only among the third-party certifications on its user IDs, so
+        // the answer is Unknown before it is asked. In a typical keyring that
+        // is most certificates, and asking anyway was most of what this
+        // function cost: at five thousand certificates with one user ID
+        // each, one in ten certified, `benches/reload.rs` measures 59 to 62ms
+        // asking about every binding and 23 to 24ms leaving these out, and
+        // review measured 690ms against 130ms with three user IDs each, since
+        // each question validates the whole certificate again.
+        //
+        // Per certificate, not per user ID: a trust signature on one of a
+        // certificate's user IDs makes it an introducer, whose own
+        // self-signature then authenticates its other user IDs, which carry
+        // no certification of their own. And only as sound as what
+        // sequoia-wot reads: a later version that took delegations from
+        // direct-key signatures as well would find paths to certificates this
+        // leaves out, so check `redges` in its store.rs when upgrading it.
+        if !roots.contains(&fingerprint)
+            && cert
+                .userids()
+                .all(|ua| ua.certifications().next().is_none())
+        {
+            continue;
+        }
         let key = fingerprint.to_hex().to_uppercase();
         for ua in cert.userids() {
             let paths = network.authenticate(
@@ -372,6 +406,72 @@ mod tests {
     fn a_plain_certification_does_not_make_an_introducer() {
         let distant = introduced(|request| request.depth = 0);
         assert_eq!(distant, Authentication::Unknown);
+    }
+
+    /// A certificate that is not a root and that nobody has certified is not
+    /// searched for a path at all, and an introducer's other user IDs, which
+    /// nobody certified either, still authenticate through it.
+    ///
+    /// Asking sequoia-wot about every binding in the store, when most can
+    /// have no path, was most of what a reload spent on the web of trust.
+    /// The second half is what leaving them out must not break: a trust
+    /// signature on one of a certificate's user IDs makes it an introducer,
+    /// whose own self-signature then vouches for its other user IDs, so the
+    /// test is of the whole certificate, not of each user ID alone.
+    #[test]
+    fn only_bindings_a_path_can_reach_are_searched() {
+        let (_dir, store) = scratch();
+        let me = generate(&KeyGenRequest::new("Me <me@example.org>"))
+            .unwrap()
+            .cert;
+        let stranger = generate(&KeyGenRequest::new("Stranger <them@example.org>"))
+            .unwrap()
+            .cert;
+        let introducer = generate(&KeyGenRequest::new("Work <work@example.org>"))
+            .unwrap()
+            .cert;
+        // The second user ID is added in a store of its own, as in
+        // a_verdict_belongs_to_one_identity_not_to_the_certificate, so that
+        // the introducer's secret key is not in the store under test.
+        let (_their_dir, their_store) = scratch();
+        their_store.insert_secret(&introducer).unwrap();
+        let introducer = crate::lifecycle::add_user_id(
+            &their_store,
+            &introducer.fingerprint().to_hex(),
+            "Home <home@example.org>",
+            None,
+        )
+        .unwrap();
+        store.insert_secret(&me).unwrap();
+        store.insert(&stranger).unwrap();
+        store.insert(&introducer).unwrap();
+
+        let mut request =
+            CertifyRequest::new(me.fingerprint().to_hex(), introducer.fingerprint().to_hex());
+        request.user_ids = vec!["Work <work@example.org>".to_string()];
+        request.depth = 1;
+        request.amount = FULL;
+        certify(&store, &request).unwrap();
+
+        let certs = store.certs().unwrap();
+        let roots: Vec<String> = store.effective_roots().unwrap().into_iter().collect();
+        let authenticated = authenticate_all(&certs, &roots);
+
+        let stranger = stranger.fingerprint().to_hex().to_uppercase();
+        assert!(
+            !authenticated
+                .keys()
+                .any(|(fingerprint, _)| *fingerprint == stranger),
+            "a certificate nobody certified was searched for a path: {authenticated:?}"
+        );
+        let introducer = introducer.fingerprint().to_hex();
+        for user_id in ["Work <work@example.org>", "Home <home@example.org>"] {
+            assert_eq!(
+                for_user_id(&authenticated, &introducer, user_id),
+                Authentication::Full,
+                "{user_id} should authenticate through the introducer's trust signature"
+            );
+        }
     }
 
     #[test]

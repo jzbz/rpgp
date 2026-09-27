@@ -269,7 +269,9 @@ pub(crate) fn has_encryption_key(valid: &ValidCert<'_>) -> bool {
 /// back.
 ///
 /// Generous for anything a person pastes into a text box, and far below what a
-/// compressed layer can expand to.
+/// compressed layer can expand to. A bound on memory, not on what a window can
+/// show: the notepad lays out far less of it than this, and keeps the rest
+/// for Copy.
 pub const MAX_IN_MEMORY_PLAINTEXT: usize = 64 * 1024 * 1024;
 
 /// A sink that refuses to grow past `limit`.

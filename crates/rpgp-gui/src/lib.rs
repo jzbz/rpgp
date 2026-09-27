@@ -18,7 +18,7 @@ use rpgp_core::keygen::{self, KeyGenRequest, KeyType};
 use rpgp_core::lifecycle;
 use rpgp_core::ops::{self, Existing, InputKind, VerifyResult};
 use rpgp_core::revoke::{self, Reason, RevokeRequest};
-use rpgp_core::{CertSummary, Sha1Policy, Store, wot};
+use rpgp_core::{CertSummary, Needle, Sha1Policy, Store, wot};
 use slint::{ModelRc, SharedString, VecModel};
 use zeroize::Zeroizing;
 
@@ -186,6 +186,13 @@ struct State {
     /// they have moved since it was asked for. One that carries a row of its
     /// own to select only gets to select it if they have not.
     selection_generation: u64,
+    /// Which reading of certifications the details pane is waiting for.
+    /// Bumped whenever a row is selected, by the user or by a reload putting
+    /// it back, and checked when the worker reading them comes back, so that
+    /// a slower read for a row the user has since left, or one made before a
+    /// change to the same certificate, is never shown; see
+    /// [`ask_for_certifications`].
+    certifications_generation: u64,
     filter: String,
     scope: Scope,
     sort: Sort,
@@ -513,6 +520,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         reload_generation: 0,
         pending_status: None,
         selection_generation: 0,
+        certifications_generation: 0,
         filter: String::new(),
         scope: Scope::All,
         sort: Sort::MineFirst,
@@ -606,8 +614,7 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
             if ui.get_busy() {
                 return;
             }
-            lock(&state).filter = text.to_lowercase();
-            apply_filter(&ui, &state);
+            refilter(&ui, &state, |state| state.filter = text.to_string());
         }
     });
 
@@ -631,8 +638,7 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
             if ui.get_busy() {
                 return;
             }
-            lock(&state).sort = Sort::from_index(index);
-            apply_filter(&ui, &state);
+            refilter(&ui, &state, |state| state.sort = Sort::from_index(index));
         }
     });
 
@@ -656,8 +662,7 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
             if ui.get_busy() {
                 return;
             }
-            lock(&state).scope = Scope::from_index(index);
-            apply_filter(&ui, &state);
+            refilter(&ui, &state, |state| state.scope = Scope::from_index(index));
         }
     });
 
@@ -702,7 +707,9 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
 
             ui.set_detail(to_row(&summary));
             ui.set_has_selection(true);
-            push_certifications(&ui, &guard, &summary);
+            let asked = ask_for_certifications(&ui, &mut guard, &summary, false);
+            drop(guard);
+            read_certifications_for(&ui, &state, asked);
         }
     });
 
@@ -1590,17 +1597,20 @@ fn run_sign_encrypt(
 /// The one definition of "shown", used both to build the model and to turn a
 /// clicked row back into a recipient. Deriving it twice from the same function
 /// is what stops the two drifting apart when the filter changes.
+///
+/// Matched as the main list's search is, so a fingerprint typed in groups
+/// finds its recipient here too; see [`Needle`].
 fn visible_recipients(state: &State) -> Vec<usize> {
-    let needle = state.se_filter.trim().to_lowercase();
+    let needle = Needle::new(&state.se_filter);
     state
         .se_recipients
         .iter()
         .enumerate()
         .filter(|(_, r)| {
             needle.is_empty()
-                || r.label.to_lowercase().contains(&needle)
-                || r.sublabel.to_lowercase().contains(&needle)
-                || r.fingerprint.to_lowercase().contains(&needle)
+                || needle.in_text(&r.label)
+                || needle.in_text(&r.sublabel)
+                || needle.in_hex(&r.fingerprint)
         })
         .map(|(i, _)| i)
         .collect()
@@ -2412,12 +2422,105 @@ fn own_key_models(keys: &[OwnKey]) -> (ModelRc<SharedString>, ModelRc<SharedStri
     )
 }
 
-/// Load and display the certifications on one certificate.
-fn push_certifications(ui: &AppWindow, state: &State, summary: &CertSummary) {
-    let certifications = match state.store.lookup(&summary.fingerprint) {
-        Ok(cert) => certify::certifications(&state.store, &cert).unwrap_or_default(),
+/// A reading of one certificate's certifications, as the details pane asked
+/// for it.
+struct AskedCertifications {
+    store: Arc<Store>,
+    fingerprint: String,
+    /// Whether the certificate has more than one user ID, so that each row
+    /// names the one it certifies.
+    show_user_id: bool,
+    /// [`State::certifications_generation`] as this reading set it.
+    generation: u64,
+}
+
+/// Start showing `summary`'s certifications in the details pane, until
+/// [`land_certifications`] puts them there: empty it and say they are being
+/// read, or, `again`, keep what it shows of the same certificate.
+///
+/// They are read by a worker, through [`read_certifications_for`], and not
+/// here on the event loop. Reading them looks up every certifier the store
+/// holds and verifies every certification against it, and it used to happen
+/// here, with the state lock held, on every click on a row and after every
+/// reload that put one back. A key certified by three hundred others in the
+/// store, each certified forty to 150 times itself, held the window for 25
+/// to 49ms a click, and 41 to 61ms the first time, before it could repaint.
+/// With its certificates borrowed through [`Store::lookup_ref`] rather than
+/// copied, the same reading now takes 11 to 12ms, on the worker.
+///
+/// On a move to another row the pane is emptied rather than left showing the
+/// last reading, which was of the row before; and Withdraw with it, so that it
+/// cannot be offered for a certification that is not there. When a reload
+/// puts back the row the pane already shows, what it shows is kept until the
+/// new reading lands, since emptying it there too would take the Withdraw
+/// button away on every reload, from under the keyboard focus if it was
+/// there, and make everything below the rows jump, for every key and not
+/// only a much-certified one. What is kept can be the reading from before
+/// whatever changed the store, for as long as the new one takes. Withdraw
+/// pressed in that time reaches [`run_revoke`], which reads the
+/// certifications again and refuses when none of ours stands. Whether a
+/// revocation certificate is on disk is one look at a file, and is still
+/// answered here.
+fn ask_for_certifications(
+    ui: &AppWindow,
+    state: &mut State,
+    summary: &CertSummary,
+    again: bool,
+) -> AskedCertifications {
+    state.certifications_generation += 1;
+    if !again {
+        ui.set_detail_certifications(ModelRc::new(VecModel::from(Vec::<CertificationRow>::new())));
+        ui.set_can_withdraw(false);
+        ui.set_certifications_pending(true);
+    }
+    ui.set_has_revocation_cert(
+        summary.has_secret && state.store.has_revocation(&summary.fingerprint),
+    );
+    AskedCertifications {
+        store: state.store.clone(),
+        fingerprint: summary.fingerprint.clone(),
+        show_user_id: summary.user_ids.len() > 1,
+        generation: state.certifications_generation,
+    }
+}
+
+/// Read the certifications [`ask_for_certifications`] asked for on a worker,
+/// and land them.
+fn read_certifications_for(ui: &AppWindow, state: &Shared, asked: AskedCertifications) {
+    let (ui_weak, state) = (ui.as_weak(), state.clone());
+    std::thread::spawn(move || {
+        let certifications = read_certifications(&asked.store, &asked.fingerprint);
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                land_certifications(&ui, &state, &asked, &certifications);
+            }
+        });
+    });
+}
+
+/// The blocking half of showing a certificate's certifications: every
+/// certification on it, verified and judged.
+fn read_certifications(store: &Store, fingerprint: &str) -> Vec<Certification> {
+    match store.lookup_ref(fingerprint) {
+        Ok(cert) => certify::certifications(store, &cert).unwrap_or_default(),
         Err(_) => Vec::new(),
-    };
+    }
+}
+
+/// Put the certifications a worker read in the details pane, unless another
+/// reading has been asked for since.
+///
+/// Split from the reading so that a test can land readings in an order of its
+/// choosing, as a race between two would.
+fn land_certifications(
+    ui: &AppWindow,
+    state: &Shared,
+    asked: &AskedCertifications,
+    certifications: &[Certification],
+) {
+    if lock(state).certifications_generation != asked.generation {
+        return;
+    }
 
     // Offer to withdraw only what a withdrawal would take back, per key and per
     // user ID: what stands, or will once its date comes. That is the question
@@ -2425,18 +2528,16 @@ fn push_certifications(ui: &AppWindow, state: &State, summary: &CertSummary) {
     // used to be its own: whether a key had made any withdrawal on a user ID,
     // whatever its date, so certifying again after withdrawing left a
     // certification in force that the app offered no way to withdraw.
-    let withdrawable = !certify::withdrawable(&certifications).is_empty();
+    let withdrawable = !certify::withdrawable(certifications).is_empty();
 
     let rows: Vec<CertificationRow> = certifications
         .iter()
-        .map(|c| certification_row(c, summary.user_ids.len() > 1))
+        .map(|c| certification_row(c, asked.show_user_id))
         .collect();
 
     ui.set_detail_certifications(ModelRc::new(VecModel::from(rows)));
     ui.set_can_withdraw(withdrawable);
-    ui.set_has_revocation_cert(
-        summary.has_secret && state.store.has_revocation(&summary.fingerprint),
-    );
+    ui.set_certifications_pending(false);
 }
 
 fn certification_row(certification: &Certification, show_user_id: bool) -> CertificationRow {
@@ -2506,23 +2607,28 @@ fn certification_row(certification: &Certification, show_user_id: bool) -> Certi
 
 /// Re-select the row for `fingerprint` after the list has been rebuilt.
 fn reselect(ui: &AppWindow, state: &Shared, fingerprint: &str) {
-    let guard = lock(state);
-    let Some(index) = guard.shown.iter().position(|&i| {
-        guard
-            .all
-            .get(i)
-            .is_some_and(|c| c.fingerprint == fingerprint)
-    }) else {
+    let mut guard = lock(state);
+    let Some(index) = guard.shown_position(fingerprint) else {
         return;
     };
 
     let Some(summary) = guard.shown_at(index).cloned() else {
         return;
     };
+    // Whether the pane already shows this certificate, and so has its
+    // certifications to keep while they are read again. By fingerprint, since
+    // apply_filter, which comes first, has cleared has_selection but left the
+    // pane as it was.
+    let again = ui.get_detail().fingerprint == fingerprint;
     ui.set_current_row(index as i32);
     ui.set_detail(to_row(&summary));
     ui.set_has_selection(true);
-    push_certifications(ui, &guard, &summary);
+    // Read again, although the row is the same one: a reload puts it back
+    // because the store changed, often by a certification of it made or
+    // withdrawn.
+    let asked = ask_for_certifications(ui, &mut guard, &summary, again);
+    drop(guard);
+    read_certifications_for(ui, state, asked);
 }
 
 // --------------------------------------------------------------------- lookup
@@ -2552,7 +2658,7 @@ fn lookup_row(store: &Store, found: &rpgp_core::keyserver::Found) -> LookupRow {
         source: found.source.as_str().into(),
         initials: initials(&name, &email, &summary.key_id).into(),
         tint_index: tint_index(&summary.fingerprint),
-        already_known: store.lookup(&summary.fingerprint).is_ok(),
+        already_known: store.lookup_ref(&summary.fingerprint).is_ok(),
     }
 }
 
@@ -3009,7 +3115,7 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
             };
             let guard = lock(&state);
             let fingerprint = ui.get_detail().fingerprint.to_string();
-            let Ok(cert) = guard.store.lookup(&fingerprint) else {
+            let Ok(cert) = guard.store.lookup_ref(&fingerprint) else {
                 return;
             };
 
@@ -3174,7 +3280,7 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
 /// Empty what the notepad shows, which lives in the window's properties, not
 /// the dialog's, and so outlives the dialog unless it is emptied.
 fn clear_notepad(ui: &AppWindow) {
-    ui.set_np_output(SharedString::new());
+    show_np_output(ui, String::new());
     ui.set_np_result(SharedString::new());
     ui.set_np_tone(0);
     ui.set_np_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
@@ -3207,13 +3313,145 @@ fn finish_notepad(ui: &AppWindow, state: &Shared, outcome: NpOutcome) {
         Ok((output, summary, tone, signatures)) => {
             let rows = signature_rows(&lock(state).all, &signatures);
             ui.set_np_signatures(ModelRc::new(VecModel::from(rows)));
-            ui.set_np_output(output.into());
+            show_np_output(ui, output);
             ui.set_np_result(summary.clone().into());
             ui.set_np_tone(tone);
             ui.set_status(summary.into());
         }
         Err(message) => report_in_notepad(ui, message),
     }
+}
+
+/// How much of a notepad run's output its output box is given to lay out at
+/// a scale factor of one: no more than this many bytes, and no more than
+/// [`NP_SHOWN_LINES`] lines. [`np_shown`] divides both by the window's scale
+/// factor.
+///
+/// The box is a word-wrapping text input, and Slint lays the whole of what it
+/// holds out on the event loop, every paragraph and every line break, when it
+/// is set and again on every repaint of the dialog. A decrypted message can
+/// be up to [`ops::MAX_IN_MEMORY_PLAINTEXT`], 64 MiB, and a few hundred bytes
+/// of compressed message can expand to that. Measured in review, laying out
+/// 64 MiB took 7 to 12 seconds and 3.6 to 4.5 GiB each time, and on the
+/// software renderer 64 KiB already took 29ms for its first frame, over one
+/// frame's time.
+///
+/// That renderer, which a machine without a usable GPU falls back to, also
+/// panics drawing text that reaches 32,767 physical pixels down the box,
+/// since it places each glyph in 16-bit coordinates. Rows of this box's 13px
+/// monospace are 16.4 pixels apart at a scale factor of one, so that is
+/// about 2,000 rows there, and at two it is half that: in a nested sway
+/// scaled to two, the thousand short lines this cut allowed when it ignored
+/// the scale took the app down. Rows stay that far apart whatever font a
+/// character in them falls back to, since Slint pins every run's line height
+/// to the metrics of the font asked for (`ranged_builder` in i-slint-core
+/// 1.17's textlayout/sharedparley.rs). But how many rows a text wraps into
+/// depends on how wide its characters are, which the cut cannot see, so the
+/// limits are set for the widest text found.
+///
+/// Where the box wraps, the row it ends and the word it moves down are
+/// together wider than the box, so at worst every row holds one word just
+/// over half its width of about 92 columns. In this monospace that is 48
+/// bytes, a word of 47 letters and a space, but a character another font
+/// draws can be far wider for its bytes. U+FDFD, three bytes, is 127 pixels
+/// wide in Noto Sans Arabic, which the app fell back to for it on the Linux
+/// machine this was measured on, so three of them and a space fill a row in
+/// ten bytes, and 32 KiB of them, which this cut once allowed, took the app
+/// down at a scale factor of one. Of the 394 font files there, only Noto
+/// Naskh Arabic drew it wider, at 159 pixels, still three to a row, and no
+/// other character came to more than 16 pixels a byte, against 42 for U+FDFD
+/// and 8 for this monospace. At 8 KiB and 500 lines that comes to at most
+/// about 1,270 rows, 499 empty lines and then U+FDFD, and 660 for text in
+/// this monospace however it is crafted; ordinary text takes fewer.
+///
+/// Divided by the scale factor, that leaves the widest text found about 1.5
+/// times under the limit at any scale, and text in this monospace about 3
+/// times; a debug build, which also counts the box's place in the window,
+/// has a little less. The margin is for what the cut cannot see. The scale
+/// is read when the output is set, so a window then moved, with the output
+/// open, to a screen scaled more than 1.5 times as much, from 100% to 175%
+/// say, could reach the limit with a crafted text. At the scale it was set
+/// at, a text would have to fill rows in five bytes or fewer to reach it,
+/// which takes a character wider than any found: 180 pixels in two bytes,
+/// or 360 in three or four.
+///
+/// Two limits, because either alone lets the other through: 8 KiB of short
+/// lines is more lines than that renderer can draw, and 500 long lines are
+/// far more than 8 KiB. A line ends wherever the box has to start a new
+/// row, which is not only at a line feed: Slint splits the text into
+/// paragraphs at line feeds alone, and parley, laying each one out, breaks
+/// the row at every character Unicode makes a mandatory break, as
+/// [`is_hard_break`] lists them. 32,000 bytes of `x` and a carriage return,
+/// or of `x` and U+2028, was 16,000 or 8,000 rows with not one line feed, and
+/// each took the app down in review at a scale factor of one.
+const NP_SHOWN_BYTES: usize = 8 * 1024;
+/// See [`NP_SHOWN_BYTES`].
+const NP_SHOWN_LINES: usize = 500;
+
+/// Put a notepad run's output in the window: all of it where Copy reads it,
+/// and as much of it as [`NP_SHOWN_BYTES`] allows in the output box, with a
+/// note under the box when that is not all.
+///
+/// Copy still copies the whole, since cutting what it copies would put a
+/// part of a message on the clipboard as though it were all of it, and the
+/// note says so. Cutting what is shown instead of refusing a long output
+/// keeps an ordinary long message readable where it fits and copyable where
+/// it does not.
+fn show_np_output(ui: &AppWindow, output: String) {
+    let shown = np_shown(&output, ui.window().scale_factor());
+    ui.set_np_output_note(
+        if shown.len() < output.len() {
+            "Only the start is shown: the rest is too long for this box. Copy copies all of it."
+        } else {
+            ""
+        }
+        .into(),
+    );
+    ui.set_np_output_shown(shown.into());
+    ui.set_np_output(output.into());
+}
+
+/// The start of `output` that the notepad's output box shows in a window at
+/// `scale`, cut at a character boundary; see [`NP_SHOWN_BYTES`].
+fn np_shown(output: &str, scale: f32) -> &str {
+    // Never more than at a scale of one, and a NaN scale is taken as one too,
+    // since `max` returns its other operand.
+    let scale = scale.max(1.0);
+    let bytes = (NP_SHOWN_BYTES as f32 / scale) as usize;
+    let lines = ((NP_SHOWN_LINES as f32 / scale) as usize).max(1);
+    let head = &output[..output.floor_char_boundary(bytes)];
+    // A break that ends the output adds only an empty row after it, so an
+    // output of exactly `lines` lines, ending in one, is shown whole rather
+    // than cut at that break with a note that leaves nothing out.
+    let counted = if head.len() == output.len() {
+        head.strip_suffix("\r\n")
+            .or_else(|| head.strip_suffix(is_hard_break))
+            .unwrap_or(head)
+    } else {
+        head
+    };
+    let mut breaks = counted
+        .char_indices()
+        .filter(|&(at, c)| is_hard_break(c) && !(c == '\n' && counted[..at].ends_with('\r')))
+        .map(|(at, _)| at);
+    match breaks.nth(lines - 1) {
+        Some(at) => &head[..at],
+        None => head,
+    }
+}
+
+/// Whether the notepad's output box starts a new row at `c`, whatever its
+/// width: the characters Unicode's line breaking makes a mandatory break.
+/// These seven are every character parley_data 0.10's table marks as one,
+/// which is what parley, under Slint 1.17, breaks a row at; worth checking
+/// again when either is upgraded. A carriage return before a line feed makes
+/// one break with it, not two, since Slint drops it from the end of the
+/// paragraph the line feed closes; [`np_shown`] counts the pair once.
+fn is_hard_break(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r' | '\u{0B}' | '\u{0C}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
 }
 
 /// Say why a notepad run failed, in the notepad's result line, which is
@@ -3229,7 +3467,7 @@ fn report_in_notepad(ui: &AppWindow, message: String) {
         // Alice" row and her plaintext on screen under a red banner
         // describing a different message.
         ui.set_np_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
-        ui.set_np_output(SharedString::new());
+        show_np_output(ui, String::new());
         ui.set_np_result(message.as_str().into());
         ui.set_np_tone(3);
     }
@@ -3838,7 +4076,7 @@ fn run_revoke(
         // Withdrawing our own endorsement: the certifier is whichever of our
         // keys actually made a certification on this certificate.
         let cert = store
-            .lookup(&target)
+            .lookup_ref(&target)
             .map_err(|e| format!("Certificate unavailable: {e}"))?;
         let certifications = certify::certifications(&store, &cert).unwrap_or_default();
 
@@ -3966,15 +4204,20 @@ struct Loaded {
     /// Bookkeeping files that would not read. Named rather than counted, so
     /// the status line can say which badge may be missing.
     degraded: Vec<&'static str>,
+    /// The certificates `all` was made from, for [`survey_agent_and_secrets`]
+    /// to hold what the agent has against.
+    certs: Vec<rpgp_core::store::CertRef>,
 }
 
 /// Re-read the store from disk and rebuild the list.
 ///
 /// Everything here is local — cert-d, the trust graph, the secret-key
 /// directory — and all of it now happens on a worker, because it does not fit
-/// in a frame. Measured by `benches/reload.rs`, the read is 18ms at a thousand
-/// certificates and 127ms at five thousand, against a 16ms budget; the web of
-/// trust alone is 53ms of that second figure. It ran on the event loop because
+/// in a frame. Measured by `benches/reload.rs`, the read was 18ms at a
+/// thousand certificates and 127ms at five thousand, against a 16ms budget,
+/// when it moved; it is about 16ms and 100ms now that the web of trust is not
+/// asked about certificates no path can reach, which cut its share of the
+/// second figure from about 60ms to 24ms. It ran on the event loop because
 /// the list had to exist before the call returned, several callers following it
 /// straight away with `reselect` — [`AfterReload`] carries that intent across
 /// the gap instead.
@@ -4098,7 +4341,7 @@ fn land_reload(
         ui.set_status(status.into());
     }
 
-    survey_agent_and_secrets(ui, state, asked.store, asked.generation);
+    survey_agent_and_secrets(ui, state, asked.store, loaded.certs, asked.generation);
 }
 
 /// What the status line says once a reload has landed, in place of the count
@@ -4285,7 +4528,11 @@ fn read_store(store: &Store) -> std::result::Result<Loaded, String> {
 
     // Ordering belongs to apply_filter, so changing the sort does not
     // require re-reading the store.
-    Ok(Loaded { all, degraded })
+    Ok(Loaded {
+        all,
+        degraded,
+        certs,
+    })
 }
 
 /// Turn signature reports into rows, resolving each signer's authentication.
@@ -4378,10 +4625,14 @@ fn signature_verdict(known: &[CertSummary], result: &ops::VerifyResult) -> (Stri
 /// The damaged-file survey rides along because it re-parses every secret key,
 /// which is the other thing in a reload that has no business on the UI thread.
 ///
-/// The certificates are re-read here rather than handed over from `reload`,
-/// because naming their type would put a `sequoia_openpgp` type in this crate
-/// and the GUI is deliberately free of them. The extra read is the cost of
-/// that boundary, and it is paid on a worker thread where nothing waits for it.
+/// `certs` are the certificates the reload this follows read, handed over
+/// from it, so that what the agent holds is matched against exactly the rows
+/// on screen. They used to be read here again, on the grounds that naming
+/// their type would put a `sequoia_openpgp` type in this crate, which the GUI
+/// keeps free of them; but `Store::certs` hands out rpgp-core's own
+/// [`CertRef`](rpgp_core::store::CertRef), and the second read, 24 to 29ms
+/// of a worker's time at five thousand certificates by `benches/reload.rs`,
+/// was thrown away on every machine without an agent, before one was asked.
 ///
 /// `generation` is that of the reload this follows, which [`land_survey`]
 /// holds against the newest.
@@ -4389,11 +4640,11 @@ fn survey_agent_and_secrets(
     ui: &AppWindow,
     state: &Shared,
     store: std::sync::Arc<Store>,
+    certs: Vec<rpgp_core::store::CertRef>,
     generation: u64,
 ) {
     let (ui_weak, state) = (ui.as_weak(), state.clone());
     std::thread::spawn(move || {
-        let certs = store.certs().unwrap_or_default();
         let agent_keys = rpgp_core::agent::annotate(&certs);
         let damaged: Vec<String> = store
             .damaged_secret_files()
@@ -4521,6 +4772,15 @@ impl State {
         self.all.get(*self.shown.get(row)?)
     }
 
+    /// The row showing `fingerprint`, if one does.
+    fn shown_position(&self, fingerprint: &str) -> Option<usize> {
+        self.shown.iter().position(|&i| {
+            self.all
+                .get(i)
+                .is_some_and(|c| c.fingerprint == fingerprint)
+        })
+    }
+
     /// The certificates whose secret key gpg-agent holds, in its own store or
     /// on a card, as [`survey_agent_and_secrets`] last found them: a key of
     /// theirs that signs, the primary that certifies or a key that decrypts,
@@ -4536,16 +4796,18 @@ impl State {
     }
 }
 
-/// Which certificates the list shows, in the order it shows them.
+/// Which certificates the list shows, in the order it shows them, for the
+/// search text `filter` as it was typed.
 ///
 /// The pure half of [`apply_filter`], split out so it can be measured: this is
 /// what a keystroke pays for, and it was unreachable from a benchmark while it
 /// lived inside a function that takes an `AppWindow`.
 pub fn visible(all: &[CertSummary], filter: &str, scope: Scope, sort: Sort) -> Vec<usize> {
+    let needle = Needle::new(filter);
     let mut shown: Vec<usize> = all
         .iter()
         .enumerate()
-        .filter(|(_, c)| scope.accepts(c) && c.matches(filter))
+        .filter(|(_, c)| scope.accepts(c) && c.matches(&needle))
         .map(|(i, _)| i)
         .collect();
     sort.apply_to(all, &mut shown);
@@ -4606,6 +4868,35 @@ fn apply_filter(ui: &AppWindow, state: &Shared) {
         }
         .into(),
     );
+}
+
+/// Apply a new search, sort or scope, and keep the user on the row they
+/// were on while it is still in the list.
+///
+/// [`apply_filter`] clears the selection, since a row index means nothing
+/// against a new set of rows, and these three used to leave it cleared: a
+/// letter typed into the search box, a change of Sort by or a click on a
+/// scope emptied the details pane and disabled Export, even with the
+/// certificate still listed. Only the index is put back. Nothing the details
+/// pane shows has changed, since the store has not been read, so it is left
+/// as it is rather than read again, as [`reselect`] does after a reload; for
+/// the search box that would be on every keystroke. A certificate the new
+/// view leaves out stays unselected, so that nothing acts on a row that is
+/// not shown.
+fn refilter(ui: &AppWindow, state: &Shared, change: impl FnOnce(&mut State)) {
+    let selected = ui
+        .get_has_selection()
+        .then(|| ui.get_detail().fingerprint.to_string());
+    change(&mut lock(state));
+    apply_filter(ui, state);
+
+    let Some(fingerprint) = selected else {
+        return;
+    };
+    if let Some(index) = lock(state).shown_position(&fingerprint) {
+        ui.set_current_row(index as i32);
+        ui.set_has_selection(true);
+    }
 }
 
 /// Whether `summary`'s certificate can certify someone else's from where its
@@ -5144,6 +5435,7 @@ mod tests {
             reload_generation: 0,
             pending_status: None,
             selection_generation: 0,
+            certifications_generation: 0,
             filter: String::new(),
             scope: Scope::All,
             sort: Sort::MineFirst,
@@ -5572,6 +5864,22 @@ mod tests {
         };
         ui.set_current_row(row as i32);
         ui.invoke_row_selected(row as i32);
+    }
+
+    /// Click the list row showing `fingerprint`, and put its certifications
+    /// in the details pane as the worker the click starts would, if there
+    /// were an event loop to take its answer.
+    fn select_row(ui: &AppWindow, state: &Shared, fingerprint: &str) {
+        click_row(ui, state, fingerprint);
+        let summary = lock(state)
+            .all
+            .iter()
+            .find(|c| c.fingerprint == fingerprint)
+            .cloned()
+            .expect("the certificate is in the list");
+        let asked = ask_for_certifications(ui, &mut lock(state), &summary, false);
+        let certifications = read_certifications(&asked.store, &asked.fingerprint);
+        land_certifications(ui, state, &asked, &certifications);
     }
 
     /// The row the details pane would show for `fingerprint`.
@@ -6247,7 +6555,7 @@ mod tests {
         let store = lock(&state).store.clone();
         // Clicking the row again is what reads its certifications afresh.
         let offered = || {
-            click_row(&ui, &state, &them_fp);
+            select_row(&ui, &state, &them_fp);
             ui.get_can_withdraw()
         };
 
@@ -7633,7 +7941,8 @@ mod tests {
     /// Closing the notepad empties what it showed from the window, and a run
     /// that lands after it closed does not put its result back.
     ///
-    /// The output, the verdict and the signer rows are the window's
+    /// The output, both whole and as much of it as the box shows, the note
+    /// under the box, the verdict and the signer rows are the window's
     /// properties rather than the dialog's, and closing only closed the
     /// dialog, so the last decrypted message stayed referenced from the window
     /// for as long as rPGP ran, or until the notepad was opened again. Escape
@@ -7653,9 +7962,13 @@ mod tests {
         let ui = window_for(&state);
         ui.window().set_size(slint::LogicalSize::new(1000.0, 700.0));
         ui.show().unwrap();
+        // Long enough that the output box is given only its start, with a
+        // note saying so, so that the plaintext is in two properties and the
+        // note in a third, and closing has all of them to empty.
+        let plaintext = "TOP SECRET\n".repeat(2 * NP_SHOWN_LINES);
         let decrypted = || -> NpOutcome {
             Ok((
-                "TOP SECRET".to_string(),
+                plaintext.clone(),
                 "Decrypted. Good signature.".to_string(),
                 1,
                 vec![report("0123", true)],
@@ -7664,21 +7977,32 @@ mod tests {
         let shown = |ui: &AppWindow| {
             (
                 ui.get_np_output().to_string(),
+                ui.get_np_output_shown().to_string(),
+                ui.get_np_output_note().to_string(),
                 ui.get_np_result().to_string(),
                 ui.get_np_signatures().row_count(),
             )
         };
-        let empty = (String::new(), String::new(), 0);
+        let empty = (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            0,
+        );
 
         ui.invoke_open_notepad();
         finish_notepad(&ui, &state, decrypted());
+        let (output, output_shown, note, result, signatures) = shown(&ui);
         assert_eq!(
-            shown(&ui),
-            (
-                "TOP SECRET".to_string(),
-                "Decrypted. Good signature.".to_string(),
-                1
-            )
+            (output.as_str(), result.as_str(), signatures),
+            (plaintext.as_str(), "Decrypted. Good signature.", 1)
+        );
+        assert!(
+            output_shown.starts_with("TOP SECRET")
+                && output_shown.len() < plaintext.len()
+                && !note.is_empty(),
+            "the premise: the box shows the start of the plaintext, and says so"
         );
 
         // A click beside the card, on the scrim, the way Close and Escape
@@ -8754,7 +9078,7 @@ mod tests {
         // certifications, which name the user ID when there is more than one.
         ui.invoke_open_certify();
         run_certify(&state, 0, true, false, 0, "").expect("the user IDs should be certified");
-        click_row(&ui, &state, &fingerprint);
+        select_row(&ui, &state, &fingerprint);
         let certification = ui
             .get_detail_certifications()
             .iter()
@@ -8948,5 +9272,442 @@ mod tests {
         );
         land_agent_survey(&ui, &state, &survey);
         assert_eq!(row_for(&state, &card).card_serial, "0006 18132963");
+    }
+
+    /// Selecting a row reads its certifications on a worker, not on the event
+    /// loop, and of two readings the one asked for last is the one shown,
+    /// whichever comes back first.
+    ///
+    /// The reading looks up every certifier and verifies every certification,
+    /// and it ran inside the click, with the state lock held, freezing the
+    /// window for as long as a much-certified key took. No event loop runs
+    /// here, so the click's own worker never lands, and the pane is left
+    /// saying the certifications are being read; the readings a race would
+    /// bring back are landed by hand.
+    #[test]
+    fn a_rows_certifications_are_read_off_the_event_loop_and_the_newest_shown() {
+        use slint::Model;
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let me = generated("Me <me@example.org>").cert;
+        let alice = generated("Alice <alice@example.org>").cert;
+        let bob = generated("Bob <bob@example.org>").cert;
+        store.insert_secret(&me).unwrap();
+        store.insert(&alice).unwrap();
+        store.insert(&bob).unwrap();
+        let me = me.fingerprint().to_hex();
+        let (alice, bob) = (alice.fingerprint().to_hex(), bob.fingerprint().to_hex());
+        // Only Alice is certified, so her reading and Bob's differ.
+        let mut request = CertifyRequest::new(&me, &alice);
+        request.user_ids = vec!["Alice <alice@example.org>".to_string()];
+        certify::certify(&store, &request).unwrap();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let shown = |ui: &AppWindow| {
+            ui.get_detail_certifications()
+                .iter()
+                .map(|c| c.certifier.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        click_row(&ui, &state, &alice);
+        assert!(
+            ui.get_certifications_pending() && shown(&ui).is_empty() && !ui.get_can_withdraw(),
+            "the click read the certifications itself, on the event loop: {:?}",
+            shown(&ui)
+        );
+
+        // Alice's reading is slow, and the user moves to Bob before it is back.
+        let summary = |fingerprint: &str| {
+            lock(&state)
+                .all
+                .iter()
+                .find(|c| c.fingerprint == fingerprint)
+                .cloned()
+                .unwrap()
+        };
+        let (of_alice, of_bob) = (summary(&alice), summary(&bob));
+        let for_alice = ask_for_certifications(&ui, &mut lock(&state), &of_alice, false);
+        let alices = read_certifications(&for_alice.store, &for_alice.fingerprint);
+        assert_eq!(alices.len(), 1, "the premise: Alice is certified");
+        click_row(&ui, &state, &bob);
+        let for_bob = ask_for_certifications(&ui, &mut lock(&state), &of_bob, false);
+        let bobs = read_certifications(&for_bob.store, &for_bob.fingerprint);
+
+        land_certifications(&ui, &state, &for_alice, &alices);
+        assert_eq!(ui.get_detail().fingerprint, bob);
+        assert!(
+            shown(&ui).is_empty() && !ui.get_can_withdraw() && ui.get_certifications_pending(),
+            "Alice's certifications were shown under Bob: {:?}",
+            shown(&ui)
+        );
+
+        land_certifications(&ui, &state, &for_bob, &bobs);
+        assert!(!ui.get_certifications_pending());
+        assert!(shown(&ui).is_empty(), "nobody has certified Bob");
+
+        // And a reading that is the newest is shown, Withdraw with it.
+        select_row(&ui, &state, &alice);
+        assert_eq!(shown(&ui), ["Me <me@example.org>"]);
+        assert!(ui.get_can_withdraw());
+        assert!(!ui.get_certifications_pending());
+    }
+
+    /// A reload that puts back the row the details pane shows keeps its
+    /// certifications, and Withdraw, until they are read again; one that
+    /// puts back another row empties the pane, as a click does.
+    ///
+    /// Emptied on every reload, the pane took Withdraw away from under the
+    /// keyboard focus each time, whatever the reload was for, and everything
+    /// below the rows jumped until the reading landed.
+    #[test]
+    fn a_reload_keeps_the_certifications_of_the_row_it_puts_back_until_read_again() {
+        use slint::Model;
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let me = generated("Me <me@example.org>").cert;
+        let alice = generated("Alice <alice@example.org>").cert;
+        let bob = generated("Bob <bob@example.org>").cert;
+        store.insert_secret(&me).unwrap();
+        store.insert(&alice).unwrap();
+        store.insert(&bob).unwrap();
+        let me = me.fingerprint().to_hex();
+        let (alice, bob) = (alice.fingerprint().to_hex(), bob.fingerprint().to_hex());
+        let mut request = CertifyRequest::new(&me, &alice);
+        request.user_ids = vec!["Alice <alice@example.org>".to_string()];
+        certify::certify(&store, &request).unwrap();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let shown = |ui: &AppWindow| {
+            ui.get_detail_certifications()
+                .iter()
+                .map(|c| c.certifier.to_string())
+                .collect::<Vec<_>>()
+        };
+        let of_alice = lock(&state)
+            .all
+            .iter()
+            .find(|c| c.fingerprint == alice)
+            .cloned()
+            .unwrap();
+
+        select_row(&ui, &state, &alice);
+        assert_eq!(shown(&ui), ["Me <me@example.org>"], "the premise");
+        assert!(ui.get_can_withdraw());
+        // A reading asked for before the reload, which the reload overtakes.
+        let before = ask_for_certifications(&ui, &mut lock(&state), &of_alice, true);
+
+        // What a reload does once it has read the store.
+        apply_filter(&ui, &state);
+        reselect(&ui, &state, &alice);
+        assert_eq!(ui.get_detail().fingerprint, alice);
+        assert!(
+            shown(&ui) == ["Me <me@example.org>"]
+                && ui.get_can_withdraw()
+                && !ui.get_certifications_pending(),
+            "the reload emptied the certifications of the row it put back: {:?}",
+            shown(&ui)
+        );
+        land_certifications(&ui, &state, &before, &[]);
+        assert_eq!(
+            shown(&ui),
+            ["Me <me@example.org>"],
+            "a reading the reload overtook was shown"
+        );
+
+        // A reload that puts back a row other than the one the pane shows, as
+        // one after an import selects what it brought in.
+        select_row(&ui, &state, &bob);
+        apply_filter(&ui, &state);
+        reselect(&ui, &state, &alice);
+        assert_eq!(ui.get_detail().fingerprint, alice);
+        assert!(
+            shown(&ui).is_empty() && !ui.get_can_withdraw() && ui.get_certifications_pending(),
+            "what the pane showed of Bob was kept under Alice"
+        );
+    }
+
+    /// A search, a change of Sort by or of scope keeps the user on the row
+    /// they were on, while that row is still listed, and leaves nothing
+    /// selected once it is not.
+    ///
+    /// Each cleared the selection, since a row index means nothing against a
+    /// new set of rows, and put nothing back: one letter typed into the search
+    /// box emptied the details pane and disabled Export.
+    #[test]
+    fn a_search_sort_or_scope_change_keeps_the_row_the_user_is_on() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let me = generated("Me <me@example.org>").cert;
+        let alice = generated("Alice <alice@example.org>").cert;
+        let bob = generated("Bob <bob@example.org>").cert;
+        store.insert_secret(&me).unwrap();
+        store.insert(&alice).unwrap();
+        store.insert(&bob).unwrap();
+        let alice = alice.fingerprint().to_hex();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let on_alice = |ui: &AppWindow| {
+            let row = usize::try_from(ui.get_current_row()).ok();
+            ui.get_has_selection()
+                && ui.get_detail().fingerprint == alice
+                && row.and_then(|r| lock(&state).shown_at(r).map(|c| c.fingerprint.clone()))
+                    == Some(alice.clone())
+        };
+        click_row(&ui, &state, &alice);
+        assert!(on_alice(&ui));
+
+        ui.invoke_filter_changed("a".into());
+        assert!(on_alice(&ui), "a search Alice still matches lost her row");
+        ui.invoke_sort_changed(1);
+        assert!(on_alice(&ui), "a change of Sort by lost her row");
+        ui.invoke_scope_changed(2);
+        assert!(on_alice(&ui), "a scope she is in lost her row");
+
+        ui.invoke_scope_changed(1);
+        assert!(
+            !ui.get_has_selection(),
+            "Alice is not one of the user's own keys, so nothing is selected"
+        );
+    }
+
+    /// A fingerprint typed or pasted in groups of four, as the details pane
+    /// and gpg print it, finds its certificate in the list and among the
+    /// recipients, where it used to find nothing in either; and typed a
+    /// character at a time, it goes on finding it, and keeping it selected,
+    /// all the way.
+    #[test]
+    fn a_fingerprint_typed_in_groups_finds_its_row_and_its_recipient() {
+        use slint::Model;
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let alice = generated("Alice <alice@example.org>").cert;
+        store.insert(&alice).unwrap();
+        store
+            .insert(&generated("Bob <bob@example.org>").cert)
+            .unwrap();
+        let grouped = CertSummary::from_cert(&alice).fingerprint_pretty();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        click_row(&ui, &state, &alice.fingerprint().to_hex());
+        for end in 1..=grouped.len() {
+            ui.invoke_filter_changed(grouped[..end].into());
+            assert!(
+                ui.get_has_selection()
+                    && ui.get_detail().fingerprint == alice.fingerprint().to_hex(),
+                "typing {:?} lost the row",
+                &grouped[..end]
+            );
+        }
+        assert_eq!(ui.get_certs().row_count(), 1, "{grouped} found no row");
+        let grouped: SharedString = grouped.into();
+
+        ui.invoke_open_sign_encrypt();
+        ui.invoke_filter_recipients(grouped.clone());
+        let recipients: Vec<String> = ui
+            .get_se_recipients()
+            .iter()
+            .map(|r| r.fingerprint.to_string())
+            .collect();
+        assert_eq!(recipients, [alice.fingerprint().to_hex()], "{grouped}");
+    }
+
+    /// The rows the notepad's output box lays `text` out in before any
+    /// wrapping: one, and one more at each character Unicode makes a
+    /// mandatory line break, a CR LF pair counting once. Written out here
+    /// rather than through `is_hard_break`, so that a character missing from
+    /// that list is not missing from the count as well.
+    fn np_rows(text: &str) -> usize {
+        1 + text
+            .replace("\r\n", "\n")
+            .chars()
+            .filter(|c| {
+                [
+                    '\n', '\r', '\u{0B}', '\u{0C}', '\u{85}', '\u{2028}', '\u{2029}',
+                ]
+                .contains(c)
+            })
+            .count()
+    }
+
+    /// A long output is shown in part, with a note saying so, and copied
+    /// whole; a short one is shown whole, with no note.
+    ///
+    /// The whole of it went into the output box, which Slint lays out on the
+    /// event loop, all of it, on every repaint: a 64 MiB decrypted message,
+    /// which a message of a few hundred bytes can expand to, froze the window
+    /// for seconds at a time, and on the software renderer an output of about
+    /// 144 KiB panicked. What is shown is cut, never what Copy copies.
+    ///
+    /// Lines are counted as the box breaks them, at every mandatory break and
+    /// not at line feeds alone: 32,000 bytes of `x` and a lone carriage
+    /// return, or of `x` and U+2028, fitted a cut that allowed 32 KiB and
+    /// counted only line feeds, and was 16,000 or 8,000 rows, enough to panic
+    /// that renderer.
+    #[test]
+    fn a_long_notepad_output_is_shown_in_part_and_copied_whole() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+        ui.invoke_open_notepad();
+        let decrypted = |output: &str| -> NpOutcome {
+            Ok((output.to_string(), "Decrypted.".to_string(), 2, Vec::new()))
+        };
+
+        // Short lines, many of them; one long line; characters three bytes
+        // long, so the cut falls inside one unless it is made at a boundary;
+        // and short lines ended by each of the other mandatory breaks, and by
+        // CR LF.
+        let many_lines = "a line of an ordinary message\n".repeat(20_000);
+        let one_line = "x".repeat(200_000);
+        let wide = "€".repeat(100_000);
+        let crlf = "a line\r\n".repeat(20_000);
+        let mut outputs = vec![many_lines, one_line, wide];
+        for other in ['\r', '\u{0B}', '\u{0C}', '\u{85}', '\u{2028}', '\u{2029}'] {
+            outputs.push(format!("x{other}").repeat(8_000));
+        }
+        outputs.push(crlf.clone());
+        for output in &outputs {
+            finish_notepad(&ui, &state, decrypted(output));
+            let shown = ui.get_np_output_shown().to_string();
+            assert!(
+                shown.len() <= NP_SHOWN_BYTES && np_rows(&shown) <= NP_SHOWN_LINES,
+                "{} bytes and {} rows were given to the output box: {:?}…",
+                shown.len(),
+                np_rows(&shown),
+                output.chars().take(4).collect::<String>()
+            );
+            assert!(!shown.is_empty() && output.starts_with(&shown));
+            assert!(
+                !ui.get_np_output_note().is_empty(),
+                "the box shows only the start, and has to say so"
+            );
+
+            clipboard::record(true);
+            ui.invoke_np_copy();
+            assert_eq!(
+                clipboard::recorded(),
+                [(output.to_string(), clipboard::Content::Private)],
+                "Copy has to copy the whole output"
+            );
+        }
+
+        // A CR LF pair is one break, as Slint lays it out, so text written on
+        // Windows is given as many lines as any other.
+        finish_notepad(&ui, &state, decrypted(&crlf));
+        assert_eq!(np_rows(&ui.get_np_output_shown()), NP_SHOWN_LINES);
+
+        // As many lines as the box is given, the last one ended by a line
+        // feed like the rest, are all shown, with no note saying otherwise.
+        let exactly = "a line\n".repeat(NP_SHOWN_LINES);
+        finish_notepad(&ui, &state, decrypted(&exactly));
+        assert_eq!(ui.get_np_output_shown(), exactly.as_str());
+        assert_eq!(ui.get_np_output_note(), "", "nothing was left out");
+
+        finish_notepad(&ui, &state, decrypted("Short and sweet."));
+        assert_eq!(ui.get_np_output_shown(), "Short and sweet.");
+        assert_eq!(ui.get_np_output(), "Short and sweet.");
+        assert_eq!(ui.get_np_output_note(), "");
+    }
+
+    /// On a screen scaled to two, the notepad's output box is given half as
+    /// many lines and bytes, and Copy still copies all of it.
+    ///
+    /// The software renderer's limit is in physical pixels, and rows are
+    /// twice as tall in them at that scale: in a nested sway scaled to two,
+    /// the thousand short lines the box was then given at every scale took
+    /// the app down.
+    #[test]
+    fn a_long_notepad_output_is_cut_shorter_on_a_screen_scaled_up() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+        ui.window()
+            .dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged { scale_factor: 2.0 });
+        assert_eq!(ui.window().scale_factor(), 2.0, "the premise");
+        ui.invoke_open_notepad();
+
+        let many_lines = "x\n".repeat(20_000);
+        let one_line = "x".repeat(200_000);
+        for output in [&many_lines, &one_line] {
+            finish_notepad(
+                &ui,
+                &state,
+                Ok((output.clone(), "Decrypted.".to_string(), 2, Vec::new())),
+            );
+            let shown = ui.get_np_output_shown().to_string();
+            assert!(
+                shown.len() <= NP_SHOWN_BYTES / 2 && np_rows(&shown) <= NP_SHOWN_LINES / 2,
+                "{} bytes and {} rows were given to the output box at twice the scale",
+                shown.len(),
+                np_rows(&shown)
+            );
+            assert!(!shown.is_empty() && output.starts_with(&shown));
+            assert!(!ui.get_np_output_note().is_empty());
+
+            clipboard::record(true);
+            ui.invoke_np_copy();
+            assert_eq!(
+                clipboard::recorded(),
+                [(output.to_string(), clipboard::Content::Private)],
+                "Copy has to copy the whole output"
+            );
+        }
+    }
+
+    /// However a text is crafted, the notepad's output box is given fewer rows
+    /// than the software renderer can draw, at any scale, with room for a
+    /// window then moved to a screen scaled half as much again; or three times
+    /// as much, for a text in the box's own monospace.
+    ///
+    /// Nothing is laid out in a test, so the rows are counted for the two
+    /// texts found to wrap into the most of them, as they wrapped in the real
+    /// box: any number of empty lines, and then U+FDFD three to a row, drawn
+    /// 127 pixels wide in Noto Sans Arabic, or words of 47 letters one to a
+    /// row. In a nested sway, 32 KiB of the first took the app down at a scale
+    /// factor of one, and 32 KiB of the second in a window moved from one to
+    /// one and a quarter. With the cut as it is, a debug build went down only
+    /// in a window moved from one to 1.75 with the first, and from one to
+    /// three with the second.
+    #[test]
+    fn a_crafted_notepad_output_is_cut_to_rows_the_software_renderer_can_draw() {
+        // Rows are 16.4 pixels apart at a scale factor of one, and a glyph
+        // 32,767 physical pixels down the box panics that renderer.
+        let (row, limit) = (16.4_f32, 32_767.0_f32);
+        let long_word = format!("{} ", "m".repeat(47));
+        let crafted = [
+            ("\u{FDFD}\u{FDFD}\u{FDFD} ", 4, 1.5_f32),
+            (long_word.as_str(), 48, 3.0),
+        ];
+        for (words, per_row, margin) in crafted {
+            for scale in [1.0_f32, 1.25, 1.5, 2.0, 3.0] {
+                for empty in 0..=NP_SHOWN_LINES {
+                    let text = "\n".repeat(empty) + &words.repeat(NP_SHOWN_BYTES / words.len() + 1);
+                    let shown = np_shown(&text, scale);
+                    let rows: usize = shown
+                        .split('\n')
+                        .map(|line| line.chars().count().div_ceil(per_row).max(1))
+                        .sum();
+                    let reach = rows as f32 * row * scale;
+                    assert!(
+                        reach * margin < limit,
+                        "{empty} empty lines and then {words:?} came to {rows} rows, \
+                         {reach} pixels down at a scale of {scale}"
+                    );
+                }
+            }
+        }
     }
 }
