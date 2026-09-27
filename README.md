@@ -735,18 +735,51 @@ run by the same user. `packaging/macos-sign.sh` is what applies it. A macOS
 binary you built yourself is unsigned and gets none of that — assume a debugger
 can attach to that one.
 
-Keeping passphrases off the accessibility bus is not platform-specific and
-applies to both. The bus publishes the contents of an ordinary text field
-verbatim and does not exempt password fields.
+Keeping passphrases off the accessibility bus and off the clipboard is not
+platform-specific and applies to both. The bus publishes the contents of an
+ordinary text field verbatim and does not exempt password fields, and Slint's
+text fields copy and cut a selection unmasked, and on Linux put whatever the
+mouse selects in the primary selection. rPGP's passphrase fields refuse copy
+and cut, and a click only focuses them: the mouse does not select in them.
 
 Set `RPGP_ALLOW_DEBUG=1` to turn off the core-dump and debugger restrictions
 when you need a backtrace.
 
 None of this is a privilege boundary. Key material passes through the GUI
 process, so root, or anything holding `CAP_SYS_PTRACE`, can still read it while
-an operation is in flight — and the passphrase you type cannot be scrubbed at
+an operation is in flight. rPGP wipes its own copy of a passphrase once the
+operation is done with it, but the passphrase you type cannot be scrubbed at
 all, because Slint's own string type keeps unzeroed copies, including an undo
-buffer. Only the smartcard path avoids this entirely, by never seeing the key.
+buffer. For the same reason a message decrypted in the notepad is dropped from
+the window when the notepad closes, not scrubbed from memory. Only the
+smartcard path avoids this entirely, by never seeing the key.
+
+## What goes on the clipboard
+
+A fingerprint, key ID or user ID copied from the details pane goes on the
+clipboard like any other copy. What the notepad's Copy puts there can be a
+decrypted message, so it goes out marked private, with each platform's way of
+asking clipboard managers and clipboard history to leave it out:
+`x-kde-passwordManagerHint` on X11 and through the Wayland data-control
+protocols, `ExcludeClipboardContentFromMonitorProcessing` on Windows, and
+`org.nspasteboard.ConcealedType` on macOS. On X11 a private copy is also
+withdrawn when rPGP's window closes, rather than handed to a clipboard manager
+to keep.
+
+The mark is a request, and it has limits:
+
+- Any program can read the clipboard while the text is on it, and a clipboard
+  manager that ignores the convention keeps it anyway.
+- In the Flatpak on GNOME or sway, where the app is not offered data-control,
+  rPGP copies over its window's own Wayland connection, which offers plain text
+  and nothing else. The copy goes out unmarked, and the status line says so.
+- Text selected in the notepad's output and copied with Ctrl+C goes through
+  Slint's own clipboard, which marks nothing, and on Linux selecting it with
+  the mouse puts it in the primary selection as well. The Copy button is the
+  way to copy a decrypted message.
+- Nothing clears the clipboard after a while. A clipboard manager records a
+  copy the moment it is made, so a timer would not keep a message out of its
+  history; the mark is what does that.
 
 ## Coming from GnuPG
 

@@ -22,6 +22,19 @@
 //! arboard can be built, Copy works as it did before smithay-clipboard came
 //! in, and smithay-clipboard's gaps are confined to where every Copy failed.
 //!
+//! What the notepad copies can be a decrypted message, so it goes out marked
+//! private: with each platform's hint asking clipboard managers to leave it
+//! out of their history (see [`Content::Private`]). A fingerprint or a user ID
+//! from the details pane is public and goes out as any other copy does. The
+//! mark only asks. It cannot stop a program reading the clipboard while the
+//! text is on it, and smithay-clipboard cannot give it at all, which the
+//! notepad then says. Nothing takes a private copy back off the clipboard
+//! after a while, as a password manager does with a password. History records
+//! a copy the moment it is made, so a timer would not keep it out of that; a
+//! message is copied to be pasted somewhere, perhaps minutes later; and
+//! clearing only what is still this copy means reading the clipboard back
+//! first, which reads whatever the user has copied since, from any program.
+//!
 //! The Wayland half exists only under `cfg(wayland_target)`, which build.rs
 //! sets on the targets where a window can be on Wayland.
 
@@ -65,6 +78,61 @@ enum Clipboard {
     /// elsewhere the first copy does. After a failure, the next copy builds
     /// it again.
     Arboard(Option<arboard::Clipboard>),
+    /// Stands in for either in the tests, none of which has a display server:
+    /// it keeps each copy and what it was asked to be, and marks a private one
+    /// as arboard does, or leaves it unmarked as smithay-clipboard does.
+    #[cfg(test)]
+    Recording {
+        copies: Vec<(String, Content)>,
+        marks: bool,
+    },
+}
+
+/// What a copy holds, as far as the desktop's clipboard managers are
+/// concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Content {
+    /// A fingerprint, a key ID or a user ID: public, and as welcome in a
+    /// clipboard manager's history as anything else the user copies.
+    Public,
+    /// The notepad's output, which can be a decrypted message, and is marked
+    /// with the platform's hint asking clipboard managers to leave it out of
+    /// their history. Ciphertext and signed text are marked as well: which one
+    /// the output holds is not tracked, and marking them costs nothing.
+    ///
+    /// On X11 and through data-control the mark is the
+    /// `x-kde-passwordManagerHint` type, which KDE's Klipper honours, as do
+    /// some other clipboard managers; on X11 it also has arboard withdraw the
+    /// copy when rPGP lets go of the clipboard, rather than hand it to a
+    /// clipboard manager to keep. On Windows it is
+    /// `ExcludeClipboardContentFromMonitorProcessing`, which keeps a copy out
+    /// of Windows' clipboard history and its cloud sync alike, and which
+    /// arboard advises against combining with its narrower history and cloud
+    /// marks. On macOS it is `org.nspasteboard.ConcealedType`, which the
+    /// clipboard managers that follow nspasteboard.org's conventions honour.
+    Private,
+}
+
+/// How a copy went, when it went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Copied {
+    /// On the clipboard, marked private if it was asked to be.
+    AsAsked,
+    /// On the clipboard, but without the private mark it asked for, which
+    /// smithay-clipboard has no way to give: it offers plain text alone.
+    ///
+    /// Only a window on Wayland can have smithay-clipboard, so on Windows and
+    /// macOS nothing makes this, and the notepad's arm for it is never taken.
+    /// The arm stays rather than being gated as well, so that the notepad's
+    /// handling of a copy reads the same on every platform.
+    #[cfg_attr(
+        not(any(wayland_target, test)),
+        expect(
+            dead_code,
+            reason = "only smithay-clipboard, on Wayland, copies without the mark"
+        )
+    )]
+    Unmarked,
 }
 
 thread_local! {
@@ -95,7 +163,8 @@ impl Drop for Attached {
 /// Dropping smithay-clipboard's handle tells its thread to stop and joins it.
 /// Dropping arboard's, where it copies through X11, makes the handover to a
 /// clipboard manager, which belongs where the window closes or the process
-/// exits anyway; through data-control it holds nothing to let go of.
+/// exits anyway, of a public copy; a private one it withdraws instead. Through
+/// data-control it holds nothing to let go of.
 fn release() {
     let clipboard = CLIPBOARD.with(|slot| slot.replace(Clipboard::NoWindow));
     drop(clipboard);
@@ -305,8 +374,9 @@ fn choose<A, E>(route: Route, arboard: impl FnOnce() -> Result<A, E>) -> Choice<
     }
 }
 
-/// Put `text` on the clipboard chosen by [`attach`].
-pub fn copy(text: String) -> std::result::Result<(), String> {
+/// Put `text` on the clipboard chosen by [`attach`], marked private if it is
+/// [`Content::Private`] and the clipboard can mark it.
+pub fn copy(text: String, content: Content) -> std::result::Result<Copied, String> {
     CLIPBOARD.with(|slot| match &mut *slot.borrow_mut() {
         // No Copy button can be pressed before its window exists or after it
         // has closed, so this is not expected. It is refused rather than
@@ -323,8 +393,15 @@ pub fn copy(text: String) -> std::result::Result<(), String> {
             // believes the window has focus, which panics it, nothing receives
             // the text, and this and every later Copy set nothing. None of it
             // is reported, as none of it is for Slint's own text fields.
+            //
+            // smithay-clipboard offers the text as plain text and nothing
+            // else, so a private copy goes without its mark, and the caller is
+            // told. It still goes rather than being refused: the notepad's
+            // output can be selected and copied with Ctrl+C through Slint's
+            // own clipboard, which on this same connection cannot mark it
+            // either, so refusing would only move the copy there.
             clipboard.store(text);
-            Ok(())
+            Ok(unmarked(content))
         }
         Clipboard::Arboard(handle) => {
             if handle.is_none() {
@@ -333,16 +410,89 @@ pub fn copy(text: String) -> std::result::Result<(), String> {
             // A clipboard that has stopped working — the X server went away,
             // say — is dropped so the next copy builds a fresh one rather than
             // failing forever.
-            let result = handle
-                .as_mut()
-                .expect("just populated")
-                .set_text(text)
+            let result = set(handle.as_mut().expect("just populated"), text, content)
+                .map(|()| Copied::AsAsked)
                 .map_err(|e| e.to_string());
             if result.is_err() {
                 *handle = None;
             }
             result
         }
+        #[cfg(test)]
+        Clipboard::Recording { copies, marks } => {
+            copies.push((text, content));
+            Ok(if *marks {
+                Copied::AsAsked
+            } else {
+                unmarked(content)
+            })
+        }
+    })
+}
+
+/// How a copy of `content` went on a clipboard that cannot mark anything.
+#[cfg(any(wayland_target, test))]
+fn unmarked(content: Content) -> Copied {
+    match content {
+        Content::Public => Copied::AsAsked,
+        Content::Private => Copied::Unmarked,
+    }
+}
+
+/// Put `text` on arboard's clipboard, with the mark [`Content::Private`]
+/// describes if it is private.
+fn set(
+    clipboard: &mut arboard::Clipboard,
+    text: String,
+    content: Content,
+) -> std::result::Result<(), arboard::Error> {
+    let set = clipboard.set();
+    match content {
+        Content::Public => set.text(text),
+        Content::Private => mark_private(set).text(text),
+    }
+}
+
+// Under the conditions arboard itself puts on each extension trait.
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
+fn mark_private(set: arboard::Set<'_>) -> arboard::Set<'_> {
+    use arboard::SetExtLinux;
+    set.exclude_from_history()
+}
+
+#[cfg(windows)]
+fn mark_private(set: arboard::Set<'_>) -> arboard::Set<'_> {
+    use arboard::SetExtWindows;
+    set.exclude_from_monitoring()
+}
+
+#[cfg(target_os = "macos")]
+fn mark_private(set: arboard::Set<'_>) -> arboard::Set<'_> {
+    use arboard::SetExtApple;
+    set.exclude_from_history()
+}
+
+/// Have [`copy`] record what it is given instead of copying it, marking a
+/// private copy only if `marks` says to.
+#[cfg(test)]
+pub(crate) fn record(marks: bool) {
+    CLIPBOARD.with(|slot| {
+        *slot.borrow_mut() = Clipboard::Recording {
+            copies: Vec::new(),
+            marks,
+        }
+    });
+}
+
+/// Everything [`copy`] has recorded since [`record`], in order.
+#[cfg(test)]
+pub(crate) fn recorded() -> Vec<(String, Content)> {
+    CLIPBOARD.with(|slot| match &*slot.borrow() {
+        Clipboard::Recording { copies, .. } => copies.clone(),
+        _ => panic!("the clipboard is not recording"),
     })
 }
 

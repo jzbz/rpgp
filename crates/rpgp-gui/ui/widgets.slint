@@ -282,6 +282,20 @@ export component Field inherits Rectangle {
         selection-foreground-color: Theme.accent-ink;
         edited => { root.edited(self.text); }
         accepted => { root.accepted(); }
+        // input-type does not stop Copy and Cut either: Slint puts the
+        // selected text itself on the clipboard, unmasked, where any program
+        // can read it and a clipboard manager keeps it. This runs before Slint
+        // acts on a key, and swallows the two it copies on, by the test Slint
+        // itself applies: control without shift, and "c" or "x". On macOS
+        // that is Cmd, which Slint reports as control. Paste is left alone:
+        // pasting from a password manager is how many people fill this in.
+        key-pressed(event) => {
+            if (root.secret && event.modifiers.control && !event.modifiers.shift
+                && (event.text == "c" || event.text == "x")) {
+                return accept;
+            }
+            return reject;
+        }
     }
 
     if input.text == "": Text {
@@ -294,6 +308,29 @@ export component Field inherits Rectangle {
         font-size: Theme.t-md;
         vertical-alignment: center;
         overflow: elide;
+    }
+
+    // Over a secret field's input, so the pointer never reaches it. When the
+    // left button comes up over a TextInput, Slint copies whatever it has
+    // selected to the primary selection on Linux, which any program can read
+    // and clipboard managers record, again without looking at input-type: a
+    // double or triple click, or a drag, put the passphrase there. Here a click
+    // only focuses the field. The pointer no longer places the caret, selects
+    // or pastes the primary selection with the middle button in a secret
+    // field; the keyboard still does all but the last, and selecting with it
+    // copies nothing anywhere.
+    if root.secret: TouchArea {
+        x: input.x;
+        y: input.y;
+        width: input.width;
+        height: input.height;
+        enabled: root.enabled;
+        mouse-cursor: MouseCursor.text;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                input.focus();
+            }
+        }
     }
 }
 

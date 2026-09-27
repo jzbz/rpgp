@@ -1289,8 +1289,10 @@ fn wire_sign_encrypt(ui: &AppWindow, state: &Shared) {
             // These two copies live on the worker for the whole operation,
             // which on a card can be a minute of waiting at a PIN prompt. The
             // Slint string they are copied from cannot be wiped — that is the
-            // toolkit's memory — but ours can be, and this is where a passphrase
-            // and a message password sit longest.
+            // toolkit's memory — but ours can be. So every callback that takes
+            // a passphrase or a message password wraps its copy the moment it
+            // leaves Slint's string, and it stays wrapped, or borrowed from the
+            // wrapped copy, until Sequoia seals it in a Password of its own.
             let (password, secret) = (
                 Zeroizing::new(password.to_string()),
                 Zeroizing::new(secret.to_string()),
@@ -1629,7 +1631,10 @@ fn wire_decrypt_verify(ui: &AppWindow, state: &Shared) {
                 return;
             }
 
-            let password = password.to_string();
+            // Wiped when the worker is done with it, as in Sign / Encrypt. It
+            // can be a key's passphrase or a message's password, and it waits
+            // here as well while a save dialog is open.
+            let password = Zeroizing::new(password.to_string());
             let start = {
                 let state = state.clone();
                 move |ui: &AppWindow, chosen: Option<PathBuf>| {
@@ -2039,7 +2044,8 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
             ui.set_status("Certifying…".into());
 
             let (ui_weak, state) = (ui_weak.clone(), state.clone());
-            let password = password.to_string();
+            // Wiped when the worker is done with it, as in Sign / Encrypt.
+            let password = Zeroizing::new(password.to_string());
             std::thread::spawn(move || {
                 let _busy = BusyGuard(ui_weak.clone());
                 let outcome = run_certify(
@@ -2623,7 +2629,7 @@ fn wire_lifecycle(ui: &AppWindow, state: &Shared) {
                 target,
                 expiry: expiry.to_string(),
                 value: value.to_string(),
-                password: password.to_string(),
+                password: Zeroizing::new(password.to_string()),
                 reason,
             };
             std::thread::spawn(move || {
@@ -2678,7 +2684,10 @@ struct LifecycleInput {
     /// Index into the expiry choices, as the dialog reports it.
     expiry: String,
     value: String,
-    password: String,
+    /// The key's passphrase, wiped when the worker drops this, as in Sign /
+    /// Encrypt. The lifecycle functions only borrow it, so this is the one
+    /// copy rPGP makes.
+    password: Zeroizing<String>,
     /// Index into Reason::ALL; only mode 4 reads it.
     reason: i32,
 }
@@ -2878,11 +2887,24 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
             // Shares the Sign / Encrypt models, so opening the notepad has to
             // fill them the same way.
             load_signing_targets(&ui, &state);
-            ui.set_np_output(SharedString::new());
-            ui.set_np_result(SharedString::new());
-            ui.set_np_tone(0);
-            ui.set_np_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
+            clear_notepad(&ui);
             ui.set_notepad_open(true);
+        }
+    });
+
+    // Every way of closing the notepad comes here: Close, Escape and a click
+    // on the scrim. What it showed lives in the window's properties rather
+    // than the dialog's, so closing the dialog alone left the last decrypted
+    // message referenced from the window, in full, for as long as rPGP ran or
+    // until the notepad was opened again.
+    ui.on_close_notepad({
+        let ui_weak = ui.as_weak();
+        move || {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            clear_notepad(&ui);
+            ui.set_notepad_open(false);
         }
     });
 
@@ -2905,9 +2927,11 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
                 return;
             };
             // The row confirms itself in Slint; the status line is for the
-            // case the clipboard refuses, which is otherwise invisible.
-            match clipboard::copy(text.to_string()) {
-                Ok(()) => ui.set_status("Copied to the clipboard".into()),
+            // case the clipboard refuses, which is otherwise invisible. A
+            // fingerprint or a user ID is public, so it goes out unmarked, as
+            // any other copy would.
+            match clipboard::copy(text.to_string(), clipboard::Content::Public) {
+                Ok(_) => ui.set_status("Copied to the clipboard".into()),
                 Err(e) => ui.set_status(format!("Could not copy: {e}").into()),
             }
         }
@@ -2919,11 +2943,24 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            // Marked private whatever it holds: see clipboard::Content.
             let text = ui.get_np_output().to_string();
-            match clipboard::copy(text) {
-                Ok(()) => {
+            match clipboard::copy(text, clipboard::Content::Private) {
+                Ok(copied) => {
                     ui.set_np_copied(true);
-                    ui.set_status("Copied to the clipboard".into());
+                    ui.set_status(
+                        match copied {
+                            clipboard::Copied::AsAsked => "Copied to the clipboard",
+                            // Said, because nothing else would tell the user
+                            // that a decrypted message may now be kept in a
+                            // clipboard manager's history.
+                            clipboard::Copied::Unmarked => {
+                                "Copied to the clipboard, where clipboard history may keep it: \
+                                 it cannot be marked private here"
+                            }
+                        }
+                        .into(),
+                    );
                     // Let the button say so, then go back to offering the action.
                     let ui_weak = ui.as_weak();
                     slint::Timer::single_shot(std::time::Duration::from_millis(1500), move || {
@@ -2962,41 +2999,69 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
                     let Some(ui) = ui_weak.upgrade() else {
                         return;
                     };
-                    ui.set_busy(false);
-                    match outcome {
-                        Ok((output, summary, tone, signatures)) => {
-                            let rows = signature_rows(&lock(&state).all, &signatures);
-                            ui.set_np_signatures(ModelRc::new(VecModel::from(rows)));
-                            ui.set_np_output(output.into());
-                            ui.set_np_result(summary.clone().into());
-                            ui.set_np_tone(tone);
-                            ui.set_status(summary.into());
-                        }
-                        Err(message) => {
-                            // Clear the previous run's verdict and output, as
-                            // the Decrypt/Verify worker does on this branch.
-                            // Both persist for the life of the dialog and were
-                            // cleared only at open, so a failed run left the
-                            // last message's "good signature — Alice
-                            // (verified)" row and her plaintext on screen under
-                            // a red banner describing a different message.
-                            ui.set_np_signatures(ModelRc::new(VecModel::from(
-                                Vec::<SignatureRow>::new(),
-                            )));
-                            ui.set_np_output(SharedString::new());
-                            ui.set_np_result(message.clone().into());
-                            ui.set_np_tone(3);
-                            ui.set_status(message.into());
-                        }
-                    }
+                    finish_notepad(&ui, &state, outcome);
                 });
             });
         }
     });
 }
 
-/// The blocking half of the notepad. Returns the output text, a summary line,
-/// a tone for the banner, and any signatures found.
+/// Empty what the notepad shows, which lives in the window's properties, not
+/// the dialog's, and so outlives the dialog unless it is emptied.
+fn clear_notepad(ui: &AppWindow) {
+    ui.set_np_output(SharedString::new());
+    ui.set_np_result(SharedString::new());
+    ui.set_np_tone(0);
+    ui.set_np_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
+    ui.set_np_copied(false);
+}
+
+/// What a notepad run gives back: the output text, a summary line, a tone for
+/// the banner, and any signatures found; or the line saying why it failed.
+type NpOutcome = Result<(String, String, i32, Vec<rpgp_core::ops::SignatureReport>), String>;
+
+/// Show what became of a notepad run, on the event loop.
+///
+/// Escape and a click on the scrim close the notepad while a run is still in
+/// flight, a decrypt waiting at a card's PIN prompt, say. A result that lands
+/// after that is not put back into the window, where closing has just emptied
+/// it, and nothing would show it; the status line still says how it went.
+fn finish_notepad(ui: &AppWindow, state: &Shared, outcome: NpOutcome) {
+    ui.set_busy(false);
+    if !ui.get_notepad_open() {
+        let line = match outcome {
+            Ok((_, summary, ..)) => summary,
+            Err(message) => message,
+        };
+        ui.set_status(line.into());
+        return;
+    }
+    match outcome {
+        Ok((output, summary, tone, signatures)) => {
+            let rows = signature_rows(&lock(state).all, &signatures);
+            ui.set_np_signatures(ModelRc::new(VecModel::from(rows)));
+            ui.set_np_output(output.into());
+            ui.set_np_result(summary.clone().into());
+            ui.set_np_tone(tone);
+            ui.set_status(summary.into());
+        }
+        Err(message) => {
+            // Clear the previous run's verdict and output, as the
+            // Decrypt/Verify worker does on this branch. Both last for as
+            // long as the dialog is open, so a failed run left the last
+            // message's "good signature — Alice (verified)" row and her
+            // plaintext on screen under a red banner describing a different
+            // message.
+            ui.set_np_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
+            ui.set_np_output(SharedString::new());
+            ui.set_np_result(message.clone().into());
+            ui.set_np_tone(3);
+            ui.set_status(message.into());
+        }
+    }
+}
+
+/// The blocking half of the notepad.
 fn run_notepad(
     state: &Shared,
     action: i32,
@@ -3004,7 +3069,7 @@ fn run_notepad(
     signer_index: i32,
     password: &str,
     secret: &str,
-) -> Result<(String, String, i32, Vec<rpgp_core::ops::SignatureReport>), String> {
+) -> NpOutcome {
     // Snapshot what is needed and release the lock: everything below is I/O,
     // and a card PIN prompt can hold it for a minute while the UI waits.
     let (store, signers, chosen) = {
@@ -3415,7 +3480,11 @@ fn wire_revoke(ui: &AppWindow, state: &Shared) {
             ui.set_status("Revoking…".into());
 
             let (ui_weak, state) = (ui_weak.clone(), state.clone());
-            let (message, password) = (message.to_string(), password.to_string());
+            // The passphrase is wiped when the worker is done with it, as in
+            // Sign / Encrypt. Withdrawing a certification only borrows it, so
+            // there this is the one copy rPGP makes. The message is public: it
+            // goes into the revocation for anyone to read.
+            let (message, password) = (message.to_string(), Zeroizing::new(password.to_string()));
             std::thread::spawn(move || {
                 let _busy = BusyGuard(ui_weak.clone());
                 let outcome = run_revoke(&state, reason, &message, &password);
@@ -6888,6 +6957,375 @@ mod tests {
         assert!(
             status.starts_with("SHA-1 accepted for Alice <alice@example.org>."),
             "the confirmation, shown beside Bob, should say it was about Alice: {status}"
+        );
+    }
+
+    /// The notepad's Copy marks what it copies private, a fingerprint's Copy
+    /// leaves it unmarked, and where the clipboard cannot mark a copy the
+    /// notepad says so.
+    ///
+    /// The notepad's output can be a decrypted message, and it used to go on
+    /// the clipboard as a fingerprint does: into every clipboard manager's
+    /// history, and on X11 handed to one to keep when rPGP let go of the
+    /// clipboard. No test has a display server to copy to, so the clipboard
+    /// here records what each copy asked for instead.
+    #[test]
+    fn the_notepad_copies_its_output_marked_private_and_says_when_it_cannot() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+        ui.set_np_output("TOP SECRET".into());
+
+        // arboard, which can mark a copy on every platform it runs on.
+        clipboard::record(true);
+        ui.invoke_np_copy();
+        assert_eq!(ui.get_status(), "Copied to the clipboard");
+        ui.invoke_copy_value("0123 4567".into());
+        assert_eq!(
+            clipboard::recorded(),
+            [
+                ("TOP SECRET".to_string(), clipboard::Content::Private),
+                ("0123 4567".to_string(), clipboard::Content::Public),
+            ],
+            "the notepad's output must be copied as private, and a fingerprint as public"
+        );
+
+        // smithay-clipboard, which can mark nothing.
+        clipboard::record(false);
+        ui.invoke_np_copy();
+        assert!(
+            ui.get_np_copied(),
+            "the copy still went, so the button should say so"
+        );
+        let status = ui.get_status();
+        assert!(
+            status.contains("clipboard history may keep it"),
+            "a decrypted message copied without the mark should say so: {status}"
+        );
+        ui.invoke_copy_value("0123 4567".into());
+        assert_eq!(
+            ui.get_status(),
+            "Copied to the clipboard",
+            "a public copy is never marked, so it lacks nothing"
+        );
+    }
+
+    /// Closing the notepad empties what it showed from the window, and a run
+    /// that lands after it closed does not put its result back.
+    ///
+    /// The output, the verdict and the signer rows are the window's
+    /// properties rather than the dialog's, and closing only closed the
+    /// dialog, so the last decrypted message stayed referenced from the window
+    /// for as long as rPGP ran, or until the notepad was opened again. Escape
+    /// and a click on the scrim close it with a run in flight, and that run's
+    /// result used to land in the same properties afterwards.
+    #[test]
+    fn closing_the_notepad_takes_what_it_showed_out_of_the_window() {
+        use slint::Model;
+        use slint::platform::{PointerEventButton, WindowEvent};
+
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+        ui.window().set_size(slint::LogicalSize::new(1000.0, 700.0));
+        ui.show().unwrap();
+        let decrypted = || -> NpOutcome {
+            Ok((
+                "TOP SECRET".to_string(),
+                "Decrypted. Good signature.".to_string(),
+                1,
+                vec![report("0123", true)],
+            ))
+        };
+        let shown = |ui: &AppWindow| {
+            (
+                ui.get_np_output().to_string(),
+                ui.get_np_result().to_string(),
+                ui.get_np_signatures().row_count(),
+            )
+        };
+        let empty = (String::new(), String::new(), 0);
+
+        ui.invoke_open_notepad();
+        finish_notepad(&ui, &state, decrypted());
+        assert_eq!(
+            shown(&ui),
+            (
+                "TOP SECRET".to_string(),
+                "Decrypted. Good signature.".to_string(),
+                1
+            )
+        );
+
+        // A click beside the card, on the scrim, the way Close and Escape
+        // close it too.
+        let position = slint::LogicalPosition::new(4.0, 4.0);
+        let button = PointerEventButton::Left;
+        ui.window()
+            .dispatch_event(WindowEvent::PointerPressed { position, button });
+        ui.window()
+            .dispatch_event(WindowEvent::PointerReleased { position, button });
+        assert!(
+            !ui.get_notepad_open(),
+            "the click should have closed the notepad"
+        );
+        assert_eq!(
+            shown(&ui),
+            empty,
+            "closing the notepad left what it showed in the window"
+        );
+
+        // Closed while a run was in flight, which then lands.
+        ui.set_busy(true);
+        finish_notepad(&ui, &state, decrypted());
+        assert_eq!(
+            shown(&ui),
+            empty,
+            "a run that landed after the notepad closed put its output back"
+        );
+        assert!(!ui.get_busy());
+        assert_eq!(
+            ui.get_status(),
+            "Decrypted. Good signature.",
+            "the status line should still say how the run went"
+        );
+    }
+
+    #[global_allocator]
+    static WATCH: freed::Watch = freed::Watch;
+
+    /// What the allocator is handed back, watched while
+    /// [`every_worker_wipes_its_copy_of_a_passphrase`] asks: whether a copy of
+    /// a passphrase is freed with the passphrase still in it.
+    ///
+    /// A plain `String` is freed as it stands, and its bytes stay in the heap
+    /// until something reuses them; `Zeroizing` wipes them first. Only byte
+    /// buffers are read, the alignment of a `String` or a `Vec<u8>`. Slint's
+    /// own strings carry a header aligned for their reference count, and those
+    /// cannot be wiped at all, as the README says, so they are not what the
+    /// test asks about. Every test in this binary pays for the watch: an
+    /// atomic load for each allocation, and a byte buffer zeroed as it is
+    /// handed out or grown, for the reason `dealloc` gives.
+    mod freed {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        use std::time::{Duration, Instant};
+
+        /// The passphrase the test hands every callback. A byte buffer of
+        /// exactly its length, allocated on the test's thread while it calls
+        /// a callback, is taken for that callback's copy of it, so the length
+        /// is an unusual one.
+        pub const MARKER: &str = "a passphrase no other test uses, 7f3a9c51, of an unusual length";
+
+        pub struct Watch;
+
+        static WATCHING: AtomicBool = AtomicBool::new(false);
+        /// Byte buffers freed with the marker still in them.
+        static UNWIPED: AtomicUsize = AtomicUsize::new(0);
+        /// How many copies the callback made.
+        static MADE: AtomicUsize = AtomicUsize::new(0);
+        /// The addresses of the copies not yet freed.
+        static COPIES: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+
+        thread_local! {
+            /// Set on the test's thread while it calls a callback.
+            static CALLING: Cell<bool> = const { Cell::new(false) };
+        }
+
+        fn is_copy(layout: Layout) -> bool {
+            layout.align() == 1 && layout.size() == MARKER.len()
+        }
+
+        unsafe impl GlobalAlloc for Watch {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                // SAFETY: passed through as it came.
+                let block = unsafe { System.alloc(layout) };
+                if block.is_null() {
+                    return block;
+                }
+                if layout.align() == 1 {
+                    // SAFETY: the block was just allocated, and this long.
+                    unsafe { block.write_bytes(0, layout.size()) };
+                }
+                if WATCHING.load(SeqCst)
+                    && is_copy(layout)
+                    && CALLING.with(Cell::get)
+                    && COPIES.iter().any(|slot| {
+                        slot.compare_exchange(0, block as usize, SeqCst, SeqCst)
+                            .is_ok()
+                    })
+                {
+                    MADE.fetch_add(1, SeqCst);
+                }
+                block
+            }
+
+            unsafe fn dealloc(&self, block: *mut u8, layout: Layout) {
+                if WATCHING.load(SeqCst) {
+                    if layout.align() == 1 && (MARKER.len()..=(1 << 16)).contains(&layout.size()) {
+                        // SAFETY: the block is still allocated, and this long,
+                        // and every byte of it has been written: `alloc`
+                        // zeroes a byte buffer as it hands it out, and
+                        // `realloc` what one grows by. Without that, a
+                        // String's spare capacity would be bytes never
+                        // written, which Rust does not allow to be read as
+                        // `u8`, and could still hold the marker left by a
+                        // block freed before it, such as one of Slint's
+                        // copies, and fail the test falsely.
+                        let bytes = unsafe { std::slice::from_raw_parts(block, layout.size()) };
+                        if bytes
+                            .windows(MARKER.len())
+                            .any(|window| window == MARKER.as_bytes())
+                        {
+                            UNWIPED.fetch_add(1, SeqCst);
+                        }
+                    }
+                    let _ = COPIES.iter().any(|slot| {
+                        slot.compare_exchange(block as usize, 0, SeqCst, SeqCst)
+                            .is_ok()
+                    });
+                }
+                // SAFETY: passed through as it came.
+                unsafe { System.dealloc(block, layout) }
+            }
+
+            unsafe fn realloc(&self, block: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                if !WATCHING.load(SeqCst) {
+                    // SAFETY: passed through as it came.
+                    let moved = unsafe { System.realloc(block, layout, size) };
+                    if !moved.is_null() && layout.align() == 1 && size > layout.size() {
+                        // Zeroed as `alloc` zeroes a new block.
+                        // SAFETY: the block is `size` long now.
+                        unsafe {
+                            moved
+                                .add(layout.size())
+                                .write_bytes(0, size - layout.size())
+                        };
+                    }
+                    return moved;
+                }
+                // As GlobalAlloc's own default does it, so that a buffer that
+                // grows or shrinks by moving is read as its old place is freed.
+                // SAFETY: the caller promises `size` is valid at this alignment.
+                let grown = unsafe { Layout::from_size_align_unchecked(size, layout.align()) };
+                // SAFETY: as for alloc and dealloc above.
+                unsafe {
+                    let moved = self.alloc(grown);
+                    if !moved.is_null() {
+                        std::ptr::copy_nonoverlapping(block, moved, layout.size().min(size));
+                        self.dealloc(block, layout);
+                    }
+                    moved
+                }
+            }
+        }
+
+        /// Call `invoke`, which hands [`MARKER`] to a callback, and wait until
+        /// every copy of it the callback made has been freed, on whichever
+        /// thread that happens. Returns how many copies it made, and how many
+        /// byte buffers were freed with the marker still in them meanwhile.
+        pub fn run(invoke: impl FnOnce()) -> (usize, usize) {
+            for slot in &COPIES {
+                slot.store(0, SeqCst);
+            }
+            UNWIPED.store(0, SeqCst);
+            MADE.store(0, SeqCst);
+            WATCHING.store(true, SeqCst);
+            CALLING.with(|calling| calling.set(true));
+            invoke();
+            CALLING.with(|calling| calling.set(false));
+
+            let outstanding = || COPIES.iter().any(|slot| slot.load(SeqCst) != 0);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while outstanding() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let freed = !outstanding();
+            WATCHING.store(false, SeqCst);
+            assert!(freed, "a copy of the passphrase was never freed");
+            (MADE.load(SeqCst), UNWIPED.load(SeqCst))
+        }
+    }
+
+    /// Every callback that takes a passphrase wipes its copy of it before the
+    /// copy is freed.
+    ///
+    /// The copy is made the moment the passphrase leaves Slint's string, and
+    /// moves to a worker, where it lives for the whole operation, a card's
+    /// PIN prompt included. Key generation, Sign / Encrypt and the notepad
+    /// held theirs in `Zeroizing`; Decrypt / Verify, Certify, the lifecycle
+    /// actions and Revoke held a plain `String`, and freed it with the
+    /// passphrase in it. Every run here but key generation stops early, with
+    /// no file or no certificate to act on, so the callback's copy is all
+    /// there is to see. A run that goes further only borrows it, or copies it
+    /// into a `Zeroizing` of its own, and Sequoia's `Password` wipes what it
+    /// takes. Key generation shows that for one whole run: it makes a key
+    /// protected by the passphrase and stores it, and nothing on the way,
+    /// rpgp-core's or Sequoia's, may free a copy unwiped either.
+    #[test]
+    fn every_worker_wipes_its_copy_of_a_passphrase() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+        // The lifecycle callback starts no worker without one.
+        lock(&state).lifecycle_fingerprint = Some("0123456789ABCDEF".to_string());
+
+        let marker = || SharedString::from(freed::MARKER);
+        let none = SharedString::new;
+        let runs: [(&str, usize, &dyn Fn()); 7] = [
+            ("Sign / Encrypt", 2, &|| {
+                ui.invoke_se_run(false, true, 0, marker(), marker())
+            }),
+            ("The notepad", 2, &|| {
+                ui.invoke_np_run(0, "a note".into(), 0, marker(), marker())
+            }),
+            ("Decrypt / Verify", 1, &|| ui.invoke_dv_run(marker())),
+            ("Certify", 1, &|| {
+                ui.invoke_certify_run(0, false, false, 0, marker())
+            }),
+            // Mode 99 is no action at all, so nothing is written.
+            ("A lifecycle action", 1, &|| {
+                ui.invoke_lifecycle_run(99, "0".into(), none(), marker(), 0)
+            }),
+            ("Revoke", 1, &|| ui.invoke_revoke_run(0, none(), marker())),
+            // Last, so that no run before it has a key to act on.
+            ("Key generation", 1, &|| {
+                ui.invoke_generate_key("Wipe".into(), "wipe@example.org".into(), marker(), 0, 0, 0)
+            }),
+        ];
+        for (what, copies, invoke) in runs {
+            // Each run leaves busy set, since the completion that would clear
+            // it runs on an event loop this backend does not have.
+            ui.set_busy(false);
+            let (made, unwiped) = freed::run(invoke);
+            assert_eq!(
+                made, copies,
+                "{what} made {made} copies of the passphrase where {copies} were expected, \
+                 so this cannot tell whether they were wiped"
+            );
+            assert_eq!(
+                unwiped, 0,
+                "{what} freed a copy of the passphrase without wiping it"
+            );
+        }
+
+        // Key generation went the whole way, so its copy was followed through
+        // rpgp-core and Sequoia and not only through the callback.
+        let keys = lock(&state).store.secret_certs().expect("the store reads");
+        assert_eq!(keys.len(), 1, "key generation should have stored its key");
+        assert!(
+            keys[0]
+                .keys()
+                .secret()
+                .all(|key| key.key().secret().is_encrypted()),
+            "the key should be protected by the passphrase"
         );
     }
 }

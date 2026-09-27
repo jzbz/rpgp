@@ -133,13 +133,27 @@ impl Reason {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RevokeRequest {
     pub fingerprint: String,
     pub reason: Reason,
     /// Free text stored in the revocation for whoever reads it later.
     pub message: String,
     pub password: Option<Zeroizing<String>>,
+}
+
+/// Written out rather than derived, so the passphrase cannot be printed; see
+/// `secret::redacted`. The message stays: it is public, written into
+/// the revocation for anyone to read.
+impl std::fmt::Debug for RevokeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RevokeRequest")
+            .field("fingerprint", &self.fingerprint)
+            .field("reason", &self.reason)
+            .field("message", &self.message)
+            .field("password", &crate::secret::redacted(&self.password))
+            .finish()
+    }
 }
 
 impl RevokeRequest {

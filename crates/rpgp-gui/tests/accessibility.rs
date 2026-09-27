@@ -10,6 +10,9 @@
 //!
 //! Verified to reproduce: before the `accessible-value` binding in
 //! `ui/widgets.slint`, this test reported the passphrase back verbatim.
+//!
+//! Nor may it reach a clipboard, which `input-type` does not stop either; see
+//! [`a_secret_field_puts_nothing_on_either_clipboard`].
 
 include!(concat!(env!("OUT_DIR"), "/field-probe.rs"));
 
@@ -61,6 +64,134 @@ fn an_ordinary_field_still_publishes_its_contents() {
         inputs[0].accessible_label().unwrap_or_default().as_str(),
         "Passphrase",
     );
+}
+
+/// The testing backend, with every text Slint puts on either clipboard kept.
+///
+/// The backend's own clipboard keeps the ordinary one and drops the primary
+/// selection, which is where a mouse selection goes.
+struct RecordingPlatform {
+    backend: i_slint_backend_testing::TestingBackend,
+    copies: std::rc::Rc<std::cell::RefCell<Vec<(slint::platform::Clipboard, String)>>>,
+}
+
+impl slint::platform::Platform for RecordingPlatform {
+    fn create_window_adapter(
+        &self,
+    ) -> Result<std::rc::Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
+        self.backend.create_window_adapter()
+    }
+
+    fn duration_since_start(&self) -> std::time::Duration {
+        self.backend.duration_since_start()
+    }
+
+    fn set_clipboard_text(&self, text: &str, clipboard: slint::platform::Clipboard) {
+        self.copies.borrow_mut().push((clipboard, text.to_string()));
+    }
+}
+
+/// A secret field puts nothing on either clipboard, however its text is
+/// selected, and an ordinary field still copies.
+///
+/// `input-type: password` only masks the glyphs on screen. Slint's TextInput
+/// copied a selection to the clipboard on Ctrl+C and Ctrl+X, and to the
+/// primary selection on Linux whenever the left button came up over one, as
+/// it does after a double or triple click or a drag, all without looking at
+/// the input type. On X11 any program can read the primary selection, and
+/// clipboard managers record both.
+#[test]
+fn a_secret_field_puts_nothing_on_either_clipboard() {
+    use slint::platform::{Clipboard, Key, PointerEventButton, WindowEvent};
+
+    let copies = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    slint::platform::set_platform(Box::new(RecordingPlatform {
+        backend: i_slint_backend_testing::TestingBackend::new(
+            i_slint_backend_testing::TestingBackendOptions {
+                mock_time: true,
+                ..Default::default()
+            },
+        ),
+        copies: copies.clone(),
+    }))
+    .expect("no platform is set on a test's own thread");
+
+    let probe = FieldProbe::new().unwrap();
+    probe.show().unwrap();
+    probe.set_secret_text(PASSPHRASE.into());
+    probe.set_plain_text(ORDINARY.into());
+    let window = probe.window();
+    let with_control = |key: &str| {
+        window.dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Control.into(),
+        });
+        press(&probe, key);
+        window.dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Control.into(),
+        });
+    };
+
+    let text_of = |secret: bool| {
+        if secret {
+            probe.get_secret_text()
+        } else {
+            probe.get_plain_text()
+        }
+    };
+    let set_text = |secret: bool, text: &str| {
+        if secret {
+            probe.set_secret_text(text.into());
+        } else {
+            probe.set_plain_text(text.into());
+        }
+    };
+
+    for (field, text) in probe_inputs(&probe).iter().zip([PASSPHRASE, ORDINARY]) {
+        let secret = text == PASSPHRASE;
+        copies.borrow_mut().clear();
+        // Three clicks in a row, which the mock clock never lets drift apart:
+        // the second selects a word and the third the whole line, and each
+        // release copies whatever is selected.
+        let (at, size) = (field.absolute_position(), field.size());
+        let position = slint::LogicalPosition::new(at.x + size.width / 2., at.y + size.height / 2.);
+        let button = PointerEventButton::Left;
+        for _ in 0..3 {
+            window.dispatch_event(WindowEvent::PointerPressed { position, button });
+            window.dispatch_event(WindowEvent::PointerReleased { position, button });
+        }
+        // The clicks gave the field focus, or the keys below would go nowhere
+        // and copy nothing whatever the field allowed.
+        press(&probe, "!");
+        assert_ne!(text_of(secret), text, "a click should give the field focus");
+        set_text(secret, text);
+        with_control("a");
+        with_control("c");
+        with_control("x");
+
+        let copied = copies.borrow().clone();
+        if secret {
+            assert_eq!(copied, [], "a secret field put its text on a clipboard");
+            assert_eq!(
+                probe.get_secret_text(),
+                PASSPHRASE,
+                "Ctrl+X in a secret field should do nothing at all"
+            );
+        } else {
+            // The same gestures on an ordinary field, so that nothing above is
+            // the gestures going nowhere.
+            for clipboard in [Clipboard::SelectionClipboard, Clipboard::DefaultClipboard] {
+                assert!(
+                    copied.contains(&(clipboard.clone(), text.to_string())),
+                    "an ordinary field should still copy to {clipboard:?}: {copied:?}"
+                );
+            }
+            assert_eq!(
+                probe.get_plain_text(),
+                "",
+                "Ctrl+X should cut an ordinary field"
+            );
+        }
+    }
 }
 
 /// Every interactive control says what it is, what it is called, and can be
@@ -967,19 +1098,130 @@ fn every_passphrase_field_in_the_real_dialogs_suppresses_its_value() {
     probe.show().unwrap();
     reached += check("NotepadDialog", &probe);
 
-    // A passphrase field in a dialog no probe instantiates, or one behind a
-    // condition no probe satisfies, would be silently uncovered — so hold the
-    // count against the source rather than against a number written here.
-    let declared =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/dialogs.slint"))
-            .expect("reading ui/dialogs.slint")
-            .matches("secret: true")
-            .count();
+    // A passphrase field in a dialog no probe instantiates, or behind a
+    // condition no probe satisfies, is never reached above. Counting
+    // `secret: true` in the source, as this used to, could not make up for
+    // that where it matters: a field that forgot the flag adds nothing to the
+    // count, and passed unseen. So every Field is read from the source too,
+    // and the flag has to agree with the placeholder, which is the label the
+    // check above classifies by, wherever the field is.
+    let mut declared = 0;
+    for file in ["ui/dialogs.slint", "ui/app-window.slint"] {
+        let source = std::fs::read_to_string(format!("{}/{file}", env!("CARGO_MANIFEST_DIR")))
+            .unwrap_or_else(|e| panic!("reading {file}: {e}"));
+        for field in fields_in(&source) {
+            let lower = field.placeholder.to_lowercase();
+            let takes_passphrase = lower.contains("passphrase") || lower.contains("password");
+            assert!(
+                field.secret || !takes_passphrase,
+                "{file}:{}: the Field {} takes a passphrase but is not marked `secret: true`",
+                field.line,
+                field.placeholder
+            );
+            assert!(
+                takes_passphrase || !field.secret,
+                "{file}:{}: the Field {} is marked secret, but its placeholder does not say \
+                 it takes a passphrase or a password, which is all it is announced by",
+                field.line,
+                field.placeholder
+            );
+            if field.secret && file == "ui/dialogs.slint" {
+                declared += 1;
+            }
+        }
+    }
+    // And every one in the dialogs is reached through a probe as well, so the
+    // suppression is seen working and not only declared.
     assert_eq!(
         reached, declared,
-        "ui/dialogs.slint marks {declared} fields secret but only {reached} were reached \
+        "ui/dialogs.slint has {declared} passphrase fields but only {reached} were reached \
          through a probe — add a probe for the dialog holding the new one"
     );
+}
+
+/// A `Field` as a `.slint` file declares it.
+struct DeclaredField {
+    /// The line it starts on, from 1.
+    line: usize,
+    /// What its `placeholder:` is set to, as written: a string literal, or
+    /// the expression it is bound to.
+    placeholder: String,
+    secret: bool,
+}
+
+/// Every `Field` instantiated in `source`.
+///
+/// Read from the text rather than parsed, which is enough for how this
+/// interface is written: a placeholder is one statement, and a Field's block
+/// holds no string with a brace of its own outside an interpolation.
+fn fields_in(source: &str) -> Vec<DeclaredField> {
+    let mut fields = Vec::new();
+    for (start, _) in source.match_indices("Field") {
+        let line_start = source[..start].rfind('\n').map_or(0, |at| at + 1);
+        let commented = source[line_start..start].contains("//");
+        // A name that only ends in Field is another component, and one that
+        // only starts with it, FieldRow, has no brace straight after.
+        let named = source[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '_');
+        let rest = source[start + "Field".len()..].trim_start();
+        if commented || named || !rest.starts_with('{') {
+            continue;
+        }
+        let open = source.len() - rest.len();
+        let body = &source[open..block_end(source, open)];
+        let placeholder = body
+            .split_once("placeholder:")
+            .and_then(|(_, after)| after.split(';').next())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        fields.push(DeclaredField {
+            line: source[..start].matches('\n').count() + 1,
+            placeholder,
+            secret: body.contains("secret: true"),
+        });
+    }
+    fields
+}
+
+/// Where the block opened by the `{` at `open` ends, just past its `}`.
+fn block_end(source: &str, open: usize) -> usize {
+    let mut depth = 0;
+    let mut chars = source[open..].char_indices();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            // A string's braces are its own: `\{…}` is how Slint interpolates.
+            '"' => {
+                while let Some((_, c)) = chars.next() {
+                    match c {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            '/' if source[open + at..].starts_with("//") => {
+                for (_, c) in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return open + at + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("the block opened at byte {open} is never closed");
 }
 
 /// The Trust root box is locked only for a key generated here. A secret key

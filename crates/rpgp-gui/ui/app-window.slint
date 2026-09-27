@@ -392,6 +392,10 @@ export component AppWindow inherits Window {
     callback lifecycle-run(int, string, string, string, int);
 
     callback open-notepad();
+    /// Every way of closing the notepad. Rust empties what it showed, which
+    /// these window properties would otherwise keep after the dialog is gone,
+    /// and then closes it.
+    callback close-notepad();
     callback np-run(int, string, int, string, string);
     callback np-copy();
 
@@ -1193,7 +1197,7 @@ export component AppWindow inherits Window {
         result: root.np-result;
         result-tone: root.np-tone;
         copied: root.np-copied;
-        dismissed => { root.notepad-open = false; }
+        dismissed => { root.close-notepad(); }
         copy-output => { root.np-copy(); }
         toggle-recipient(index) => { root.se-toggle-recipient(index); }
         run(action, text, signer, password, secret) => {

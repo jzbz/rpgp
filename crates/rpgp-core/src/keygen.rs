@@ -113,13 +113,8 @@ pub struct KeyGenRequest {
     pub password: Option<Zeroizing<String>>,
 }
 
-/// Written out rather than derived, so the passphrase cannot be printed.
-///
-/// `Zeroizing` is `#[repr(transparent)]` and its `Debug` delegates straight to
-/// the inner `String`, so a derived one rendered the passphrase verbatim into
-/// whatever formatted it. Nothing does today; the point is that a `dbg!` or an
-/// error that captured the request would, and the type carrying a secret should
-/// not depend on nobody ever doing that.
+/// Written out rather than derived, so the passphrase cannot be printed; see
+/// `secret::redacted`.
 impl std::fmt::Debug for KeyGenRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KeyGenRequest")
@@ -127,13 +122,7 @@ impl std::fmt::Debug for KeyGenRequest {
             .field("key_type", &self.key_type)
             .field("standard", &self.standard)
             .field("validity", &self.validity)
-            .field(
-                "password",
-                match self.password {
-                    Some(_) => &"<redacted>",
-                    None => &"None",
-                },
-            )
+            .field("password", &crate::secret::redacted(&self.password))
             .finish()
     }
 }

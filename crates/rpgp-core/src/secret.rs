@@ -20,8 +20,26 @@
 use sequoia_openpgp::crypto::{KeyPair, Password, Signer};
 use sequoia_openpgp::packet::Key;
 use sequoia_openpgp::packet::key::{KeyParts, KeyRole, SecretKeyMaterial, SecretParts};
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
+
+/// What a request's `Debug` shows in place of the passphrase it carries.
+///
+/// `Zeroizing` is `#[repr(transparent)]` and its `Debug` delegates straight to
+/// the inner `String`, so a derived `Debug` renders the passphrase verbatim
+/// into whatever formats the request. Nothing does today; the point is that a
+/// `dbg!` or an error that captured a request would, and a type carrying a
+/// secret should not depend on nobody ever doing that. So every request that
+/// carries one, [`crate::keygen::KeyGenRequest`],
+/// [`crate::certify::CertifyRequest`] and [`crate::revoke::RevokeRequest`],
+/// writes its `Debug` out and puts this where the passphrase would be.
+pub(crate) fn redacted(password: &Option<Zeroizing<String>>) -> &'static str {
+    match password {
+        Some(_) => "<redacted>",
+        None => "None",
+    }
+}
 
 /// Whether `secret` is key material this process could ever use, as opposed to
 /// a placeholder standing where key material is not.
@@ -229,5 +247,47 @@ mod tests {
                 "{wrong:?} should be skipped"
             );
         }
+    }
+
+    /// No request that carries a passphrase prints it when formatted.
+    ///
+    /// Certify's and Revoke's used to derive `Debug`, which went through
+    /// `Zeroizing`'s own and printed the passphrase in full, while the key
+    /// generation request beside them had already been written out not to.
+    /// Everything else in each still prints, so the output is not simply blank.
+    #[test]
+    fn no_request_prints_the_passphrase_it_carries() {
+        use crate::certify::CertifyRequest;
+        use crate::revoke::RevokeRequest;
+
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let passphrase = || Some(Zeroizing::new(PASSPHRASE.to_string()));
+
+        let mut keygen = KeyGenRequest::new("Alice <alice@example.org>");
+        keygen.password = passphrase();
+        let mut certify = CertifyRequest::new("CERTIFIER", "TARGET");
+        certify.password = passphrase();
+        let mut revoke = RevokeRequest::new("FINGERPRINT");
+        revoke.message = "moved to a new key".to_string();
+        revoke.password = passphrase();
+
+        for (printed, shown) in [
+            (format!("{keygen:?}"), "Alice <alice@example.org>"),
+            (format!("{certify:?}"), "TARGET"),
+            (format!("{revoke:?}"), "moved to a new key"),
+        ] {
+            assert!(
+                !printed.contains(PASSPHRASE),
+                "a request printed its passphrase: {printed}"
+            );
+            assert!(printed.contains("<redacted>"), "{printed}");
+            assert!(printed.contains(shown), "{printed}");
+        }
+
+        certify.password = None;
+        assert!(
+            !format!("{certify:?}").contains("<redacted>"),
+            "a request with no passphrase should not claim to hide one"
+        );
     }
 }

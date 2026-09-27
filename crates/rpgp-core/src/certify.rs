@@ -30,7 +30,7 @@ pub const FULL: u8 = 120;
 /// Partial confidence: enough only in combination with other certifications.
 pub const PARTIAL: u8 = 60;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CertifyRequest {
     /// Fingerprint of our own certificate doing the certifying.
     pub certifier: String,
@@ -52,6 +52,23 @@ pub struct CertifyRequest {
     pub amount: u8,
     pub expires: Option<Duration>,
     pub password: Option<Zeroizing<String>>,
+}
+
+/// Written out rather than derived, so the passphrase cannot be printed; see
+/// `secret::redacted`.
+impl std::fmt::Debug for CertifyRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CertifyRequest")
+            .field("certifier", &self.certifier)
+            .field("target", &self.target)
+            .field("user_ids", &self.user_ids)
+            .field("exportable", &self.exportable)
+            .field("depth", &self.depth)
+            .field("amount", &self.amount)
+            .field("expires", &self.expires)
+            .field("password", &crate::secret::redacted(&self.password))
+            .finish()
+    }
 }
 
 impl CertifyRequest {
