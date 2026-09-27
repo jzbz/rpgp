@@ -5,9 +5,14 @@ export struct CertRow {
     fingerprint: string,
     fingerprint-pretty: string,
     key-id: string,
+    // The user IDs, and the revocation's note below, are shown with every
+    // character that draws nothing or moves the text around it written out,
+    // "[U+202E]", by rpgp-gui's `display::text`. The Rust side keeps the
+    // certificate's own text for everything that acts on it.
     primary-user-id: string,
     name: string,
     email: string,
+    // One user ID a line.
     user-ids: string,
     algorithm: string,
     created: string,
@@ -36,12 +41,17 @@ export struct CertRow {
     // The user has opted this certificate into SHA-1 verification. Widens what
     // verifies and nothing else — never what is trusted.
     sha1-accepted: bool,
-    // Why the certificate was revoked; empty when it has not been.
+    // Why the certificate was revoked, in the app's words; empty when it has
+    // not been.
     revocation: string,
+    // The note left with that revocation, written by whoever signed it, and
+    // shown as theirs rather than the app's; often empty.
+    revocation-note: string,
     // That revocation is hard, so there is no harder one left to give. A key
     // revoked only softly can still be marked compromised.
     revocation-hard: bool,
-    // Smartcard serial when gpg-agent signs for this key from a card.
+    // The smartcard gpg-agent signs for this key from, when it is on one, by
+    // the number `gpg -K` gives it: "0006 18132963" for an OpenPGP card.
     card-serial: string,
 }
 
@@ -49,8 +59,10 @@ export struct CertRow {
 // before storing it lists it.
 export struct PendingRevocationRow {
     name: string,
-    // The reason as the details pane will show it, with its note.
+    // The reason, and the note left with it, as the details pane will show
+    // them.
     reason: string,
+    note: string,
     // Hard: signatures the key made in the past stop counting too.
     hard: bool,
     // The user holds this key's secret half, in the store or in gpg-agent,
@@ -79,8 +91,13 @@ export struct UserIdRow {
 
 export struct RecipientRow {
     fingerprint: string,
+    // The name, or the whole user ID where there is none.
     label: string,
+    // The address, or nothing.
     sublabel: string,
+    // What tells two certificates with the same user ID apart, which the
+    // address alone does not: a person's old and new key usually share it.
+    key-id: string,
     initials: string,
     tint-index: int,
     selected: bool,
@@ -121,7 +138,10 @@ export struct SubkeyRow {
 
 // A user ID row in the certificate details dialog.
 export struct UserIdDetailRow {
+    // As shown and copied, with any hidden character written out.
     text: string,
+    // As the certificate has it: what Revoke user ID names, and never shown.
+    user-id: string,
     is-primary: bool,
     revoked: bool,
     self-signed: string,

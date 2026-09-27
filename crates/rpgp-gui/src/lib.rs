@@ -23,6 +23,7 @@ use slint::{ModelRc, SharedString, VecModel};
 use zeroize::Zeroizing;
 
 mod clipboard;
+mod display;
 pub mod hardening;
 
 slint::include_modules!();
@@ -114,13 +115,36 @@ impl Scope {
 }
 
 /// A certificate offered as an encryption recipient, plus whether it is ticked.
+///
+/// The name and address are the certificate's own, as the filter matches
+/// them; [`push_sign_encrypt`] makes them safe to show.
 struct Recipient {
     fingerprint: String,
+    /// The name, or the whole user ID where it has none.
     label: String,
+    /// The address, or nothing.
     sublabel: String,
+    key_id: String,
     initials: String,
     tint: i32,
     selected: bool,
+}
+
+/// One of the user's own keys, offered in a Sign as or Certify with list.
+///
+/// The key ID goes with it because a person's old and new key, or the Modern
+/// and Compatible pair the key generator offers, commonly carry the same user
+/// ID, and the lists showed that alone: two identical entries, with nothing to
+/// say which would sign.
+#[derive(Debug, Clone)]
+struct OwnKey {
+    fingerprint: String,
+    /// The primary user ID as the certificate has it, with "(smartcard)"
+    /// in front of it where a card will be asked: in front, because the key
+    /// ID beside it can leave too little room for the whole user ID, and the
+    /// end is what is elided. [`display::text`] is applied where it is shown.
+    label: String,
+    key_id: String,
 }
 
 /// Everything the callbacks share.
@@ -175,9 +199,9 @@ struct State {
     /// index a row reports is an index into what is *shown*, so the filter has
     /// to be applied in the same place the mapping back is done.
     se_filter: String,
-    /// (fingerprint, label) of every certificate that can sign and has a
-    /// secret key in the store.
-    se_signers: Vec<(String, String)>,
+    /// Every certificate that can sign and has a secret key in the store, or
+    /// in gpg-agent.
+    se_signers: Vec<OwnKey>,
 
     dv_input: Option<PathBuf>,
     dv_data: Option<PathBuf>,
@@ -192,9 +216,9 @@ struct State {
     certify_target: Option<String>,
     /// (user ID, ticked)
     certify_user_ids: Vec<(String, bool)>,
-    /// (fingerprint, label) of our own keys that can certify, from the store
-    /// or through gpg-agent (see [`can_certify_with`]), the target excepted.
-    certify_certifiers: Vec<(String, String)>,
+    /// Our own keys that can certify, from the store or through gpg-agent
+    /// (see [`can_certify_with`]), the target excepted.
+    certify_certifiers: Vec<OwnKey>,
 
     /// Certificates found on the network, not yet in the store.
     lookup_results: Vec<rpgp_core::keyserver::Found>,
@@ -215,6 +239,11 @@ struct State {
     delete_target: Option<(String, bool)>,
     /// Fingerprint of the certificate the lifecycle dialog is about.
     lifecycle_fingerprint: Option<String>,
+    /// The user ID or subkey a revoke mode of that dialog is about, exactly
+    /// as the certificate has it. The dialog shows it through
+    /// [`display::text`], so what is revoked is taken from here rather than
+    /// read back from the dialog.
+    lifecycle_target: String,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -491,6 +520,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         import_revocations: None,
         delete_target: None,
         lifecycle_fingerprint: None,
+        lifecycle_target: String::new(),
     }));
 
     ui.set_version(env!("CARGO_PKG_VERSION").into());
@@ -1015,8 +1045,9 @@ fn ask_to_store_revocations(ui: &AppWindow, state: &Shared, file: revoke::Revoca
         .revocations
         .iter()
         .map(|pending| PendingRevocationRow {
-            name: pending.name.clone().into(),
-            reason: pending.describe().into(),
+            name: display::text(&pending.name).into(),
+            reason: pending.reason.label().into(),
+            note: display::text(&pending.message).into(),
             hard: pending.reason.is_hard(),
             yours: pending.yours,
         })
@@ -1479,9 +1510,10 @@ fn run_sign_encrypt(
     // refresh reaches cert-d alone, so folding that in is what puts it in front
     // of the refusal in `ops`.
     let signer = if sign {
-        let (fingerprint, _) = signers
+        let fingerprint = &signers
             .get(signer_index.max(0) as usize)
-            .ok_or_else(|| "Choose a key to sign with".to_string())?;
+            .ok_or_else(|| "Choose a key to sign with".to_string())?
+            .fingerprint;
         Some(
             store
                 .full_cert(fingerprint)
@@ -1565,26 +1597,23 @@ fn push_sign_encrypt(ui: &AppWindow, state: &State) {
         .map(|i| &state.se_recipients[i])
         .map(|r| RecipientRow {
             fingerprint: r.fingerprint.clone().into(),
-            label: r.label.clone().into(),
-            sublabel: r.sublabel.clone().into(),
+            label: display::text(&r.label).into(),
+            sublabel: display::text(&r.sublabel).into(),
+            key_id: r.key_id.clone().into(),
             initials: r.initials.clone().into(),
             tint_index: r.tint,
             selected: r.selected,
         })
         .collect();
-
-    let signers: Vec<SharedString> = state
-        .se_signers
-        .iter()
-        .map(|(_, label)| SharedString::from(label.as_str()))
-        .collect();
+    let (signers, signer_key_ids) = own_key_models(&state.se_signers);
 
     // Counted over every recipient, not the shown ones: a selection hidden by
     // the filter is still encrypted to, and a count that dropped when you
     // typed would say the opposite.
     ui.set_se_selected_count(state.se_recipients.iter().filter(|r| r.selected).count() as i32);
     ui.set_se_recipients(ModelRc::new(VecModel::from(rows)));
-    ui.set_se_signers(ModelRc::new(VecModel::from(signers)));
+    ui.set_se_signers(signers);
+    ui.set_se_signer_key_ids(signer_key_ids);
 
     ui.set_choose_outputs(state.choose_outputs);
     match &state.se_input {
@@ -1836,7 +1865,7 @@ fn show_decrypt_verify(ui: &AppWindow, state: &Shared, read: DvRead, outcome: Dv
         } else {
             format!("{}: {message}", read.names)
         };
-        ui.set_status(format!("Not for the files now chosen. {message}").into());
+        ui.set_status(display::text(&format!("Not for the files now chosen. {message}")).into());
         return;
     }
 
@@ -1861,6 +1890,7 @@ fn show_decrypt_verify(ui: &AppWindow, state: &Shared, read: DvRead, outcome: Dv
 /// changed since the run began, as the pickers refuse what they bring while
 /// it is in flight, so the check in [`show_decrypt_verify`] is not needed.
 fn report_in_decrypt_verify(ui: &AppWindow, message: String) {
+    let message = display::text(&message);
     ui.set_dv_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
     ui.set_dv_result(message.as_str().into());
     ui.set_dv_tone(3);
@@ -2058,7 +2088,7 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
             // in the store has. "(smartcard)" goes by the key certifying uses,
             // the primary, and only where the agent is what signs with it: a
             // usable one in the store is taken first.
-            let certifiers: Vec<(String, String)> = guard
+            let certifiers: Vec<OwnKey> = guard
                 .all
                 .iter()
                 .filter(|c| can_certify_with(c) && c.fingerprint != target.fingerprint)
@@ -2069,11 +2099,15 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
                             .as_ref()
                             .is_some_and(rpgp_core::agent::AgentKey::is_on_card);
                     let label = if on_card {
-                        format!("{} (smartcard)", c.primary_user_id)
+                        format!("(smartcard) {}", c.primary_user_id)
                     } else {
                         c.primary_user_id.clone()
                     };
-                    (c.fingerprint.clone(), label)
+                    OwnKey {
+                        fingerprint: c.fingerprint.clone(),
+                        label,
+                        key_id: c.key_id.clone(),
+                    }
                 })
                 .collect();
 
@@ -2081,7 +2115,7 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
             guard.certify_user_ids = user_ids;
             guard.certify_certifiers = certifiers;
 
-            ui.set_certify_target(target.primary_user_id.clone().into());
+            ui.set_certify_target(display::text(&target.primary_user_id).into());
             push_certify(&ui, &guard);
             drop(guard);
             ui.set_certify_open(true);
@@ -2292,9 +2326,10 @@ fn run_certify(
             .certify_target
             .clone()
             .ok_or_else(|| "No certificate selected".to_string())?;
-        let (certifier, _) = guard
+        let certifier = guard
             .certify_certifiers
             .get(certifier_index.max(0) as usize)
+            .map(|key| key.fingerprint.clone())
             .ok_or_else(|| "Choose a key to certify with".to_string())?;
         let user_ids: Vec<String> = guard
             .certify_user_ids
@@ -2302,7 +2337,7 @@ fn run_certify(
             .filter(|(_, selected)| *selected)
             .map(|(uid, _)| uid.clone())
             .collect();
-        (guard.store.clone(), target, certifier.clone(), user_ids)
+        (guard.store.clone(), target, certifier, user_ids)
     };
     if user_ids.is_empty() {
         return Err("Select at least one user ID".to_string());
@@ -2324,25 +2359,42 @@ fn run_certify(
     Ok(count)
 }
 
+/// Show the Certify dialog's user IDs and keys.
+///
+/// The user IDs are shown with [`display::text`] and toggled by position, and
+/// what is certified is the text kept in `state`, so a user ID with a hidden
+/// character in it is both told apart from its neighbours and certified as the
+/// certificate has it.
 fn push_certify(ui: &AppWindow, state: &State) {
     let rows: Vec<UserIdRow> = state
         .certify_user_ids
         .iter()
         .map(|(text, selected)| UserIdRow {
-            text: text.clone().into(),
+            text: display::text(text).into(),
             selected: *selected,
         })
         .collect();
-
-    let certifiers: Vec<SharedString> = state
-        .certify_certifiers
-        .iter()
-        .map(|(_, label)| SharedString::from(label.as_str()))
-        .collect();
+    let (certifiers, key_ids) = own_key_models(&state.certify_certifiers);
 
     ui.set_certify_chosen(state.certify_user_ids.iter().filter(|(_, s)| *s).count() as i32);
     ui.set_certify_user_ids(ModelRc::new(VecModel::from(rows)));
-    ui.set_certify_certifiers(ModelRc::new(VecModel::from(certifiers)));
+    ui.set_certify_certifiers(certifiers);
+    ui.set_certify_certifier_key_ids(key_ids);
+}
+
+/// A Sign as or Certify with list as its Select takes it: the labels, and the
+/// key IDs drawn beside them, which are what tell two keys with the same user
+/// ID apart.
+fn own_key_models(keys: &[OwnKey]) -> (ModelRc<SharedString>, ModelRc<SharedString>) {
+    let labels: Vec<SharedString> = keys
+        .iter()
+        .map(|key| display::text(&key.label).into())
+        .collect();
+    let key_ids: Vec<SharedString> = keys.iter().map(|key| key.key_id.as_str().into()).collect();
+    (
+        ModelRc::new(VecModel::from(labels)),
+        ModelRc::new(VecModel::from(key_ids)),
+    )
 }
 
 /// Load and display the certifications on one certificate.
@@ -2376,7 +2428,7 @@ fn certification_row(certification: &Certification, show_user_id: bool) -> Certi
     let mut parts: Vec<String> = Vec::new();
 
     if show_user_id {
-        parts.push(certification.user_id.clone());
+        parts.push(display::text(&certification.user_id));
     }
     if certification.is_revocation {
         parts.push("withdrawn".to_string());
@@ -2428,8 +2480,8 @@ fn certification_row(certification: &Certification, show_user_id: bool) -> Certi
     parts.extend(discounted.map(str::to_string));
 
     CertificationRow {
-        certifier: certification.certifier.clone().into(),
-        user_id: certification.user_id.clone().into(),
+        certifier: display::text(&certification.certifier).into(),
+        user_id: display::text(&certification.user_id).into(),
         detail: parts.join(" · ").into(),
         good: certification.is_good(),
         by_me: certification.by_me,
@@ -2468,7 +2520,25 @@ fn reselect(ui: &AppWindow, state: &Shared, fingerprint: &str) {
 /// there for good.
 fn report_in_lookup(ui: &AppWindow, message: String) {
     ui.set_lookup_results(ModelRc::new(VecModel::from(Vec::<LookupRow>::new())));
-    ui.set_lookup_status(message.into());
+    ui.set_lookup_status(display::text(&message).into());
+}
+
+/// The row Lookup shows for a certificate a search found, its primary user ID
+/// through [`display::text`]: whoever published the certificate wrote it.
+///
+/// Split from the search, which goes to the network, so that a test can see
+/// the row without one.
+fn lookup_row(store: &Store, found: &rpgp_core::keyserver::Found) -> LookupRow {
+    let summary = rpgp_core::CertSummary::from_cert(&found.cert);
+    let (name, email) = split_user_id(&summary.primary_user_id);
+    LookupRow {
+        primary_user_id: display::text(&summary.primary_user_id).into(),
+        fingerprint_pretty: summary.fingerprint_pretty().into(),
+        source: found.source.as_str().into(),
+        initials: initials(&name, &email, &summary.key_id).into(),
+        tint_index: tint_index(&summary.fingerprint),
+        already_known: store.lookup(&summary.fingerprint).is_ok(),
+    }
 }
 
 fn wire_lookup(ui: &AppWindow, state: &Shared) {
@@ -2515,24 +2585,8 @@ fn wire_lookup(ui: &AppWindow, state: &Shared) {
                     match outcome {
                         Ok(found) => {
                             let mut guard = lock(&state);
-                            let rows: Vec<LookupRow> = found
-                                .iter()
-                                .map(|f| {
-                                    let summary = rpgp_core::CertSummary::from_cert(&f.cert);
-                                    let (name, email) = split_user_id(&summary.primary_user_id);
-                                    LookupRow {
-                                        primary_user_id: summary.primary_user_id.clone().into(),
-                                        fingerprint_pretty: summary.fingerprint_pretty().into(),
-                                        source: f.source.as_str().into(),
-                                        initials: initials(&name, &email, &summary.key_id).into(),
-                                        tint_index: tint_index(&summary.fingerprint),
-                                        already_known: guard
-                                            .store
-                                            .lookup(&summary.fingerprint)
-                                            .is_ok(),
-                                    }
-                                })
-                                .collect();
+                            let rows: Vec<LookupRow> =
+                                found.iter().map(|f| lookup_row(&guard.store, f)).collect();
                             let count = rows.len();
                             guard.lookup_results = found;
                             drop(guard);
@@ -2566,10 +2620,11 @@ fn wire_lookup(ui: &AppWindow, state: &Shared) {
                     .ok()
                     .and_then(|i| guard.lookup_results.get(i))
                 {
-                    Some(found) => guard
-                        .store
-                        .insert(&found.cert)
-                        .map(|()| rpgp_core::CertSummary::from_cert(&found.cert).primary_user_id),
+                    Some(found) => guard.store.insert(&found.cert).map(|()| {
+                        display::text(
+                            &rpgp_core::CertSummary::from_cert(&found.cert).primary_user_id,
+                        )
+                    }),
                     None => return,
                 }
             };
@@ -2621,16 +2676,25 @@ fn wire_lifecycle(ui: &AppWindow, state: &Shared) {
     // has drifted away from the pane. The name the dialog shows comes from
     // the same read, rather than being bound to the pane, for the same
     // reason.
+    //
+    // The user ID a revoke mode is about is kept here as well, as it came:
+    // the dialog shows it with its hidden characters written out, which is
+    // not the text the certificate carries, so the run cannot take it back
+    // from the dialog.
     let open = |ui: &AppWindow, state: &Shared, mode: i32, target: SharedString| {
         let detail = ui.get_detail();
         if detail.fingerprint.is_empty() {
             return;
         }
-        lock(state).lifecycle_fingerprint = Some(detail.fingerprint.to_string());
+        {
+            let mut guard = lock(state);
+            guard.lifecycle_fingerprint = Some(detail.fingerprint.to_string());
+            guard.lifecycle_target = target.to_string();
+        }
         ui.set_lifecycle_key_name(detail.primary_user_id);
         ui.set_lifecycle_key_id(detail.key_id);
         ui.set_lifecycle_mode(mode);
-        ui.set_lifecycle_target(target);
+        ui.set_lifecycle_target(display::text(&target).into());
         ui.set_lifecycle_open(true);
     };
 
@@ -2693,12 +2757,17 @@ fn wire_lifecycle(ui: &AppWindow, state: &Shared) {
             // Written every time the dialog opens, which is the only way to
             // reach this button, and dropped when an action goes through, so
             // it never answers for an earlier dialog.
-            let fingerprint = lock(&state).lifecycle_fingerprint.clone();
+            let (fingerprint, target) = {
+                let guard = lock(&state);
+                (
+                    guard.lifecycle_fingerprint.clone(),
+                    guard.lifecycle_target.clone(),
+                )
+            };
             let Some(fingerprint) = fingerprint else {
                 report_in_dialog(&ui, "No certificate selected".to_string());
                 return;
             };
-            let target = ui.get_lifecycle_target().to_string();
             ui.set_busy(true);
             ui.set_status("Working…".into());
 
@@ -2932,7 +3001,8 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
             let user_ids: Vec<UserIdDetailRow> = rpgp_core::cert::user_ids(&cert)
                 .iter()
                 .map(|u| UserIdDetailRow {
-                    text: u.text.clone().into(),
+                    text: display::text(&u.text).into(),
+                    user_id: u.text.clone().into(),
                     is_primary: u.is_primary,
                     revoked: u.revoked,
                     self_signed: format_time(u.self_signed).into(),
@@ -3115,7 +3185,7 @@ fn finish_notepad(ui: &AppWindow, state: &Shared, outcome: NpOutcome) {
             Ok((_, summary, ..)) => summary,
             Err(message) => message,
         };
-        ui.set_status(line.into());
+        ui.set_status(display::text(&line).into());
         return;
     }
     match outcome {
@@ -3136,11 +3206,12 @@ fn finish_notepad(ui: &AppWindow, state: &Shared, outcome: NpOutcome) {
 /// notepad has closed, for the reason [`finish_notepad`] gives. A worker's
 /// panic comes here too, through [`BusyGuard`].
 fn report_in_notepad(ui: &AppWindow, message: String) {
+    let message = display::text(&message);
     if ui.get_notepad_open() {
         // Clear the previous run's verdict and output, as a failed Decrypt /
         // Verify run does. Both last for as long as the dialog is open, so a
-        // failed run left the last message's "good signature — Alice
-        // (verified)" row and her plaintext on screen under a red banner
+        // failed run left the last message's "good signature (verified) —
+        // Alice" row and her plaintext on screen under a red banner
         // describing a different message.
         ui.set_np_signatures(ModelRc::new(VecModel::from(Vec::<SignatureRow>::new())));
         ui.set_np_output(SharedString::new());
@@ -3179,9 +3250,10 @@ fn run_notepad(
     // Return types inferred: naming them would mean importing a Sequoia
     // type into the GUI, which this crate deliberately avoids.
     let signer = || {
-        let (fingerprint, _) = signers
+        let fingerprint = &signers
             .get(signer_index.max(0) as usize)
-            .ok_or_else(|| "Choose a key to sign with".to_string())?;
+            .ok_or_else(|| "Choose a key to sign with".to_string())?
+            .fingerprint;
         // Everything the store knows, as in `run_sign_encrypt` and for the same
         // reasons: the local secret signs, and a revocation that reached cert-d
         // alone is still in the certificate `ops` is asked to sign with.
@@ -3333,11 +3405,8 @@ fn build_signing_targets(state: &mut State, preselect: Option<&str>) {
                 } else {
                     name
                 },
-                sublabel: if email.is_empty() {
-                    c.key_id.clone()
-                } else {
-                    email
-                },
+                sublabel: email,
+                key_id: c.key_id.clone(),
                 fingerprint: c.fingerprint.clone(),
             }
         })
@@ -3345,16 +3414,17 @@ fn build_signing_targets(state: &mut State, preselect: Option<&str>) {
 
     // A card key has no local secret: the agent holds it. Label those so it is
     // obvious which choice will ask for a PIN.
-    let signers: Vec<(String, String)> = state
+    let signers: Vec<OwnKey> = state
         .all
         .iter()
         .filter(|c| c.can_sign && (c.has_secret || c.agent.sign.is_some()))
-        .map(|c| {
-            let label = match c.card_serial() {
-                Some(_) => format!("{} (smartcard)", c.primary_user_id),
+        .map(|c| OwnKey {
+            fingerprint: c.fingerprint.clone(),
+            label: match c.card_serial() {
+                Some(_) => format!("(smartcard) {}", c.primary_user_id),
                 None => c.primary_user_id.clone(),
-            };
-            (c.fingerprint.clone(), label)
+            },
+            key_id: c.key_id.clone(),
         })
         .collect();
 
@@ -3720,7 +3790,7 @@ fn open_revoke_dialog(ui: &AppWindow, state: &Shared, certification: bool) {
     guard.revoke_upgrade = upgrade;
     drop(guard);
 
-    ui.set_revoke_target(target.primary_user_id.into());
+    ui.set_revoke_target(display::text(&target.primary_user_id).into());
     ui.set_revoke_is_certification(certification);
     ui.set_revoke_upgrade(upgrade);
     ui.set_revoke_open(true);
@@ -3957,31 +4027,41 @@ fn reload_after(ui: &AppWindow, state: &Shared, after: AfterReload) {
 
             // After apply_filter, never before: that sets the status line
             // itself, so a message written earlier would be overwritten by the
-            // ordinary count and the reader would never see it. The caller's
-            // own confirmation wins over the degraded notice, which is the
-            // order these two arrived in when the caller set its status on the
-            // line after `reload`.
-            if let Some(status) = after.status {
+            // ordinary count and the reader would never see it.
+            if let Some(status) = landed_status(after.status, loaded.degraded) {
                 ui.set_status(status.into());
-            } else if !loaded.degraded.is_empty() {
-                // Two reads can land under one name: the SHA-1 list is read
-                // twice, and the trust roots come from two files. So dedupe
-                // rather than name one part of the store twice.
-                let mut degraded = loaded.degraded;
-                degraded.sort_unstable();
-                degraded.dedup();
-                ui.set_status(
-                    format!(
-                        "Loaded, but could not read: {}. Badges for those may be missing.",
-                        degraded.join(", ")
-                    )
-                    .into(),
-                );
             }
 
             survey_agent_and_secrets(&ui, &state, store);
         });
     });
+}
+
+/// What the status line says once a reload has landed, in place of the count
+/// `apply_filter` put there: the caller's confirmation, through
+/// [`display::text`], since one can quote a user ID or a revocation's note;
+/// or else which parts of the store could not be read; or nothing.
+///
+/// The caller's own confirmation wins over the degraded notice, which is the
+/// order these two arrived in when the caller set its status on the line after
+/// `reload`. Split from [`reload_after`], whose landing only an event loop
+/// runs, so that a test can read the line without one.
+fn landed_status(status: Option<String>, mut degraded: Vec<&'static str>) -> Option<String> {
+    if let Some(status) = status {
+        return Some(display::text(&status));
+    }
+    if degraded.is_empty() {
+        return None;
+    }
+    // Two reads can land under one name: the SHA-1 list is read twice, and the
+    // trust roots come from two files. So dedupe rather than name one part of
+    // the store twice.
+    degraded.sort_unstable();
+    degraded.dedup();
+    Some(format!(
+        "Loaded, but could not read: {}. Badges for those may be missing.",
+        degraded.join(", ")
+    ))
 }
 
 /// Report a failure of the operation the open dialog started, in that dialog
@@ -3998,7 +4078,14 @@ fn reload_after(ui: &AppWindow, state: &Shared, after: AfterReload) {
 /// here: each says how its run went, failures and panics included, in a line
 /// of its own; see [`report_in_decrypt_verify`], [`report_in_notepad`] and
 /// [`report_in_lookup`].
+///
+/// The message is shown through [`display::text`], as each of those lines and
+/// the status line after a reload are: a failure can quote a user ID, as
+/// rpgp-core's refusals of a revoked key or of a user ID it cannot find do,
+/// and a status line can quote a revocation's note. The app's own words have
+/// nothing in them to write out.
 fn report_in_dialog(ui: &AppWindow, message: String) {
+    let message = display::text(&message);
     ui.set_dialog_error(message.as_str().into());
     ui.set_status(message.into());
 }
@@ -4006,7 +4093,7 @@ fn report_in_dialog(ui: &AppWindow, message: String) {
 /// [`report_in_dialog`], for an operation whose failure also reloads the
 /// store; see [`report_and_reload`].
 fn report_in_dialog_and_reload(ui: &AppWindow, state: &Shared, message: String) {
-    ui.set_dialog_error(message.as_str().into());
+    ui.set_dialog_error(display::text(&message).into());
     report_and_reload(ui, state, message);
 }
 
@@ -4025,7 +4112,8 @@ fn report_in_dialog_and_reload(ui: &AppWindow, state: &Shared, message: String) 
 /// the list then still shows the old picture, and that is the more pressing
 /// thing to know.
 fn report_and_reload(ui: &AppWindow, state: &Shared, message: String) {
-    ui.set_status(message.clone().into());
+    let message = display::text(&message);
+    ui.set_status(message.as_str().into());
     reload_after(
         ui,
         state,
@@ -4148,6 +4236,10 @@ fn read_store(store: &Store) -> std::result::Result<Loaded, String> {
 /// certificate from an authenticated one, exactly as the README describes; the
 /// verify banner did not, so a lookalike key produced the same reassurance as
 /// the real one.
+///
+/// The signer's user ID, and the reason a bad signature is bad, go through
+/// [`display::text`]: the notepad draws the name in one line with its
+/// verdict, and an override left open in the name turned the verdict round.
 fn signature_rows(known: &[CertSummary], signatures: &[ops::SignatureReport]) -> Vec<SignatureRow> {
     signatures
         .iter()
@@ -4164,8 +4256,8 @@ fn signature_rows(known: &[CertSummary], signatures: &[ops::SignatureReport]) ->
                 .unwrap_or_default();
             SignatureRow {
                 good: s.good,
-                signer: s.signer.clone().into(),
-                detail: s.detail.clone().into(),
+                signer: display::text(&s.signer).into(),
+                detail: display::text(&s.detail).into(),
                 authentication: authentication.as_str().into(),
                 authenticated: authentication == rpgp_core::Authentication::Full,
                 sha1: s.sha1,
@@ -4447,18 +4539,31 @@ fn can_certify_with(summary: &CertSummary) -> bool {
     summary.can_certify && (summary.primary_secret || summary.agent.certify.is_some())
 }
 
+/// A certificate as the list and the details pane show it.
+///
+/// Every user ID, and the note left with a revocation, goes through
+/// [`display::text`]: all of them are written by whoever made the certificate
+/// or revoked it. The user IDs are joined a line each, which is why a newline
+/// inside one has to be written out, or one user ID read as two. The reason a
+/// certificate was revoked is the app's own label and needs nothing.
 pub fn to_row(summary: &CertSummary) -> CertRow {
     let (name, email) = split_user_id(&summary.primary_user_id);
     CertRow {
         fingerprint: summary.fingerprint.clone().into(),
         fingerprint_pretty: summary.fingerprint_pretty().into(),
         key_id: summary.key_id.clone().into(),
-        primary_user_id: summary.primary_user_id.clone().into(),
+        primary_user_id: display::text(&summary.primary_user_id).into(),
         initials: initials(&name, &email, &summary.key_id).into(),
         tint_index: tint_index(&summary.fingerprint),
-        name: name.into(),
-        email: email.into(),
-        user_ids: summary.user_ids.join("\n").into(),
+        name: display::text(&name).into(),
+        email: display::text(&email).into(),
+        user_ids: summary
+            .user_ids
+            .iter()
+            .map(|user_id| display::text(user_id))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into(),
         algorithm: summary.algorithm.clone().into(),
         created: format_time(Some(summary.created)).into(),
         expires: format_time(summary.expires).into(),
@@ -4471,8 +4576,13 @@ pub fn to_row(summary: &CertSummary) -> CertRow {
         sha1_blocked: summary.sha1_blocked,
         sha1_accepted: summary.sha1_accepted,
         revocation: summary.revocation.clone().unwrap_or_default().into(),
+        revocation_note: display::text(&summary.revocation_note).into(),
         revocation_hard: summary.revocation_hard,
-        card_serial: summary.card_serial().unwrap_or_default().into(),
+        card_serial: summary
+            .card_serial()
+            .map(display::card_number)
+            .unwrap_or_default()
+            .into(),
     }
 }
 
@@ -4492,10 +4602,15 @@ fn split_user_id(user_id: &str) -> (String, String) {
 
 /// Up to two letters for the monogram, falling back through name, e-mail and
 /// key ID so a certificate with no user ID still gets a legible circle.
+///
+/// A word gives the first of its characters that [`display::text`] leaves as
+/// it is. Its first character, whatever it was, used to go in the circle, and
+/// a word that began with an override or a control put there something that
+/// drew nothing, or broke the line.
 fn initials(name: &str, email: &str, key_id: &str) -> String {
     let from_name: String = name
         .split_whitespace()
-        .filter_map(|word| word.chars().next())
+        .filter_map(|word| word.chars().find(|&c| !display::hidden(c)))
         .take(2)
         .collect();
     if !from_name.is_empty() {
@@ -4962,6 +5077,7 @@ mod tests {
             import_revocations: None,
             delete_target: None,
             lifecycle_fingerprint: None,
+            lifecycle_target: String::new(),
         }))
     }
 
@@ -5052,7 +5168,11 @@ mod tests {
         let state = state_for(store);
         {
             let mut guard = lock(&state);
-            guard.se_signers = vec![(fingerprint.clone(), "Alice <alice@example.org>".to_string())];
+            guard.se_signers = vec![OwnKey {
+                fingerprint: fingerprint.clone(),
+                label: "Alice <alice@example.org>".to_string(),
+                key_id: cert.keyid().to_hex(),
+            }];
             guard.se_input = Some(input.clone());
         }
 
@@ -5145,7 +5265,12 @@ mod tests {
                 .iter()
                 .any(|r| r.fingerprint == fingerprint)
         };
-        let signs_with = |fingerprint: &str| guard.se_signers.iter().any(|(f, _)| f == fingerprint);
+        let signs_with = |fingerprint: &str| {
+            guard
+                .se_signers
+                .iter()
+                .any(|key| key.fingerprint == fingerprint)
+        };
 
         assert!(
             offered_to(&live) && signs_with(&live),
@@ -6144,7 +6269,11 @@ mod tests {
     fn certifiers_for(ui: &AppWindow, state: &Shared, fingerprint: &str) -> Vec<(String, String)> {
         click_row(ui, state, fingerprint);
         ui.invoke_open_certify();
-        lock(state).certify_certifiers.clone()
+        lock(state)
+            .certify_certifiers
+            .iter()
+            .map(|key| (key.fingerprint.clone(), key.label.clone()))
+            .collect()
     }
 
     /// A key whose primary only gpg-agent holds opens Certify when the survey
@@ -6197,7 +6326,8 @@ mod tests {
     /// A key whose card holds only its subkeys, the primary being kept
     /// offline as most YubiKey guides advise, is not offered to certify with:
     /// it opens no Certify button, and the dialog another key opens does not
-    /// list it. It can sign, and the sign dialog still offers it.
+    /// list it. It can sign, and the sign dialog still offers it, marked as
+    /// on a card.
     ///
     /// The dialog listed every certificate the agent could sign for, labelled
     /// "(smartcard)", and certifying with it failed at the last step for want
@@ -6244,8 +6374,12 @@ mod tests {
 
         ui.invoke_open_sign_encrypt();
         assert!(
-            lock(&state).se_signers.iter().any(|(f, _)| *f == card_fp),
-            "the card signs, and should be offered as a signer"
+            lock(&state)
+                .se_signers
+                .iter()
+                .any(|key| key.fingerprint == card_fp
+                    && key.label == "(smartcard) Card <card@example.org>"),
+            "the card signs, and should be offered as a signer, marked as on a card"
         );
     }
 
@@ -6283,7 +6417,7 @@ mod tests {
         assert_eq!(certifiers_for(&ui, &state, &bob_fp).len(), 1);
     }
 
-    /// "(smartcard)" beside a certifier says that certifying with it will ask
+    /// "(smartcard)" before a certifier says that certifying with it will ask
     /// for the card, so it goes by where the agent holds the primary key,
     /// which certifies, and not the signing key, which the list's badge
     /// shows; and not at all where the store holds a usable primary, which is
@@ -6342,7 +6476,7 @@ mod tests {
         let mut listed = certifiers_for(&ui, &state, &bob_fp);
         listed.sort();
         let mut expected = vec![
-            (card_fp, "Card <card@example.org> (smartcard)".to_string()),
+            (card_fp, "(smartcard) Card <card@example.org>".to_string()),
             (file_fp, "File <file@example.org>".to_string()),
             (local_fp, "Local <local@example.org>".to_string()),
         ];
@@ -8033,5 +8167,524 @@ mod tests {
                 .all(|key| key.key().secret().is_encrypted()),
             "the key should be protected by the passphrase"
         );
+    }
+
+    /// A key generated here with every user ID in `user_ids`, the first
+    /// primary, under `standard`. Key generation refuses a control character
+    /// but not a format character, such as an override, and reads a user ID
+    /// with no angle brackets as a name, whatever it holds.
+    fn generated_with(
+        user_ids: &[&str],
+        standard: rpgp_core::keygen::Standard,
+    ) -> rpgp_core::keygen::GeneratedKey {
+        let mut request = KeyGenRequest::new(user_ids[0]);
+        request.user_ids = user_ids.iter().map(|uid| uid.to_string()).collect();
+        request.standard = standard;
+        rpgp_core::keygen::generate(&request).unwrap()
+    }
+
+    /// A user ID is shown with whatever in it draws nothing, or turns the
+    /// text around it round, written out as its code point, everywhere the
+    /// window shows one: the list and the details pane, the Certify and
+    /// Revoke dialogs, the recipient and signer lists, a signature's signer.
+    ///
+    /// They were shown as the certificate had them, and Slint applies the
+    /// bidirectional algorithm in full: an override drew an address
+    /// backwards, one left open reversed the notepad's own verdict after the
+    /// name, and a newline made one user ID read as two in the details pane.
+    #[test]
+    fn a_user_id_is_shown_with_what_it_hides_written_out() {
+        i_slint_backend_testing::init_no_event_loop();
+        use slint::Model;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        // An address drawn backwards by an override that is never closed, and
+        // a second user ID that differs from a third by a zero-width space.
+        const SPOOF: &str = "Mallory \u{202E}gro.elpmaxe@ecila";
+        const SHOWN: &str = "Mallory [U+202E]gro.elpmaxe@ecila";
+        let mallory = generated_with(
+            &[SPOOF, "Mal", "M\u{200B}al"],
+            rpgp_core::keygen::Standard::default(),
+        )
+        .cert;
+        let me = generated("Me <me@example.org>").cert;
+        store.insert_secret(&mallory).unwrap();
+        store.insert_secret(&me).unwrap();
+        let mallory = mallory.fingerprint().to_hex();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let row = row_for(&state, &mallory);
+        assert_eq!(row.primary_user_id, SHOWN);
+        assert_eq!(row.name, SHOWN, "the name is the whole user ID here");
+        // In the order the certificate keeps them, which is by their bytes.
+        let each = ["Mal", SHOWN, "M[U+200B]al"];
+        assert_eq!(
+            row.user_ids.split('\n').collect::<Vec<_>>(),
+            each,
+            "one user ID a line, and those that differ shown differently"
+        );
+        assert_eq!(
+            row.initials, "MG",
+            "the monogram took the override for a letter"
+        );
+
+        // Certify, on Mallory's row, by another of the user's keys.
+        click_row(&ui, &state, &mallory);
+        ui.invoke_open_certify();
+        assert_eq!(ui.get_certify_target(), SHOWN);
+        let offered: Vec<String> = ui
+            .get_certify_user_ids()
+            .iter()
+            .map(|row| row.text.to_string())
+            .collect();
+        assert_eq!(offered, each);
+
+        // Revoke.
+        ui.invoke_open_revoke();
+        assert_eq!(ui.get_revoke_target(), SHOWN);
+
+        // Sign / Encrypt, where it is both a recipient and a signer.
+        ui.invoke_open_sign_encrypt();
+        let recipients = ui.get_se_recipients();
+        assert!(
+            recipients.iter().any(|r| r.label == SHOWN),
+            "no recipient reads {SHOWN:?}: {:?}",
+            recipients.iter().map(|r| r.label).collect::<Vec<_>>()
+        );
+        assert!(ui.get_se_signers().iter().any(|signer| signer == SHOWN));
+
+        // A signature it made.
+        let rows = signature_rows(
+            &lock(&state).all,
+            &[ops::SignatureReport {
+                good: true,
+                signer: SPOOF.to_string(),
+                fingerprint: Some(mallory.clone()),
+                detail: String::new(),
+                sha1: false,
+            }],
+        );
+        assert_eq!(rows[0].signer, SHOWN);
+    }
+
+    /// A user ID shown with a hidden character written out is certified, and
+    /// revoked, as the certificate has it: what the dialogs show is for the
+    /// user to read, and what they act on stays the certificate's own text,
+    /// by which rpgp-core finds the user ID.
+    #[test]
+    fn a_user_id_shown_written_out_is_acted_on_as_the_certificate_has_it() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        const HIDDEN: &str = "M\u{200B}al";
+        let mallory = generated_with(&["Mal", HIDDEN], rpgp_core::keygen::Standard::default()).cert;
+        let me = generated_with(&["Me", HIDDEN], rpgp_core::keygen::Standard::default()).cert;
+        store.insert(&mallory).unwrap();
+        store.insert_secret(&me).unwrap();
+        let (mallory, me) = (mallory.fingerprint().to_hex(), me.fingerprint().to_hex());
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+
+        // Certify the second of Mallory's user IDs alone.
+        click_row(&ui, &state, &mallory);
+        ui.invoke_open_certify();
+        ui.invoke_certify_toggle_user_id(0);
+        assert_eq!(ui.get_certify_chosen(), 1);
+        run_certify(&state, 0, true, false, 0, "").expect("the user ID should be certified");
+        let store = lock(&state).store.clone();
+        let certified: Vec<String> =
+            certify::certifications(&store, &store.lookup(&mallory).unwrap())
+                .unwrap()
+                .into_iter()
+                .map(|certification| certification.user_id)
+                .collect();
+        assert_eq!(certified, [HIDDEN]);
+
+        // Revoke the same user ID on the user's own key, as the Details
+        // dialog's Revoke button opens it.
+        click_row(&ui, &state, &me);
+        ui.invoke_open_revoke_user_id(HIDDEN.into());
+        assert_eq!(ui.get_lifecycle_target(), "M[U+200B]al");
+        ui.invoke_lifecycle_run(2, "0".into(), SharedString::new(), SharedString::new(), 0);
+        let retired = || {
+            store.secret_cert(&me).is_ok_and(|cert| {
+                rpgp_core::cert::user_ids(&cert)
+                    .iter()
+                    .any(|uid| uid.text == HIDDEN && uid.revoked)
+            })
+        };
+        wait_for("the user ID to be revoked", retired);
+    }
+
+    /// A failure that quotes a user ID shows it written out as well, on
+    /// every line that reports one: rpgp-core names what it refused by the
+    /// certificate's own text. Those are the open dialog's line and the
+    /// status line; Decrypt / Verify's, the notepad's and Lookup's own lines;
+    /// the status line a result goes to once its files have been changed or
+    /// the notepad closed; and the status line a reload leaves. The reason a
+    /// bad signature is bad is written out the same way.
+    #[test]
+    fn a_failure_quoting_a_user_id_shows_it_written_out() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let me = generated("Me <me@example.org>").cert;
+        store.insert_secret(&me).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+
+        let failed = run_lifecycle(
+            &state,
+            &LifecycleInput {
+                mode: 2,
+                fingerprint: me.fingerprint().to_hex(),
+                target: "Nobody \u{202E}ereh".to_string(),
+                expiry: "0".to_string(),
+                value: String::new(),
+                password: Zeroizing::new(String::new()),
+                reason: 0,
+            },
+        )
+        .expect_err("there is no such user ID to revoke");
+        assert!(failed.contains('\u{202E}'), "the premise: {failed:?}");
+        let shown = |line: SharedString, on: &str| {
+            assert!(
+                line.contains("Nobody [U+202E]ereh") && !line.contains('\u{202E}'),
+                "{on}: {line:?}"
+            );
+        };
+        // Each line is emptied first, so that what it shows is what the next
+        // report put there.
+        let clear = || {
+            ui.set_dialog_error(SharedString::new());
+            ui.set_status(SharedString::new());
+        };
+
+        report_in_dialog(&ui, failed.clone());
+        shown(ui.get_dialog_error(), "the dialog");
+        assert_eq!(ui.get_status(), ui.get_dialog_error());
+
+        // A failure that reads the store again behind it. With no event loop
+        // the reload never lands, so what it would leave on the status line
+        // is asked of landed_status.
+        clear();
+        report_in_dialog_and_reload(&ui, &state, failed.clone());
+        shown(ui.get_dialog_error(), "the dialog, before a reload");
+        shown(ui.get_status(), "the status line, before a reload");
+        clear();
+        report_and_reload(&ui, &state, failed.clone());
+        shown(ui.get_status(), "the status line, before a reload");
+        shown(
+            landed_status(Some(failed.clone()), Vec::new())
+                .unwrap_or_default()
+                .into(),
+            "the status line a reload leaves",
+        );
+
+        clear();
+        report_in_decrypt_verify(&ui, failed.clone());
+        shown(ui.get_dv_result(), "Decrypt / Verify");
+        shown(ui.get_status(), "the status line, with Decrypt / Verify");
+        clear();
+        let changed = DvRead {
+            generation: lock(&state).dv_generation + 1,
+            names: "a.txt.sig".to_string(),
+        };
+        show_decrypt_verify(&ui, &state, changed, Err(failed.clone()));
+        shown(
+            ui.get_status(),
+            "the status line, for files no longer chosen",
+        );
+
+        clear();
+        ui.set_notepad_open(true);
+        report_in_notepad(&ui, failed.clone());
+        shown(ui.get_np_result(), "the notepad");
+        shown(ui.get_status(), "the status line, with the notepad");
+        clear();
+        ui.set_notepad_open(false);
+        finish_notepad(&ui, &state, Err(failed.clone()));
+        shown(ui.get_status(), "the status line, the notepad closed");
+
+        report_in_lookup(&ui, failed.clone());
+        shown(ui.get_lookup_status(), "Lookup");
+
+        let bad = signature_rows(
+            &[],
+            &[ops::SignatureReport {
+                good: false,
+                signer: "unknown".to_string(),
+                fingerprint: None,
+                detail: failed,
+                sha1: false,
+            }],
+        );
+        shown(bad[0].detail.clone(), "a bad signature's reason");
+    }
+
+    /// R2-012's own case, an address drawn backwards by an override inside
+    /// its angle brackets, is shown written out wherever the window shows a
+    /// user ID or a part of one: the address line of the list and the details
+    /// pane, a recipient's address, the Details dialog's user IDs, both user
+    /// IDs of a certification, and Lookup's row and the line saying it was
+    /// imported.
+    ///
+    /// `Mallory <\u{202E}gro.elpmaxe@ecila\u{202C}>` drew as Mallory over
+    /// "alice@example.org".
+    #[test]
+    fn an_address_drawn_backwards_is_shown_with_its_override_written_out() {
+        i_slint_backend_testing::init_no_event_loop();
+        use slint::Model;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        const SPOOF: &str = "Mallory <\u{202E}gro.elpmaxe@ecila\u{202C}>";
+        const SHOWN: &str = "Mallory <[U+202E]gro.elpmaxe@ecila[U+202C]>";
+        const ADDRESS: &str = "[U+202E]gro.elpmaxe@ecila[U+202C]";
+        // The user's key hides a character as well, for the certification's
+        // certifier.
+        let mallory = generated_with(&[SPOOF, "Mal"], rpgp_core::keygen::Standard::default()).cert;
+        let me = generated_with(
+            &["M\u{200B}e <me@example.org>"],
+            rpgp_core::keygen::Standard::default(),
+        )
+        .cert;
+        store.insert(&mallory).unwrap();
+        store.insert_secret(&me).unwrap();
+        let fingerprint = mallory.fingerprint().to_hex();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let row = row_for(&state, &fingerprint);
+        assert_eq!(row.primary_user_id, SHOWN);
+        assert_eq!(
+            (row.name.as_str(), row.email.as_str()),
+            ("Mallory", ADDRESS)
+        );
+
+        ui.invoke_open_sign_encrypt();
+        let recipient = ui
+            .get_se_recipients()
+            .iter()
+            .find(|r| r.fingerprint == fingerprint)
+            .expect("Mallory can be encrypted to");
+        assert_eq!(
+            (recipient.label.as_str(), recipient.sublabel.as_str()),
+            ("Mallory", ADDRESS)
+        );
+
+        // Shown written out in the Details dialog, and handed to Revoke user
+        // ID as the certificate has it.
+        click_row(&ui, &state, &fingerprint);
+        ui.invoke_open_details();
+        let user_ids: Vec<(String, String)> = ui
+            .get_detail_user_ids()
+            .iter()
+            .map(|uid| (uid.text.to_string(), uid.user_id.to_string()))
+            .collect();
+        assert!(
+            user_ids.contains(&(SHOWN.to_string(), SPOOF.to_string())),
+            "{user_ids:?}"
+        );
+
+        // Certified by the user's key, and shown in the details pane's
+        // certifications, which name the user ID when there is more than one.
+        ui.invoke_open_certify();
+        run_certify(&state, 0, true, false, 0, "").expect("the user IDs should be certified");
+        click_row(&ui, &state, &fingerprint);
+        let certification = ui
+            .get_detail_certifications()
+            .iter()
+            .find(|c| c.user_id == SHOWN)
+            .expect("a certification should show the user ID written out");
+        assert_eq!(certification.certifier, "M[U+200B]e <me@example.org>");
+        assert!(
+            certification.detail.starts_with(&format!("{SHOWN} · ")),
+            "{:?}",
+            certification.detail
+        );
+
+        // Found by a lookup, and imported from it.
+        let found = rpgp_core::keyserver::Found {
+            cert: mallory,
+            source: rpgp_core::keyserver::Source::Keyserver,
+        };
+        let listed = lookup_row(&lock(&state).store, &found);
+        assert_eq!(listed.primary_user_id, SHOWN);
+        lock(&state).lookup_results = vec![found];
+        ui.invoke_lookup_import(0);
+        assert_eq!(
+            ui.get_lookup_status(),
+            format!("Imported {SHOWN}. It is unverified until you certify it.")
+        );
+    }
+
+    /// Two of the user's keys with the same user ID, a Modern and a
+    /// Compatible one say, are told apart by their key IDs wherever one is
+    /// chosen: as a recipient, as the key to sign with and as the key to
+    /// certify with. A version 6 key's ID is the head of its fingerprint, and
+    /// a version 4 key's its tail.
+    ///
+    /// The recipient list showed the name and the address, and the other two
+    /// lists the user ID alone, so the two keys read the same in all three.
+    #[test]
+    fn two_keys_with_the_same_user_id_are_told_apart_wherever_one_is_chosen() {
+        i_slint_backend_testing::init_no_event_loop();
+        use slint::Model;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        const ALICE: &str = "Alice <alice@example.org>";
+        let modern = generated_with(&[ALICE], rpgp_core::keygen::Standard::Rfc9580).cert;
+        let compatible = generated_with(&[ALICE], rpgp_core::keygen::Standard::Rfc4880).cert;
+        let bob = generated("Bob <bob@example.org>").cert;
+        store.insert_secret(&modern).unwrap();
+        store.insert_secret(&compatible).unwrap();
+        store.insert(&bob).unwrap();
+        let (modern, compatible, bob) = (
+            modern.fingerprint().to_hex(),
+            compatible.fingerprint().to_hex(),
+            bob.fingerprint().to_hex(),
+        );
+        let (modern_id, compatible_id) = (&modern[..16], &compatible[24..]);
+        let mut expected = vec![modern_id.to_string(), compatible_id.to_string()];
+        expected.sort();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let sorted = |model: ModelRc<SharedString>| {
+            let mut ids: Vec<String> = model.iter().map(|id| id.to_string()).collect();
+            ids.sort();
+            ids
+        };
+
+        ui.invoke_open_sign_encrypt();
+        let mut recipients: Vec<String> = ui
+            .get_se_recipients()
+            .iter()
+            .filter(|r| r.label == "Alice")
+            .map(|r| {
+                assert_eq!(r.sublabel, "alice@example.org");
+                r.key_id.to_string()
+            })
+            .collect();
+        recipients.sort();
+        assert_eq!(recipients, expected, "the recipient rows");
+        assert_eq!(
+            ui.get_se_signers()
+                .iter()
+                .map(|signer| signer.to_string())
+                .collect::<Vec<_>>(),
+            [ALICE, ALICE],
+            "the premise: the signers read alike"
+        );
+        assert_eq!(sorted(ui.get_se_signer_key_ids()), expected, "Sign as");
+
+        click_row(&ui, &state, &bob);
+        ui.invoke_open_certify();
+        assert_eq!(
+            sorted(ui.get_certify_certifier_key_ids()),
+            expected,
+            "Certify with"
+        );
+    }
+
+    /// The note left with a revocation is kept apart from its reason, which
+    /// is the app's own words, and shown with what it hides written out, in
+    /// the details pane and in the dialog that asks before a revocation of
+    /// the user's own key is stored, which names the key written out as well;
+    /// the status line quotes it, written out too.
+    ///
+    /// Anyone holding the key writes the note, and it was joined on after the
+    /// reason, in the banner's red, as one sentence of the app's.
+    #[test]
+    fn a_revocation_note_is_kept_apart_from_its_reason() {
+        i_slint_backend_testing::init_no_event_loop();
+        use slint::Model;
+        let dir = tempfile::tempdir().unwrap();
+        let (theirs, store) = (
+            Store::open(dir.path().join("theirs.d"), dir.path().join("theirs")).unwrap(),
+            Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap(),
+        );
+        const NOTE: &str = "rPGP: import 0x1234 instead\n\u{202E}detrevni";
+        const SHOWN: &str = "rPGP: import 0x1234 instead[U+000A][U+202E]detrevni";
+        // The name the dialog gives the key, its primary user ID, hides a
+        // character as well.
+        let key = generated_with(
+            &["M\u{200B}e <me@example.org>"],
+            rpgp_core::keygen::Standard::default(),
+        )
+        .cert;
+        let fingerprint = key.fingerprint().to_hex();
+        store.insert_secret(&key).unwrap();
+
+        // The revocation, made by another copy of the key and read from a
+        // file, as Import reads one.
+        theirs.insert_secret(&key).unwrap();
+        let mut request = RevokeRequest::new(&fingerprint);
+        request.reason = Reason::Superseded;
+        request.message = NOTE.to_string();
+        let revoked = revoke::revoke_cert(&theirs, &request).unwrap();
+        let signature = revoked.primary_key().self_revocations().next().unwrap();
+        let path = dir.path().join("me.rev");
+        std::fs::write(&path, revoke::armor(signature).unwrap()).unwrap();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let file = match import_into(&lock(&state).store, &path, &HashSet::new()) {
+            Ok(Imported::Confirm(file)) => file,
+            other => panic!("expected to be asked about the user's own key: {other:?}"),
+        };
+        ask_to_store_revocations(&ui, &state, file.clone());
+        let asked = ui.get_import_revocations();
+        let asked = asked.row_data(0).unwrap();
+        assert_eq!(asked.name, "M[U+200B]e <me@example.org>");
+        assert_eq!(asked.reason, "Replaced by a newer key");
+        assert_eq!(asked.note, SHOWN);
+
+        // The status line the reload after storing it leaves.
+        let after = store_revocations(&lock(&state).store, &file).unwrap();
+        let status = landed_status(after.status, Vec::new()).unwrap_or_default();
+        assert!(
+            status.starts_with(&format!(
+                "Revoked M[U+200B]e <me@example.org>: Replaced by a newer key — “{SHOWN}”."
+            )),
+            "the status line should quote the note: {status}"
+        );
+
+        let summary = CertSummary::from_cert(&lock(&state).store.lookup(&fingerprint).unwrap());
+        assert_eq!(
+            summary.revocation.as_deref(),
+            Some("Replaced by a newer key")
+        );
+        assert_eq!(summary.revocation_note, NOTE);
+        let row = to_row(&summary);
+        assert_eq!(row.revocation, "Replaced by a newer key");
+        assert_eq!(row.revocation_note, SHOWN);
+    }
+
+    /// A key on an OpenPGP card is shown with the card's number as `gpg -K`
+    /// gives it, not the 32 digits of its application identifier, which ran
+    /// the details pane's smartcard pill past the pane's edge.
+    #[test]
+    fn a_card_is_shown_by_its_number() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let card = generated("Card <card@example.org>").cert;
+        store.insert(&card).unwrap();
+        let card = card.fingerprint().to_hex();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let survey = found(
+            &card,
+            rpgp_core::agent::AgentHolds {
+                sign: agent_key(Some("D2760001240103040006181329630000")),
+                ..Default::default()
+            },
+        );
+        land_survey(&ui, &state, &survey, &[]);
+        assert_eq!(row_for(&state, &card).card_serial, "0006 18132963");
     }
 }

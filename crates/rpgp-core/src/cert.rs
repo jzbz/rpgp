@@ -171,8 +171,16 @@ pub struct CertSummary {
     /// by the caller from [`crate::Store::sha1_accepted`], like
     /// [`CertSummary::is_trust_root`] beside it.
     pub sha1_accepted: bool,
-    /// Why the certificate was revoked, when it has been.
+    /// Why the certificate was revoked, when it has been, in this app's words:
+    /// the reason's [`crate::revoke::Reason::label`].
     pub revocation: Option<String>,
+    /// The note left with that revocation, as whoever signed it wrote it, or
+    /// empty. Kept apart from the reason, after which it used to be joined
+    /// with a dash into one line of the details pane's red banner, so that it
+    /// can be shown as a quotation rather than in the app's own voice: anyone
+    /// holding the key can write it, a thief among them, and "Replaced by a
+    /// newer key — use 0x… instead" read as the app's advice.
+    pub revocation_note: String,
     /// Whether that revocation is hard, invalidating the signatures the key
     /// made before it as well as after. A key revoked only softly, retired or
     /// superseded, still has a hard revocation to give if its secret turns
@@ -376,7 +384,13 @@ impl CertSummary {
             implicit_root: false,
             sha1_blocked,
             sha1_accepted: false,
-            revocation: reason.as_ref().map(describe_revocation),
+            revocation: reason
+                .as_ref()
+                .map(|(reason, _)| reason.label().to_string()),
+            revocation_note: reason
+                .as_ref()
+                .map(|(_, note)| note.clone())
+                .unwrap_or_default(),
             revocation_hard: reason.is_some_and(|(reason, _)| reason.is_hard()),
             agent: Default::default(),
         }
@@ -589,13 +603,14 @@ pub(crate) fn resolve_user_id<'a>(cert: &'a Cert, wanted: &str) -> Result<UserID
     Ok(found)
 }
 
-/// A revocation's reason as the details pane shows it: the label, and the
-/// note after it where there is one.
+/// A revocation's reason in one line: the label, and the note after it where
+/// there is one, in quotation marks, since whoever signed the revocation wrote
+/// it and this app did not.
 pub(crate) fn describe_revocation((reason, message): &(crate::revoke::Reason, String)) -> String {
     if message.is_empty() {
         reason.label().to_string()
     } else {
-        format!("{} — {message}", reason.label())
+        format!("{} — “{message}”", reason.label())
     }
 }
 

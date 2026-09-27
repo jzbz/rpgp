@@ -524,10 +524,11 @@ fn a_selection_row_says_what_it_is_and_whether_it_is_chosen() {
     i_slint_backend_testing::init_no_event_loop();
     use i_slint_backend_testing::{AccessibleRole, ElementHandle};
 
-    let recipient = |label: &str, mail: &str, selected: bool| RecipientRow {
+    let recipient = |label: &str, mail: &str, key_id: &str, selected: bool| RecipientRow {
         fingerprint: label.into(),
         label: label.into(),
         sublabel: mail.into(),
+        key_id: key_id.into(),
         initials: label[..1].into(),
         tint_index: 0,
         selected,
@@ -535,20 +536,21 @@ fn a_selection_row_says_what_it_is_and_whether_it_is_chosen() {
 
     let probe = SelectionProbe::new().unwrap();
     probe.set_recipients(slint::ModelRc::new(slint::VecModel::from(vec![
-        recipient("Alice", "alice@example.org", false),
-        recipient("Bob", "bob@example.org", true),
+        recipient("Alice", "alice@example.org", "A11CE00000000001", false),
+        recipient("Bob", "bob@example.org", "B0B0000000000002", true),
     ])));
     probe.show().unwrap();
 
-    // The address is part of the name, not decoration: it is the only thing
-    // separating two keys held for the same person.
+    // The address and the key ID are part of the name, not decoration: the key
+    // ID is what separates two keys held for the same person, which usually
+    // share the address too.
     let row = |name: &str| {
         ElementHandle::find_by_accessible_label(&probe, name)
             .next()
             .unwrap_or_else(|| panic!("no recipient row is called {name:?}"))
     };
-    let alice = || row("Alice, alice@example.org");
-    let bob = || row("Bob, bob@example.org");
+    let alice = || row("Alice, alice@example.org, key ID A11CE00000000001");
+    let bob = || row("Bob, bob@example.org, key ID B0B0000000000002");
 
     assert_eq!(alice().accessible_role(), Some(AccessibleRole::Checkbox));
     assert_eq!(bob().accessible_role(), Some(AccessibleRole::Checkbox));
@@ -615,6 +617,7 @@ fn the_notepad_recipient_row_carries_the_same_contract() {
             fingerprint: "AAAA".into(),
             label: "Alice".into(),
             sublabel: "alice@example.org".into(),
+            key_id: "A11CE00000000001".into(),
             initials: "A".into(),
             tint_index: 0,
             selected: true,
@@ -622,9 +625,12 @@ fn the_notepad_recipient_row_carries_the_same_contract() {
     ])));
     probe.show().unwrap();
 
-    let row = ElementHandle::find_by_accessible_label(&probe, "Alice, alice@example.org")
-        .next()
-        .expect("the notepad's recipient row announces nothing");
+    let row = ElementHandle::find_by_accessible_label(
+        &probe,
+        "Alice, alice@example.org, key ID A11CE00000000001",
+    )
+    .next()
+    .expect("the notepad's recipient row announces nothing");
     assert_eq!(row.accessible_role(), Some(AccessibleRole::Checkbox));
     assert_eq!(row.accessible_checked(), Some(true));
 
@@ -652,6 +658,7 @@ fn a_recipient_row_takes_no_toggle_while_a_run_is_in_flight() {
             fingerprint: "AAAA".into(),
             label: "Alice".into(),
             sublabel: "alice@example.org".into(),
+            key_id: "A11CE00000000001".into(),
             initials: "A".into(),
             tint_index: 0,
             selected: true,
@@ -696,7 +703,13 @@ fn row_is_inert_while_busy(
     use i_slint_backend_testing::AccessibleRole;
     use slint::platform::PointerEventButton;
 
-    let row = || control(root, "Alice, alice@example.org", AccessibleRole::Checkbox);
+    let row = || {
+        control(
+            root,
+            "Alice, alice@example.org, key ID A11CE00000000001",
+            AccessibleRole::Checkbox,
+        )
+    };
 
     set_busy(true);
     assert_eq!(
@@ -1181,6 +1194,7 @@ fn sign_encrypt_encrypts_alone_when_no_key_here_can_sign() {
             fingerprint: "AAAA".into(),
             label: "Alice".into(),
             sublabel: "alice@example.org".into(),
+            key_id: "A11CE00000000001".into(),
             initials: "A".into(),
             tint_index: 0,
             selected: true,
@@ -2514,4 +2528,350 @@ fn a_message_too_long_for_the_status_bar_is_shown_from_its_beginning() {
         "the first line drawn runs to {reach}px, so it is not \"Refused.\": the \
          beginning of the message was cut"
     );
+}
+
+/// A row in the certificate list says what its description carries: the key
+/// ID, which its second line shows where there is no address. The comment on
+/// it promised the fingerprint while it published the key ID, and nothing
+/// held the two to each other.
+#[test]
+fn a_certificate_row_describes_itself_by_its_key_id() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::AccessibleRole;
+
+    let probe = CertListProbe::new().unwrap();
+    probe.set_certs(slint::ModelRc::new(slint::VecModel::from(vec![listed(1)])));
+    probe.show().unwrap();
+    let row = control(
+        &probe,
+        "User 01 <user01@example.org>",
+        AccessibleRole::ListItem,
+    );
+    assert_eq!(
+        row.accessible_description().as_deref(),
+        Some("Key ID 0000000000000001")
+    );
+}
+
+/// Two keys with the same user ID read differently wherever one is chosen,
+/// to the eye and to a screen reader: the recipient rows of Sign / Encrypt
+/// and the notepad, and the Sign as and Certify with lists, each show every
+/// key's ID beside it, and announce it.
+///
+/// A person's old and new key usually carry the same user ID, and so do the
+/// Modern and Compatible pair the key generator offers. The recipient rows
+/// showed the name and the address, and the two lists the user ID alone, so
+/// the two keys read alike in all of them.
+#[test]
+fn keys_with_the_same_user_id_read_differently_wherever_one_is_chosen() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementRoot};
+
+    const ALICE: &str = "Alice <alice@example.org>";
+    const KEYS: [&str; 2] = ["A11CE00000000001", "A11CE00000000002"];
+    let twins = || {
+        slint::ModelRc::new(slint::VecModel::from(
+            KEYS.iter()
+                .map(|key_id| RecipientRow {
+                    fingerprint: (*key_id).into(),
+                    label: "Alice".into(),
+                    sublabel: "alice@example.org".into(),
+                    key_id: (*key_id).into(),
+                    initials: "A".into(),
+                    tint_index: 0,
+                    selected: false,
+                })
+                .collect::<Vec<_>>(),
+        ))
+    };
+    let labels = || {
+        slint::ModelRc::new(slint::VecModel::from(vec![
+            slint::SharedString::from(ALICE);
+            2
+        ]))
+    };
+    let key_ids = || {
+        slint::ModelRc::new(slint::VecModel::from(
+            KEYS.map(slint::SharedString::from).to_vec(),
+        ))
+    };
+
+    // Each recipient row is announced with its key ID, and draws it.
+    fn rows_differ(dialog: &str, root: &impl ElementRoot) {
+        for key_id in KEYS {
+            control(
+                root,
+                &format!("Alice, alice@example.org, key ID {key_id}"),
+                AccessibleRole::Checkbox,
+            );
+            assert_eq!(
+                ElementHandle::find_by_accessible_label(root, key_id).count(),
+                1,
+                "{dialog}: the recipient row should show {key_id}"
+            );
+        }
+    }
+    // The list's value names the chosen key's ID after its user ID, in the
+    // words a recipient row uses, the closed list draws it, and the open list
+    // draws every key's.
+    fn choices_differ(dialog: &str, root: &impl ElementRoot, label: &str) {
+        let count = |key_id: &str| ElementHandle::find_by_accessible_label(root, key_id).count();
+        let select = control(root, label, AccessibleRole::Combobox);
+        assert_eq!(
+            select.accessible_value().as_deref(),
+            Some(format!("{ALICE}, key ID {}", KEYS[0]).as_str()),
+            "{dialog}: {label} should announce the chosen key's ID"
+        );
+        assert_eq!(
+            (count(KEYS[0]), count(KEYS[1])),
+            (1, 0),
+            "{dialog}: {label} should show the chosen key's ID"
+        );
+        select.invoke_accessible_default_action();
+        assert_eq!(
+            (count(KEYS[0]), count(KEYS[1])),
+            (2, 1),
+            "{dialog}: {label}'s list should show each key's ID"
+        );
+    }
+
+    let probe = SelectionProbe::new().unwrap();
+    probe.set_signers(slint::ModelRc::default());
+    probe.set_recipients(twins());
+    probe.show().unwrap();
+    rows_differ("Sign / Encrypt", &probe);
+    probe.hide().unwrap();
+
+    let probe = SelectionProbe::new().unwrap();
+    probe.set_signers(labels());
+    probe.set_signer_key_ids(key_ids());
+    probe.show().unwrap();
+    choices_differ("Sign / Encrypt", &probe, "Sign as");
+    probe.hide().unwrap();
+
+    let probe = NotepadProbe::new().unwrap();
+    probe.set_recipients(twins());
+    probe.show().unwrap();
+    rows_differ("The notepad", &probe);
+    probe.hide().unwrap();
+
+    let probe = NotepadProbe::new().unwrap();
+    probe.set_signers(labels());
+    probe.set_signer_key_ids(key_ids());
+    probe.show().unwrap();
+    choices_differ("The notepad", &probe, "Sign as");
+    probe.hide().unwrap();
+
+    let probe = CertifyProbe::new().unwrap();
+    probe.set_certifiers(labels());
+    probe.set_certifier_key_ids(key_ids());
+    probe.show().unwrap();
+    choices_differ("Certify", &probe, "Certify with");
+}
+
+/// A recipient with no address has its name in the middle of its row in
+/// Sign / Encrypt, with no empty line under it.
+///
+/// The key ID used to take the address's line where there was none. Once it
+/// had a column of its own that line was left empty, and an empty line still
+/// takes its height, so the name sat above the middle of the row.
+#[test]
+fn a_recipient_with_no_address_has_its_name_in_the_middle_of_its_row() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+
+    const KEY_ID: &str = "3A11000000000001";
+    let probe = SelectionProbe::new().unwrap();
+    probe.set_signers(slint::ModelRc::default());
+    probe.set_recipients(slint::ModelRc::new(slint::VecModel::from(vec![
+        RecipientRow {
+            fingerprint: KEY_ID.into(),
+            label: "Mallory".into(),
+            sublabel: "".into(),
+            key_id: KEY_ID.into(),
+            initials: "M".into(),
+            tint_index: 0,
+            selected: false,
+        },
+    ])));
+    probe.show().unwrap();
+
+    let row = control(
+        &probe,
+        &format!("Mallory, key ID {KEY_ID}"),
+        AccessibleRole::Checkbox,
+    );
+    let name = ElementHandle::find_by_accessible_label(&probe, "Mallory")
+        .next()
+        .expect("the row shows the name");
+    let middle =
+        |element: &ElementHandle| element.absolute_position().y + element.size().height / 2.0;
+    assert!(
+        (middle(&name) - middle(&row)).abs() <= 1.0,
+        "the name's middle is at {}, the row's at {}",
+        middle(&name),
+        middle(&row)
+    );
+}
+
+/// The note left with a revocation is shown under the reason, as a note of
+/// its own in quotation marks, and the banner grows to hold it however long
+/// it runs; the dialog that asks before a revocation is stored shows it the
+/// same way.
+///
+/// Whoever holds a key writes the note, a thief included. It used to follow
+/// the app's reason after a dash, in the same red, as one sentence, so that
+/// "Replaced by a newer key — use 0x… instead" read as the app's advice.
+#[test]
+fn a_revocation_note_is_quoted_apart_from_its_reason() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::ElementHandle;
+
+    const REASON: &str = "Replaced by a newer key";
+    let probe = RevocationBannerProbe::new().unwrap();
+    probe.show().unwrap();
+    let find = |label: &str| {
+        ElementHandle::find_by_accessible_label(&probe, label)
+            .next()
+            .unwrap_or_else(|| panic!("nothing in the banner reads {label:?}"))
+    };
+    let quoted = |note: &str| format!("Note left with the revocation: “{note}”");
+    assert_eq!(
+        ElementHandle::find_by_accessible_label(&probe, &quoted("")).count(),
+        0,
+        "with no note there is no note line"
+    );
+
+    for note in [
+        "use 0x1234 instead".to_string(),
+        "and a great deal more after it ".repeat(12),
+    ] {
+        probe.set_note(note.as_str().into());
+        let banner = ElementHandle::find_by_element_type_name(&probe, "RevocationBanner")
+            .next()
+            .expect("the probe shows the banner");
+        let (reason, note) = (find(REASON), find(&quoted(&note)));
+        let bottom =
+            |element: &ElementHandle| element.absolute_position().y + element.size().height;
+        assert!(
+            bottom(&reason) <= note.absolute_position().y,
+            "the note should be on lines of its own under the reason"
+        );
+        assert!(
+            bottom(&note) <= bottom(&banner),
+            "the note runs out of the banner: {} past {}",
+            bottom(&note),
+            bottom(&banner)
+        );
+    }
+
+    let probe = ImportRevocationProbe::new().unwrap();
+    probe.set_revocations(slint::ModelRc::new(slint::VecModel::from(vec![
+        PendingRevocationRow {
+            name: "Me <me@example.org>".into(),
+            reason: REASON.into(),
+            note: "use 0x1234 instead".into(),
+            hard: false,
+            yours: true,
+        },
+    ])));
+    probe.show().unwrap();
+    assert!(
+        ElementHandle::find_by_accessible_label(&probe, REASON)
+            .next()
+            .is_some()
+            && ElementHandle::find_by_accessible_label(&probe, &quoted("use 0x1234 instead"))
+                .next()
+                .is_some(),
+        "the import dialog should show the reason and the note apart"
+    );
+}
+
+/// The notepad gives its verdict on a signature before the signer's name,
+/// and nothing of its own after it.
+///
+/// The name is the signer's to choose. Followed by the verdict, a user ID
+/// ending in "(verified)" put a verdict of its own where the app's belonged,
+/// and pushed the real one after it.
+#[test]
+fn the_notepad_gives_its_verdict_before_the_signers_name() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::ElementHandle;
+
+    let probe = NotepadProbe::new().unwrap();
+    probe.set_result("Valid signature, but the signer's identity is not verified".into());
+    probe.set_signatures(slint::ModelRc::new(slint::VecModel::from(vec![
+        SignatureRow {
+            good: true,
+            signer: "Alice <alice@example.org> (verified)".into(),
+            authentication: "unverified".into(),
+            ..Default::default()
+        },
+        SignatureRow {
+            good: true,
+            signer: "Bob <bob@example.org>".into(),
+            authentication: "unverified".into(),
+            sha1: true,
+            ..Default::default()
+        },
+    ])));
+    probe.show().unwrap();
+    for line in [
+        "good signature (unverified) — Alice <alice@example.org> (verified)",
+        "good signature (unverified, SHA-1) — Bob <bob@example.org>",
+    ] {
+        assert!(
+            ElementHandle::find_by_accessible_label(&probe, line)
+                .next()
+                .is_some(),
+            "the notepad should read {line:?}"
+        );
+    }
+}
+
+/// In the Details dialog, a user ID with a hidden character in it is shown,
+/// announced and copied written out, and Revoke user ID names it as the
+/// certificate has it, which is how rpgp-core finds it.
+#[test]
+fn a_user_id_is_shown_written_out_and_revoked_as_the_certificate_has_it() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+
+    const SHOWN: &str = "M[U+200B]al";
+    const STORED: &str = "M\u{200B}al";
+    let probe = DetailsProbe::new().unwrap();
+    probe.set_user_ids(slint::ModelRc::new(slint::VecModel::from(vec![
+        UserIdDetailRow {
+            text: "Mal".into(),
+            user_id: "Mal".into(),
+            is_primary: true,
+            ..Default::default()
+        },
+        UserIdDetailRow {
+            text: SHOWN.into(),
+            user_id: STORED.into(),
+            ..Default::default()
+        },
+    ])));
+    probe.show().unwrap();
+
+    assert!(
+        ElementHandle::find_by_accessible_label(&probe, SHOWN)
+            .next()
+            .is_some(),
+        "the user ID should be shown written out"
+    );
+    let copy = ElementHandle::find_by_accessible_label(&probe, "Copy user ID")
+        .find(|copy| copy.accessible_description().as_deref() == Some(SHOWN))
+        .expect("the copy button should say which user ID it copies, as shown");
+    copy.invoke_accessible_default_action();
+    assert_eq!(probe.get_copied(), SHOWN);
+
+    control(
+        &probe,
+        &format!("Revoke user ID {SHOWN}"),
+        AccessibleRole::Button,
+    )
+    .invoke_accessible_default_action();
+    assert_eq!(probe.get_revoked(), STORED);
 }

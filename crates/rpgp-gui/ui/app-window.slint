@@ -1,8 +1,8 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Theme, Icons, Icon } from "theme.slint";
 import {
-    Btn, CertList, Check, Divider, Field, FieldRow, Monogram, Pill, RevokeOffer, ScopeTabs,
-    SectionLabel, Select, StatusBar, Tone, TrustRootCheck, Variant,
+    Btn, CertList, Check, Divider, Field, FieldRow, Monogram, Pill, RevocationBanner, RevokeOffer,
+    ScopeTabs, SectionLabel, Select, StatusBar, Tone, TrustRootCheck, Variant,
 } from "widgets.slint";
 import { CertRow, CertificationRow, LookupRow, PendingRevocationRow, RecipientRow, SignatureRow, SubkeyRow, UserIdDetailRow, UserIdRow } from "types.slint";
 import { AboutDialog, CertifyDialog, DecryptVerifyDialog, DetailsDialog, ImportRevocationDialog, KeygenDialog, LifecycleDialog, LookupDialog, NotepadDialog, DeleteDialog, RevokeDialog, SignEncryptDialog } from "dialogs.slint";
@@ -154,6 +154,8 @@ export component AppWindow inherits Window {
     in property <string> se-output-sign: "";
     in property <[RecipientRow]> se-recipients;
     in property <[string]> se-signers;
+    // Each signer's key ID, which the Sign as list draws beside it.
+    in property <[string]> se-signer-key-ids;
     in property <int> se-selected-count: 0;
     callback open-sign-encrypt();
     callback se-pick-input();
@@ -181,6 +183,7 @@ export component AppWindow inherits Window {
     in property <string> certify-target: "";
     in property <[UserIdRow]> certify-user-ids;
     in property <[string]> certify-certifiers;
+    in property <[string]> certify-certifier-key-ids;
     in property <int> certify-chosen: 0;
     callback open-certify();
     callback certify-toggle-user-id(int);
@@ -635,8 +638,11 @@ export component AppWindow inherits Window {
                                 tone: Tone.warn;
                                 glyph: Icons.shield;
                             }
+                            // "smartcard" alone, as in the list: which card
+                            // is the Smartcard row's to say. With its serial
+                            // this pill ran past the pane's edge.
                             if root.detail.card-serial != "": Pill {
-                                text: "smartcard " + root.detail.card-serial;
+                                text: "smartcard";
                                 tone: Tone.accent;
                                 glyph: Icons.key;
                             }
@@ -648,28 +654,9 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        if root.detail.revocation != "": Rectangle {
-                            background: Theme.danger-soft;
-                            border-radius: Theme.r-md;
-                            // Without this the rectangle takes one line's
-                            // height and clips the wrapped reason.
-                            height: banner.preferred-height;
-                            banner := HorizontalLayout {
-                                padding: Theme.s3;
-                                spacing: Theme.s2;
-                                Icon {
-                                    glyph: Icons.revoke;
-                                    tint: Theme.danger;
-                                    y: 1px;
-                                }
-                                Text {
-                                    text: root.detail.revocation;
-                                    color: Theme.danger;
-                                    font-size: Theme.t-sm;
-                                    wrap: word-wrap;
-                                    horizontal-stretch: 1;
-                                }
-                            }
+                        if root.detail.revocation != "": RevocationBanner {
+                            reason: root.detail.revocation;
+                            note: root.detail.revocation-note;
                         }
 
                         // Shown only when the opt-in is the actual question:
@@ -680,9 +667,10 @@ export component AppWindow inherits Window {
                         if root.detail.sha1-blocked || root.detail.sha1-accepted: Rectangle {
                             background: Theme.warn-soft;
                             border-radius: Theme.r-md;
-                            // As above the revocation notice: without this the
-                            // box keeps one line's height and the wrapped
-                            // explanation is drawn outside it.
+                            // Probably only spells out the height Slint gives a
+                            // rectangle from the layout inside it, as it gives
+                            // RevocationBanner above, which binds none; kept
+                            // until that is checked for this notice too.
                             height: sha1-banner.preferred-height;
 
                             sha1-banner := VerticalLayout {
@@ -743,6 +731,14 @@ export component AppWindow inherits Window {
                             FieldRow {
                                 label: "Key ID";
                                 value: root.detail.key-id;
+                                mono: true;
+                                copyable: true;
+                                enabled: !root.dialog-open;
+                                copy => { root.copy-value(self.value); }
+                            }
+                            if root.detail.card-serial != "": FieldRow {
+                                label: "Smartcard";
+                                value: root.detail.card-serial;
                                 mono: true;
                                 copyable: true;
                                 enabled: !root.dialog-open;
@@ -952,6 +948,7 @@ export component AppWindow inherits Window {
         output-sign: root.se-output-sign;
         recipients: root.se-recipients;
         signers: root.se-signers;
+        signer-key-ids: root.se-signer-key-ids;
         chosen-recipients: root.se-selected-count;
         dismissed => { root.signenc-open = false; }
         pick-input => { root.se-pick-input(); }
@@ -1009,6 +1006,7 @@ export component AppWindow inherits Window {
         busy: root.busy;
         recipients: root.se-recipients;
         signers: root.se-signers;
+        signer-key-ids: root.se-signer-key-ids;
         chosen-recipients: root.se-selected-count;
         output: root.np-output;
         signatures: root.np-signatures;
@@ -1029,6 +1027,7 @@ export component AppWindow inherits Window {
         target-name: root.certify-target;
         user-ids: root.certify-user-ids;
         certifiers: root.certify-certifiers;
+        certifier-key-ids: root.certify-certifier-key-ids;
         chosen-count: root.certify-chosen;
         dismissed => { root.certify-open = false; }
         toggle-user-id(index) => { root.certify-toggle-user-id(index); }

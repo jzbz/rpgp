@@ -31,7 +31,7 @@ Inside `crates/rpgp-gui/ui`:
 | File | Contents |
 | --- | --- |
 | `theme.slint` | Colour, spacing and type tokens, plus the icon paths. |
-| `widgets.slint` | Buttons, fields, pills, the certificate list and its scope tabs, the status line, the dialog frame — the app's own controls. |
+| `widgets.slint` | Buttons, fields, pills, the certificate list and its scope tabs, the status line, the revocation banner, the dialog frame — the app's own controls. |
 | `dialogs.slint` | New key pair, Sign / Encrypt, Decrypt / Verify, Certify, Revoke, Lifecycle, Lookup, Details, Notepad, About. |
 | `app-window.slint` | The shell that assembles them. |
 | `types.slint` | Structs shared with Rust. |
@@ -200,6 +200,25 @@ because confusing them is how people end up trusting the wrong key:
   certifications in the store. A perfectly valid certificate from a stranger is
   unauthenticated, and a key you confirmed years ago stays authenticated after
   it expires.
+
+What a certificate calls itself is its maker's to write, so the window shows a
+user ID as the certificate has it, save for what cannot be seen: each control
+character, a newline among them, and each format character, a bidirectional
+override or isolate, a zero-width space and their like, is written out as its
+code point, `[U+202E]`. Slint lays text out by the Unicode bidirectional
+algorithm, overrides included, so a user ID holding one could draw its address
+backwards and, left open, turn the app's own words round after it, and a newline
+made one user ID read as two. A zero-width joiner or non-joiner with a visible
+character outside ASCII on each side is left alone, since Persian and the Indic
+scripts spell with them, as do emoji sequences. A revocation's note is shown the
+same way, under the reason and quoted, since anyone holding the key can write
+it. A copy takes the text as shown, but nothing else changes: a user ID is still
+found, certified and revoked by the text the certificate carries.
+
+A person's old and new keys usually carry the same user ID, as do the Modern and
+Compatible pair that New key pair offers, so every list a key is chosen from,
+the recipients and the Sign as and Certify with lists, shows each key's ID
+beside it.
 
 Certifying is done from a certificate's details pane. A certification always
 names one *user ID* — OpenPGP has no way to vouch for a certificate as a whole
@@ -505,14 +524,17 @@ Certifying takes the certificate's primary key, so **Certify identity…** is
 offered once some key's primary can sign: its secret is in rPGP's store, as key
 material rather than the stub GnuPG exports in place of a primary kept offline
 or on a card, or the agent holds it, in its own store or on a card. The
-certifier list marks one on a card "(smartcard)". A card holding only the
-subkeys, the primary being kept offline as many YubiKey guides advise, signs
-and decrypts through the agent but is not offered as a certifier, and nor is a
-key imported from `gpg --export-secret-subkeys`, unless the agent holds its
-primary. What the agent holds is learnt by the survey after each reload of the
-list, so a key only the agent holds opens Certify once the agent has answered,
-which is at once unless the agent has hung; a dialog opened before then lists
-only the keys in rPGP's store.
+certifier list puts "(smartcard)" in front of one on a card, where the key ID
+beside it cannot crowd the mark out, and the details pane names the card a key
+signs from by the number `gpg -K` gives it, `0006 18132963` for an OpenPGP card,
+the manufacturer's and then the card's own. A card holding only the subkeys, the
+primary being kept offline as many YubiKey guides advise, signs and decrypts
+through the agent but is not offered as a certifier, and nor is a key imported
+from `gpg --export-secret-subkeys`, unless the agent holds its primary. What the
+agent holds is learnt by the survey after each reload of the list, so a key only
+the agent holds opens Certify once the agent has answered, which is at once
+unless the agent has hung; a dialog opened before then lists only the keys in
+rPGP's store.
 
 A message the keys in rPGP's own store do not open is taken to the agent, and
 only to a key it could be for: the key each of its session-key packets names,
@@ -770,9 +792,10 @@ smartcard path avoids this entirely, by never seeing the key.
 ## What goes on the clipboard
 
 A fingerprint, key ID or user ID copied from the details pane goes on the
-clipboard like any other copy. What the notepad's Copy puts there can be a
-decrypted message, so it goes out marked private, with each platform's way of
-asking clipboard managers and clipboard history to leave it out:
+clipboard like any other copy, a user ID as it is shown, with any character it
+hides written out. What the notepad's Copy puts there can be a decrypted
+message, so it goes out marked private, with each platform's way of asking
+clipboard managers and clipboard history to leave it out:
 `x-kde-passwordManagerHint` on X11 and through the Wayland data-control
 protocols, `ExcludeClipboardContentFromMonitorProcessing` on Windows, and
 `org.nspasteboard.ConcealedType` on macOS. On X11 a private copy is also

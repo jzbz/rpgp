@@ -412,9 +412,9 @@ pub struct PendingRevocation {
 }
 
 impl PendingRevocation {
-    /// This revocation's own reason and note, worded as the details pane words
-    /// a revocation. Once it is stored the pane may still name another, where
-    /// the key already carries one.
+    /// This revocation's own reason and note in one line, the note quoted, as
+    /// the status line reports it once stored. The details pane may then name
+    /// another, where the key already carries one.
     pub fn describe(&self) -> String {
         crate::cert::describe_revocation(&(self.reason, self.message.clone()))
     }

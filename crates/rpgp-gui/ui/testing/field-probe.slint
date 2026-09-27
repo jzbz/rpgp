@@ -2,13 +2,13 @@
 // dialogs, so a Rust test can operate them and inspect what the accessibility
 // tree publishes. Not part of the application.
 import { Field, Btn, Check, Select, FieldRow, TextArea, TrustRootCheck } from "../widgets.slint";
-import { CertList, ScopeTabs, StatusBar } from "../widgets.slint";
+import { CertList, RevocationBanner, ScopeTabs, StatusBar } from "../widgets.slint";
 // The rule the details pane draws its Revoke button by, for a test to ask.
 export { RevokeOffer } from "../widgets.slint";
 import { SignEncryptDialog, CertifyDialog, NotepadDialog, DeleteDialog } from "../dialogs.slint";
 import { KeygenDialog, DecryptVerifyDialog, RevokeDialog, LifecycleDialog } from "../dialogs.slint";
 import { ImportRevocationDialog, DetailsDialog, LookupDialog } from "../dialogs.slint";
-import { CertRow, RecipientRow, UserIdRow, SignatureRow } from "../types.slint";
+import { CertRow, PendingRevocationRow, RecipientRow, UserIdDetailRow, UserIdRow, SignatureRow } from "../types.slint";
 
 // One passphrase Field and one ordinary Field.
 export component FieldProbe inherits Window {
@@ -126,6 +126,7 @@ export component SelectionProbe inherits Window {
     in-out property <bool> busy: false;
     in-out property <string> error;
     in-out property <[string]> signers: ["Probe <probe@example.org>"];
+    in-out property <[string]> signer-key-ids;
     in-out property <int> chosen-recipients: 0;
     in-out property <int> runs: 0;
     in-out property <bool> encrypted;
@@ -141,6 +142,7 @@ export component SelectionProbe inherits Window {
         input-path: "/tmp/message.txt";
         recipients: root.recipients;
         signers: root.signers;
+        signer-key-ids: root.signer-key-ids;
         chosen-recipients: root.chosen-recipients;
         busy: root.busy;
         error: root.error;
@@ -155,6 +157,8 @@ export component SelectionProbe inherits Window {
 
 export component CertifyProbe inherits Window {
     in-out property <[UserIdRow]> user-ids;
+    in-out property <[string]> certifiers;
+    in-out property <[string]> certifier-key-ids;
     in-out property <int> toggled-user-id: -1;
     in-out property <string> error;
     in-out property <length> probe-height: 720px;
@@ -167,6 +171,8 @@ export component CertifyProbe inherits Window {
         height: 100%;
         target-name: "Alice";
         user-ids: root.user-ids;
+        certifiers: root.certifiers;
+        certifier-key-ids: root.certifier-key-ids;
         error: root.error;
         toggle-user-id(index) => { root.toggled-user-id = index; }
     }
@@ -175,6 +181,11 @@ export component CertifyProbe inherits Window {
 // The notepad carries a third copy of the recipient row, behind its own filter.
 export component NotepadProbe inherits Window {
     in-out property <[RecipientRow]> recipients;
+    // Empty unless a test sets them, so that the other tests find the notepad
+    // as they always have: with no key to sign with, and no verdict.
+    in-out property <[string]> signers;
+    in-out property <[string]> signer-key-ids;
+    in-out property <[SignatureRow]> signatures;
     in-out property <int> toggled-recipient: -1;
     in-out property <bool> busy: false;
     // Empty unless a test sets it. The output area exists only while there is
@@ -190,6 +201,9 @@ export component NotepadProbe inherits Window {
         width: 100%;
         height: 100%;
         recipients: root.recipients;
+        signers: root.signers;
+        signer-key-ids: root.signer-key-ids;
+        signatures: root.signatures;
         output: root.output;
         result: root.result;
         result-tone: 3;
@@ -298,10 +312,20 @@ export component RevokeUpgradeProbe inherits Window {
 
 // The dialog that asks before a revocation certificate for the user's own
 // keys is stored, holding more revocations than fit in the window at the
-// smallest size the app allows.
+// smallest size the app allows unless a test gives it others.
 export component ImportRevocationProbe inherits Window {
     in-out property <int> runs: 0;
     in-out property <string> error;
+    in-out property <[PendingRevocationRow]> revocations: [
+        { name: "Me <me@example.org>", reason: "Secret key may be compromised", hard: true, yours: true },
+        { name: "Me <me@work.example.org>", reason: "Secret key may be compromised", hard: true, yours: true },
+        { name: "Ann <ann@example.org>", reason: "No longer used", hard: false, yours: false },
+        { name: "Ben <ben@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
+        { name: "Cai <cai@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
+        { name: "Dee <dee@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
+        { name: "Eve <eve@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
+        { name: "Fay <fay@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
+    ];
 
     width: 860px;
     height: 520px;
@@ -311,16 +335,7 @@ export component ImportRevocationProbe inherits Window {
         height: 100%;
         yours: 2;
         error: root.error;
-        revocations: [
-            { name: "Me <me@example.org>", reason: "Secret key may be compromised", hard: true, yours: true },
-            { name: "Me <me@work.example.org>", reason: "Secret key may be compromised", hard: true, yours: true },
-            { name: "Ann <ann@example.org>", reason: "No longer used", hard: false, yours: false },
-            { name: "Ben <ben@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
-            { name: "Cai <cai@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
-            { name: "Dee <dee@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
-            { name: "Eve <eve@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
-            { name: "Fay <fay@example.org>", reason: "No reason given (treated as compromised)", hard: true, yours: false },
-        ];
+        revocations: root.revocations;
         run => { root.runs += 1; }
     }
 }
@@ -495,6 +510,19 @@ export component DetailsProbe inherits Window {
     in-out property <string> copied;
     in-out property <int> copies: 0;
     in-out property <string> revoked;
+    in-out property <[UserIdDetailRow]> user-ids: [
+        {
+            text: "Alice <alice@example.org>",
+            user-id: "Alice <alice@example.org>",
+            is-primary: true,
+            self-signed: "2026-01-01",
+        },
+        {
+            text: "Alice <alice@work.example>",
+            user-id: "Alice <alice@work.example>",
+            self-signed: "2026-01-01",
+        },
+    ];
 
     width: 760px;
     height: 720px;
@@ -510,10 +538,7 @@ export component DetailsProbe inherits Window {
             key-id: "89ABCDEF01234567",
             algorithm: "Ed25519",
         };
-        user-ids: [
-            { text: "Alice <alice@example.org>", is-primary: true, self-signed: "2026-01-01" },
-            { text: "Alice <alice@work.example>", self-signed: "2026-01-01" },
-        ];
+        user-ids: root.user-ids;
         copy-value(text) => {
             root.copied = text;
             root.copies += 1;
@@ -549,6 +574,23 @@ export component StatusProbe inherits Window {
         StatusBar {
             text: root.text;
             announce: root.announce;
+        }
+    }
+}
+
+// The details pane's revocation notice, at the width the pane gives it.
+export component RevocationBannerProbe inherits Window {
+    in-out property <string> reason: "Replaced by a newer key";
+    in-out property <string> note;
+
+    width: 288px;
+    height: 300px;
+
+    VerticalLayout {
+        alignment: start;
+        RevocationBanner {
+            reason: root.reason;
+            note: root.note;
         }
     }
 }

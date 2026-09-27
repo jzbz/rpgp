@@ -504,6 +504,12 @@ export global RevokeOffer {
 // a plain button plus a PopupWindow.
 export component Select inherits Rectangle {
     in property <[string]> model;
+    /// Each option's key ID, drawn after it in faint monospace and never
+    /// elided, where the option itself can be, and read after it as "key ID":
+    /// what tells apart two keys that read alike, since a person's old and new
+    /// keys commonly carry the same user ID. The signer and certifier lists
+    /// fill it; empty where the options are not keys.
+    in property <[string]> key-ids;
     in property <bool> enabled: true;
     in-out property <int> current: 0;
     /// Names the choice being made. The chosen option is the value; without a
@@ -511,12 +517,19 @@ export component Select inherits Rectangle {
     in property <string> label;
     callback changed(int);
 
+    property <string> chosen: root.current >= 0 && root.current < root.model.length
+        ? root.model[root.current]
+        : "";
+    property <string> chosen-key-id: root.current >= 0 && root.current < root.key-ids.length
+        ? root.key-ids[root.current]
+        : "";
+
     accessible-role: combobox;
     accessible-label: root.label;
     accessible-enabled: root.enabled;
-    accessible-value: root.current >= 0 && root.current < root.model.length
-        ? root.model[root.current]
-        : "";
+    // With the key ID, so that someone listening can tell two keys apart as
+    // well, in the words a recipient row uses for it.
+    accessible-value: root.chosen-key-id == "" ? root.chosen : root.chosen + ", key ID " + root.chosen-key-id;
     // Gated for the reasons Btn gives, here, in the key handler, and on the
     // options, since each is a way of changing the choice.
     accessible-action-default => {
@@ -538,14 +551,21 @@ export component Select inherits Rectangle {
         spacing: Theme.s2;
 
         Text {
-            text: root.current >= 0 && root.current < root.model.length
-                ? root.model[root.current]
-                : "";
+            text: root.chosen;
             color: Theme.text;
             font-size: Theme.t-md;
             vertical-alignment: center;
             horizontal-stretch: 1;
             overflow: elide;
+        }
+
+        // Neither stretches nor elides, so a long option gives way to it.
+        if root.chosen-key-id != "": Text {
+            text: root.chosen-key-id;
+            color: Theme.text-faint;
+            font-size: Theme.t-sm;
+            font-family: "Source Code Pro";
+            vertical-alignment: center;
         }
 
         Icon {
@@ -626,12 +646,21 @@ export component Select inherits Rectangle {
                     HorizontalLayout {
                         padding-left: Theme.s2;
                         padding-right: Theme.s2;
+                        spacing: Theme.s2;
                         Text {
                             text: label;
                             color: Theme.text;
                             font-size: Theme.t-md;
                             vertical-alignment: center;
+                            horizontal-stretch: 1;
                             overflow: elide;
+                        }
+                        if root.key-ids[index] != "": Text {
+                            text: root.key-ids[index];
+                            color: Theme.text-faint;
+                            font-size: Theme.t-sm;
+                            font-family: "Source Code Pro";
+                            vertical-alignment: center;
                         }
                     }
 
@@ -841,6 +870,68 @@ export component FieldRow inherits Rectangle {
     }
 }
 
+// The note left with a revocation, as a quotation of whoever signed it.
+//
+// Anyone holding a key can revoke it, a thief as well as its owner, and write
+// what they like in the note. The details pane used to run it on after the
+// app's own reason, following a dash, in the same red, so that "Replaced by a
+// newer key — use 0x… instead" read as the app's advice. Quoted, credited to
+// the revocation and in the ordinary colour of text, it reads as someone
+// else's words. The note has its hidden characters written out before it gets
+// here, so it cannot break the line or turn the words round either.
+export component RevocationNote inherits Text {
+    in property <string> note;
+
+    text: "Note left with the revocation: “" + root.note + "”";
+    color: Theme.text-dim;
+    font-size: Theme.t-sm;
+    wrap: word-wrap;
+}
+
+// The details pane's notice that a certificate is revoked: why, in the app's
+// words and its danger colour, and under that any note left with the
+// revocation. Here rather than in app-window.slint so that the tests can
+// reach it.
+//
+// It binds no height of its own. Slint sizes a rectangle whose child is a
+// layout by what that layout asks for, every wrapped line of the reason and
+// the note included, and the pane lays its contents out from the top, so the
+// banner is as tall as its text.
+export component RevocationBanner inherits Rectangle {
+    in property <string> reason;
+    in property <string> note;
+
+    background: Theme.danger-soft;
+    border-radius: Theme.r-md;
+
+    HorizontalLayout {
+        padding: Theme.s3;
+        spacing: Theme.s2;
+
+        Icon {
+            glyph: Icons.revoke;
+            tint: Theme.danger;
+            y: 1px;
+        }
+
+        VerticalLayout {
+            spacing: Theme.s1;
+            horizontal-stretch: 1;
+
+            Text {
+                text: root.reason;
+                color: Theme.danger;
+                font-size: Theme.t-sm;
+                wrap: word-wrap;
+            }
+
+            if root.note != "": RevocationNote {
+                note: root.note;
+            }
+        }
+    }
+}
+
 // The window's rail tabs, its certificate list and its status line are here
 // rather than in app-window.slint so that tests/accessibility.rs can reach
 // them, as it reaches TrustRootCheck: the window is compiled without the debug
@@ -1008,11 +1099,13 @@ component CertListRow inherits Rectangle {
     callback clicked();
 
     // The row announces who it is and whether it is the selected one. The
-    // description carries the fingerprint, which is what someone listening
-    // rather than looking actually needs to tell two keys apart.
+    // description carries the key ID, which the row's second line shows where
+    // there is no address: short enough to hear on every step through the
+    // list, where a fingerprint read out at each one would not be. Telling two
+    // keys apart for certain is the fingerprint's job, in the details pane.
     accessible-role: list-item;
     accessible-label: root.cert.primary-user-id;
-    accessible-description: "Key " + root.cert.key-id;
+    accessible-description: "Key ID " + root.cert.key-id;
     accessible-enabled: root.enabled;
     accessible-item-selectable: true;
     accessible-item-selected: root.selected;

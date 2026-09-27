@@ -1,6 +1,6 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Theme, Icons, Icon } from "theme.slint";
-import { Btn, Check, DialogError, DialogShell, Divider, Field, FieldRow, Monogram, Pill, SectionLabel, Select, TextArea, Tone, Variant } from "widgets.slint";
+import { Btn, Check, DialogError, DialogShell, Divider, Field, FieldRow, Monogram, Pill, RevocationNote, SectionLabel, Select, TextArea, Tone, Variant } from "widgets.slint";
 import { CertRow, CertificationRow, LookupRow, PendingRevocationRow, RecipientRow, SignatureRow, SubkeyRow, UserIdDetailRow, UserIdRow } from "types.slint";
 
 // A file slot: label, the chosen path (or a hint), and a Choose button.
@@ -214,6 +214,8 @@ export component SignEncryptDialog inherits DialogShell {
     in property <string> output-sign;
     in property <[RecipientRow]> recipients;
     in property <[string]> signers;
+    /// Each signer's key ID, drawn beside it.
+    in property <[string]> signer-key-ids;
     callback pick-input();
     callback toggle-recipient(int);
     callback run(bool, bool, int, string, string);
@@ -355,8 +357,12 @@ export component SignEncryptDialog inherits DialogShell {
                             // The row draws a tick box but is not one: without these a screen
                             // reader sees an unlabelled rectangle and cannot tell a chosen
                             // recipient from an unchosen one. Check declares the same set.
+                            // The key ID is in the label as it is on the row, for the reason
+                            // given there.
                             accessible-role: checkbox;
-                            accessible-label: entry.label + ", " + entry.sublabel;
+                            accessible-label: entry.label
+                                + (entry.sublabel == "" ? "" : ", " + entry.sublabel)
+                                + ", key ID " + entry.key-id;
                             accessible-checkable: true;
                             accessible-checked: entry.selected;
                             // Inert while a run is in flight, as Check is when disabled. Inside
@@ -406,12 +412,28 @@ export component SignEncryptDialog inherits DialogShell {
                                         font-size: Theme.t-md;
                                         overflow: elide;
                                     }
-                                    Text {
+                                    // Left out where there is no address: an
+                                    // empty line still takes its height, and
+                                    // would hold the name above the middle.
+                                    if entry.sublabel != "": Text {
                                         text: entry.sublabel;
                                         color: Theme.text-faint;
                                         font-size: Theme.t-xs;
                                         overflow: elide;
                                     }
+                                }
+
+                                // The key ID, which is what tells apart two
+                                // certificates with the same name and address,
+                                // as a person's old and new key usually are. It
+                                // does not elide, so a long name or address
+                                // gives way to it.
+                                Text {
+                                    text: entry.key-id;
+                                    color: Theme.text-faint;
+                                    font-size: Theme.t-xs;
+                                    font-family: "Source Code Pro";
+                                    vertical-alignment: center;
                                 }
                             }
 
@@ -442,6 +464,7 @@ export component SignEncryptDialog inherits DialogShell {
                 Select {
                     label: "Sign as";
                     model: root.signers;
+                    key-ids: root.signer-key-ids;
                     enabled: !root.busy;
                     current: root.signer-index;
                     changed(index) => { root.signer-index = index; }
@@ -699,6 +722,8 @@ export component CertifyDialog inherits DialogShell {
     in property <string> target-name;
     in property <[UserIdRow]> user-ids;
     in property <[string]> certifiers;
+    /// Each certifier's key ID, drawn beside it.
+    in property <[string]> certifier-key-ids;
     in property <int> chosen-count;
     callback toggle-user-id(int);
     callback run(int, bool, bool, int, string);
@@ -836,6 +861,7 @@ export component CertifyDialog inherits DialogShell {
                         Select {
                             label: "Certify with";
                             model: root.certifiers;
+                            key-ids: root.certifier-key-ids;
                             enabled: !root.busy;
                             current: root.certifier-index;
                             changed(index) => { root.certifier-index = index; }
@@ -1116,6 +1142,9 @@ export component ImportRevocationDialog inherits DialogShell {
                         font-size: Theme.t-sm;
                         wrap: word-wrap;
                     }
+                    if entry.note != "": RevocationNote {
+                        note: entry.note;
+                    }
                     if entry.hard: Text {
                         text: "A hard revocation: signatures this key made in the past stop "
                             + "counting too.";
@@ -1236,6 +1265,8 @@ export component DeleteDialog inherits DialogShell {
 export component NotepadDialog inherits DialogShell {
     in property <[RecipientRow]> recipients;
     in property <[string]> signers;
+    /// Each signer's key ID, drawn beside it.
+    in property <[string]> signer-key-ids;
     in property <int> chosen-recipients;
     in property <string> output;
     in property <[SignatureRow]> signatures;
@@ -1336,7 +1367,9 @@ export component NotepadDialog inherits DialogShell {
                             // reader sees an unlabelled rectangle and cannot tell a chosen
                             // recipient from an unchosen one. Check declares the same set.
                             accessible-role: checkbox;
-                            accessible-label: entry.label + ", " + entry.sublabel;
+                            accessible-label: entry.label
+                                + (entry.sublabel == "" ? "" : ", " + entry.sublabel)
+                                + ", key ID " + entry.key-id;
                             accessible-checkable: true;
                             accessible-checked: entry.selected;
                             // Inert while a run is in flight, as in Sign / Encrypt, whose
@@ -1373,10 +1406,11 @@ export component NotepadDialog inherits DialogShell {
                                     vertical-alignment: center;
                                     overflow: elide;
                                 }
-                                // Beside the name rather than under it: these
-                                // rows are 34px and a second line would halve
-                                // how many fit. It is what tells two keys for
-                                // the same person apart, so it elides last.
+                                // The address, beside the name rather than
+                                // under it: these rows are 34px and a second
+                                // line would halve how many fit. It stretches,
+                                // so it is the first to give way when the row
+                                // is short of room.
                                 Text {
                                     text: entry.sublabel;
                                     color: Theme.text-faint;
@@ -1384,6 +1418,17 @@ export component NotepadDialog inherits DialogShell {
                                     vertical-alignment: center;
                                     overflow: elide;
                                     horizontal-stretch: 1;
+                                }
+                                // The key ID never gives way: it, and not the
+                                // address, is what tells a person's old and
+                                // new key apart, since both usually carry the
+                                // same one.
+                                Text {
+                                    text: entry.key-id;
+                                    color: Theme.text-faint;
+                                    font-size: Theme.t-xs;
+                                    font-family: "Source Code Pro";
+                                    vertical-alignment: center;
                                 }
                             }
                             pick := TouchArea {
@@ -1402,6 +1447,7 @@ export component NotepadDialog inherits DialogShell {
             if root.signers.length > 0: Select {
                 label: "Sign as";
                 model: root.signers;
+                key-ids: root.signer-key-ids;
                 enabled: !root.busy;
                 current: root.signer-index;
                 changed(index) => { root.signer-index = index; }
@@ -1448,11 +1494,16 @@ export component NotepadDialog inherits DialogShell {
                     // The notepad's banner is text rather than pills, so the
                     // SHA-1 caveat rides in the parenthesis beside the
                     // authentication verdict rather than as a badge of its own.
-                    text: (signature.good ? "good signature — " : "BAD — ")
-                        + (signature.good
-                            ? signature.signer + " (" + signature.authentication
-                                + (signature.sha1 ? ", SHA-1" : "") + ")"
-                            : signature.detail);
+                    //
+                    // The verdict comes before the signer's name, and nothing
+                    // of the app's after it. The name is the signer's own
+                    // choice, and followed by the verdict, a user ID ending
+                    // in "(verified)" put a verdict of its own where the
+                    // app's belonged, and pushed the real one to after it.
+                    text: signature.good
+                        ? "good signature (" + signature.authentication
+                            + (signature.sha1 ? ", SHA-1" : "") + ") — " + signature.signer
+                        : "BAD — " + signature.detail;
                     color: Theme.text;
                     font-size: Theme.t-sm;
                     wrap: word-wrap;
@@ -1742,7 +1793,9 @@ export component DetailsDialog inherits DialogShell {
                     // announced as an unlabelled button.
                     label: "Revoke user ID " + uid.text;
                     variant: Variant.ghost;
-                    clicked => { root.revoke-user-id(uid.text); }
+                    // By the user ID as the certificate has it, which is not
+                    // the text shown where it holds a hidden character.
+                    clicked => { root.revoke-user-id(uid.user-id); }
                 }
             }
         }
@@ -1847,6 +1900,8 @@ export component DetailsDialog inherits DialogShell {
 export component LifecycleDialog inherits DialogShell {
     /// 0 change expiry, 1 add a user ID, 2 revoke a user ID
     in property <int> mode;
+    /// The user ID or subkey a revoke mode is about, as shown: what is revoked
+    /// is kept in Rust, as the certificate has it.
     in property <string> target;
     /// The key the dialog was opened for. Publish names it in its warning:
     /// that is the step that cannot be undone, and without it nothing in the
