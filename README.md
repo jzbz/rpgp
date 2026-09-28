@@ -100,7 +100,7 @@ run and then lets you through.
 ```bash
 brew install --cask jzbz/tap/rpgp                  # macOS, from the tap
 flatpak install ./rpgp-*.flatpak                   # Linux, from the bundle
-winget install rPGP.rPGP                           # Windows
+winget install jzbz.rPGP                           # Windows
 ```
 
 The cask lives in `github.com/jzbz/homebrew-tap`, a tap of this project's own;

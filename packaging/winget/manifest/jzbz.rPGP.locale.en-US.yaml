@@ -1,11 +1,12 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
 
-PackageIdentifier: rPGP.rPGP
+PackageIdentifier: jzbz.rPGP
 PackageVersion: 0.1.3
 PackageLocale: en-US
 Publisher: Jonathan Zeppettini
 PublisherUrl: https://jz.bz/
 PublisherSupportUrl: https://github.com/jzbz/rpgp/issues
+PrivacyUrl: https://rpgp.app/privacy/
 Author: Jonathan Zeppettini
 PackageName: rPGP
 PackageUrl: https://rpgp.app/

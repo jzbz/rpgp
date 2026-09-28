@@ -8,7 +8,7 @@
 # Commands[0], --rename, PortableCommandAlias, then the file's own name, so
 # without it the command would be "rpgp-v0.1.3-x86_64" and would change every
 # release. Portable also means no Start Menu entry.
-PackageIdentifier: rPGP.rPGP
+PackageIdentifier: jzbz.rPGP
 PackageVersion: 0.1.3
 InstallerType: portable
 UpgradeBehavior: install

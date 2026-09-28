@@ -16,6 +16,17 @@ becomes the asset name, `rpgp-v0.1.2-x86_64`, and it would change every release.
 
 Portable also means no Start Menu entry. That is the trade for shipping one file.
 
+## The identifier
+
+`jzbz.rPGP`. The first submission went in as `rPGP.rPGP`, naming the project
+rather than the account, and winget's moderators asked for `jzbz.rPGP` instead:
+the publisher segment is the account that publishes, and it keeps the package
+apart from the unrelated `rpgp/rpgp` OpenPGP library. The identifier is
+effectively permanent once a version is merged, since changing it later means a
+new package and an orphaned old one that silently stops updating, so it changed
+before the first merge rather than after. In winget-pkgs the manifests live at
+`manifests/j/jzbz/rPGP/<version>/`.
+
 ## The order matters
 
 winget validation downloads the asset and checks its hash, so **the GitHub release
@@ -28,7 +39,7 @@ over SHA256SUMS, not before.
 By hand, per release, and deliberately so — see below. From any machine, once the
 release is published (Komac is Rust and runs on Linux):
 
-    komac update rPGP.rPGP --version 0.1.3 \
+    komac update jzbz.rPGP --version 0.1.3 \
       --urls https://github.com/jzbz/rpgp/releases/download/v0.1.3/rpgp-v0.1.3-x86_64.exe \
       --submit
 
