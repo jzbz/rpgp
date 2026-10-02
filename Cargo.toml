@@ -38,7 +38,13 @@ sequoia-openpgp = { version = "2.4", default-features = false, features = [
 sequoia-cert-store = { version = "0.7", default-features = false }
 # Web-of-trust authentication. Depends on the same sequoia-openpgp 2.x and
 # cert-store 0.7 we already use, and forces no crypto backend of its own.
-sequoia-wot = "0.15"
+#
+# Held at 0.15.2. 0.15.3 no longer judges the certified key's own validity, so
+# a certification of a key that had expired or been revoked counts, and two of
+# certify.rs's tests fail under it; it also deprecates the
+# CertificationError::Target* variants that certify::verdict matches. Lift the
+# pin together with reworking certify.rs for that.
+sequoia-wot = "=0.15.2"
 # Talks to the user's running gpg-agent. This is how rpgp reaches smartcard
 # keys: scdaemon owns the reader exclusively, so going through the agent is the
 # only way in on a machine that has GnuPG set up — and PIN entry stays with the
