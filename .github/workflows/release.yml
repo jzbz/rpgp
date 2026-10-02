@@ -304,11 +304,20 @@ jobs:
           name: flatpak-${{ matrix.arch }}
           path: '*.flatpak'
 
-  # Wired into `release` below, which needs this job and uploads its .exe:
-  # Windows has shipped since v0.1.2 and the winget manifests point at the asset
-  # produced here. It also keeps the release build honest — the workspace links
-  # on Windows in CI, but a debug link is not a release link, and LTO and
-  # codegen settings have their own ways of failing.
+  # Wired into `release` below, which needs this job and uploads its .exe
+  # files: Windows has shipped since v0.1.2 and the winget manifests point at
+  # an asset produced here. It also keeps the release build honest — the
+  # workspace links on Windows in CI, but a debug link is not a release link,
+  # and LTO and codegen settings have their own ways of failing.
+  #
+  # Two files come out of it. The bare rpgp-<tag>-x86_64.exe is the whole
+  # program, for whoever downloads it directly. rpgp-<tag>-x86_64-setup.exe is
+  # that same exe inside a per-user Inno Setup installer
+  # (packaging/windows/rpgp.iss), which is what winget installs: a portable
+  # package gets no Start Menu entry, and no winget manifest field can give it
+  # one, so the entry has to come from an installer, along with an uninstaller
+  # that takes it away again. The installer is unsigned for the same reason
+  # the exe is (see `release`), and SHA256SUMS covers it like any other asset.
   #
   # Dispatching this workflow with a ref that does not start with `v` builds
   # every job here and skips the publish step, which is how to exercise this
@@ -339,13 +348,271 @@ jobs:
           RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release --workspace --locked
 
+      # The hash is kept as well as printed. Inno Setup's installer, its
+      # compiler and the setup exe all run in this workspace after this, and
+      # the last step checks the exe against it before anything is uploaded.
       - name: Stage the binary
+        id: stage
         shell: pwsh
         run: |
           $name = "rpgp-$env:TAG-x86_64.exe"
           Copy-Item target\release\rpgp.exe $name
           Get-Item $name | Select-Object Name, Length
-          (Get-FileHash -Algorithm SHA256 $name).Hash
+          $hash = (Get-FileHash -Algorithm SHA256 $name).Hash
+          $hash
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "sha256=$hash"
+
+      # Inno Setup from its authors' own GitHub release, pinned like the
+      # actions above: by content rather than by name, so the hash is the pin
+      # and the URL only says where to look. Not the copy on the image, which
+      # Chocolatey installs with no version pin, so it moves whenever the image
+      # is rebuilt, and which vanished outright for a while when windows-latest
+      # moved to Server 2025. The compiler's version is part of what decides the
+      # installer's bytes, and the next step requires those to be repeatable.
+      #
+      # Moving to a newer Inno Setup means reading the asset's digest from the
+      # API (`gh api repos/jrsoftware/issrc/releases/tags/<tag> --jq '.assets[]
+      # | select(.name | endswith("-x64.exe")) | .digest'`) and confirming it
+      # against a download of your own; checking that download's Authenticode
+      # signature, which names Pyrsys B.V. (Get-AuthenticodeSignature), its
+      # .issig, which ISSigTool or anything doing ECDSA P-256 can verify with
+      # jrsoftware's def02.ispublickey, and its release attestation (`gh
+      # release verify-asset <tag> <file> --repo jrsoftware/issrc`); then
+      # changing the URL, the hash and this comment together, and reading that
+      # version's revision history for anything rpgp.iss uses. 7.1.0 was
+      # checked all four ways on 2026-10-02, and the three steps below were
+      # first run with it on a Windows 11 machine, under Windows PowerShell 5.1
+      # where the runner has pwsh 7, which is why they keep to what both share.
+      #
+      # Installed under RUNNER_TEMP and never in the workspace: upload-artifact
+      # below takes every .exe at the top of the workspace, and anything else
+      # that lands there ships. /PORTABLE=1 is an option of Inno Setup's own
+      # installer that writes no uninstall entry, shortcut or file association,
+      # and /CURRENTUSER keeps it from asking for an administrator's rights.
+      #
+      # The download is retried, as apt and flatpak are above: a failed
+      # request to GitHub is usually gone a few seconds later, and failing a
+      # tag build over one would leave only a re-run. Three attempts, each
+      # given a minute to answer, ten seconds apart, and timeout-minutes still
+      # bounds the step as a whole. The hash is checked once, on the file that
+      # finally arrived, and a mismatch is not retried: it means the pin and
+      # the asset disagree.
+      - name: Install Inno Setup
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          INNO_URL: https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe
+          INNO_SHA256: 0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup.exe'
+          $inno = Join-Path $env:RUNNER_TEMP 'inno'
+          $log = Join-Path $env:RUNNER_TEMP 'innosetup.log'
+          $attempts = 3
+          foreach ($attempt in 1..$attempts) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -TimeoutSec 60 -Uri $env:INNO_URL -OutFile $installer
+              break
+            } catch {
+              if ($attempt -eq $attempts) {
+                throw "could not download $env:INNO_URL in $attempts attempts; the last error was: $($_.Exception.Message)"
+              }
+              "::warning::Inno Setup download attempt $attempt failed: $($_.Exception.Message)"
+              Start-Sleep -Seconds 10
+            }
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash
+          if ($hash -ne $env:INNO_SHA256) {
+            throw "$env:INNO_URL has SHA-256 $hash, not the pinned $env:INNO_SHA256"
+          }
+          $p = Start-Process -FilePath $installer -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-',
+            '/CURRENTUSER', '/PORTABLE=1', "/DIR=`"$inno`"", "/LOG=`"$log`"")
+          $null = $p.Handle
+          if (-not $p.WaitForExit(240000)) { throw 'the Inno Setup installer was still running after 4 minutes' }
+          if ($p.ExitCode -ne 0) {
+            Get-Content -LiteralPath $log -ErrorAction SilentlyContinue
+            throw "the Inno Setup installer exited $($p.ExitCode)"
+          }
+          & (Join-Path $inno 'ISCC.exe') --version
+
+      # The version is the exe's own ProductVersion, which winresource fills
+      # from the crate's version: it is what winget will read back from the
+      # uninstall entry, and a dispatch naming a commit has no tag to take one
+      # from. A tag build whose tag disagrees with it stops here rather than
+      # shipping an installer that reports a different version from its name.
+      # So does a pre-release such as 0.2.0-rc.1: the setup's file version is
+      # numeric, and shipping one would mean passing the script a numeric
+      # version beside the full one.
+      #
+      # Compiled twice, the second time from a copy of the exe at another path
+      # and under another name, into RUNNER_TEMP. Two identical hashes are the
+      # cheap evidence that the installer is a function of the exe's bytes, the
+      # script and the pinned compiler, and not of when it was compiled or of
+      # where the exe and the output sit, which is what lets someone holding
+      # the signed exe and the tagged script rebuild the setup exe that
+      # SHA256SUMS lists and compare the bytes (packaging/windows/README.md).
+      # A difference fails the build, as a broken compile would: what gets
+      # signed should be something that can be rebuilt.
+      - name: Build the installer
+        id: setup
+        timeout-minutes: 10
+        shell: pwsh
+        env:
+          BUILD_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          $exe = (Resolve-Path -LiteralPath "rpgp-$env:TAG-x86_64.exe").Path
+          $version = (Get-Item -LiteralPath $exe).VersionInfo.ProductVersion
+          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "the exe's ProductVersion is '$version', not X.Y.Z"
+          }
+          if ($env:BUILD_TAG -and "v$version" -ne $env:BUILD_TAG) {
+            throw "the exe is version $version, but this is a build of $env:BUILD_TAG"
+          }
+          $iscc = Join-Path $env:RUNNER_TEMP 'inno\ISCC.exe'
+          $name = "rpgp-$env:TAG-x86_64-setup"
+          $again = Join-Path $env:RUNNER_TEMP 'setup-again'
+          $copy = Join-Path $again 'source\rpgp.exe'
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $copy) | Out-Null
+          Copy-Item -LiteralPath $exe -Destination $copy
+          function Compile([string] $source, [string] $dir) {
+            & $iscc --quiet "--define=AppVersion=$version" "--define=SourceExe=$source" `
+              "--output-dir=$dir" "--output-filename=$name" packaging\windows\rpgp.iss
+            if ($LASTEXITCODE -ne 0) { throw "ISCC exited $LASTEXITCODE" }
+          }
+          Compile $exe $PWD.Path
+          Compile $copy $again
+          $first = (Get-FileHash -Algorithm SHA256 -LiteralPath "$name.exe").Hash
+          $second = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $again "$name.exe")).Hash
+          if ($first -ne $second) {
+            throw "two compiles of the same exe and script differ: $first and $second"
+          }
+          Get-Item -LiteralPath "$name.exe" | Select-Object Name, Length
+          $first
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "version=$version", "sha256=$first"
+
+      # The runner is discarded after the job, so installing on it costs
+      # nothing and leaves nothing on a machine anyone keeps. Silent, with the
+      # switches winget passes an Inno installer under --silent; then what the
+      # install should have made, and an uninstall that should take all of it
+      # away again. Inno's uninstaller hands the work to a copy of itself in
+      # %TEMP% and some of it may still be going when the first one exits, so
+      # the step waits for the result rather than trusting the exit.
+      #
+      # The files placed in %LOCALAPPDATA%\rpgp and %APPDATA%\pgp.cert.d before
+      # the install stand in for the key store, and are as much the point of
+      # this step as the shortcut is: an uninstaller that removed either
+      # directory would delete people's secret keys, and nothing else would
+      # notice before a user did. One sits at the top of each and one a level
+      # down, in rpgp\secrets, where the secret keys are, and in a directory
+      # named the way pgp.cert.d names a certificate's, so an uninstaller that
+      # removed only a subdirectory fails the step too. The step refuses to
+      # start where rPGP or its store is already present, since that is a
+      # machine someone uses.
+      #
+      # Last of all it checks the two exes against the hashes their own steps
+      # recorded. Inno Setup's installer, its compiler and the setup exe have
+      # all run in this workspace since the bare exe was staged, and comparing
+      # the installed exe with the staged one as it is now would pass a swap
+      # of both.
+      - name: Exercise the installer
+        timeout-minutes: 10
+        shell: pwsh
+        env:
+          RPGP_VERSION: ${{ steps.setup.outputs.version }}
+          STAGED_SHA256: ${{ steps.stage.outputs.sha256 }}
+          SETUP_SHA256: ${{ steps.setup.outputs.sha256 }}
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $setup = (Resolve-Path -LiteralPath "rpgp-$env:TAG-x86_64-setup.exe").Path
+          $exe = (Resolve-Path -LiteralPath "rpgp-$env:TAG-x86_64.exe").Path
+          $app = Join-Path $env:LOCALAPPDATA 'Programs\rPGP'
+          $lnk = Join-Path ([Environment]::GetFolderPath('Programs', 'DoNotVerify')) 'rPGP.lnk'
+          $desktopLnk = Join-Path ([Environment]::GetFolderPath('Desktop', 'DoNotVerify')) 'rPGP.lnk'
+          $arp = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\jzbz.rPGP_is1'
+          $appPaths = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\rpgp.exe'
+          $stores = (Join-Path $env:LOCALAPPDATA 'rpgp'), (Join-Path $env:APPDATA 'pgp.cert.d')
+          $logs = (Join-Path $env:RUNNER_TEMP 'setup.log'), (Join-Path $env:RUNNER_TEMP 'uninstall.log')
+
+          foreach ($path in @($app, $lnk, $arp, $appPaths) + $stores) {
+            if (Test-Path -LiteralPath $path) {
+              throw "$path already exists. This step installs and uninstalls rPGP, and belongs on a throwaway runner."
+            }
+          }
+          $places = @($stores) + @((Join-Path $stores[0] 'secrets'), (Join-Path $stores[1] '00'))
+          $sentinels = foreach ($dir in $places) {
+            New-Item -ItemType Directory -Path $dir | Out-Null
+            $file = Join-Path $dir 'sentinel'
+            Set-Content -LiteralPath $file -Value "stands in for the key store: $([guid]::NewGuid())"
+            [pscustomobject]@{ Path = $file; Hash = (Get-FileHash -LiteralPath $file).Hash }
+          }
+
+          function Invoke-Bounded([string] $file, [string[]] $arguments) {
+            $p = Start-Process -FilePath $file -ArgumentList $arguments -PassThru
+            $null = $p.Handle
+            if (-not $p.WaitForExit(300000)) { throw "$file was still running after 5 minutes" }
+            $p.ExitCode
+          }
+
+          try {
+            $code = Invoke-Bounded $setup @('/SP-', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$($logs[0])`"")
+            if ($code -ne 0) { throw "the installer exited $code" }
+
+            $installed = Join-Path $app 'rpgp.exe'
+            if ((Get-FileHash -LiteralPath $installed).Hash -ne (Get-FileHash -LiteralPath $exe).Hash) {
+              throw "$installed is not the exe this job built"
+            }
+            if (-not (Test-Path -LiteralPath $lnk)) { throw "no Start Menu shortcut at $lnk" }
+            $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+            if ($shortcut.TargetPath -ne $installed) { throw "the shortcut points at $($shortcut.TargetPath)" }
+            if ($shortcut.WorkingDirectory -ne $app) { throw "the shortcut starts in $($shortcut.WorkingDirectory)" }
+            if (Test-Path -LiteralPath $desktopLnk) { throw "the installer put a shortcut on the desktop" }
+            $command = (Get-Item -LiteralPath $appPaths).GetValue('')
+            if ($command -ne $installed) { throw "App Paths\rpgp.exe names $command" }
+            $entry = Get-ItemProperty -LiteralPath $arp
+            if ($entry.DisplayName -cne 'rPGP') { throw "the uninstall entry is named $($entry.DisplayName)" }
+            if ($entry.DisplayVersion -cne $env:RPGP_VERSION) { throw "the uninstall entry says version $($entry.DisplayVersion)" }
+            if ($entry.Publisher -cne 'Jonathan Zeppettini') { throw "the uninstall entry's publisher is $($entry.Publisher)" }
+            if (-not $entry.QuietUninstallString) { throw 'the uninstall entry has no QuietUninstallString' }
+            "installed $($env:RPGP_VERSION): shortcut, App Paths, uninstall entry and payload as expected"
+
+            $uninstaller = $entry.UninstallString -replace '^"([^"]+)".*$', '$1'
+            if ((Split-Path -Parent $uninstaller) -ne $app) { throw "the uninstaller is $uninstaller" }
+            $code = Invoke-Bounded $uninstaller @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$($logs[1])`"")
+            if ($code -ne 0) { throw "the uninstaller exited $code" }
+            $deadline = (Get-Date).AddSeconds(60)
+            while ($left = @($app, $lnk, $arp, $appPaths | Where-Object { Test-Path -LiteralPath $_ })) {
+              if ((Get-Date) -gt $deadline) { throw "the uninstall left behind: $($left -join ', ')" }
+              Start-Sleep -Seconds 1
+            }
+            foreach ($s in $sentinels) {
+              if (-not (Test-Path -LiteralPath $s.Path) -or (Get-FileHash -LiteralPath $s.Path).Hash -ne $s.Hash) {
+                throw "the uninstall touched $($s.Path)"
+              }
+            }
+            'uninstalled: the shortcut, the folder, App Paths and the uninstall entry are gone, and the key store is as it was'
+          } catch {
+            foreach ($log in $logs) {
+              if (Test-Path -LiteralPath $log) { "--- $log"; Get-Content -LiteralPath $log }
+            }
+            throw
+          }
+
+          # Last, because upload-artifact takes every .exe here: anything else
+          # that had landed in the workspace would be published with them, and
+          # so would either of these changed after its own step.
+          $expected = "rpgp-$env:TAG-x86_64-setup.exe", "rpgp-$env:TAG-x86_64.exe"
+          $found = @(Get-ChildItem -File | Where-Object { $_.Name -like '*.exe' } | ForEach-Object { $_.Name })
+          if (Compare-Object $expected $found) {
+            throw "the workspace holds $($found -join ', '), not $($expected -join ' and ')"
+          }
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash -ne $env:STAGED_SHA256) {
+            throw "$exe is no longer the exe 'Stage the binary' hashed as $env:STAGED_SHA256"
+          }
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $setup).Hash -ne $env:SETUP_SHA256) {
+            throw "$setup is no longer the setup 'Build the installer' hashed as $env:SETUP_SHA256"
+          }
+          'the bare exe and the setup exe are the bytes their steps hashed'
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -513,11 +780,18 @@ jobs:
       # Microsoft has reset established publisher reputation as recently as 2026
       # by migrating intermediate CAs.
       #
-      # winget is the answer instead, and it is free: `winget install` carries
-      # no Mark-of-the-Web and raises no SmartScreen prompt at all, so for users
-      # who install that way the warning never happens. See packaging/winget/.
-      # A Microsoft developer account is for Store submission and signs nothing
-      # that is downloaded directly.
+      # winget is the answer instead, and it is free. It does mark what it
+      # downloads, Internet zone at first like a browser, but once the file
+      # matches the manifest's hash and the source is a trusted one, as the
+      # default community repository is, it rewrites the mark to the Trusted
+      # zone before running it, so the installer starts without a SmartScreen
+      # prompt and for users who install that way the warning never happens.
+      # Smart App Control is the exception: on a Windows 11 machine where it is
+      # enforcing, unsigned code from an unknown publisher is blocked whatever
+      # the mark says, winget or not. The setup exe is unsigned like the bare
+      # one, for the same reasons. See packaging/winget/. A Microsoft developer
+      # account is for Store submission and signs nothing that is downloaded
+      # directly.
       #
       # macOS is deliberately absent, because there the same shortcut does not
       # exist: Gatekeeper refuses an unsigned .app outright, offering "Move to

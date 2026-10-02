@@ -91,11 +91,12 @@ XDG_DATA_HOME=/tmp/rpgp-demo cargo run -p rpgp-core --example seed-demo-store &&
 ## Installing
 
 A [release](https://github.com/jzbz/rpgp/releases) carries a Flatpak bundle for
-`x86_64` and `aarch64`, a universal `.app` for macOS, and one self-contained
-`.exe` for Windows. The macOS bundle is signed with a Developer ID and notarised
-by Apple, so it opens on first launch rather than having to be talked past
-Gatekeeper; the Windows executable is not signed, so SmartScreen warns on first
-run and then lets you through.
+`x86_64` and `aarch64`, a universal `.app` for macOS, and for Windows one
+self-contained `.exe` and a per-user installer around that same `.exe`. The
+macOS bundle is signed with a Developer ID and notarised by Apple, so it opens
+on first launch rather than having to be talked past Gatekeeper; neither Windows
+file is signed, so SmartScreen warns the first time one downloaded in a browser
+is run, and then lets you through.
 
 ```bash
 brew install --cask jzbz/tap/rpgp                  # macOS, from the tap
@@ -106,6 +107,17 @@ winget install jzbz.rPGP                           # Windows
 The cask lives in `github.com/jzbz/homebrew-tap`, a tap of this project's own;
 `packaging/homebrew/README.md` says why that rather than homebrew-cask. Whatever
 the route, the signed `SHA256SUMS` on the release is worth checking first.
+
+From the release after 0.1.3, winget installs rPGP through that installer, for
+your account only and without asking for an administrator: rPGP goes in the
+Start Menu and in Apps & Features, Win+R `rpgp` starts it from a normal, not
+elevated, Run box, and `winget uninstall jzbz.rPGP`, with rPGP closed, takes
+all of that away again without touching your certificates or keys. A winget
+install of 0.1.3 or earlier is the bare `.exe` instead, which winget will not
+upgrade to the installer: close rPGP, then run `winget uninstall jzbz.rPGP`
+and `winget install jzbz.rPGP`, once. Your keys stay where they are through
+both, and the new install finds them. `packaging/winget/README.md` has the
+detail.
 
 ## Verifying a download
 
