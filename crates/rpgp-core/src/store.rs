@@ -2745,7 +2745,9 @@ mod tests {
     }
 
     /// Against the developer's own GnuPG keyring when there is one. Read-only:
-    /// it imports into a scratch store and never touches ~/.gnupg.
+    /// it imports into a scratch store and never touches ~/.gnupg. The same
+    /// import of a small Keybox made for the purpose runs with the rest, in
+    /// `imports_a_gnupg_keybox_whatever_it_is_called`.
     #[test]
     #[ignore = "reads the local GnuPG keyring"]
     fn imports_the_local_gnupg_keybox() {
@@ -2770,6 +2772,160 @@ mod tests {
         assert_eq!(store.certs().unwrap().len(), imported.len());
         // A Keybox holds only public certificates.
         assert!(imported.iter().all(|c| !c.is_tsk()));
+    }
+
+    /// A Keybox as gpg writes one: a header record, then one OpenPGP record for
+    /// each of two certificates, [`KEYBOX_CERTS`] in that order. Made for these
+    /// tests with gpg 2.4.9 in a scratch GNUPGHOME, gpg's own output rather than
+    /// bytes shaped by hand, because the container is the thing in question.
+    /// gpg takes an unset or empty GNUPGHOME to mean ~/.gnupg, so the recipe
+    /// makes its own home and stops at the first command that fails. GNUPGHOME
+    /// is assigned apart from its export, which would hide a failed mktemp from
+    /// `set -e`, and the subshell leaves the pasting shell's own as it was:
+    ///
+    /// ```text
+    /// (
+    /// set -e
+    /// GNUPGHOME="$(mktemp -d)"
+    /// export GNUPGHOME
+    /// echo disable-scdaemon > "$GNUPGHOME/gpg-agent.conf"
+    /// gpg --batch --passphrase '' --pinentry-mode loopback \
+    ///     --quick-gen-key 'Keybox Fixture <keybox@example.invalid>' ed25519 default never
+    /// gpg --batch --passphrase '' --pinentry-mode loopback \
+    ///     --quick-gen-key 'Keybox Fixture Two <keybox-two@example.invalid>' ed25519 default never
+    /// cp "$GNUPGHOME/pubring.kbx" gnupg-pubring.kbx
+    /// gpgconf --kill all
+    /// gpgconf --remove-socketdir
+    /// rm -r "$GNUPGHOME"
+    /// )
+    /// ```
+    ///
+    /// Two throwaway keys, an Ed25519 primary each and no subkeys, which keeps
+    /// the file at 820 bytes. Public certificates only: GnuPG keeps secret keys
+    /// in gpg-agent's files rather than the Keybox, and those went with the
+    /// scratch home.
+    const KEYBOX: &[u8] = include_bytes!("../tests/fixtures/gnupg-pubring.kbx");
+    const KEYBOX_CERTS: [&str; 2] = [
+        "16E11F68B4D8AA4D75640CBADBC570C7E7375390",
+        "28D57A5F6D036A49AB2C4C4B44767213072BA9EC",
+    ];
+
+    /// Where each record of a Keybox lies. A record opens with its own length,
+    /// four bytes big-endian that count themselves, and the next record starts
+    /// where it ends.
+    fn keybox_records(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+        let mut records = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let length = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            records.push(at..at + length);
+            at += length;
+        }
+        records
+    }
+
+    /// A Keybox is imported for what is in it, whatever it is called: both of
+    /// the fixture's certificates, public halves only.
+    ///
+    /// Until the fixture, the only test of this read the developer's own
+    /// keyring, was ignored, and wherever there was no keyring passed having
+    /// checked nothing, so neither the sniff nor the walk over the records ever
+    /// ran in CI. A sniff that looked for the magic anywhere but eight bytes in
+    /// would have handed every Keybox to CertParser, which cannot read one, and
+    /// a pubring.kbx chosen in Import would have failed to import.
+    #[test]
+    fn imports_a_gnupg_keybox_whatever_it_is_called() {
+        let (dir, store) = scratch();
+        // Named as an armored keyring would be, so that only the magic can send
+        // it to the Keybox reader.
+        let path = dir.path().join("keyring.asc");
+        fs::write(&path, KEYBOX).unwrap();
+
+        let imported = store.import_file(&path).unwrap();
+        let fingerprints: Vec<String> = imported
+            .iter()
+            .map(|cert| cert.fingerprint().to_hex())
+            .collect();
+        assert_eq!(fingerprints, KEYBOX_CERTS);
+        assert!(imported.iter().all(|cert| !cert.is_tsk()));
+        assert_eq!(
+            listed(&store),
+            BTreeSet::from(KEYBOX_CERTS.map(String::from))
+        );
+    }
+
+    /// A Keybox record that is read whole but fails its checksum, or holds no
+    /// certificate that will parse, is passed over and the rest of the keyring
+    /// still comes in, while a Keybox with no certificate in it at all is an
+    /// error rather than an empty import.
+    ///
+    /// A record read whole can fail at two points: sequoia-ipc refuses the
+    /// record when its SHA-1 checksum does not match, and the certificate in it
+    /// when the checksum matches but the data is not OpenPGP. import_keybox
+    /// passes over both, as it does the header and any X.509 record; letting
+    /// either error through would fail the import at the first bad record.
+    ///
+    /// A record cut short by the end of the file is neither, and is not tested
+    /// here. sequoia-ipc fails to read it without moving past it, and gives the
+    /// same error each time it is asked for the next record, so import_keybox
+    /// never finishes; that wants a fix of its own.
+    #[test]
+    fn a_keybox_record_with_a_bad_checksum_or_certificate_is_passed_over() {
+        let records = keybox_records(KEYBOX);
+        assert_eq!(records.len(), 3, "a header and two certificates");
+        let first = records[1].clone();
+        // An OpenPGP record gives its data's offset within the record at byte
+        // 8 and its length at byte 12, and the checksum follows the data.
+        let field = |at: usize| {
+            let at = first.start + at;
+            u32::from_be_bytes(KEYBOX[at..at + 4].try_into().unwrap()) as usize
+        };
+        let data = first.start + field(8)..first.start + field(8) + field(12);
+        let checksum = data.end..data.end + 20;
+        assert_eq!(checksum.end, first.end, "the checksum ends the record");
+
+        let import = |bytes: &[u8]| {
+            let (dir, store) = scratch();
+            let path = dir.path().join("pubring.kbx");
+            fs::write(&path, bytes).unwrap();
+            let imported = store.import_file(&path).map(|certs| {
+                certs
+                    .iter()
+                    .map(|cert| cert.fingerprint().to_hex())
+                    .collect::<Vec<_>>()
+            });
+            (imported, listed(&store))
+        };
+        let second = KEYBOX_CERTS[1];
+
+        // A checksum that does not match its record.
+        let mut damaged = KEYBOX.to_vec();
+        damaged[checksum.end - 1] ^= 0xff;
+        let (imported, kept) = import(&damaged);
+        assert_eq!(imported.unwrap(), [second], "a record failing its checksum");
+        assert_eq!(kept, BTreeSet::from([second.to_string()]));
+
+        // A checksum that matches, over data that is no certificate.
+        let mut damaged = KEYBOX.to_vec();
+        damaged[data].fill(0);
+        let sum = {
+            use sha1::{Digest, Sha1};
+            Sha1::digest(&damaged[first.start..checksum.start])
+        };
+        damaged[checksum].copy_from_slice(&sum);
+        let (imported, kept) = import(&damaged);
+        assert_eq!(
+            imported.unwrap(),
+            [second],
+            "a record holding no certificate"
+        );
+        assert_eq!(kept, BTreeSet::from([second.to_string()]));
+
+        // The header and nothing after it.
+        let (imported, kept) = import(&KEYBOX[..records[0].end]);
+        let err = imported.unwrap_err().to_string();
+        assert!(err.contains("holds no OpenPGP certificates"), "{err}");
+        assert!(kept.is_empty());
     }
 
     /// Secret key material and revocation certificates must not be readable
@@ -3914,6 +4070,106 @@ mod tests {
         store.delete(&lower, true).unwrap();
         assert!(!store.has_secret(&fingerprint), "no orphaned secret key");
         assert!(store.reopen().unwrap().certs().unwrap().is_empty());
+    }
+
+    /// No fingerprint a caller passes names a file outside the store, while the
+    /// spaced form the details pane shows still names the certificate's own.
+    ///
+    /// A certificate's files are named from its fingerprint, and `hex_only` is
+    /// all that stands between a caller's text and the file system: without
+    /// it, `delete("../0123", true)` unlinks the `0123.pgp` beside the secrets
+    /// directory. No caller in the tree passes text like that, and no test did
+    /// either, so a filter weakened to strip only what a pasted fingerprint
+    /// carries, its spaces and colons, kept every test green.
+    ///
+    /// A filter reduced to a case change fails the path-builder checks first,
+    /// whatever the file standing in for one that is not the store's is called.
+    /// What only the checks that reach the disk catch is has_secret, delete or
+    /// save_revocation building a secret or revocation path of its own instead
+    /// of asking secret_path or revocation_path, and one that is to find the
+    /// store's files upper-cases the fingerprint, as those two do. So the
+    /// stand-in is named in digits, which read the same in either case: on a
+    /// case-sensitive file system one named in lower case is not the file such
+    /// a path reaches, and this test would pass a has_secret or delete that
+    /// built one.
+    #[test]
+    fn no_fingerprint_names_a_file_outside_the_store() {
+        use std::path::Component;
+
+        let (dir, store) = scratch();
+
+        // Each path builder first, and without touching the disk, so that one
+        // letting a path out fails here rather than in a delete that unlinks
+        // what the path names. Relative, absolute and Windows paths, and input
+        // with no hex digit in it at all. The checks go by components, because
+        // `Path::starts_with` does not resolve `..` and takes `certs.d/../x` to
+        // be inside certs.d.
+        for input in [
+            "../../etc/thing",
+            "/abs/path",
+            "a/../../b",
+            "..\\..\\x",
+            "C:\\x",
+            "..",
+            "",
+        ] {
+            for (path, home) in [
+                (store.secret_path(input), &store.secrets_dir),
+                (store.revocation_path(input), &store.revocations_dir),
+            ] {
+                assert_eq!(
+                    path.parent(),
+                    Some(home.as_path()),
+                    "{input:?} named {}",
+                    path.display()
+                );
+            }
+            let path = store.cert_path(input);
+            let inside = path.strip_prefix(&store.cert_dir).is_ok_and(|rest| {
+                rest.components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+            });
+            assert!(inside, "{input:?} named {}", path.display());
+        }
+
+        // The spaced form is why the filter strips rather than refuses, and it
+        // has to come out as the name the files were written under.
+        let cert = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
+            "Alice <alice@example.org>",
+        ))
+        .unwrap()
+        .cert;
+        let fingerprint = cert.fingerprint().to_hex();
+        let spaced = crate::cert::CertSummary::from_cert(&cert).fingerprint_pretty();
+        assert_ne!(spaced, fingerprint);
+        assert_eq!(store.secret_path(&spaced), store.secret_path(&fingerprint));
+        assert_eq!(
+            store.revocation_path(&spaced),
+            store.revocation_path(&fingerprint)
+        );
+        assert_eq!(store.cert_path(&spaced), store.cert_path(&fingerprint));
+
+        // Then the calls that reach the disk, against a file beside the secrets
+        // directory, which is where `../0123` lands unfiltered.
+        let beside = dir.path().join("0123.pgp");
+        fs::write(&beside, b"not the store's to delete").unwrap();
+        let hostile = "../0123";
+
+        assert!(
+            !store.has_secret(hostile),
+            "has_secret found a file outside the secrets directory"
+        );
+        store.delete(hostile, true).unwrap();
+        assert!(
+            beside.exists(),
+            "a delete unlinked a file outside the store"
+        );
+        store.save_revocation(hostile, b"a revocation").unwrap();
+        assert!(
+            !dir.path().join("0123.rev").exists(),
+            "a revocation was written outside the revocations directory"
+        );
+        assert!(store.has_revocation("0123"));
     }
 
     /// The fingerprints `store` lists, in the form the files are named.

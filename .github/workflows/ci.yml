@@ -371,12 +371,11 @@ jobs:
       # No display is set up, and none is needed: the GUI tests drive Slint
       # through its testing backend with no event loop.
       #
-      # Seven tests stay ignored: one hits the network, one wants a local
-      # stand-in for the VKS API, three ask the developer's own gpg-agent
-      # about a key of theirs (two of them interactive, because the agent
-      # prompts for a PIN), one reads the developer's own GnuPG keyring, and
-      # the last is not a test at all — it is the helper process the
-      # hardening tests re-exec.
+      # Six tests stay ignored: one hits the network, three ask the
+      # developer's own gpg-agent about a key of theirs (two of them
+      # interactive, because the agent prompts for a PIN), one reads the
+      # developer's own GnuPG keyring, and the last is not a test at all — it
+      # is the helper process the hardening tests re-exec.
       #
       # No other test reaches a gpg-agent. rpgp-core's agent tests
       # (tests/gpg_agent.rs and tests/agent_connection.rs) start one of their

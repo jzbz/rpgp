@@ -932,7 +932,9 @@ pub struct Published {
 /// Split out so the guarantees in publish's doc comment can be asserted on the
 /// upload itself, without a keyserver to talk to. The test that claimed to
 /// prove them only ever inspected the *reply*, and carried `#[ignore]`, so
-/// nothing would have caught a regression here.
+/// nothing would have caught a regression here. That test,
+/// `publishes_to_a_local_keyserver`, now runs against a stand-in on a local
+/// socket and checks that publish sends what this returns.
 fn upload_body(cert: &Cert) -> Result<String> {
     use sequoia_openpgp::serialize::SerializeInto;
 
@@ -1195,6 +1197,81 @@ mod tests {
             }
         });
         (port, hits)
+    }
+
+    /// A stand-in for a VKS keyserver: it answers one connection for each of
+    /// `replies`, in order, and hands back each request it answered, as the
+    /// request line and the body.
+    ///
+    /// Unlike [`serve_once`] it reads a request whole, by its Content-Length,
+    /// before it answers. An upload carries a whole certificate, which can
+    /// outgrow serve_once's single read of 2 KiB or arrive over several reads,
+    /// and a socket closed on a request it has not finished reading can be
+    /// reset before the client has read the reply.
+    fn serve_vks(replies: Vec<Vec<u8>>) -> (String, std::sync::mpsc::Receiver<(String, Vec<u8>)>) {
+        use std::io::{Read, Write};
+
+        fn read_request(socket: &mut std::net::TcpStream) -> Option<(String, Vec<u8>)> {
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut more = |request: &mut Vec<u8>| {
+                let read = socket.read(&mut chunk).ok().filter(|&read| read > 0)?;
+                request.extend_from_slice(&chunk[..read]);
+                Some(())
+            };
+            let body = loop {
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+                more(&mut request)?;
+            };
+            let head = String::from_utf8_lossy(&request[..body]).into_owned();
+            let length = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })?;
+            while request.len() < body + length {
+                more(&mut request)?;
+            }
+            let line = head.lines().next()?.to_owned();
+            Some((line, request[body..body + length].to_vec()))
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (requests, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = socket.set_read_timeout(Some(TIMEOUT));
+                let Some(request) = read_request(&mut socket) else {
+                    return;
+                };
+                // Handed over before the reply goes out, so that a caller
+                // holding the reply finds the request already waiting.
+                let _ = requests.send(request);
+                let _ = socket.write_all(&reply);
+                let _ = socket.flush();
+            }
+        });
+        (origin, received)
+    }
+
+    /// A reply for [`serve_vks`] to send: `status`, then `body` as
+    /// `content_type`.
+    fn vks_reply(status: &str, content_type: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
     }
 
     /// An armored certificate, as a reply a fetch would accept. Used to bait
@@ -1531,52 +1608,96 @@ mod tests {
         unsafe { std::env::remove_var("RPGP_KEYSERVER") };
     }
 
-    /// Publishing against a local stand-in for the VKS API, so the request we
-    /// build and the reply we parse are exercised without uploading anything
-    /// to public infrastructure.
+    /// Publishing, against a stand-in for the VKS API on a local socket: what
+    /// publish and request_verification send, and what publish makes of the
+    /// replies.
+    ///
+    /// This was `#[ignore]`d for want of a stand-in, so none of it was checked:
+    /// the upload's path and body, the reading of `key_fpr`, `status` and
+    /// `token` out of the reply, the verification request, and the refusal
+    /// that passes the server's own explanation on. A renamed reply key, or a
+    /// path that lost its `/v1`, would have gone out with every test green, on
+    /// an action that cannot be taken back, and what the window reports of it
+    /// is made from what publish returns. Nothing in the test set
+    /// `RPGP_KEYSERVER` either, so a run with `-- --ignored` and the variable
+    /// unset would send a generated certificate to keys.openpgp.org.
     #[test]
-    /// Run it against any server that answers `POST /vks/v1/upload` with
-    /// `{"key_fpr", "status", "token"}` and accepts `POST
-    /// /vks/v1/request-verify`, pointed at by `RPGP_KEYSERVER`. Asserting on
-    /// the request is the point: the upload must be an armored *public* key
-    /// block containing no secret key material.
-    #[ignore = "needs a local stand-in for the VKS API at $RPGP_KEYSERVER"]
     fn publishes_to_a_local_keyserver() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let cert = crate::keygen::generate(&crate::keygen::KeyGenRequest::new(
             "Demo <demo@example.invalid>",
         ))
         .unwrap()
         .cert;
+        let fingerprint = cert.fingerprint().to_hex();
+        let address = "demo@example.invalid".to_string();
 
-        let published = publish(&cert).expect("the mock should accept the upload");
-        eprintln!("fingerprint: {}", published.fingerprint);
-        eprintln!("addresses:   {:?}", published.addresses);
-        eprintln!("token:       {:?}", published.token);
+        // The fingerprint in lower case and the state in capitals, so that
+        // they match only once publish has normalised them.
+        let accepted = serde_json::json!({
+            "key_fpr": fingerprint.to_lowercase(),
+            "status": { "demo@example.invalid": "UNPUBLISHED" },
+            "token": "t",
+        })
+        .to_string();
+        let (origin, requests) = serve_vks(vec![
+            vks_reply("200 OK", "application/json", &accepted),
+            vks_reply("200 OK", "application/json", &accepted),
+        ]);
+        unsafe { std::env::set_var("RPGP_KEYSERVER", &origin) };
 
-        // The mock echoes a placeholder; what matters is that the reply's
-        // key_fpr is parsed and upper-cased rather than dropped.
-        assert_eq!(published.fingerprint.len(), 40);
-        assert!(published.fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
-        assert!(published.token.is_some());
-        assert!(
-            published
-                .addresses
-                .iter()
-                .any(|(a, state)| a == "demo@example.invalid" && state == "unpublished")
+        let published = publish(&cert).unwrap();
+        let (line, body) = requests
+            .try_recv()
+            .expect("the upload never reached the stand-in");
+        assert_eq!(line, "POST /vks/v1/upload HTTP/1.1");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({ "keytext": upload_body(&cert).unwrap() })
         );
+        assert_eq!(published.fingerprint, fingerprint);
+        assert_eq!(
+            published.addresses,
+            [(address.clone(), "unpublished".to_string())]
+        );
+        assert_eq!(published.token.as_deref(), Some("t"));
 
+        // With the token from the reply, as the window asks.
         request_verification(
             published.token.as_deref().unwrap(),
-            &["demo@example.invalid".to_string()],
+            std::slice::from_ref(&address),
         )
-        .expect("verification request should be accepted");
+        .unwrap();
+        let (line, body) = requests
+            .try_recv()
+            .expect("the verification request never reached the stand-in");
+        assert_eq!(line, "POST /vks/v1/request-verify HTTP/1.1");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({ "token": "t", "addresses": [address] })
+        );
+
+        // A refusal, which the server explains in its body.
+        let (origin, _requests) = serve_vks(vec![vks_reply(
+            "400 Bad Request",
+            "text/plain",
+            "no key in the upload\n",
+        )]);
+        unsafe { std::env::set_var("RPGP_KEYSERVER", &origin) };
+        let err = publish(&cert).unwrap_err().to_string();
+        assert!(
+            err.contains("refused the upload (400 Bad Request): no key in the upload"),
+            "{err}"
+        );
+
+        unsafe { std::env::remove_var("RPGP_KEYSERVER") };
     }
 
     /// What publish actually uploads: a public key block, with no secret key
     /// material and no local certifications.
     ///
-    /// Runs without a keyserver, so unlike the ignored integration test below
-    /// this one guards the property on every `cargo test`.
+    /// Asserted on upload_body, so it needs no stand-in for a keyserver;
+    /// `publishes_to_a_local_keyserver` checks that this is what publish sends.
     ///
     /// The local-certification half is the part with teeth. Serialising a
     /// `Cert` writes only the public half whatever `strip_secret_key_material`
