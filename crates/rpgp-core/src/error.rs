@@ -150,7 +150,8 @@ pub enum Error {
     #[error("revoked, but the secret key file could not be updated to match: {0}")]
     SecretKeyNotUpdated(#[source] Box<Error>),
 
-    /// An import that stopped at a certificate it could not store.
+    /// An import that stopped at a certificate it could not store, or at a
+    /// record of a GnuPG Keybox it could not read.
     ///
     /// `stored` is how many it had stored before that one, and those stay
     /// stored. An import used to return the failing certificate's own error,

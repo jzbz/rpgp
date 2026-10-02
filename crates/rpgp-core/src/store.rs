@@ -1060,16 +1060,77 @@ impl Store {
     ///
     /// Only public certificates: GnuPG keeps secret keys separately, in
     /// gpg-agent's own format, and they are reached through the agent instead.
+    ///
+    /// A record that is there whole and yields no certificate, because it
+    /// fails its checksum, its fields point past its end or its data is not
+    /// OpenPGP, is passed over as the header and an X.509 record are, and the
+    /// rest still comes in. One that is not there whole, because the file ends
+    /// part way through it or it gives a length no record can have, stops the
+    /// import, since no record after it can be found. What was stored before
+    /// it stays, and the error is [`Error::ImportStopped`], as for a
+    /// certificate that cannot be stored.
     pub fn import_keybox(&self, path: impl AsRef<Path>) -> Result<Vec<Cert>> {
-        use sequoia_ipc::keybox::{Keybox, KeyboxRecord};
+        use sequoia_ipc::keybox::{Keybox, KeyboxRecord, KeyboxRecordType};
 
         let path = path.as_ref();
-        let keybox = Keybox::from_file(path)
-            .map_err(|e| Error::invalid(format!("{} is not a Keybox: {e}", path.display())))?;
+        let bytes =
+            fs::read(path).map_err(|e| Error::io(format!("reading {}", path.display()), e))?;
 
+        // Each record is found here and handed to sequoia-ipc on its own,
+        // rather than walking sequoia-ipc's iterator over the whole file. That
+        // iterator fails to read a record that is not all there without moving
+        // past it, and gives the same error each time it is asked for the next,
+        // so a Keybox cut short was never done with. Nor do its errors say
+        // whether it moved past the record, so stopping at the first would
+        // also stop at a record it read whole and refused, for a checksum that
+        // does not match, which is one to pass over. Here each turn moves past
+        // a record of at least six bytes or returns, so the walk ends whatever
+        // sequoia-ipc makes of a record.
         let mut imported = Vec::new();
-        for record in keybox {
-            let Ok(KeyboxRecord::OpenPGP(record)) = record else {
+        let mut at = 0;
+        while at < bytes.len() {
+            let rest = &bytes[at..];
+            // A record opens with its own length, four bytes big-endian that
+            // count themselves, and then a byte each for its type and version.
+            let length = rest
+                .first_chunk::<4>()
+                .map(|length| u32::from_be_bytes(*length) as usize);
+            let record = match length {
+                Some(length) if length < 6 => {
+                    return Err(stopped_after(
+                        &imported,
+                        Error::invalid(format!(
+                            "{} is damaged at byte {at}: a Keybox record cannot be {length} \
+                             bytes long",
+                            path.display()
+                        )),
+                    ));
+                }
+                Some(length) if length <= rest.len() => &rest[..length],
+                _ => {
+                    return Err(stopped_after(
+                        &imported,
+                        Error::invalid(format!(
+                            "{} ends before the end of the Keybox record that starts at byte {at}",
+                            path.display()
+                        )),
+                    ));
+                }
+            };
+            at += record.len();
+
+            // An OpenPGP record that sequoia-ipc would panic on, rather than
+            // refuse, is passed over before it gets there.
+            if KeyboxRecordType::from(record[4]) == KeyboxRecordType::OpenPGP
+                && !keybox_checksum_fits(record)
+            {
+                continue;
+            }
+            // A reader of this record alone, asked for it once.
+            let record = Keybox::from_bytes(record)
+                .ok()
+                .and_then(|mut one| one.next());
+            let Some(Ok(KeyboxRecord::OpenPGP(record))) = record else {
                 continue;
             };
             // One unreadable record should not lose the rest of a keyring.
@@ -1102,7 +1163,9 @@ impl Store {
     /// unwritable directory, would most likely fail again for every
     /// certificate after it. What was stored before it stays, and the error is
     /// [`Error::ImportStopped`], which counts it, so that the caller can tell
-    /// an import that wrote nothing from one that wrote some of the file.
+    /// an import that wrote nothing from one that wrote some of the file. A
+    /// GnuPG Keybox goes to [`Store::import_keybox`], which stops in the same
+    /// way at a record it cannot read.
     pub fn import_file(&self, path: impl AsRef<Path>) -> Result<Vec<Cert>> {
         let path = path.as_ref();
 
@@ -1272,12 +1335,40 @@ fn merge_secret(existing: Cert, incoming: &Cert) -> Result<Cert> {
     Ok(existing.merge_public_and_secret(stripped)?)
 }
 
-/// What an import returns when it cannot store a certificate, having stored
-/// those in `imported` before it.
+/// What an import returns when it cannot store a certificate, or read a
+/// Keybox record, having stored those in `imported` before it.
 fn stopped_after(imported: &[Cert], source: Error) -> Error {
     Error::ImportStopped {
         stored: imported.len(),
         source: Box::new(source),
+    }
+}
+
+/// Whether an OpenPGP record from a Keybox is long enough to hold the data and
+/// the checksum it says it holds.
+///
+/// The record gives its data's offset within itself at byte 8 and the data's
+/// length at byte 12, and the 20-byte SHA-1 checksum follows the data.
+/// sequoia-ipc 0.36.1 takes the checksum from where those two fields put it,
+/// and hashes the record up to there, before it checks that the record
+/// reaches that far, so reading a record whose fields point past its end
+/// panics there instead of refusing it. Every other slice it takes of a record
+/// on the way to its certificate is checked first, so this is the one check
+/// [`Store::import_keybox`] needs to make for it.
+fn keybox_checksum_fits(record: &[u8]) -> bool {
+    let field = |at: usize| {
+        record
+            .get(at..at + 4)
+            .and_then(|field| <[u8; 4]>::try_from(field).ok())
+            .map(|field| u64::from(u32::from_be_bytes(field)))
+    };
+    match (field(8), field(12)) {
+        // As u64, where the sum cannot overflow, as it could in a 32-bit
+        // usize.
+        (Some(offset), Some(length)) => offset + length + 20 <= record.len() as u64,
+        // Too short to hold the two fields at all, which sequoia-ipc refuses
+        // without reading them.
+        _ => false,
     }
 }
 
@@ -2859,16 +2950,17 @@ mod tests {
     /// still comes in, while a Keybox with no certificate in it at all is an
     /// error rather than an empty import.
     ///
-    /// A record read whole can fail at two points: sequoia-ipc refuses the
-    /// record when its SHA-1 checksum does not match, and the certificate in it
-    /// when the checksum matches but the data is not OpenPGP. import_keybox
-    /// passes over both, as it does the header and any X.509 record; letting
-    /// either error through would fail the import at the first bad record.
+    /// Two of the ways a record read whole can fail are tested here:
+    /// sequoia-ipc refuses the record when its SHA-1 checksum does not match,
+    /// and the certificate in it when the checksum matches but the data is not
+    /// OpenPGP. import_keybox passes over both, as it does the header and any
+    /// X.509 record; letting either error through would fail the import at the
+    /// first bad record. A record whose own fields put its checksum past its
+    /// end is passed over too, in
+    /// `a_keybox_record_pointing_past_its_end_is_passed_over`.
     ///
-    /// A record cut short by the end of the file is neither, and is not tested
-    /// here. sequoia-ipc fails to read it without moving past it, and gives the
-    /// same error each time it is asked for the next record, so import_keybox
-    /// never finishes; that wants a fix of its own.
+    /// A record cut short by the end of the file is not read whole, and stops
+    /// the import instead; see `a_keybox_cut_short_keeps_what_came_before_it`.
     #[test]
     fn a_keybox_record_with_a_bad_checksum_or_certificate_is_passed_over() {
         let records = keybox_records(KEYBOX);
@@ -2926,6 +3018,211 @@ mod tests {
         let err = imported.unwrap_err().to_string();
         assert!(err.contains("holds no OpenPGP certificates"), "{err}");
         assert!(kept.is_empty());
+    }
+
+    /// What `import` returns, run on a thread of its own, failing the test if
+    /// it has not returned within a few seconds. An import of a Keybox that
+    /// never finishes then fails its test rather than hanging the whole run.
+    /// A panic in the import is passed on as the test's own.
+    ///
+    /// The thread of an import that never finishes is left running, and goes
+    /// when the test binary exits.
+    fn finishing<T: Send + 'static>(import: impl FnOnce() -> T + Send + 'static) -> T {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        let limit = Duration::from_secs(5);
+        let (done, finished) = mpsc::channel();
+        let worker = std::thread::spawn(move || done.send(import()));
+        match finished.recv_timeout(limit) {
+            Ok(outcome) => outcome,
+            Err(RecvTimeoutError::Disconnected) => match worker.join() {
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(_) => unreachable!("the import's thread ended without sending"),
+            },
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("the import had not finished after {limit:?}")
+            }
+        }
+    }
+
+    /// Import `bytes` as a `pubring.kbx`, through import_file as Import does
+    /// and on a thread of its own (see `finishing`), into a scratch store:
+    /// the fingerprints the import returned, or its error, and what the store
+    /// then lists.
+    fn import_keybox_bytes(bytes: &[u8]) -> (Result<Vec<String>>, BTreeSet<String>) {
+        let (dir, store) = scratch();
+        let store = Arc::new(store);
+        let path = dir.path().join("pubring.kbx");
+        fs::write(&path, bytes).unwrap();
+        let importing = Arc::clone(&store);
+        let imported = finishing(move || {
+            importing.import_file(&path).map(|certs| {
+                certs
+                    .iter()
+                    .map(|cert| cert.fingerprint().to_hex())
+                    .collect::<Vec<_>>()
+            })
+        });
+        (imported, listed(&store))
+    }
+
+    /// A Keybox cut short stores the certificates before the cut, says how
+    /// many, and finishes: cut inside its second record, inside its first, and
+    /// inside its header.
+    ///
+    /// It used never to finish. sequoia-ipc fails to read a record that is not
+    /// all there without moving past it, and gives the same error each time it
+    /// is asked for the next record, and import_keybox passed over each error
+    /// and asked again; a pubring.kbx cut short by a copy that did not
+    /// complete, chosen in Import, kept a core busy until the app was closed,
+    /// with the window disabled and the certificates before the cut not shown.
+    #[test]
+    fn a_keybox_cut_short_keeps_what_came_before_it() {
+        let records = keybox_records(KEYBOX);
+        let (header, first, second) = (&records[0], &records[1], &records[2]);
+
+        // 100 bytes short of the end, inside the second record.
+        let (imported, kept) = import_keybox_bytes(&KEYBOX[..KEYBOX.len() - 100]);
+        match imported {
+            Err(e @ Error::ImportStopped { stored: 1, .. }) => {
+                let message = e.to_string();
+                assert!(
+                    message.starts_with("1 certificate(s) were stored, and then: ")
+                        && message.ends_with(&format!(
+                            " ends before the end of the Keybox record that starts at byte {}",
+                            second.start
+                        )),
+                    "{message}"
+                );
+            }
+            other => panic!("cut in the second record: {other:?}"),
+        }
+        assert_eq!(kept, BTreeSet::from([KEYBOX_CERTS[0].to_string()]));
+
+        // Past the magic, which is at bytes 8 to 11, so that import_file still
+        // sends what is left of the header to the Keybox reader.
+        let in_the_header = header.start + 20;
+        for (cut, starts) in [
+            (first.start + first.len() / 2, first.start),
+            (in_the_header, header.start),
+        ] {
+            let (imported, kept) = import_keybox_bytes(&KEYBOX[..cut]);
+            match imported {
+                Err(e @ Error::ImportStopped { stored: 0, .. }) => {
+                    let message = e.to_string();
+                    assert!(
+                        message.ends_with(&format!(
+                            " ends before the end of the Keybox record that starts at byte {starts}"
+                        )) && !message.contains("were stored"),
+                        "cut at {cut}: {message}"
+                    );
+                }
+                other => panic!("cut at {cut}: {other:?}"),
+            }
+            assert!(kept.is_empty(), "cut at {cut}: {kept:?}");
+        }
+    }
+
+    /// A Keybox record that gives a length too short for any record stops the
+    /// import there, keeping what came before it.
+    ///
+    /// The file is all there, and sequoia-ipc's iterator would still never be
+    /// done with it: it moves past a record by the length the record gives, so
+    /// a length of nought left it refusing the same record for ever. One of
+    /// five moved it into the middle of the record, where it read a length
+    /// GnuPG never wrote, here one longer than the rest of the file, and
+    /// stalled there as it does at a cut.
+    #[test]
+    fn a_keybox_record_with_an_impossible_length_stops_the_import() {
+        let second = keybox_records(KEYBOX)[2].clone();
+        for length in [0u32, 5] {
+            let mut damaged = KEYBOX.to_vec();
+            damaged[second.start..second.start + 4].copy_from_slice(&length.to_be_bytes());
+            let (imported, kept) = import_keybox_bytes(&damaged);
+            match imported {
+                Err(e @ Error::ImportStopped { stored: 1, .. }) => {
+                    let message = e.to_string();
+                    assert!(
+                        message.ends_with(&format!(
+                            " is damaged at byte {}: a Keybox record cannot be {length} bytes long",
+                            second.start
+                        )),
+                        "{message}"
+                    );
+                }
+                other => panic!("a length of {length}: {other:?}"),
+            }
+            assert_eq!(kept, BTreeSet::from([KEYBOX_CERTS[0].to_string()]));
+        }
+    }
+
+    /// Wherever a Keybox is cut, its import finishes, and stores the
+    /// certificates whose records came whole before the cut.
+    ///
+    /// Every cut, so that those in the first six bytes of a record are among
+    /// them, where the length and type are not all there to read, and those
+    /// on the boundary between two records, where nothing is cut short.
+    /// Through import_keybox rather than import_file, because import_file
+    /// reads anything shorter than the twelve bytes that hold the Keybox magic
+    /// as a keyring of another kind.
+    #[test]
+    fn a_keybox_cut_anywhere_finishes() {
+        let records = keybox_records(KEYBOX);
+        let (dir, store) = scratch();
+        let store = Arc::new(store);
+        for cut in 1..=KEYBOX.len() {
+            let path = dir.path().join(format!("cut-at-{cut}.kbx"));
+            fs::write(&path, &KEYBOX[..cut]).unwrap();
+            let importing = Arc::clone(&store);
+            let outcome =
+                finishing(move || importing.import_keybox(&path).map(|certs| certs.len()));
+            // Every record but the first, the header, holds a certificate.
+            let whole = records.iter().filter(|record| record.end <= cut).count();
+            let certs = whole.saturating_sub(1);
+            let on_a_boundary = records.iter().any(|record| record.end == cut);
+            match outcome {
+                Ok(imported) if on_a_boundary => assert_eq!(imported, certs, "cut at {cut}"),
+                Err(Error::Invalid(message)) if on_a_boundary && certs == 0 => {
+                    assert!(
+                        message.contains("holds no OpenPGP certificates"),
+                        "{message}"
+                    );
+                }
+                Err(Error::ImportStopped { stored, .. }) if !on_a_boundary => {
+                    assert_eq!(stored, certs, "cut at {cut}");
+                }
+                other => panic!("cut at {cut}: {other:?}"),
+            }
+        }
+    }
+
+    /// A Keybox record whose own fields put its checksum past its end is
+    /// passed over, like one whose checksum does not match, and the rest of
+    /// the keyring still comes in.
+    ///
+    /// sequoia-ipc takes an OpenPGP record's checksum from after its data, at
+    /// the offset and length the record gives for the data, and slices the
+    /// record there before checking that it is that long, so such a record
+    /// panicked in sequoia-ipc. In the app that was on Import's worker thread,
+    /// so the window survived, but the rest of the keyring was not imported,
+    /// and the status line said nothing had changed though the certificates
+    /// before the record had been stored. Three ways past the end: the
+    /// checksum ending one byte beyond the record, where the data itself still
+    /// fits, the data length as large as its field holds, and the data offset
+    /// likewise.
+    #[test]
+    fn a_keybox_record_pointing_past_its_end_is_passed_over() {
+        let first = keybox_records(KEYBOX)[1].clone();
+        let field = |at: usize| first.start + at..first.start + at + 4;
+        let length = u32::from_be_bytes(KEYBOX[field(12)].try_into().unwrap());
+        let second = KEYBOX_CERTS[1];
+        for (at, value) in [(12, length + 1), (12, u32::MAX), (8, u32::MAX)] {
+            let mut damaged = KEYBOX.to_vec();
+            damaged[field(at)].copy_from_slice(&value.to_be_bytes());
+            let (imported, kept) = import_keybox_bytes(&damaged);
+            assert_eq!(imported.unwrap(), [second], "{value} at byte {at}");
+            assert_eq!(kept, BTreeSet::from([second.to_string()]));
+        }
     }
 
     /// Secret key material and revocation certificates must not be readable

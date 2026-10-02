@@ -912,11 +912,12 @@ fn import_into(
                 ..Default::default()
             }))
         }
-        // The file held a certificate, so it is no revocation certificate, and
-        // what came before that one is stored. Handed to the fallback below as
-        // well, a keyring that had stored a revoked certificate before it
-        // stopped was reported as that certificate revoked, and the reason the
-        // import stopped went unsaid.
+        // The file held a certificate, or is a GnuPG Keybox, so it is no
+        // revocation certificate, and what came before the point where the
+        // import stopped is stored. Handed to the fallback below as well, a
+        // keyring that had stored a revoked certificate before it stopped was
+        // reported as that certificate revoked, and the reason the import
+        // stopped went unsaid.
         Err(stopped @ rpgp_core::Error::ImportStopped { .. }) => Err(stopped),
         Err(import_error) => {
             // A file holding no revocation of a key is neither a keyring nor
