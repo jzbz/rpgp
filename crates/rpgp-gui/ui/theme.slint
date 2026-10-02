@@ -2,12 +2,14 @@ import { Palette } from "std-widgets.slint";
 
 // One source of truth for colour, spacing and type.
 //
-// The app follows the system light/dark setting but not the system *style*:
-// Slint's cupertino/fluent widget styles would make the app look like two
-// different products on the two platforms. Everything visible here is drawn by
-// this design system, so rpgp looks like itself on macOS and on Linux, and only
-// picks up platform character where it should — the window frame, the font, and
-// the scrollbars.
+// The app follows the system light/dark setting but not a platform *style*:
+// Slint's native style would draw cupertino widgets on macOS and fluent ones on
+// Linux and Windows, and the app would look like two different products.
+// Everything visible here is drawn by this design system, so rpgp looks like
+// itself on every platform and takes only the window frame from the one it
+// runs on. The font is the bundled Geist, which AppWindow sets as its default
+// family, and the scrollbars are std-widgets' fluent ones everywhere, as
+// build.rs pins that style.
 export global Theme {
     out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
 

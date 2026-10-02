@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <!-- Without a manifest Windows treats the process as DPI-unaware and
-       bitmap-scales the whole window on any display above 100%, which on a
-       4K screen renders the app blurry. PerMonitorV2 lets Slint scale itself
-       and re-scale when the window moves between displays. -->
+  <!-- PerMonitorV2 lets Slint scale itself and re-scale when the window moves
+       between displays. winit's event loop sets the same awareness when Slint
+       builds it, before any window exists, so this is not what keeps the app
+       from being bitmap-scaled and blurry today. It declares the awareness
+       from the moment the process starts instead, so that it holds even if a
+       later winit or Slint stops setting it. -->
   <asmv3:application xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
     <asmv3:windowsSettings>
       <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>

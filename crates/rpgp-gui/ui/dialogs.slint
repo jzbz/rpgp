@@ -1507,11 +1507,20 @@ export component NotepadDialog inherits DialogShell {
                         padding: Theme.s3;
                         spacing: Theme.s1;
                         Text {
-                            // Bound, not inherited. Slint sizes a wrapping
-                            // text's preferred height at its natural width
-                            // unless the width is already bound, so an unbound
-                            // one reports a single line however many it draws,
-                            // and the extra lines land outside the box.
+                            // Not what makes the box tall enough, as this used
+                            // to say. Measured on Slint 1.17.1's testing
+                            // backend, the box holds every wrapped line of
+                            // this text and of the signature lines below
+                            // without their bindings, as RevocationBanner
+                            // holds its note without one. That is not true of
+                            // every wrapping text: the Decrypt / Verify result
+                            // does need its width bound, or its box stays one
+                            // line tall. What this binding, and the same one
+                            // on each signature line, do here is make them as
+                            // wide as the whole banner, padding included, so a
+                            // line that runs their full width ends Theme.s3
+                            // past the box's right edge. Left in place until a
+                            // test holds them inside the box.
                             width: parent.width;
                             // Announced, as Decrypt / Verify's verdict is.
                             accessible-live-region: polite;
@@ -1577,7 +1586,13 @@ export component NotepadDialog inherits DialogShell {
                         read-only: true;
                     }
                     if root.output-note != "": Text {
-                        // Bound, as the banner's lines are, so that it wraps.
+                        // Not what makes it wrap, as this used to say: on
+                        // Slint 1.17.1's testing backend the note wraps to
+                        // the same height, and the Close button below sits
+                        // where it did, without this binding. It does no
+                        // harm, as this layout has no padding for the note to
+                        // overhang, and is left in place because no test
+                        // would catch its removal.
                         width: parent.width;
                         text: root.output-note;
                         color: Theme.text-dim;

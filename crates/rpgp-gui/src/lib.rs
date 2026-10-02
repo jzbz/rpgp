@@ -3635,7 +3635,6 @@ fn string_of(bytes: Vec<u8>) -> String {
 }
 
 /// Fill the shared recipient and signer models from the store.
-/// Fill the shared recipient and signer models from the store.
 ///
 /// `preselect` is the one thing the two callers disagree about: the
 /// sign/encrypt dialog ticks whatever the list has highlighted, the notepad
@@ -5016,7 +5015,6 @@ fn tint_index(fingerprint: &str) -> i32 {
     (hash % PALETTE) as i32
 }
 
-/// The binary's entry point, here so `main.rs` stays a wrapper.
 /// Report a failure that happened before there was a window to put it in.
 ///
 /// Every startup error funnels through here, and until now every one of them
@@ -5046,10 +5044,12 @@ fn report_fatal(message: &str) {
         .show();
 }
 
+/// The binary's entry point, here so `main.rs` stays a wrapper.
 pub fn run_app() -> ExitCode {
     // First, before the renderer brings up wgpu and long before any key
-    // material exists: everything after this point is inside a process that
-    // will not dump core.
+    // material exists: on Linux and macOS everything after this point is
+    // inside a process that will not dump core. On Windows `harden` protects
+    // nothing; its documentation says what that leaves open.
     hardening::harden();
     configure_renderer();
 
@@ -7209,13 +7209,15 @@ mod tests {
     /// ID stands in for the lifecycle modes, which share one handler.
     ///
     /// Nothing is set up for that second pass, so nothing it starts reaches
-    /// the store or the network. Add user ID and Delete have no target and
-    /// start no worker at all. The rest, key generation apart, start workers
-    /// that fail at once, for want of a file, a key, a target or a query. Key
-    /// generation does make a key, but only its completion would store it,
-    /// and that never gets so far: this thread has no event loop to run it,
-    /// and on another test's loop it returns at once, since this window
-    /// cannot be upgraded on a thread other than its own.
+    /// the network, and only key generation reaches the store. Add user ID
+    /// and Delete have no target and start no worker at all. The rest, key
+    /// generation apart, start workers that fail at once, for want of a file,
+    /// a key, a target or a query. Key generation's worker makes a key and
+    /// stores it itself, through `keygen::save`, in this test's temporary
+    /// store. Its completion, which would reload the list, never gets so far:
+    /// this thread has no event loop to run it, and on another test's loop it
+    /// returns at once, since this window cannot be upgraded on a thread other
+    /// than its own.
     #[test]
     fn nothing_starts_while_an_operation_is_in_flight() {
         i_slint_backend_testing::init_no_event_loop();

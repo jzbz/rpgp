@@ -9,7 +9,9 @@
 //! It is explicitly not aimed at a *perfect* read of the whole address space,
 //! because the pre-key is a static sitting in that same address space. A core
 //! file or a debugger attach hands over both halves at once. Those are what
-//! this module closes.
+//! this module closes: both on Linux, and the core file on macOS, where the
+//! signed release's hardened runtime refuses the attach instead. On Windows
+//! it closes neither; see [`harden`].
 //!
 //! What it does not close: this is not a privilege boundary. Key material
 //! still passes through this process, and root, or anything holding
@@ -23,7 +25,13 @@
 /// core, nothing for `coredumpctl`, and `gdb` refusing to attach.
 const ALLOW_DEBUG: &str = "RPGP_ALLOW_DEBUG";
 
-/// Refuse to dump core, and on Linux refuse to be attached to.
+/// Refuse to dump core on Unix, and on Linux refuse to be attached to as well.
+///
+/// On Windows it refuses neither: the core-dump limit is set only on Unix and
+/// the attach refusal only on Linux, and nothing else in the app stands in for
+/// them. A process running as the same user can open rpgp there and read its
+/// memory, and nothing keeps key material out of a crash dump that Windows is
+/// set up to collect.
 ///
 /// Best-effort throughout. Every one of these can fail under a sandbox or a
 /// hardened kernel, and none of them failing is a reason not to start — the
@@ -37,11 +45,14 @@ pub fn harden() {
 
     #[cfg(unix)]
     {
-        // Belt and braces, and the only one of the two available on macOS.
-        // On a systemd machine this is close to useless on its own, because
-        // `kernel.core_pattern` pipes to systemd-coredump and a pipe target
-        // ignores RLIMIT_CORE; PR_SET_DUMPABLE below is what actually stops
-        // it there.
+        // Belt and braces on Linux, and the only one of the two available on
+        // macOS. Where `kernel.core_pattern` pipes to a program, as it pipes
+        // to systemd-coredump on a systemd machine, the kernel runs that
+        // program whatever this limit says. systemd-coredump reads the limit
+        // itself and stores no core while it is zero, but that is its own
+        // policy rather than the kernel's, and another handler need not share
+        // it. PR_SET_DUMPABLE below is what stops the kernel producing a dump
+        // at all.
         let no_core = rustix::process::Rlimit {
             current: Some(0),
             maximum: Some(0),

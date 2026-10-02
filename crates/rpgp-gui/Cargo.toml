@@ -32,8 +32,9 @@ slint = { version = "1.17", default-features = false, features = [
     "renderer-femtovg-wgpu",
     "renderer-software",
     # Needed only to widen the backend set wgpu is allowed to pick from; see
-    # `configure_renderer` in main.rs. The API is unstable and tied to wgpu's
-    # major version, so it will need revisiting when Slint moves to wgpu 30.
+    # `configure_renderer` in src/lib.rs. The API is unstable and tied to
+    # wgpu's major version, so it will need revisiting when Slint moves to
+    # wgpu 30.
     "unstable-wgpu-29",
     # Window::window_handle, which is how the clipboard learns whether the
     # window is on Wayland and reaches its connection; see src/clipboard.rs.
@@ -95,8 +96,9 @@ slint-build = "1.17"
 
 # Windows only, and a build dependency, so it never enters the shipped binary
 # or any other platform's graph. Without it the .exe has no resource section at
-# all: no icon (the taskbar and title bar show a generic placeholder), no
-# version info (Explorer's Details tab is blank), and no manifest (the process
-# is DPI-unaware and Windows bitmap-scales it on any HiDPI display).
+# all: no icon for Explorer to draw for the file and its shortcuts (the window
+# sets its own at run time), no version info (Explorer's Details tab is
+# blank), and no manifest (the process is then DPI-aware only once winit's
+# event loop makes it so, not from the moment it starts; see build.rs).
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

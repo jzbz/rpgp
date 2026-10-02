@@ -680,10 +680,16 @@ export component AppWindow inherits Window {
                         if root.detail.sha1-blocked || root.detail.sha1-accepted: Rectangle {
                             background: Theme.warn-soft;
                             border-radius: Theme.r-md;
-                            // Probably only spells out the height Slint gives a
+                            // Only spells out the height Slint gives a
                             // rectangle from the layout inside it, as it gives
-                            // RevocationBanner above, which binds none; kept
-                            // until that is checked for this notice too.
+                            // RevocationBanner above, which binds none: on
+                            // Slint's testing backend, in a layout that starts
+                            // its contents at the top as this pane's does, a
+                            // copy of the notice is as tall without this
+                            // binding as with it. Kept because no test reaches
+                            // the notice itself to catch a change, the window
+                            // being compiled without the debug information the
+                            // testing backend finds elements by.
                             height: sha1-banner.preferred-height;
 
                             sha1-banner := VerticalLayout {

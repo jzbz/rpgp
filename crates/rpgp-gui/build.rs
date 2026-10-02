@@ -1,8 +1,10 @@
 fn main() {
     // Pin the widget style. The app draws its own controls, but std-widgets'
-    // ListView still supplies the scrollbars, and leaving the style to the
-    // platform default would give macOS cupertino scrollbars and Linux fluent
-    // ones inside an otherwise identical window.
+    // ListView and ScrollView still supply the scrollbars, and pinning keeps
+    // them alike on every platform. Slint 1.17 compiles with fluent when
+    // nothing names a style, but SLINT_STYLE in the build's environment can
+    // name another: `native` would give a macOS build cupertino scrollbars.
+    // with_style takes precedence over that variable.
     let config = slint_build::CompilerConfiguration::new().with_style("fluent".into());
     // A test-only harness for tests/accessibility.rs. Compiled unconditionally
     // because a build script cannot tell that it is building for `cargo test`;
@@ -12,7 +14,7 @@ fn main() {
     //
     // Compiled *before* the app, because each call overwrites the variable
     // that slint::include_modules!() reads: the last one compiled is the one
-    // main.rs gets. The test include!s its own file by name.
+    // src/lib.rs gets. The test include!s its own file by name.
     // with_debug_info is what makes the ElementHandle API able to see the
     // element tree. Set on the probe alone so the shipped binary does not
     // carry it.
@@ -52,10 +54,20 @@ fn wayland_target() {
 /// Give the Windows binary an icon, a version tab and a manifest.
 ///
 /// Without this the .exe carries no resource section whatsoever, which shows up
-/// three ways: the taskbar and title bar draw a generic placeholder because
-/// WM_GETICON returns nothing, Explorer's Details tab is empty, and the process
-/// is DPI-unaware so Windows bitmap-scales the window on any display above 100%
-/// and the whole app renders blurry.
+/// in Explorer: it draws a generic icon for the file and for any shortcut to
+/// it, the Start Menu entry the installer makes among them, and its Details
+/// tab is empty. The running window is unaffected, since Slint gives it
+/// AppWindow's `icon`, which its title bar and taskbar button draw (see
+/// app-window.slint). The version resource is not only for Explorer either:
+/// release.yml reads its ProductVersion to version the installer.
+///
+/// The manifest's DPI awareness makes no visible difference to the window.
+/// winit's Windows event loop makes the process per-monitor aware itself, and
+/// Slint builds that loop before any window exists, so without the manifest
+/// the window would still be scaled sharply rather than blurred. The manifest
+/// declares the same awareness from the moment the process starts, so it does
+/// not rest on a default of winit's that an event loop built
+/// `with_dpi_aware(false)` turns off.
 ///
 /// Two guards, because they answer different questions. The `cfg(windows)` on
 /// the function matches how Cargo gates the dependency itself: a build script

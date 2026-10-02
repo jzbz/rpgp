@@ -95,8 +95,10 @@ impl VerifyResult {
 /// its passphrase. This half took a plain `String` and so left the caller's
 /// copy — the only copy, since nothing here duplicates it — in freed memory
 /// after the message was written. Defence in depth rather than a fix for a
-/// reachable bug: reading it needs the address space, which `harden` already
-/// closes to `ptrace` and core dumps.
+/// reachable bug, on Linux at least: reading it needs the address space, which
+/// the GUI's `harden` closes there to `ptrace` and core dumps. On Windows
+/// `harden` closes neither, and a process running as the same user can read
+/// it.
 pub fn encrypt(
     recipients: &[Cert],
     passwords: &[Zeroizing<String>],

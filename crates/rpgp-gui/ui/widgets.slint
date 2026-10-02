@@ -824,9 +824,9 @@ export component FieldRow inherits Rectangle {
                 vertical-alignment: top;
             }
 
-            // Two variants rather than a conditional font-family: leaving the
-            // family unset is what lets the value inherit the platform's UI
-            // font.
+            // The second variant names no family, so its value is set in the
+            // window's default family: the bundled Geist that AppWindow sets,
+            // not the platform's UI font.
             if root.mono: Text {
                 text: root.value;
                 color: Theme.text;

@@ -1,8 +1,10 @@
 //! Render the Decrypt/Verify banner in a REAL window, for eyeballing layout.
 //!
-//! Not a test. Slint's headless test backend does not wrap text, so a geometry
-//! assertion there passes whether or not the banner is clipped; this puts the
-//! same component in front of an actual renderer so a screenshot can settle it.
+//! Not a test. Slint's headless testing backend, which tests/accessibility.rs
+//! runs on, does wrap text: it lays text out with parley, so the geometry
+//! assertions there measure wrapped lines. What it does not do, as the tests
+//! set it up, is draw anything, so this puts the same component in front of an
+//! actual renderer for a screenshot to show what the window draws.
 //!
 //!   env -u WAYLAND_DISPLAY DISPLAY=:99 cargo run -p rpgp-gui --example banner_probe
 //!

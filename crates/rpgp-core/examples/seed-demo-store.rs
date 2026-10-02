@@ -1,7 +1,17 @@
 //! Fill a store with throwaway keys and a small web of trust, so the GUI can be
 //! looked at with content in it. Never point this at a real store.
 //!
-//!     XDG_DATA_HOME=/tmp/demo cargo run -p rpgp-core --example seed-demo-store
+//!     cargo run -p rpgp-core --example seed-demo-store -- /tmp/rpgp-demo
+//!
+//! It writes only inside the directory it is given, laid out as
+//! `Store::open_default` lays out the data directory, so on Linux the GUI
+//! opens it with
+//!
+//!     XDG_DATA_HOME=/tmp/rpgp-demo cargo run -p rpgp-gui
+//!
+//! That half is for Linux alone. The `dirs` crate reads `XDG_DATA_HOME` there
+//! but not on macOS or Windows, where the GUI opens the default store whatever
+//! the variable says.
 //!
 //! The resulting graph covers every state the trust column can show:
 //!

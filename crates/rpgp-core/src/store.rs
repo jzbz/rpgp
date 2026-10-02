@@ -37,9 +37,10 @@
 //! and on Linux the GUI process refuses core dumps and debugger attach (see
 //! `rpgp-gui`'s `hardening` module; on macOS the attach half comes from the
 //! hardened runtime the release is codesigned with, in
-//! `packaging/macos-sign.sh`). None of that is a privilege boundary:
-//! key material does pass through this process, so root — or anything holding
-//! `CAP_SYS_PTRACE` — can still read it.
+//! `packaging/macos-sign.sh`, and on Windows the process refuses neither).
+//! None of that is a privilege boundary: key material does pass through this
+//! process, so root — or anything holding `CAP_SYS_PTRACE` — can still read
+//! it.
 //!
 //! `sequoia-keystore` is not the fix it appears to be, which is why this is
 //! still the design. Its default IPC policy silently degrades to a thread in

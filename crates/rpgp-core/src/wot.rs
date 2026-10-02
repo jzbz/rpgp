@@ -7,9 +7,14 @@
 //! a chain of certifications from one of the store's trust roots to the binding
 //! between a certificate and one of its user IDs.
 //!
-//! The two are independent, and both matter: a perfectly valid certificate from
-//! a stranger is unauthenticated, and an expired certificate can still be one
-//! you long ago confirmed belongs to a friend.
+//! Both matter, and validity comes first: a perfectly valid certificate from a
+//! stranger is unauthenticated, and so is an expired or revoked one, however
+//! well it was certified while it was live. sequoia-wot 0.15.2 finds no path
+//! to a certificate that is expired or revoked at the network's reference
+//! time, which [`authenticate_all`] leaves at now, so a friend's key confirmed
+//! years ago reads as unauthenticated once it expires. 0.15.3 does find one,
+//! since it no longer checks the target's status; the workspace Cargo.toml says
+//! why rPGP is held at 0.15.2.
 
 use std::collections::HashMap;
 
