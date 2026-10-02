@@ -31,8 +31,9 @@ use rpgp_core::{Error, Store, ops};
 use sequoia_gpg_agent::{Agent, Context};
 use sequoia_openpgp::cert::prelude::SubkeyRevocationBuilder;
 use sequoia_openpgp::cert::{CipherSuite, KeyBuilder, Preferences};
+use sequoia_openpgp::crypto::S2K;
 use sequoia_openpgp::crypto::mpi::{Ciphertext, MPI, PublicKey};
-use sequoia_openpgp::packet::key::{PublicParts, UnspecifiedRole};
+use sequoia_openpgp::packet::key::{PublicParts, SecretKeyMaterial, UnspecifiedRole};
 use sequoia_openpgp::packet::pkesk::PKESK3;
 use sequoia_openpgp::packet::{Key, PKESK};
 use sequoia_openpgp::parse::Parse;
@@ -40,7 +41,7 @@ use sequoia_openpgp::policy::StandardPolicy;
 use sequoia_openpgp::serialize::stream::{Encryptor, LiteralWriter, Message, Recipient};
 use sequoia_openpgp::serialize::{Serialize, SerializeInto};
 use sequoia_openpgp::types::{KeyFlags, ReasonForRevocation};
-use sequoia_openpgp::{Cert, Packet, PacketPile};
+use sequoia_openpgp::{Cert, Fingerprint, Packet, PacketPile};
 
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
@@ -685,6 +686,98 @@ fn the_agent_is_found_to_certify_only_where_it_holds_the_primary() {
         "{listed:?}"
     );
     assert_eq!(agent_home.prompts(), 0);
+}
+
+/// One key exported twice by gpg 2.4.9, its primary signing as well as
+/// certifying, as GnuPG's default primary does: as `gpg
+/// --export-secret-subkeys` writes it, the primary a stub and the subkeys
+/// whole, and again once the subkeys' secrets have gone as a card takes them,
+/// every secret a stub. `tests/gnupg_stubs.rs` has the recipe.
+const SIGNING_SUBKEYS: &[u8] = include_bytes!("fixtures/gnupg-signing-subkeys.asc");
+const SIGNING_STUBS: &[u8] = include_bytes!("fixtures/gnupg-signing-stubs.asc");
+
+/// Whether `secret` is GnuPG's stub, read off the S2K rather than through
+/// `secret::is_usable`, which is what decides the signing below and so cannot
+/// also be what says the premise holds.
+fn is_gnu_stub(secret: &SecretKeyMaterial) -> bool {
+    matches!(
+        secret,
+        SecretKeyMaterial::Encrypted(encrypted)
+            if matches!(encrypted.s2k(), S2K::Private { tag: 101, .. })
+    )
+}
+
+/// The key that made the one signature in `armored`, by the fingerprint the
+/// signature names.
+fn signed_by(armored: &[u8]) -> Fingerprint {
+    match PacketPile::from_bytes(armored).unwrap().children().next() {
+        Some(Packet::Signature(signature)) => signature
+            .issuer_fingerprints()
+            .next()
+            .expect("the signature names the key that made it")
+            .clone(),
+        other => panic!("not a signature: {other:?}"),
+    }
+}
+
+/// A key that came across from GnuPG with a stub for every secret, as one
+/// whose primary is kept offline and whose subkeys are on a card does, signs
+/// through the agent holding the signing subkey, without a prompt.
+///
+/// Signing used to take the first key that can sign and has a secret in the
+/// store, and a stub counts as one: here that is the primary. No passphrase
+/// opens a stub, so signing failed asking for one, and the agent was never
+/// asked, while decrypting and certifying passed the same stubs over and
+/// asked it.
+#[test]
+fn a_key_whose_secrets_here_are_stubs_signs_through_the_agent() {
+    let Some(agent_home) = Throwaway::start() else {
+        return;
+    };
+    // The subkeys alone, as the card holds them.
+    agent_home.give(&with_secrets_of(
+        &Cert::from_bytes(SIGNING_SUBKEYS).unwrap(),
+        false,
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+    let path = dir.path().join("signing-stubs.asc");
+    std::fs::write(&path, SIGNING_STUBS).unwrap();
+    store.import_file(&path).unwrap();
+
+    let fingerprint = Cert::from_bytes(SIGNING_STUBS)
+        .unwrap()
+        .fingerprint()
+        .to_hex();
+    // The certificate the GUI signs with: both halves of what the store holds.
+    let signer = store.full_cert(&fingerprint).unwrap();
+    let policy = StandardPolicy::new();
+    let valid = signer.with_policy(&policy, None).unwrap();
+    assert!(
+        valid.primary_key().for_signing(),
+        "premise: the primary signs, and so comes first"
+    );
+    assert!(
+        signer.keys().count() == 3
+            && signer
+                .keys()
+                .all(|ka| ka.key().optional_secret().is_some_and(is_gnu_stub)),
+        "premise: the store holds a stub for every key and nothing more"
+    );
+    let subkey = valid
+        .keys()
+        .subkeys()
+        .for_signing()
+        .next()
+        .expect("premise: a signing subkey");
+
+    let mut signature = Vec::new();
+    ops::sign_detached(&signer, None, b"signed on the card", &mut signature)
+        .unwrap_or_else(|e| panic!("the agent holds the signing subkey: {e}"));
+    let verified = ops::verify_detached(&store, &signature, b"signed on the card").unwrap();
+    assert!(verified.all_good(), "{:?}", verified.signatures);
+    assert_eq!(signed_by(&signature), subkey.key().fingerprint());
+    assert_eq!(agent_home.prompts(), 0, "no key here has a passphrase");
 }
 
 /// The agent's passphrase prompt names the certificate whose key it unlocks:

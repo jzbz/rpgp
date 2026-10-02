@@ -538,6 +538,14 @@ pub fn verify_detached(store: &Store, signature: &[u8], data: &[u8]) -> Result<V
 /// leaves the card, and the PIN prompt is the agent's own pinentry rather than
 /// anything rpgp draws.
 ///
+/// A GnuPG stub is not local key material, though sequoia reads it as a
+/// secret ([`crate::secret::is_usable`]). A signing key whose secret here is a
+/// stub is passed over, and the agent is asked when no other signing key has
+/// its secret here, as certifying, withdrawing a certification and decrypting
+/// treat a stub. A signing key whose secret is here is used ahead of the
+/// agent, wherever it comes among the certificate's keys, as those paths use a
+/// real secret here first.
+///
 /// Every signing path in this module comes through here — detached, cleartext
 /// and the signer inside [`encrypt_stream`] — so the revocation guard sits here
 /// once rather than at each of the three.
@@ -558,6 +566,12 @@ fn signing_keypair(
         .with_policy(&policy, None)
         .map_err(|_| Error::NoSecretKey(cert.fingerprint().to_hex()))?;
 
+    // The first signing key whose secret is key material, not the first that
+    // `secret()` lets through, which a stub passes. Taking that one made an
+    // imported card stub, or the stub `gpg --export-secret-subkeys` leaves for
+    // a primary that signs, the key to sign with: no passphrase opens a stub,
+    // so signing failed asking for one, though the signing subkey beside such
+    // a primary could have signed here, and gpg-agent with the card.
     let Some(ka) = valid
         .keys()
         .secret()
@@ -565,7 +579,7 @@ fn signing_keypair(
         .revoked(false)
         .supported()
         .for_signing()
-        .next()
+        .find(|ka| crate::secret::is_usable(ka.key().secret()))
     else {
         return Ok(Box::new(crate::agent::signer_for(cert)?));
     };

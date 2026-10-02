@@ -552,13 +552,19 @@ home other than the Flatpak's `GNUPGHOME`, or `~/.gnupg` where that is unset,
 is not reached, because GnuPG gives each such home's socket a directory of its
 own.
 
-Signing, certifying and decrypting all work on a card. Where the agent puts its
-prompt is the agent's business: `sequoia-gpg-agent` builds those options from
-`GPG_TTY`, `TERM` and `DISPLAY` when a crypto operation opens its connection.
-The connection that only lists keys deliberately sets none, for the reason in
-the note in `connected` in `agent.rs`. What a passphrase prompt says is rPGP's
-to give, and it gives what GnuPG's own does: the certificate's primary user ID,
-the key's ID, and for a subkey the primary key's ID too.
+Signing, certifying and decrypting all work on a card, whether rPGP's store
+holds only the key's public certificate or also the stubs
+`gpg --export-secret-keys` writes in place of the keys on the card: rPGP passes
+a stub over and asks the agent, as it does for a key it holds no secret of,
+unless another key of the certificate that can sign came across whole, as the
+section on coming from GnuPG explains.
+Where the agent puts its prompt is the agent's business: `sequoia-gpg-agent`
+builds those options from `GPG_TTY`, `TERM` and `DISPLAY` when a crypto
+operation opens its connection. The connection that only lists keys deliberately
+sets none, for the reason in the note in `connected` in `agent.rs`. What a
+passphrase prompt says is rPGP's to give, and it gives what GnuPG's own does:
+the certificate's primary user ID, the key's ID, and for a subkey the primary
+key's ID too.
 
 Certifying takes the certificate's primary key, so **Certify identity…** is
 offered once some key's primary can sign: its secret is in rPGP's store, as key
@@ -912,14 +918,21 @@ Four caveats:
   different protections: gpg-agent's, and rPGP's weaker on-disk one. Delete
   `/tmp/rpgp-secret.asc` afterwards, and understand that rPGP's copy is only as
   safe as the passphrase on it.
-- **Smartcard keys are best left out of the secret export.**
-  `--export-secret-keys` emits only a stub for a key that lives on a YubiKey,
-  since its secret cannot leave the card, and a stub here can keep signing from
-  reaching the agent: rPGP takes a stub for a signing key as the key to sign
-  with, and no passphrase opens it. Decrypting and certifying pass a stub over
-  and ask the agent; signing does not. Give `gpg --export-secret-keys` only
-  the keys with no part on a card, and the card keys work through gpg-agent, as
-  above, with just their public certificates here.
+- **A key on a card comes across as a stub.** `--export-secret-keys` emits
+  only a stub for a key that lives on a YubiKey, since its secret cannot leave
+  the card, as `--export-secret-subkeys` does for a primary kept offline. rPGP
+  passes a stub over and asks gpg-agent, so the card keys sign, certify and
+  decrypt as above, as they do with just their public certificates here. What
+  the stubs add is the key's place under My keys, and with it the details
+  pane's operations on the key. Publishing signs nothing, so a stub is enough
+  for it. The rest sign with the primary key: they work where its secret came
+  across, as it does when only the subkeys are on the card, and where the
+  primary is a stub too they are refused, with the stub named. Revoking such a
+  key then takes a revocation certificate from `gpg --gen-revoke`, as it does
+  with only the public certificate here. A secret that did come across is used
+  before the agent is asked, so a primary that signs as well as certifies, as
+  GnuPG's default primary does, signs messages here, with its passphrase,
+  rather than the signing key on the card.
 - **Ownertrust does not come across.** It has no direct counterpart here, so
   `--export-ownertrust` has nowhere to go: authentication starts from trust
   roots instead, as the section on certifying above describes. A key of your

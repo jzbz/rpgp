@@ -1014,6 +1014,23 @@ fn primary_signer(cert: &Cert, password: Option<&str>) -> Result<sequoia_openpgp
         .clone()
         .parts_into_secret()
         .map_err(|_| Error::NoSecretKey(cert.fingerprint().to_hex()))?;
+
+    // A GnuPG stub passes `parts_into_secret`, as it passes every test for a
+    // secret that sequoia makes, so a key imported with its primary on a card
+    // or kept offline came this far: it was asked for a passphrase the stub
+    // has none of, and anyone who typed one was given an S2K error. Revoking
+    // signs with the store's own secret and never asks gpg-agent, so there is
+    // nothing to fall back to. The stub is refused by name, as `lifecycle`
+    // refuses it in `unlock_primary`, and the refusal says what does revoke
+    // such a key.
+    if !crate::secret::is_usable(key.secret()) {
+        return Err(Error::invalid(
+            "this key's primary secret is a GnuPG stub: the primary key itself is \
+             offline or on a smartcard; revoke it with gpg --gen-revoke and import \
+             the revocation certificate",
+        ));
+    }
+
     // Keeps its primary role: an RFC 9580 secret cannot be decrypted without
     // it. See crate::secret::unlock.
     crate::secret::keypair(key, password)
