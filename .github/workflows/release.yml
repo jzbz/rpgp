@@ -75,7 +75,7 @@ permissions:
   contents: read
 
 env:
-  RUNTIME_VERSION: "25.08"
+  RUNTIME_VERSION: "26.08"
   # The tag being released. A tag push carries it in github.ref_name; a manual
   # run names it explicitly, which is the only way to build a tag cut before
   # this workflow existed — workflow_dispatch reads the workflow file from the
