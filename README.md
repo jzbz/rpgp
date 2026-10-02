@@ -38,11 +38,17 @@ Inside `crates/rpgp-gui/ui`:
 
 ## Look and feel
 
-The app follows the system light/dark setting but not the system *widget
-style*: Slint would otherwise give macOS `cupertino` controls and Linux
-`fluent` ones, which reads as two different products. `build.rs` pins the
-style, so the only platform character left is the window frame, the UI font
-and the scrollbars.
+The app follows the system light/dark setting but not a platform *widget
+style*. The scrollbars, the one part std-widgets still draws, are where a style
+would show, and `build.rs` pins `fluent` for every platform: Slint's `native`
+style, which a build could otherwise select, would draw them `cupertino` on
+macOS and `fluent` elsewhere, which reads as two different products. Nor is the
+font the platform's: the interface is set in Geist, which `app-window.slint`
+bundles and makes the window's default family. What is left of the platform is
+the window frame, the file chooser, the message box that reports a failure to
+start, the application menu in the macOS menu bar, and the system font that
+draws any character Geist does not have. On a Wayland desktop that leaves the
+frame to the app, winit draws it, in an Adwaita-like style.
 
 Everything else is drawn by the design system in `theme.slint` and
 `widgets.slint`. Only the scrolling comes from std-widgets: `ListView`, which
@@ -81,12 +87,17 @@ reaches your agent: the ones that exercise the agent start one of their own in
 a temporary directory, or stand in for one, and those that need GnuPG skip
 where it is not installed.
 
-To try the app with content in it, seed a throwaway store. It writes only
-inside the `XDG_DATA_HOME` you give it:
+To try the app with content in it, seed a throwaway store. The example writes
+only inside the directory it is given, laid out as the app lays out its data
+directory, so on Linux `XDG_DATA_HOME` points the app at it:
 
 ```bash
-XDG_DATA_HOME=/tmp/rpgp-demo cargo run -p rpgp-core --example seed-demo-store && XDG_DATA_HOME=/tmp/rpgp-demo cargo run -p rpgp-gui
+cargo run -p rpgp-core --example seed-demo-store -- /tmp/rpgp-demo && XDG_DATA_HOME=/tmp/rpgp-demo cargo run -p rpgp-gui
 ```
+
+The second half is for Linux alone. The `dirs` crate reads `XDG_DATA_HOME`
+there but not on macOS or Windows, where the app opens your own store whatever
+the variable says.
 
 ## Installing
 
@@ -182,7 +193,7 @@ macOS; `renderer-femtovg-wgpu` is the same renderer over Vulkan and Metal.
 A machine with no usable GPU falls back to the software renderer
 automatically. Slint left alone would abort instead; how that is handled, and
 two approaches that do not work, are documented above `configure_renderer` in
-`main.rs`.
+`crates/rpgp-gui/src/lib.rs`.
 
 ### OpenPGP: Sequoia with the RustCrypto backend
 
@@ -193,8 +204,8 @@ because it does not guarantee constant-time operation everywhere.
 
 Both are real warnings rather than paperwork: this build is more exposed to
 timing side channels than a Nettle or OpenSSL build. On a desktop where an
-attacker is not co-resident that is an acceptable trade for a single-language
-build. It would not be on a shared host.
+attacker is not co-resident that is an acceptable trade for OpenPGP
+cryptography with no C in it. It would not be on a shared host.
 
 `compression-bzip2` is off, as it links C bzip2. The cost is that
 BZip2-compressed messages cannot be read; nothing modern produces them.
@@ -203,7 +214,8 @@ BZip2-compressed messages cannot be read; nothing modern produces them.
 
 | Library | Via | Why |
 | --- | --- | --- |
-| `libsqlite3` | `sequoia-cert-store` → `rusqlite` | cert-d keeps a SQLite index for lookup by e-mail and subkey. Not optional in that crate. |
+| `ring` | `rustls` | The cryptography under every HTTPS connection, for WKD and keyserver lookup and for publishing: `keyserver.rs` builds its TLS on ring's provider. C and assembly, built into every release. |
+| `libsqlite3` | `sequoia-cert-store` → `rusqlite` | cert-d keeps a SQLite index for lookup by e-mail and subkey. Not optional in that crate. Linked from the system on Linux and macOS. On Windows `sequoia-cert-store` turns on `rusqlite`'s `bundled` feature, so SQLite's C source is compiled into the `.exe`. |
 | `fontconfig` | `i-slint-core` | System font discovery on Linux. |
 | `libwayland` | `winit`, `smithay-clipboard` | Loaded at runtime on a Wayland session. |
 
@@ -220,7 +232,9 @@ because confusing them is how people end up trusting the wrong key:
 - **Authentication** — does the name on it belong to the person you think? This
   is the `verified` / `partly verified` pill, computed by `sequoia-wot` from the
   certifications in the store. A perfectly valid certificate from a stranger is
-  unauthenticated, and a key you confirmed years ago stays authenticated after
+  unauthenticated, and so is one that has expired or been revoked, however well
+  it was certified while it was live: `sequoia-wot` 0.15.2, which rPGP pins,
+  finds no path to it, so a key you confirmed years ago reads as unverified once
   it expires.
 
 What a certificate calls itself is its maker's to write, so the window shows a
@@ -744,12 +758,23 @@ app:
 That sharing is a property of a native build. The Flatpak keeps its store inside
 `~/.var/app/app.rpgp.rpgp/data` and shares it with nothing: `XDG_DATA_HOME`
 points into the sandbox there, and Flathub does not grant access to the real one
-without an exception. Point `RPGP_CERT_STORE` at a path both can reach if you
-want one store across both.
+without an exception.
+
+`RPGP_CERT_STORE` moves the public certificates and nothing else, so it cannot
+make the two builds share one store. A native build pointed at the Flatpak's
+`~/.var/app/app.rpgp.rpgp/data/pgp.cert.d`, which it can reach as it is, lists
+the certificates the Flatpak does, though no longer the ones `sq` uses. Secret
+keys, the revocation certificates and the lists of trust roots, of imported
+keys and of certificates you accept SHA-1 from stay with each build, in its
+own `rpgp` directory (below). So a key generated in one build cannot sign or
+decrypt in the other and is not a trust root there, what it certified can read
+as verified in one and not in the other, and the build without its secret
+deletes the certificate as it would anyone else's, with no word of a secret
+key.
 
 Every time the list is read, at Refresh and after each change made here, each
 certificate in it is checked against its file, so a certificate that `sq` or a
-second rPGP window has changed or deleted there shows up as it now is.
+second rPGP window has changed or deleted in cert-d shows up as it now is.
 
 Secret keys do **not** go there — cert-d is a store of public certificates, and
 a transferable secret key in it would be readable by every tool that scans the
@@ -796,15 +821,23 @@ run by the same user. `packaging/macos-sign.sh` is what applies it. A macOS
 binary you built yourself is unsigned and gets none of that — assume a debugger
 can attach to that one.
 
-Keeping passphrases off the accessibility bus and off the clipboard is not
-platform-specific and applies to both. The bus publishes the contents of an
-ordinary text field verbatim and does not exempt password fields, and Slint's
-text fields copy and cut a selection unmasked, and on Linux put whatever the
-mouse selects in the primary selection. rPGP's passphrase fields refuse copy
-and cut, and a click only focuses them: the mouse does not select in them.
+**Windows.** Nothing. The process sets no core-dump limit there and refuses no
+debugger, and nothing else in rPGP stands in for either, so a process running
+as the same user can open rPGP and read its memory, and nothing keeps key
+material out of a crash dump that Windows is set up to collect.
 
-Set `RPGP_ALLOW_DEBUG=1` to turn off the core-dump and debugger restrictions
-when you need a backtrace.
+Keeping passphrases off the accessibility bus and off the clipboard is not
+platform-specific and applies on all three. The bus publishes the contents of
+an ordinary text field verbatim and does not exempt password fields, and
+Slint's text fields copy and cut a selection unmasked, and on Linux put
+whatever the mouse selects in the primary selection. rPGP's passphrase fields
+refuse copy and cut, and a click only focuses them: the mouse does not select
+in them.
+
+Set `RPGP_ALLOW_DEBUG=1` to turn off what the process does itself, the
+core-dump limit and on Linux the non-dumpable flag, when you need a backtrace.
+It cannot lift the hardened runtime a signed macOS bundle carries, and on
+Windows there is nothing for it to turn off.
 
 None of this is a privilege boundary. Key material passes through the GUI
 process, so root, or anything holding `CAP_SYS_PTRACE`, can still read it while
@@ -812,8 +845,11 @@ an operation is in flight. rPGP wipes its own copy of a passphrase once the
 operation is done with it, but the passphrase you type cannot be scrubbed at
 all, because Slint's own string type keeps unzeroed copies, including an undo
 buffer. For the same reason a message decrypted in the notepad is dropped from
-the window when the notepad closes, not scrubbed from memory. Only the
-smartcard path avoids this entirely, by never seeing the key.
+the window when the notepad closes, not scrubbed from memory. Only a key on a
+card avoids this entirely, since its secret never leaves the card. For a key in
+gpg-agent's own store, neither the key nor its passphrase enters rPGP, since
+the agent decrypts the key in its own process and takes the passphrase at its
+own prompt.
 
 ## What goes on the clipboard
 
@@ -847,9 +883,20 @@ The mark is a request, and it has limits:
 
 ## Coming from GnuPG
 
-rPGP does not read `~/.gnupg`, and nothing it does will disturb it. Public certificates need no export at all: point Import at
-`~/.gnupg/pubring.kbx`. Secret keys still need exporting, since GnuPG keeps
-them in gpg-agent's own format:
+rPGP does not read `~/.gnupg`, and nothing it does will disturb it. Public
+certificates need no export at all: point Import at `~/.gnupg/pubring.kbx`.
+
+Nor do secret keys, to sign, certify and decrypt. Once a key's public
+certificate is here, rPGP does all three by asking gpg-agent, whether the agent
+keeps the key in its own store or on a card, as the section on smartcards above
+describes: the agent's own prompt takes the passphrase or PIN, and the secret
+never enters rPGP. The rest still needs the secret in rPGP's own store:
+publishing the key, revoking it, changing its expiry, adding a user ID, and
+revoking a user ID or a subkey. Until then the key is listed under Other
+people, not My keys, and revoking it takes a revocation certificate from
+`gpg --gen-revoke`, brought in through Import as the section on revocation
+above describes. To copy secret keys into rPGP's own store, export them, since
+GnuPG keeps them in gpg-agent's own format:
 
 ```bash
 gpg --export --armor > /tmp/rpgp-public.asc && gpg --export-secret-keys --armor > /tmp/rpgp-secret.asc
@@ -865,10 +912,19 @@ Four caveats:
   different protections: gpg-agent's, and rPGP's weaker on-disk one. Delete
   `/tmp/rpgp-secret.asc` afterwards, and understand that rPGP's copy is only as
   safe as the passphrase on it.
-- **Smartcard keys cannot come across.** `--export-secret-keys` emits a stub for
-  a key that lives on a YubiKey. Those need the gpg-agent route below.
-- **Ownertrust does not come across.** rPGP has no trust model yet, so
-  `--export-ownertrust` has nowhere to go.
+- **Smartcard keys are best left out of the secret export.**
+  `--export-secret-keys` emits only a stub for a key that lives on a YubiKey,
+  since its secret cannot leave the card, and a stub here can keep signing from
+  reaching the agent: rPGP takes a stub for a signing key as the key to sign
+  with, and no passphrase opens it. Decrypting and certifying pass a stub over
+  and ask the agent; signing does not. Give `gpg --export-secret-keys` only
+  the keys with no part on a card, and the card keys work through gpg-agent, as
+  above, with just their public certificates here.
+- **Ownertrust does not come across.** It has no direct counterpart here, so
+  `--export-ownertrust` has nowhere to go: authentication starts from trust
+  roots instead, as the section on certifying above describes. A key of your
+  own from GnuPG, imported or left with the agent, is not one until you tick
+  Trust root in its details pane.
 - **Elliptic-curve keys are read the long way.** GnuPG 2.3 and later, exporting
   a key with a passphrase, write an elliptic-curve secret with a length that
   counts its leading zero bits, and Sequoia, the library rPGP is built on,
@@ -884,7 +940,7 @@ Four caveats:
   Brainpool curve still cannot be used: this build has no support for those
   curves.
 
-Reading `~/.gnupg` in place is possible but not built:
+How each part of `~/.gnupg` comes across:
 
 - `pubring.kbx` **can be imported directly.** It is GnuPG's Keybox container
   rather than an OpenPGP keyring, so `CertParser` cannot read it, but
@@ -892,9 +948,8 @@ Reading `~/.gnupg` in place is possible but not built:
   recognised by its magic bytes rather than its name — and every public
   certificate comes across. X.509 records in the same file are skipped.
 - Secret keys under `private-keys-v1.d` are in gpg-agent's own S-expression
-  format, not OpenPGP. The only sound way to use them is to ask gpg-agent, via
-  `sequoia-keystore`'s gpg-agent backend — which would also solve smartcards and
-  would mean rPGP never holds key material at all.
+  format, not OpenPGP, and rPGP does not read them: it asks the agent to use
+  them, through `sequoia-gpg-agent`, as above.
 - A pre-2.1 `~/.gnupg/pubring.gpg` *is* a plain OpenPGP keyring and imports
   as-is today.
 
@@ -906,6 +961,6 @@ Two dependencies add obligations MIT does not, both relevant only when
 shipping binaries: Slint's royalty-free terms require the attribution in the
 About box, and `sequoia-openpgp` is LGPL-2.0-or-later linked statically.
 
-The bundled fonts (Geo, Source Code Pro) are SIL Open Font License 1.1, which
-requires its text to ship with them; it sits beside them in
+The bundled fonts (Geo, Source Code Pro, Geist) are SIL Open Font License
+1.1, which requires its text to ship with them; it sits beside them in
 `crates/rpgp-gui/ui/fonts`. Icons are Lucide, ISC, likewise.

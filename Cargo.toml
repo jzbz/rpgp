@@ -43,7 +43,9 @@ sequoia-cert-store = { version = "0.7", default-features = false }
 # a certification of a key that had expired or been revoked counts, and two of
 # certify.rs's tests fail under it; it also deprecates the
 # CertificationError::Target* variants that certify::verdict matches. Lift the
-# pin together with reworking certify.rs for that.
+# pin together with reworking certify.rs for that, and with rpgp-core's wot.rs
+# module doc and the README's Authentication paragraph, which both say an
+# expired or revoked key reads as unauthenticated.
 sequoia-wot = "=0.15.2"
 # Talks to the user's running gpg-agent. This is how rpgp reaches smartcard
 # keys: scdaemon owns the reader exclusively, so going through the agent is the
@@ -57,11 +59,11 @@ sequoia-ipc = { version = "0.36", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 # Keyserver and WKD lookup. reqwest with rustls only: sequoia-net would do this
 # for us but hardcodes hyper-tls and a dnssec-openssl resolver with no feature
-# to opt out, which would put OpenSSL into a build that has avoided C
-# dependencies everywhere else.
+# to opt out, which would put OpenSSL into a build that has kept it out
+# everywhere else.
 #
 # `rustls-no-provider` and not `rustls`, which since 0.13 means aws-lc-rs: a C
-# library, kept out for the same reason. `rustls-no-provider` in turn leaves
+# library, kept out as OpenSSL is. `rustls-no-provider` in turn leaves
 # reqwest to encrypt with whatever provider the process installed and to verify
 # through rustls-platform-verifier, which on macOS and Windows hands each
 # certificate to the operating system to judge. This build wants neither, so
