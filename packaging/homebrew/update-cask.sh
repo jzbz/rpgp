@@ -1,7 +1,7 @@
 #!/bin/sh
 # Emit the cask for a published release, with the real hash filled in.
 #
-#   ./packaging/homebrew/update-cask.sh v0.1.2 > ~/zx/dev/homebrew-tap/Casks/rpgp.rb
+#   ./packaging/homebrew/update-cask.sh v0.1.2 > ../homebrew-tap/Casks/rpgp.rb
 #
 # Run after the release is published, its SHA256SUMS signed and the notarised
 # macOS zip attached — the hash has to be of the artifact users will actually

@@ -41,10 +41,10 @@ or in one step, without tapping first:
 ## Per release
 
 After the release is published, its `SHA256SUMS` signed and the notarised zip
-attached:
+attached, from this repository's root with the tap checked out beside it:
 
-    ./packaging/homebrew/update-cask.sh v0.1.2 > ~/zx/dev/homebrew-tap/Casks/rpgp.rb
-    cd ~/zx/dev/homebrew-tap && git commit -S -m "rpgp 0.1.2" Casks/rpgp.rb && git push
+    ./packaging/homebrew/update-cask.sh v0.1.2 > ../homebrew-tap/Casks/rpgp.rb
+    cd ../homebrew-tap && git commit -S -m "rpgp 0.1.2" Casks/rpgp.rb && git push
 
 Name the file rather than reaching for `git commit -a`: the tap is shared now,
 and a bump for one app has no business carrying another app's in-flight change.
