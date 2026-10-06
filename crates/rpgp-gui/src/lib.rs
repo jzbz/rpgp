@@ -1316,23 +1316,31 @@ fn ask_where_to_save(
 /// folder is the save dialog's to ask for, so the name is all there is to say
 /// beforehand.
 ///
-/// For display only. The dialogs are also given the full path, and that is
-/// what tells one chosen file from another: two files of one name from two
-/// folders must still count as a change of input.
+/// Through [`display::text`] either way. A file's name is whatever whoever
+/// made it chose, an attachment's its sender's, and one carrying U+202E would
+/// otherwise reverse the window's own words after it: "Decrypted to x" and
+/// then ". The message was not signed." drawn backwards.
+///
+/// For display only. The dialogs are also given the full path, as it is, and
+/// that is what tells one chosen file from another: two files of one name from
+/// two folders must still count as a change of input.
 fn shown_path(sandboxed: bool, path: &Path) -> String {
     if sandboxed {
-        path.file_name()
-            .unwrap_or(path.as_os_str())
-            .to_string_lossy()
-            .into_owned()
+        display::text(
+            &path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy(),
+        )
     } else {
-        path.display().to_string()
+        display::text(&path.display().to_string())
     }
 }
 
 /// An error message as the window shows it: inside a Flatpak with each
 /// document-portal folder taken out of the paths in it, as [`shown_path`]
-/// takes it out of a path, and outside one as it is.
+/// takes it out of a path, and either way through [`display::text`], since
+/// the paths in it carry their files' names as whoever made them chose.
 ///
 /// The core names the file an operation failed on as the process sees it,
 /// "writing /run/user/1000/doc/1a2b3c4d/notes.txt.asc.part: No space left on
@@ -1343,7 +1351,7 @@ fn shown_path(sandboxed: bool, path: &Path) -> String {
 /// own, since an error is free text and a path can appear in it anywhere.
 fn shown_error(sandboxed: bool, message: String) -> String {
     if !sandboxed {
-        return message;
+        return display::text(&message);
     }
     let mut shown = String::with_capacity(message.len());
     let mut rest = message.as_str();
@@ -1359,7 +1367,7 @@ fn shown_error(sandboxed: bool, message: String) -> String {
         }
     }
     shown.push_str(rest);
-    shown
+    display::text(&shown)
 }
 
 /// The length of the document-portal folder `text` starts with, if it starts
@@ -2045,13 +2053,16 @@ fn run_decrypt_verify(
 
 /// How a status line names the files a run read. The file names alone: a
 /// status line has no room for two paths, and inside a Flatpak the dialog
-/// shows only the names as well.
+/// shows only the names as well. Through [`display::text`], as in
+/// [`shown_path`].
 fn dv_names(input: Option<&Path>, kind: InputKind, data: Option<&Path>) -> String {
     let name = |path: &Path| {
-        path.file_name()
-            .unwrap_or(path.as_os_str())
-            .to_string_lossy()
-            .into_owned()
+        display::text(
+            &path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy(),
+        )
     };
     match (input, data) {
         (Some(input), Some(data)) if kind == InputKind::DetachedSignature => {
@@ -4838,8 +4849,13 @@ fn land_survey(
     // been overtaken would add it to the line the newer reload leaves, whose
     // own survey adds it again, or to that reload's error; the newer survey
     // finds the damaged files as they are by then.
+    //
+    // The names through display::text, as every file's name is shown: rPGP
+    // names these files by fingerprint, but a file put there by anything else,
+    // a restored backup or another tool, is named by it.
     if !damaged.is_empty() && lock(state).reload_generation == generation {
         let mut status = ui.get_status().to_string();
+        let names: Vec<String> = damaged.iter().map(|name| display::text(name)).collect();
         append_sentence(
             &mut status,
             &format!(
@@ -4847,7 +4863,7 @@ fn land_survey(
                 damaged.len(),
                 if damaged.len() == 1 { "" } else { "s" },
                 if damaged.len() == 1 { "was" } else { "were" },
-                damaged.join(", ")
+                names.join(", ")
             ),
         );
         ui.set_status(status.into());
@@ -5823,6 +5839,18 @@ mod tests {
                 !inside,
                 "the portal's directory is named only outside: {summary}"
             );
+
+            // A name chosen to turn the rest of the line round is written out.
+            let output = saved.join(format!("{inside}\u{202E}.txt"));
+            let (_, outcome) = run_decrypt_verify(&state, "", Some(output));
+            let (summary, _, _) = outcome.expect("the message decrypts");
+            assert!(
+                summary.contains(&format!(
+                    "{inside}[U+202E].txt. The message was not signed."
+                )),
+                "the result: {summary}"
+            );
+            assert!(!summary.contains('\u{202E}'), "the result: {summary}");
         }
     }
 
@@ -5838,6 +5866,79 @@ mod tests {
             "/run/user/1000/doc/1a2b3c4d/notes.txt"
         );
         assert_eq!(shown_path(true, Path::new("/")), "/");
+    }
+
+    /// A file's name is shown with whatever it hides written out, inside a
+    /// Flatpak and out, so a name ending in U+202E cannot turn round the words
+    /// the window puts after it, and one with a newline cannot start a line.
+    /// The dialogs are still given the path as it is, which is what they tell
+    /// one choice from the next by.
+    #[test]
+    fn a_files_name_is_shown_with_what_it_hides_written_out() {
+        let path = Path::new("/run/user/1000/doc/1a2b3c4d/x\u{202E}fdp.exe\nreport");
+        assert_eq!(shown_path(true, path), "x[U+202E]fdp.exe[U+000A]report");
+        assert_eq!(
+            shown_path(false, path),
+            "/run/user/1000/doc/1a2b3c4d/x[U+202E]fdp.exe[U+000A]report"
+        );
+        assert_eq!(
+            dv_names(Some(path), InputKind::Message, None),
+            "x[U+202E]fdp.exe[U+000A]report"
+        );
+        // The portal's folder taken out first, then what the name hides
+        // written out.
+        for (sandboxed, folder) in [(true, ""), (false, "/run/user/1000/doc/1a2b3c4d/")] {
+            let message = format!(
+                "Export failed: writing {}: Permission denied",
+                path.display()
+            );
+            assert_eq!(
+                shown_error(sandboxed, message),
+                format!(
+                    "Export failed: writing {folder}x[U+202E]fdp.exe[U+000A]report: Permission denied"
+                )
+            );
+        }
+
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let input = dir.path().join("x\u{202E}fdp.exe");
+        let (signature, signed) = (
+            dir.path().join("y\u{2067}.sig"),
+            dir.path().join("y\u{2067}"),
+        );
+        for sandboxed in [true, false] {
+            lock(&state).choose_outputs = sandboxed;
+            ui.invoke_open_sign_encrypt();
+            choose_se_input(&ui, &state, input.clone());
+            assert_eq!(ui.get_se_input(), input.display().to_string().as_str());
+            assert!(ui.get_se_input_shown().ends_with("x[U+202E]fdp.exe"));
+            assert!(!ui.get_se_output_encrypt().contains('\u{202E}'));
+            assert!(!ui.get_se_output_sign().contains('\u{202E}'));
+            ui.set_signenc_open(false);
+
+            ui.invoke_open_decrypt_verify();
+            choose_dv_input(&ui, &state, signature.clone(), InputKind::DetachedSignature);
+            choose_dv_data(&ui, &state, signed.clone());
+            assert_eq!(ui.get_dv_input(), signature.display().to_string().as_str());
+            assert_eq!(ui.get_dv_data(), signed.display().to_string().as_str());
+            assert_eq!(lock(&state).dv_input.as_ref(), Some(&signature));
+            assert_eq!(lock(&state).dv_data.as_ref(), Some(&signed));
+            assert!(ui.get_dv_input_shown().ends_with("y[U+2067].sig"));
+            assert!(ui.get_dv_data_shown().ends_with("y[U+2067]"));
+            ui.set_verify_open(false);
+        }
+        assert_eq!(
+            dv_names(
+                Some(&signature),
+                InputKind::DetachedSignature,
+                Some(&signed)
+            ),
+            "y[U+2067].sig against y[U+2067]"
+        );
     }
 
     /// Inside a Flatpak an error keeps everything but the document portal's
@@ -8104,6 +8205,21 @@ mod tests {
             format!("{count}. {notice}"),
             "the damaged file should be named once, after the count"
         );
+
+        // A file put there by something other than rPGP is named by it, and
+        // what its name hides is written out.
+        let again = ask_for_reload(&ui, &state, AfterReload::default());
+        let latest = again.generation;
+        land_reload(&ui, &state, again, read_store(&store));
+        land_survey(
+            &ui,
+            &state,
+            latest,
+            &nothing_in_the_agent,
+            &["backup\u{202E}.pgp".to_string()],
+        );
+        let status = ui.get_status();
+        assert!(status.ends_with("skipped: backup[U+202E].pgp"), "{status}");
     }
 
     /// The notepad's Copy marks what it copies private, a fingerprint's Copy
