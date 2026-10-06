@@ -130,9 +130,11 @@ Komac writes it; the dry run shows it:
 If the dry run shows anything else, run it again with `--output <dir>` in place
 of `--dry-run`, correct the manifests there by hand, and send that directory
 with `komac submit <dir>`, which submits manifests as they stand and analyses
-no installer. Expect the pull request to get the bot's
-`Manifest-Metadata-Consistency` label for the change of installer type, for a
-moderator to clear.
+no installer. The bot's `Manifest-Metadata-Consistency` label goes with a
+comment listing what the published version has and the new one lacks,
+properties or architectures, not with a change of installer type as such. So
+the new manifest keeps every field 0.1.3's had, `Commands` included, and the
+change of installer type is left to the moderator who reviews it.
 
 The hash comes from the signed file, not from Komac. In a directory holding the
 release's `SHA256SUMS` and `SHA256SUMS.asc`:
@@ -148,8 +150,11 @@ exe's bytes exactly, which release.yml checks by installing the setup on its
 runner, so the bare exe's line vouches for what ends up on disk as well.
 
 `manifest/` here holds what was actually submitted, for review before it is sent
-and as the starting point for the next version. Until the next submission that is
-still 0.1.3's portable manifest; replace it with what goes in. Keep
+and as the starting point for the next version: 0.1.4's, the first with the
+installer, submitted as microsoft/winget-pkgs#447335. Those went in without
+Komac: written by hand to the list above, checked with `winget validate
+--manifest` on Windows, and committed, signed, on a branch of a fork of
+winget-pkgs. Replace them with what goes in each time. Keep
 `InstallerSha256` in step with the release's signed `SHA256SUMS` rather than
 recomputing it: pinning the hash that signature covers is the only thread
 connecting a winget install back to key 249738C8641C3359.
