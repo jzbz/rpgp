@@ -151,6 +151,8 @@ export component AppWindow inherits Window {
     in property <bool> choose-outputs: false;
     in-out property <bool> signenc-open: false;
     in property <string> se-input: "";
+    // What the dialog's File field shows; see SignEncryptDialog.
+    in property <string> se-input-shown: root.se-input;
     // Both are supplied so the dialog can preview the right one as the
     // encrypt/sign checkboxes change, without a round trip to Rust.
     in property <string> se-output-encrypt: "";
@@ -169,6 +171,8 @@ export component AppWindow inherits Window {
     in-out property <bool> verify-open: false;
     in property <string> dv-input: "";
     in property <string> dv-data: "";
+    in property <string> dv-input-shown: root.dv-input;
+    in property <string> dv-data-shown: root.dv-data;
     in property <bool> dv-needs-data: false;
     in property <string> dv-output: "";
     in property <[SignatureRow]> dv-signatures;
@@ -963,6 +967,7 @@ export component AppWindow inherits Window {
         busy: root.busy;
         error: root.dialog-error;
         input-path: root.se-input;
+        input-shown: root.se-input-shown;
         choose-output: root.choose-outputs;
         output-encrypt: root.se-output-encrypt;
         output-sign: root.se-output-sign;
@@ -1092,6 +1097,8 @@ export component AppWindow inherits Window {
         busy: root.busy;
         input-path: root.dv-input;
         data-path: root.dv-data;
+        input-shown: root.dv-input-shown;
+        data-shown: root.dv-data-shown;
         needs-data: root.dv-needs-data;
         choose-output: root.choose-outputs;
         output-path: root.dv-output;

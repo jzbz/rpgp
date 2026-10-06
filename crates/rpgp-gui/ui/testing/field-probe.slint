@@ -274,6 +274,9 @@ export component KeygenProbe inherits Probe {
 export component DecryptProbe inherits Probe {
     // The passphrase field is conditional on a file having been chosen.
     in-out property <string> input-path: "/tmp/message.txt";
+    // What the file field shows, which the window sets apart from the path
+    // inside a Flatpak.
+    in-out property <string> input-shown: root.input-path;
     in-out property <int> runs: 0;
     in-out property <string> sent;
 
@@ -283,6 +286,7 @@ export component DecryptProbe inherits Probe {
         width: 100%;
         height: 100%;
         input-path: root.input-path;
+        input-shown: root.input-shown;
         run(password) => {
             root.sent = password;
             root.runs += 1;
@@ -403,6 +407,15 @@ export component OutputProbe inherits Probe {
     in-out property <bool> choose-output: false;
     in-out property <string> encrypted;
     in-out property <string> decrypted;
+    // The chosen files, each as its full path and as its field shows it,
+    // which Rust sets apart inside a Flatpak.
+    in-out property <string> se-input: "/tmp/message.txt";
+    in-out property <string> se-input-shown: root.se-input;
+    in-out property <string> dv-input: "/tmp/message.txt.asc";
+    in-out property <string> dv-input-shown: root.dv-input;
+    in-out property <bool> needs-data: false;
+    in-out property <string> dv-data;
+    in-out property <string> dv-data-shown: root.dv-data;
 
     width: 620px;
     height: 720px;
@@ -410,14 +423,19 @@ export component OutputProbe inherits Probe {
     SignEncryptDialog {
         width: 100%;
         height: 100%;
-        input-path: "/tmp/message.txt";
+        input-path: root.se-input;
+        input-shown: root.se-input-shown;
         choose-output: root.choose-output;
         output-encrypt: root.encrypted;
     }
     DecryptVerifyDialog {
         width: 100%;
         height: 100%;
-        input-path: "/tmp/message.txt.asc";
+        input-path: root.dv-input;
+        input-shown: root.dv-input-shown;
+        needs-data: root.needs-data;
+        data-path: root.dv-data;
+        data-shown: root.dv-data-shown;
         choose-output: root.choose-output;
         output-path: root.decrypted;
     }

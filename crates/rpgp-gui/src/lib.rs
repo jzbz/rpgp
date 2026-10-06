@@ -770,12 +770,17 @@ fn wire_list(ui: &AppWindow, state: &Shared) {
                 let Some(ui) = ui_weak.upgrade() else {
                     return;
                 };
-                let outcome = lock(&state)
-                    .store
-                    .export_file(std::slice::from_ref(&fingerprint), file.path());
+                // The store out from a brief lock, as State::store asks: the
+                // write below goes through the document portal in a Flatpak,
+                // and a portal that stalls must not stall every worker with it.
+                let (store, sandboxed) = {
+                    let state = lock(&state);
+                    (state.store.clone(), state.choose_outputs)
+                };
+                let outcome = store.export_file(std::slice::from_ref(&fingerprint), file.path());
                 ui.set_status(SharedString::from(match outcome {
-                    Ok(()) => format!("Exported to {}", file.path().display()),
-                    Err(e) => format!("Export failed: {e}"),
+                    Ok(()) => format!("Exported to {}", shown_path(sandboxed, file.path())),
+                    Err(e) => shown_error(sandboxed, format!("Export failed: {e}")),
                 }));
             });
         }
@@ -838,7 +843,14 @@ fn finish_import(ui: &AppWindow, state: &Shared, outcome: rpgp_core::Result<Impo
     match outcome {
         Ok(Imported::Done(after)) => reload_after(ui, state, after),
         Ok(Imported::Confirm(file)) => ask_to_store_revocations(ui, state, file),
-        Err(e) => report_and_reload(ui, state, format!("Import failed: {e}")),
+        Err(e) => {
+            let sandboxed = lock(state).choose_outputs;
+            report_and_reload(
+                ui,
+                state,
+                shown_error(sandboxed, format!("Import failed: {e}")),
+            )
+        }
     }
 }
 
@@ -1292,22 +1304,89 @@ fn ask_where_to_save(
     }
 }
 
-/// How the Sign / Encrypt and Decrypt dialogs name the output a run will
-/// write: in full where it is derived beside the input, and by the name alone
-/// where a save dialog will ask for the rest. The folder is then the user's to
-/// choose, and inside a Flatpak the input's own folder is a document-portal
-/// path that names nothing the user could find on the host.
-fn output_preview(state: &State, output: &Path) -> SharedString {
-    if state.choose_outputs {
-        output
-            .file_name()
-            .unwrap_or(output.as_os_str())
+/// How the window names a file the user picked, saved or is about to have
+/// written: in full outside a Flatpak, and by its name alone inside one, which
+/// `sandboxed` says (it is [`State::choose_outputs`]).
+///
+/// Inside the sandbox every such path is the document portal's, of the form
+/// `/run/user/<uid>/doc/<id>/<name>` or `/run/flatpak/doc/<id>/<name>`, which
+/// names one of the portal's folders rather than the one the user chose: the
+/// file they picked in ~/Documents shows up under a random id they have never
+/// seen. The name is the part of it they will recognise. For an output the
+/// folder is the save dialog's to ask for, so the name is all there is to say
+/// beforehand.
+///
+/// For display only. The dialogs are also given the full path, and that is
+/// what tells one chosen file from another: two files of one name from two
+/// folders must still count as a change of input.
+fn shown_path(sandboxed: bool, path: &Path) -> String {
+    if sandboxed {
+        path.file_name()
+            .unwrap_or(path.as_os_str())
             .to_string_lossy()
             .into_owned()
-            .into()
     } else {
-        output.display().to_string().into()
+        path.display().to_string()
     }
+}
+
+/// An error message as the window shows it: inside a Flatpak with each
+/// document-portal folder taken out of the paths in it, as [`shown_path`]
+/// takes it out of a path, and outside one as it is.
+///
+/// The core names the file an operation failed on as the process sees it,
+/// "writing /run/user/1000/doc/1a2b3c4d/notes.txt.asc.part: No space left on
+/// device", and Sequoia quotes it, "Reading \"…\"". The portal's folder is
+/// the one part of that which tells the user nothing; what remains is the
+/// operation, the file's name, staging suffix and all, and the system's
+/// reason. The paths are found by their shape rather than by being the run's
+/// own, since an error is free text and a path can appear in it anywhere.
+fn shown_error(sandboxed: bool, message: String) -> String {
+    if !sandboxed {
+        return message;
+    }
+    let mut shown = String::with_capacity(message.len());
+    let mut rest = message.as_str();
+    while let Some(at) = rest.find("/run/") {
+        shown.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        match portal_folder(tail) {
+            Some(len) => rest = &tail[len..],
+            None => {
+                shown.push_str("/run/");
+                rest = &tail["/run/".len()..];
+            }
+        }
+    }
+    shown.push_str(rest);
+    shown
+}
+
+/// The length of the document-portal folder `text` starts with, if it starts
+/// with one: `/run/flatpak/doc/<id>/`, where the portal is mounted inside the
+/// sandbox, or `/run/user/<uid>/doc/<id>/`, where it is mounted on the host
+/// and where an older portal still points the sandbox. The id is the portal's
+/// own, letters, digits, `_` and `-`, which no other path under /run takes.
+fn portal_folder(text: &str) -> Option<usize> {
+    let after = match text.strip_prefix("/run/flatpak/doc/") {
+        Some(after) => after,
+        None => {
+            let after = text.strip_prefix("/run/user/")?;
+            let uid = after.bytes().take_while(u8::is_ascii_digit).count();
+            if uid == 0 {
+                return None;
+            }
+            after[uid..].strip_prefix("/doc/")?
+        }
+    };
+    let id = after
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+        .count();
+    if id == 0 || after.as_bytes().get(id) != Some(&b'/') {
+        return None;
+    }
+    Some(text.len() - after.len() + id + 1)
 }
 
 // ------------------------------------------------------------- sign / encrypt
@@ -1417,6 +1496,7 @@ fn wire_sign_encrypt(ui: &AppWindow, state: &Shared) {
                         .into(),
                     );
                     let ui_weak = ui.as_weak();
+                    let sandboxed = lock(&state).choose_outputs;
                     std::thread::spawn(move || {
                         let _busy = BusyGuard(ui_weak.clone(), report_in_dialog);
                         let outcome = run_sign_encrypt(
@@ -1436,7 +1516,9 @@ fn wire_sign_encrypt(ui: &AppWindow, state: &Shared) {
                             match outcome {
                                 Ok(output) => {
                                     ui.set_signenc_open(false);
-                                    ui.set_status(format!("Wrote {}", output.display()).into());
+                                    ui.set_status(
+                                        format!("Wrote {}", shown_path(sandboxed, &output)).into(),
+                                    );
                                 }
                                 Err(message) => report_in_dialog(&ui, message),
                             }
@@ -1508,7 +1590,7 @@ fn run_sign_encrypt(
 ) -> Result<PathBuf, String> {
     // Snapshot what is needed and release the lock: everything below is I/O,
     // and a card PIN prompt can hold it for a minute while the UI waits.
-    let (store, input, signers, recipients) = {
+    let (store, input, signers, recipients, sandboxed) = {
         let guard = lock(state);
         (
             guard.store.clone(),
@@ -1520,6 +1602,7 @@ fn run_sign_encrypt(
                 .filter(|r| r.selected)
                 .map(|r| (r.fingerprint.clone(), r.label.clone()))
                 .collect::<Vec<_>>(),
+            guard.choose_outputs,
         )
     };
     let input = input.ok_or_else(|| "Choose a file first".to_string())?;
@@ -1579,7 +1662,7 @@ fn run_sign_encrypt(
             &output,
             existing,
         )
-        .map_err(|e| format!("Encryption failed: {e}"))?;
+        .map_err(|e| shown_error(sandboxed, format!("Encryption failed: {e}")))?;
         Ok(output)
     } else {
         let signer = signer.ok_or_else(|| "Nothing to do: tick Encrypt or Sign".to_string())?;
@@ -1588,7 +1671,7 @@ fn run_sign_encrypt(
             None => (ops::signature_name(&input), Existing::Refuse),
         };
         ops::sign_detached_file(&signer, password, &input, &output, existing)
-            .map_err(|e| format!("Signing failed: {e}"))?;
+            .map_err(|e| shown_error(sandboxed, format!("Signing failed: {e}")))?;
         Ok(output)
     }
 }
@@ -1642,14 +1725,17 @@ fn push_sign_encrypt(ui: &AppWindow, state: &State) {
     ui.set_se_signer_key_ids(signer_key_ids);
 
     ui.set_choose_outputs(state.choose_outputs);
+    let shown = |path: &Path| SharedString::from(shown_path(state.choose_outputs, path));
     match &state.se_input {
         Some(path) => {
             ui.set_se_input(path.display().to_string().into());
-            ui.set_se_output_encrypt(output_preview(state, &ops::encrypted_name(path)));
-            ui.set_se_output_sign(output_preview(state, &ops::signature_name(path)));
+            ui.set_se_input_shown(shown(path));
+            ui.set_se_output_encrypt(shown(&ops::encrypted_name(path)));
+            ui.set_se_output_sign(shown(&ops::signature_name(path)));
         }
         None => {
             ui.set_se_input(SharedString::new());
+            ui.set_se_input_shown(SharedString::new());
             ui.set_se_output_encrypt(SharedString::new());
             ui.set_se_output_sign(SharedString::new());
         }
@@ -1957,8 +2043,9 @@ fn run_decrypt_verify(
     )
 }
 
-/// How a status line names the files a run read. The file names alone: the
-/// dialog shows full paths, and a status line has no room for two of them.
+/// How a status line names the files a run read. The file names alone: a
+/// status line has no room for two paths, and inside a Flatpak the dialog
+/// shows only the names as well.
 fn dv_names(input: Option<&Path>, kind: InputKind, data: Option<&Path>) -> String {
     let name = |path: &Path| {
         path.file_name()
@@ -1991,12 +2078,13 @@ fn decrypt_or_verify(
     chosen: Option<PathBuf>,
 ) -> DvOutcome {
     let input = input.ok_or_else(|| "Choose a file first".to_string())?;
+    let sandboxed = lock(state).choose_outputs;
 
     if kind == InputKind::DetachedSignature {
         let data = data.ok_or_else(|| "Choose the file the signature covers".to_string())?;
 
         let result = ops::verify_detached_files(store, &input, &data)
-            .map_err(|e| format!("Verification failed: {e}"))?;
+            .map_err(|e| shown_error(sandboxed, format!("Verification failed: {e}")))?;
 
         let summary = if result.signatures.is_empty() {
             ("The file contains no signature".to_string(), 2)
@@ -2018,19 +2106,17 @@ fn decrypt_or_verify(
         .into_iter()
         .collect();
     let result = ops::decrypt_file(store, &input, &candidates, &output, existing)
-        .map_err(|e| format!("Decryption failed: {e}"))?;
+        .map_err(|e| shown_error(sandboxed, format!("Decryption failed: {e}")))?;
+    let output = shown_path(sandboxed, &output);
 
     // A message with no encryption layer opens just as cleanly, so saying
     // "Decrypted to" would tell the reader that something which crossed the
     // network in clear arrived confidentially. Say what actually happened,
     // and hold the tone below green whatever the signature turned out to be.
     let written = if result.encrypted {
-        format!("Decrypted to {}", output.display())
+        format!("Decrypted to {output}")
     } else {
-        format!(
-            "This message was not encrypted. Written to {}",
-            output.display()
-        )
+        format!("This message was not encrypted. Written to {output}")
     };
     let summary = if result.signatures.is_empty() {
         (format!("{written}. The message was not signed."), 2)
@@ -2050,19 +2136,20 @@ fn decrypt_or_verify(
 fn push_decrypt_verify(ui: &AppWindow, state: &State) {
     ui.set_dv_needs_data(state.dv_kind == InputKind::DetachedSignature);
 
-    ui.set_dv_input(match &state.dv_input {
-        Some(path) => path.display().to_string().into(),
+    let full = |path: &Option<PathBuf>| match path {
+        Some(path) => SharedString::from(path.display().to_string()),
         None => SharedString::new(),
-    });
-    ui.set_dv_data(match &state.dv_data {
-        Some(path) => path.display().to_string().into(),
+    };
+    let shown = |path: &Option<PathBuf>| match path {
+        Some(path) => SharedString::from(shown_path(state.choose_outputs, path)),
         None => SharedString::new(),
-    });
+    };
+    ui.set_dv_input(full(&state.dv_input));
+    ui.set_dv_input_shown(shown(&state.dv_input));
+    ui.set_dv_data(full(&state.dv_data));
+    ui.set_dv_data_shown(shown(&state.dv_data));
     ui.set_choose_outputs(state.choose_outputs);
-    ui.set_dv_output(match &state.dv_input {
-        Some(path) => output_preview(state, &ops::decrypted_name(path)),
-        None => SharedString::new(),
-    });
+    ui.set_dv_output(shown(&state.dv_input.as_deref().map(ops::decrypted_name)));
 }
 
 // ------------------------------------------------------------ certify / trust
@@ -4008,11 +4095,12 @@ fn wire_revoke(ui: &AppWindow, state: &Shared) {
                 let Some(ui) = ui_weak.upgrade() else {
                     return;
                 };
+                let sandboxed = lock(&state).choose_outputs;
                 ui.set_status(
                     match std::fs::copy(&source, file.path()) {
                         Ok(_) => format!(
                             "Saved to {}. Keep it somewhere you can reach without this key.",
-                            file.path().display()
+                            shown_path(sandboxed, file.path())
                         ),
                         Err(e) => format!("Could not save the revocation certificate: {e}"),
                     }
@@ -5681,6 +5769,121 @@ mod tests {
         )
         .unwrap();
         assert!(flatpak_sandbox(root.path()));
+    }
+
+    /// Inside a Flatpak a result names the file written by its name alone,
+    /// not by the document-portal path the save dialog handed back, which
+    /// names a directory the user has never seen. Outside, it names the path.
+    #[test]
+    fn inside_a_flatpak_a_result_names_the_file_not_the_portal_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let alice = generated("Alice <alice@example.org>").cert;
+        store.insert_secret(&alice).unwrap();
+
+        // Shaped like the paths the portal hands back in the sandbox.
+        let portal = dir.path().join("doc");
+        let (picked, saved) = (portal.join("1a2b3c4d"), portal.join("5e6f7a8b"));
+        std::fs::create_dir_all(&picked).unwrap();
+        std::fs::create_dir_all(&saved).unwrap();
+        let message = picked.join("reply.txt.asc");
+        let mut armored = Vec::new();
+        ops::encrypt(
+            std::slice::from_ref(&alice),
+            &[],
+            None,
+            b"the plaintext",
+            &mut armored,
+        )
+        .unwrap();
+        std::fs::write(&message, armored).unwrap();
+
+        let state = state_for(store);
+        {
+            let mut guard = lock(&state);
+            guard.dv_input = Some(message.clone());
+            guard.dv_kind = InputKind::Message;
+        }
+        for inside in [true, false] {
+            lock(&state).choose_outputs = inside;
+            let output = saved.join(if inside { "inside.txt" } else { "outside.txt" });
+            let (_, outcome) = run_decrypt_verify(&state, "", Some(output.clone()));
+            let (summary, _, _) = outcome.expect("the message decrypts");
+            let named = if inside {
+                "inside.txt".to_string()
+            } else {
+                output.display().to_string()
+            };
+            assert!(
+                summary.starts_with(&format!("Decrypted to {named}.")),
+                "inside a Flatpak: {inside}; the result: {summary}"
+            );
+            assert_eq!(
+                summary.contains(&*saved.to_string_lossy()),
+                !inside,
+                "the portal's directory is named only outside: {summary}"
+            );
+        }
+    }
+
+    /// How a chosen file is named for display: by its name inside a Flatpak,
+    /// and in full outside one. A path with no name to take, which no dialog
+    /// returns, is shown as it is rather than as nothing.
+    #[test]
+    fn a_chosen_file_is_shown_by_name_only_inside_a_flatpak() {
+        let path = Path::new("/run/user/1000/doc/1a2b3c4d/notes.txt");
+        assert_eq!(shown_path(true, path), "notes.txt");
+        assert_eq!(
+            shown_path(false, path),
+            "/run/user/1000/doc/1a2b3c4d/notes.txt"
+        );
+        assert_eq!(shown_path(true, Path::new("/")), "/");
+    }
+
+    /// Inside a Flatpak an error keeps everything but the document portal's
+    /// folders: the operation, the file's name with any staging suffix, the
+    /// quotes Sequoia puts round a path, and the system's reason. A path that
+    /// only resembles the portal's, and every path outside a Flatpak, is left
+    /// as it is.
+    #[test]
+    fn inside_a_flatpak_an_error_names_the_file_without_the_portal_folder() {
+        let shown = |message: &str| shown_error(true, message.to_string());
+        assert_eq!(
+            shown(
+                "Import failed: /run/user/1000/doc/1a2b3c4d/photo.jpg contains no OpenPGP certificates"
+            ),
+            "Import failed: photo.jpg contains no OpenPGP certificates"
+        );
+        assert_eq!(
+            shown(
+                "Encryption failed: writing /run/user/1000/doc/Zz_9-x/notes.txt.asc.part: No space left on device"
+            ),
+            "Encryption failed: writing notes.txt.asc.part: No space left on device"
+        );
+        assert_eq!(
+            shown(
+                "Import failed: Reading \"/run/flatpak/doc/fX_kvZVq4/Lucía's key.asc\": Permission denied"
+            ),
+            "Import failed: Reading \"Lucía's key.asc\": Permission denied"
+        );
+        assert_eq!(
+            shown(
+                "Verification failed: reading /run/flatpak/doc/a1/x.sig and /run/flatpak/doc/b2/x"
+            ),
+            "Verification failed: reading x.sig and x"
+        );
+        for untouched in [
+            "no agent at /run/user/1000/gnupg/S.gpg-agent",
+            "/run/user/doc/1a2b/x",
+            "/run/flatpak/doc/x",
+            "/run/flatpak/doc//x",
+            "/run/user/1000/doc/a.b/x",
+            "/run/",
+        ] {
+            assert_eq!(shown(untouched), untouched);
+        }
+        let outside = "Import failed: /run/user/1000/doc/1a2b3c4d/photo.jpg is empty";
+        assert_eq!(shown_error(false, outside.to_string()), outside);
     }
 
     /// An output chosen in the save dialog is written exactly where it was
@@ -7480,8 +7683,10 @@ mod tests {
 
     /// Inside a Flatpak the Sign / Encrypt and Decrypt dialogs are told that
     /// Run will ask where to save, and are given the output as the file name
-    /// the save dialog will offer. Outside, they are given the path beside the
-    /// input, as they always were.
+    /// the save dialog will offer, and each chosen file to show by its name.
+    /// Outside, they are given the paths, as they always were. Either way they
+    /// are also given each chosen file's full path, which is how they tell one
+    /// choice from the next.
     ///
     /// Inside the sandbox the input is a document-portal path, which names
     /// nothing the user could find on the host, and "Writes" a path beside it
@@ -7499,6 +7704,8 @@ mod tests {
         // Nothing is read from either, so neither needs to exist.
         let portal = dir.path().join("doc").join("1a2b3c4d");
         let (input, message) = (portal.join("notes.txt"), portal.join("reply.txt.asc"));
+        let (signature, signed) = (portal.join("notes.txt.sig"), portal.join("notes.txt"));
+        let full = |path: &Path| SharedString::from(path.display().to_string());
 
         for inside in [true, false] {
             lock(&state).choose_outputs = inside;
@@ -7513,6 +7720,8 @@ mod tests {
             ui.invoke_open_sign_encrypt();
             choose_se_input(&ui, &state, input.clone());
             assert_eq!(ui.get_choose_outputs(), inside);
+            assert_eq!(ui.get_se_input(), full(&input));
+            assert_eq!(ui.get_se_input_shown(), name("notes.txt"));
             assert_eq!(ui.get_se_output_encrypt(), name("notes.txt.asc"));
             assert_eq!(ui.get_se_output_sign(), name("notes.txt.sig"));
             ui.set_signenc_open(false);
@@ -7523,7 +7732,15 @@ mod tests {
             ui.invoke_open_decrypt_verify();
             choose_dv_input(&ui, &state, message.clone(), InputKind::Message);
             assert_eq!(ui.get_choose_outputs(), inside);
+            assert_eq!(ui.get_dv_input(), full(&message));
+            assert_eq!(ui.get_dv_input_shown(), name("reply.txt.asc"));
             assert_eq!(ui.get_dv_output(), name("reply.txt"));
+
+            choose_dv_input(&ui, &state, signature.clone(), InputKind::DetachedSignature);
+            choose_dv_data(&ui, &state, signed.clone());
+            assert_eq!(ui.get_dv_input_shown(), name("notes.txt.sig"));
+            assert_eq!(ui.get_dv_data(), full(&signed));
+            assert_eq!(ui.get_dv_data_shown(), name("notes.txt"));
             ui.set_verify_open(false);
         }
     }

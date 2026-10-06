@@ -809,6 +809,46 @@ fn the_file_dialogs_say_when_run_will_ask_where_to_save() {
     assert!(!says("Writes message.txt.asc") && !says("Writes message.txt"));
 }
 
+/// Inside a Flatpak each file field shows the chosen file by its name, which
+/// Rust gives apart from the path, the document portal's: the file Sign /
+/// Encrypt works on, the message or signature, and the file a detached
+/// signature signs. The paths stay the dialogs' to tell one choice from the
+/// next, and are shown nowhere.
+#[test]
+fn inside_a_flatpak_the_file_fields_show_names_not_portal_paths() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::ElementHandle;
+
+    let probe = OutputProbe::new().unwrap();
+    probe.show().unwrap();
+    let says = |line: &str| {
+        ElementHandle::find_by_accessible_label(&probe, line)
+            .next()
+            .is_some()
+    };
+    let portal = |id: &str, name: &str| format!("/run/user/1000/doc/{id}/{name}");
+    let files = [
+        (portal("1a2b3c4d", "report.pdf"), "report.pdf"),
+        (portal("5e6f7a8b", "report.pdf.sig"), "report.pdf.sig"),
+        (portal("9c0d1e2f", "report-copy.pdf"), "report-copy.pdf"),
+    ];
+
+    // As Rust sets them inside the sandbox.
+    probe.set_choose_output(true);
+    probe.set_se_input(files[0].0.as_str().into());
+    probe.set_se_input_shown(files[0].1.into());
+    probe.set_dv_input(files[1].0.as_str().into());
+    probe.set_dv_input_shown(files[1].1.into());
+    probe.set_needs_data(true);
+    probe.set_dv_data(files[2].0.as_str().into());
+    probe.set_dv_data_shown(files[2].1.into());
+
+    for (path, name) in &files {
+        assert!(says(name), "{name} is not shown");
+        assert!(!says(path), "{path} is shown");
+    }
+}
+
 /// The details pane offers to revoke a key held here until a revocation of it
 /// is hard, and once the key is retired, offers to mark it compromised.
 ///
@@ -1300,6 +1340,49 @@ fn choosing_another_message_empties_the_passphrase_field() {
         "what was typed for the next message should be all that is sent"
     );
     assert_eq!(probe.get_runs(), 3);
+}
+
+/// Inside a Flatpak the file field shows the chosen file's name rather than
+/// the document-portal path it came back as, and the dialog still tells two
+/// files of one name apart: one chosen from another folder empties the
+/// passphrase field as any other choice does, because what is compared is the
+/// path, which differs, and not the name, which does not.
+#[test]
+fn a_file_of_the_same_name_from_another_folder_still_empties_the_passphrase_field() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+
+    const LABEL: &str = "Passphrase for the secret key (if any)";
+    const NAME: &str = "message.txt.asc";
+    const FIRST: &str = "/run/user/1000/doc/1a2b3c4d/message.txt.asc";
+    const SECOND: &str = "/run/user/1000/doc/5e6f7a8b/message.txt.asc";
+    let probe = DecryptProbe::new().unwrap();
+    probe.set_input_path(FIRST.into());
+    probe.set_input_shown(NAME.into());
+    probe.show().unwrap();
+    let shows = |text: &str| ElementHandle::find_by_accessible_label(&probe, text).count() > 0;
+    let field = || control(&probe, LABEL, AccessibleRole::TextInput);
+    let looks_empty = || ElementHandle::find_by_accessible_label(&probe, LABEL).count() == 2;
+    let decrypt = || {
+        control(&probe, "Decrypt", AccessibleRole::Button).invoke_accessible_default_action();
+        probe.get_sent()
+    };
+
+    assert!(shows(NAME), "the field should show the file's name");
+    assert!(!shows(FIRST), "the field should not show the portal's path");
+
+    field().set_accessible_value(PASSPHRASE);
+    assert!(!looks_empty());
+    assert_eq!(decrypt(), PASSPHRASE);
+
+    probe.set_input_path(SECOND.into());
+    slint::platform::update_timers_and_animations();
+    assert!(shows(NAME));
+    assert!(
+        looks_empty(),
+        "a file of the same name from another folder kept the last passphrase"
+    );
+    assert_eq!(decrypt(), "");
 }
 
 /// The suppression has two halves: the binding inside `Field`, which the two
