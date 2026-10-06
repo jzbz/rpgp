@@ -4,7 +4,7 @@
   <id>app.rpgp.rPGP</id>
 
   <name>rPGP</name>
-  <summary>Manage OpenPGP certificates and keys</summary>
+  <summary>Encrypt, sign and manage keys</summary>
 
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
@@ -38,9 +38,10 @@
       authenticates a key</li>
       <li>Revoke keys, user IDs and subkeys, with the consequences spelled
       out</li>
-      <li>Look up and publish keys over WKD and HKPS</li>
-      <li>Use keys held on a smartcard through gpg-agent, so the secret never
-      leaves the card</li>
+      <li>Look up keys over WKD and HKPS, and publish your own to a
+      keyserver</li>
+      <li>Use keys held on a smartcard through the GnuPG agent already on
+      your system, so the secret never leaves the card</li>
     </ul>
     <p>
       Written in Rust throughout, using Sequoia for OpenPGP and Slint for the
@@ -50,26 +51,34 @@
 
   <launchable type="desktop-id">app.rpgp.rPGP.desktop</launchable>
 
+  <!-- Each URL names the commit that last changed the screenshots, not a
+       branch, as Flathub asks: a later retake cannot then change what an
+       older release shows. Retaking them means pointing every URL at the
+       new commit. -->
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/jzbz/rpgp/master/packaging/screenshots/01-main-window.png</image>
-      <caption>The certificate list, with what authenticates the selected key</caption>
+      <image>https://raw.githubusercontent.com/jzbz/rpgp/6ea738cb1d3be122a7c37b12fedcb36534d2da9e/packaging/screenshots/01-main-window.png</image>
+      <caption>The certificate list, with Carol verified through a certification from Trent</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/jzbz/rpgp/master/packaging/screenshots/05-notepad.png</image>
-      <caption>Decrypting and verifying a message as text, without files</caption>
+      <image>https://raw.githubusercontent.com/jzbz/rpgp/6ea738cb1d3be122a7c37b12fedcb36534d2da9e/packaging/screenshots/02-notepad.png</image>
+      <caption>Decrypting a pasted message in the notepad and verifying Bob's signature</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/jzbz/rpgp/master/packaging/screenshots/03-sign-encrypt.png</image>
-      <caption>Signing and encrypting a file to chosen recipients</caption>
+      <image>https://raw.githubusercontent.com/jzbz/rpgp/6ea738cb1d3be122a7c37b12fedcb36534d2da9e/packaging/screenshots/03-sign-encrypt.png</image>
+      <caption>Encrypting a file for Bob and Carol and signing it as Alice</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/jzbz/rpgp/master/packaging/screenshots/02-new-key-pair.png</image>
-      <caption>Generating a key pair to RFC 9580 or RFC 4880</caption>
+      <image>https://raw.githubusercontent.com/jzbz/rpgp/6ea738cb1d3be122a7c37b12fedcb36534d2da9e/packaging/screenshots/04-new-key-pair.png</image>
+      <caption>Creating a passphrase-protected key pair to RFC 9580</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/jzbz/rpgp/master/packaging/screenshots/04-decrypt-verify.png</image>
-      <caption>Decrypting a file and reporting who signed it</caption>
+      <image>https://raw.githubusercontent.com/jzbz/rpgp/6ea738cb1d3be122a7c37b12fedcb36534d2da9e/packaging/screenshots/05-decrypt-verify.png</image>
+      <caption>Decrypting a file and checking that Bob's signature on it is good</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/jzbz/rpgp/6ea738cb1d3be122a7c37b12fedcb36534d2da9e/packaging/screenshots/06-main-window-light.png</image>
+      <caption>The certificate list in the light style</caption>
     </screenshot>
   </screenshots>
 
@@ -101,12 +110,18 @@
     <display_length compare="ge">768</display_length>
   </requires>
 
+  <!-- A store draws the icon on these, so they have to stand apart from its
+       #3457dc tile: a pale tint of it for light, a deep navy for dark. -->
   <branding>
-    <color type="primary" scheme_preference="light">#3457dc</color>
-    <color type="primary" scheme_preference="dark">#6f8dff</color>
+    <color type="primary" scheme_preference="light">#b4c2f7</color>
+    <color type="primary" scheme_preference="dark">#1b2557</color>
   </branding>
 
-  <content_rating type="oars-1.1"/>
+  <!-- Publish sends the certificate, with its names and email addresses, to
+       the keyserver, keys.openpgp.org unless RPGP_KEYSERVER names another. -->
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-contacts">intense</content_attribute>
+  </content_rating>
 
   <releases>
     <release version="0.1.4" date="2026-10-06">
