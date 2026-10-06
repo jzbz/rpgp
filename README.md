@@ -119,16 +119,20 @@ The cask lives in `github.com/jzbz/homebrew-tap`, a tap of this project's own;
 `packaging/homebrew/README.md` says why that rather than homebrew-cask. Whatever
 the route, the signed `SHA256SUMS` on the release is worth checking first.
 
-From the release after 0.1.3, winget installs rPGP through that installer, for
-your account only and without asking for an administrator: rPGP goes in the
-Start Menu and in Apps & Features, Win+R `rpgp` starts it from a normal, not
-elevated, Run box, and `winget uninstall jzbz.rPGP`, with rPGP closed, takes
-all of that away again without touching your certificates or keys. A winget
-install of 0.1.3 or earlier is the bare `.exe` instead, which winget will not
-upgrade to the installer: close rPGP, then run `winget uninstall jzbz.rPGP`
-and `winget install jzbz.rPGP`, once. Your keys stay where they are through
-both, and the new install finds them. `packaging/winget/README.md` has the
-detail.
+From 0.1.4, winget installs rPGP through that installer, for your account only
+and without asking for an administrator: rPGP goes in the Start Menu and in Apps
+& Features, Win+R `rpgp` starts it from a normal, not elevated, Run box, and
+`winget uninstall jzbz.rPGP`, with rPGP closed, takes all of that away again
+without touching your certificates or keys. That starts once winget's community
+repository carries a version with the installer, which follows each release by
+hand and waits on winget's reviewers; until then `winget install jzbz.rPGP`
+gives 0.1.3's bare `.exe`. `winget show jzbz.rPGP` says which: its installer
+type reads `inno` for the installer and `portable` for the bare `.exe`. A winget
+install of 0.1.3 or earlier is the bare `.exe`, which winget will not upgrade to
+the installer: once winget offers the installer, close rPGP, then run
+`winget uninstall jzbz.rPGP` and `winget install jzbz.rPGP`, once. Your keys
+stay where they are through both, and the new install finds them.
+`packaging/winget/README.md` has the detail.
 
 ## Verifying a download
 
