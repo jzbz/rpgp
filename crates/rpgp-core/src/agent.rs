@@ -487,7 +487,7 @@ fn holds(cert: &Cert, held: &[AgentKey]) -> AgentHolds {
 /// certification against the certifier's primary key and nothing else, so a
 /// certification made by a certification subkey on a card counted for nobody.
 /// See [`crate::certify::certify`].
-pub fn certifier_for(cert: &Cert) -> Result<sequoia_gpg_agent::KeyPair> {
+pub fn certifier_for(cert: &Cert) -> Result<AgentSigner> {
     keypair_for(cert, Purpose::Certify)
 }
 
@@ -504,7 +504,7 @@ pub fn certifier_for(cert: &Cert) -> Result<sequoia_gpg_agent::KeyPair> {
 /// `pub(crate)` where its neighbours are `pub`: it is the one entry point here
 /// that does not ask about revocation, and a bypass is not something to offer
 /// outside the crate that decides when it applies.
-pub(crate) fn certification_withdrawer_for(cert: &Cert) -> Result<sequoia_gpg_agent::KeyPair> {
+pub(crate) fn certification_withdrawer_for(cert: &Cert) -> Result<AgentSigner> {
     keypair_for(cert, Purpose::WithdrawCertification)
 }
 
@@ -522,7 +522,7 @@ enum Purpose {
 ///
 /// Prefers a key the agent reports as being on a smartcard, so a certificate
 /// whose secret exists both on a card and in a file signs on the card.
-pub fn signer_for(cert: &Cert) -> Result<sequoia_gpg_agent::KeyPair> {
+pub fn signer_for(cert: &Cert) -> Result<AgentSigner> {
     keypair_for(cert, Purpose::Sign)
 }
 
@@ -531,13 +531,16 @@ pub fn signer_for(cert: &Cert) -> Result<sequoia_gpg_agent::KeyPair> {
 ///
 /// This does not move any PIN prompt: the agent asks when the returned keypair
 /// is *used*, not when it is built.
-fn keypair_for(cert: &Cert, purpose: Purpose) -> Result<sequoia_gpg_agent::KeyPair> {
+fn keypair_for(cert: &Cert, purpose: Purpose) -> Result<AgentSigner> {
     // Ahead of `keys()`, which is what opens the socket: a request that is going
     // to be refused should not enumerate the agent's keys first, and should fail
     // saying the certificate is revoked rather than saying whatever the agent
     // says when it is not running at all.
     refuse_if_revoked_for(cert, purpose)?;
-    signer(cert, &select_key(cert, purpose, &keys()?)?)
+    Ok(AgentSigner {
+        pair: signer(cert, &select_key(cert, purpose, &keys()?)?)?,
+        name: crate::revoke::name_of(cert),
+    })
 }
 
 /// Refuses `cert` when `purpose` is new use of a key its owner has withdrawn.
@@ -842,20 +845,22 @@ fn could_open(key: &Key<PublicParts, UnspecifiedRole>, pkesk: &PKESK) -> bool {
 
 /// What the agent said, when `error` came from it: a cancelled PIN or
 /// passphrase prompt, a card that is not there, no pinentry to ask with, a
-/// decryption it turned down, or a connection that failed.
+/// decryption or a signature it turned down, or a connection that failed.
 ///
-/// `None` for everything else, which is a key that did not fit: sequoia-ipc
-/// finishing the decryption on this side and finding the result is not a
-/// session key. That is kept quiet, as Sequoia keeps it, because saying which
-/// check a packet failed tells whoever made it something about the key.
+/// `None` for everything else. For a decryption that is a key that did not
+/// fit: sequoia-ipc finishing the decryption on this side and finding the
+/// result is not a session key. That is kept quiet, as Sequoia keeps it,
+/// because saying which check a packet failed tells whoever made it something
+/// about the key. For a signature ([`AgentSigner`]) it is a failure on this
+/// side of the socket, which is handed back to Sequoia as it was.
 ///
 /// The agent's own words, and not a kind of refusal read out of them:
 /// sequoia-gpg-agent 0.6.2 keeps the text of the Assuan `ERR` line and drops
-/// its code (`KeyPair::decrypt_async` through `Agent::operation_failed`), and
-/// the text is gpg-agent's `gpg_strerror`, which it translates into the user's
-/// language. So a cancelled prompt cannot be told apart from a card that could
-/// not use one packet, and matching on "Operation cancelled" would work only
-/// in English.
+/// its code (`KeyPair::decrypt_async` and `KeyPair::sign_async`, through
+/// `Agent::operation_failed`), and the text is gpg-agent's `gpg_strerror`,
+/// which it translates into the user's language. So a cancelled prompt cannot
+/// be told apart from a card that could not use one packet, and matching on
+/// "Operation cancelled" would work only in English.
 ///
 /// The code is there to be had by asking another way: `Agent` is also a
 /// stream of the agent's responses, and an `ERR` read from it keeps its code.
@@ -863,15 +868,96 @@ fn could_open(key: &Key<PublicParts, UnspecifiedRole>, pkesk: &PKESK) -> bool {
 /// cancelled prompt from the rest and lift the rule that the first refusal
 /// ends a decryption. It needs the `Stream` trait, and so futures-core as a
 /// dependency of this crate, which it does not have today.
+///
+/// One answer is put another way, the one in [`NO_TERMINAL`], because the
+/// agent's words for it point nowhere near what is wrong.
 pub(crate) fn refusal(error: &anyhow::Error) -> Option<String> {
     use sequoia_gpg_agent::assuan;
 
     Some(match error.downcast_ref::<sequoia_gpg_agent::Error>()? {
+        sequoia_gpg_agent::Error::Assuan(assuan::Error::OperationFailed(message))
+            if message == NO_TERMINAL =>
+        {
+            NO_TERMINAL_REASON.to_owned()
+        }
         sequoia_gpg_agent::Error::Assuan(assuan::Error::OperationFailed(message)) => {
             message.clone()
         }
         other => other.to_string(),
     })
+}
+
+/// What gpg-agent answers when its pinentry asks in a terminal and the client
+/// has none: `ERR 83918950`, GPG_ERR_ENOTTY from the pinentry, in the words
+/// gpg-agent 2.4 gives it in English and in the C locale.
+///
+/// A terminal pinentry, `pinentry-curses` most often, is one gpg-agent.conf
+/// names or the one the system's GnuPG uses when it names none. From a shell
+/// it works, since `gpg` hands the agent its terminal with `GPG_TTY`.
+/// sequoia-gpg-agent hands on `GPG_TTY` too, or else the terminal on standard
+/// input, and rPGP started from the desktop has neither, so there every PIN or
+/// passphrase prompt fails this way, and the words name an ioctl.
+///
+/// Matched as the whole message, because only the words reach rPGP (see
+/// [`refusal`]), and in English only: gpg-agent words the answer in the
+/// user's language, and there it is passed on as it came. `pinentry-tty`
+/// fails differently, as "Operation cancelled", which is also what pressing
+/// Cancel says, so that one cannot be told apart and is passed on too.
+const NO_TERMINAL: &str = "Inappropriate ioctl for device <Pinentry>";
+
+/// [`NO_TERMINAL`] put the way the user can act on, which the README spells
+/// out with the command that reloads the agent.
+pub const NO_TERMINAL_REASON: &str = "its pinentry asks in a terminal, which rPGP does not \
+     have: set pinentry-program in gpg-agent.conf to a graphical pinentry and reload the agent";
+
+/// An agent keypair that signs or certifies, and that says what the agent
+/// said when it would not.
+///
+/// sequoia-gpg-agent's `KeyPair` fails a signature with its own error, which
+/// Sequoia carries out of the signing stream or the signature builder
+/// unchanged, and which then read "OpenPGP operation failed: Operation
+/// failed:" ahead of the agent's words. A decryption reports a refusal as
+/// [`Error::AgentRefused`] (see `through_agent` in `ops.rs`); this does the
+/// same for every signature the agent makes, and [`Error`]'s conversion from
+/// Sequoia's error takes it out again.
+pub struct AgentSigner {
+    pair: KeyPair,
+    /// Whose key it is, as [`Error::AgentRefused`] names it.
+    name: String,
+}
+
+impl sequoia_openpgp::crypto::Signer for AgentSigner {
+    fn public(&self) -> &Key<PublicParts, UnspecifiedRole> {
+        self.pair.public()
+    }
+
+    fn acceptable_hashes(&self) -> &[sequoia_openpgp::types::HashAlgorithm] {
+        self.pair.acceptable_hashes()
+    }
+
+    fn sign(
+        &mut self,
+        hash_algo: sequoia_openpgp::types::HashAlgorithm,
+        digest: &[u8],
+    ) -> sequoia_openpgp::Result<sequoia_openpgp::crypto::mpi::Signature> {
+        self.pair
+            .sign(hash_algo, digest)
+            .map_err(|error| refused(&self.name, error))
+    }
+}
+
+/// `error` from the agent's keypair for `name`'s key, as [`AgentSigner`]
+/// hands it to Sequoia: the agent's answer as [`Error::AgentRefused`] when
+/// there is one, and otherwise `error` as it was.
+fn refused(name: &str, error: anyhow::Error) -> anyhow::Error {
+    match refusal(&error) {
+        Some(reason) => Error::AgentRefused {
+            name: name.to_owned(),
+            reason,
+        }
+        .into(),
+        None => error,
+    }
 }
 
 #[cfg(test)]
@@ -1601,5 +1687,118 @@ mod tests {
             found.keygrip,
             found.card_serial
         );
+    }
+
+    /// What sequoia-gpg-agent 0.6.2 makes of an Assuan ERR line saying
+    /// `words`.
+    fn agent_error(words: &str) -> anyhow::Error {
+        sequoia_gpg_agent::Error::from(sequoia_gpg_agent::assuan::Error::OperationFailed(
+            words.into(),
+        ))
+        .into()
+    }
+
+    /// A signer that fails as [`AgentSigner`] does when the agent turns a
+    /// signature down with `words`, for a key it does not need to hold.
+    struct TurnedDown {
+        key: Key<PublicParts, UnspecifiedRole>,
+        words: &'static str,
+    }
+
+    impl sequoia_openpgp::crypto::Signer for TurnedDown {
+        fn public(&self) -> &Key<PublicParts, UnspecifiedRole> {
+            &self.key
+        }
+
+        fn sign(
+            &mut self,
+            _: sequoia_openpgp::types::HashAlgorithm,
+            _: &[u8],
+        ) -> sequoia_openpgp::Result<sequoia_openpgp::crypto::mpi::Signature> {
+            Err(refused(
+                "Alice <alice@example.org>",
+                agent_error(self.words),
+            ))
+        }
+    }
+
+    /// gpg-agent with a terminal pinentry, asked by a program with no
+    /// terminal, answers that an ioctl was inappropriate, which says nothing
+    /// a user could act on. It is put as what to change; the agent's other
+    /// answers, and this one in another language, are passed on as they came.
+    #[test]
+    fn a_pinentry_that_needs_a_terminal_is_named_for_what_it_is() {
+        assert_eq!(
+            refusal(&agent_error("Inappropriate ioctl for device <Pinentry>")).as_deref(),
+            Some(NO_TERMINAL_REASON)
+        );
+        for words in [
+            "Operation cancelled <Pinentry>",
+            // The same answer from scdaemon, which is not about a prompt.
+            "Inappropriate ioctl for device <SCD>",
+            // As an agent running in German words it: glibc's strerror, and
+            // libgpg-error's name for the source, which German keeps.
+            "Unpassender IOCTL (I/O-Control) für das Gerät <Pinentry>",
+        ] {
+            assert_eq!(refusal(&agent_error(words)).as_deref(), Some(words));
+        }
+        assert_eq!(refusal(&anyhow::anyhow!("not from the agent")), None);
+    }
+
+    /// A signature the agent turns down comes back from Sequoia, through the
+    /// signature builder and through the signing stream, as the agent's
+    /// refusal, as a decryption's does, and not as "OpenPGP operation failed:
+    /// Operation failed:" ahead of the agent's words.
+    #[test]
+    fn a_signature_the_agent_turns_down_is_reported_as_its_refusal() {
+        use sequoia_openpgp::packet::signature::SignatureBuilder;
+        use sequoia_openpgp::serialize::stream::{Message, Signer};
+        use sequoia_openpgp::types::SignatureType;
+
+        let alice = generated("Alice <alice@example.org>");
+        let key = alice.primary_key().key().clone().role_into_unspecified();
+        let turned_down = || TurnedDown {
+            key: key.clone(),
+            words: "Inappropriate ioctl for device <Pinentry>",
+        };
+        let is_the_refusal = |error: Error| match &error {
+            Error::AgentRefused { name, reason } => {
+                assert_eq!(name, "Alice <alice@example.org>");
+                assert_eq!(reason, NO_TERMINAL_REASON);
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("gpg-agent: its pinentry asks in a terminal"),
+                    "{error}"
+                );
+            }
+            other => panic!("not reported as the agent's refusal: {other}"),
+        };
+
+        let built = SignatureBuilder::new(SignatureType::Binary)
+            .sign_message(&mut turned_down(), b"to be signed")
+            .expect_err("signed although the agent turned it down");
+        is_the_refusal(Error::from(built));
+
+        let mut sink = Vec::new();
+        let mut stream = Signer::new(Message::new(&mut sink), turned_down())
+            .unwrap()
+            .detached()
+            .build()
+            .unwrap();
+        std::io::Write::write_all(&mut stream, b"to be signed").unwrap();
+        let streamed = stream
+            .finalize()
+            .expect_err("signed although the agent turned it down");
+        is_the_refusal(Error::from(streamed));
+
+        // What did not come from the agent is left as Sequoia's error.
+        assert!(matches!(
+            Error::from(refused(
+                "Alice <alice@example.org>",
+                anyhow::anyhow!("not the agent")
+            )),
+            Error::OpenPgp(_)
+        ));
     }
 }

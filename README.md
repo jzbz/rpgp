@@ -566,6 +566,22 @@ passphrase prompt says is rPGP's to give, and it gives what GnuPG's own does:
 the certificate's primary user ID, the key's ID, and for a subkey the primary
 key's ID too.
 
+A pinentry that asks in a terminal, `pinentry-curses` or `pinentry-tty`, cannot
+ask for rPGP started from the desktop. `gpg` hands the agent the terminal it
+runs in, through `GPG_TTY`, and `sequoia-gpg-agent` hands on `GPG_TTY` or the
+terminal on standard input; rPGP started from the desktop has neither, so every
+PIN or passphrase prompt the agent puts up for it fails at once. For
+`pinentry-curses` the agent answers "Inappropriate ioctl for device <Pinentry>",
+which rPGP reports as a pinentry that asks in a terminal; for `pinentry-tty` it
+answers "Operation cancelled", which cannot be told from pressing Cancel. Where
+gpg-agent runs in a language other than English, its words are passed on as it
+gave them. The cure is a graphical pinentry, such as `pinentry-qt` or
+`pinentry-gnome3` on Linux and `pinentry-mac` on macOS: name it with
+`pinentry-program` in `gpg-agent.conf` in the GnuPG home, `~/.gnupg` unless
+`GNUPGHOME` says otherwise, and run `gpgconf --reload gpg-agent`. For the
+Flatpak that is the host's `gpg-agent.conf`, since the prompt is the host
+agent's.
+
 Certifying takes the certificate's primary key, so **Certify identity…** is
 offered once some key's primary can sign: its secret is in rPGP's store, as key
 material rather than the stub GnuPG exports in place of a primary kept offline

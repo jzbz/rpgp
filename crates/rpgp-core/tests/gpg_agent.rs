@@ -9,8 +9,9 @@
 //! the agent rpgp-core asks is chosen for the whole process.
 //!
 //! The agent is told never to start scdaemon, so nothing here opens a card
-//! reader, and to prompt through a stand-in pinentry that always answers
-//! Cancel and counts how often it was asked. Keys go in without a passphrase
+//! reader, and to prompt through a stand-in pinentry that turns every prompt
+//! down, with Cancel unless a test picks another answer, and counts how often
+//! it was asked. Keys go in without a passphrase
 //! unless a test wants the prompt.
 //!
 //! Where GnuPG is not installed they skip rather than fail, unless
@@ -45,20 +46,30 @@ use sequoia_openpgp::{Cert, Fingerprint, Packet, PacketPile};
 
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
-/// A pinentry whose user presses Cancel every time, and which writes a line to
-/// `LOG` each time it is asked for a PIN or passphrase, and to `@DESC@` the
-/// description the agent gives it for each prompt, as the agent sent it.
+/// A pinentry that turns down every request for a PIN or passphrase with
+/// `@ANSWER@`, an Assuan `ERR` line, and which writes a line to `LOG` each
+/// time it is asked, and to `@DESC@` the description the agent gives it for
+/// each prompt, as the agent sent it.
 const PINENTRY: &str = r#"#!/bin/sh
 echo "OK Pleased to meet you"
 while IFS= read -r line; do
   case "$line" in
-    GETPIN*) echo asked >> 'LOG'; echo "ERR 83886179 Operation cancelled <Pinentry>" ;;
+    GETPIN*) echo asked >> 'LOG'; echo "@ANSWER@" ;;
     SETDESC\ *) printf '%s\n' "${line#SETDESC }" >> '@DESC@'; echo "OK" ;;
     BYE*) echo "OK closing connection"; exit 0 ;;
     *) echo "OK" ;;
   esac
 done
 "#;
+
+/// What the stand-in pinentry answers when its user presses Cancel:
+/// GPG_ERR_CANCELED from the pinentry.
+const CANCELLED: &str = "ERR 83886179 Operation cancelled <Pinentry>";
+
+/// What pinentry-curses answers when it has no terminal to draw in, as when a
+/// program started from the desktop asks for a prompt: GPG_ERR_ENOTTY from the
+/// pinentry. The real one answers this, run that way.
+const NO_TERMINAL: &str = "ERR 83918950 Inappropriate ioctl for device <Pinentry>";
 
 /// A gpg-agent of the test's own, which rpgp-core asks until it is dropped.
 struct Throwaway {
@@ -71,9 +82,15 @@ struct Throwaway {
 }
 
 impl Throwaway {
-    /// Start an agent in a fresh temporary home, or `None` where GnuPG is not
-    /// installed.
+    /// Start an agent in a fresh temporary home, whose pinentry's user
+    /// presses Cancel at every prompt, or `None` where GnuPG is not installed.
     fn start() -> Option<Self> {
+        Self::start_answering(CANCELLED)
+    }
+
+    /// [`Throwaway::start`], with a pinentry that turns every prompt down with
+    /// `answer` instead.
+    fn start_answering(answer: &str) -> Option<Self> {
         let one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
         let ctx = match Context::ephemeral() {
             Ok(ctx) => ctx,
@@ -90,6 +107,7 @@ impl Throwaway {
         std::fs::write(
             &pinentry,
             PINENTRY
+                .replace("@ANSWER@", answer)
                 .replace("LOG", &pinentry_log.display().to_string())
                 .replace("@DESC@", &descriptions.display().to_string()),
         )
@@ -155,6 +173,38 @@ impl Throwaway {
     fn descriptions(&self) -> Vec<String> {
         let log = std::fs::read_to_string(&self.descriptions).unwrap_or_default();
         log.lines().map(unescape).collect()
+    }
+
+    /// What the agent itself says when its pinentry turns a prompt down,
+    /// asked for a passphrase directly: the words of its `ERR` line, in the
+    /// language the agent runs in.
+    fn answer_to_a_prompt(&self) -> String {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut agent = Agent::connect_to(self.home()).await.unwrap();
+            let asked = agent
+                .get_passphrase(
+                    &Some("rpgp-test".into()),
+                    &None,
+                    None,
+                    None,
+                    false,
+                    0,
+                    false,
+                    false,
+                    |_, _| Ok(None),
+                )
+                .await;
+            match asked {
+                Err(sequoia_gpg_agent::Error::Assuan(
+                    sequoia_gpg_agent::assuan::Error::OperationFailed(words),
+                )) => words,
+                other => panic!("the prompt was not turned down: {other:?}"),
+            }
+        })
     }
 }
 
@@ -455,6 +505,83 @@ fn a_cancelled_prompt_is_the_answer_and_is_not_put_up_again() {
         other => panic!("reported as something other than the agent refusing: {other}"),
     }
     assert!(refused.to_string().starts_with("gpg-agent: "), "{refused}");
+}
+
+/// A pinentry that needs a terminal, asked through the agent by a program
+/// that has none, as pinentry-curses is when rPGP is started from the
+/// desktop: the agent answers that an ioctl was inappropriate. Signing,
+/// certifying and decrypting each report that as the agent's refusal, put as
+/// what to change where the agent answered in English, and in the agent's own
+/// words where it answered in another language. Signing and certifying used to
+/// read "OpenPGP operation failed: Operation failed:" ahead of the words.
+#[test]
+fn a_pinentry_that_needs_a_terminal_is_reported_as_what_to_change() {
+    let Some(agent_home) = Throwaway::start_answering(NO_TERMINAL) else {
+        return;
+    };
+    let alice = key("Alice <alice@example.org>", Some("alice's passphrase"));
+    let bob = key("Bob <bob@example.org>", None);
+    agent_home.give(&alice);
+    let dir = tempfile::tempdir().unwrap();
+    let store = public_store(&dir, &[&alice, &bob]);
+    let public = store.lookup(&alice.fingerprint().to_hex()).unwrap();
+    assert!(!public.is_tsk(), "premise: no secret here but the agent's");
+
+    // In another language the agent's words pass through as they came, so a
+    // developer's locale decides which of the two this checks. CI's agent
+    // answers in English, and there it has to be the first, or a change in
+    // gpg-agent's wording would leave the mapping unchecked with every
+    // assertion below still passing.
+    let words = agent_home.answer_to_a_prompt();
+    if std::env::var_os("RPGP_TEST_REQUIRE_GPG_AGENT").is_some_and(|v| !v.is_empty()) {
+        assert_eq!(
+            words, "Inappropriate ioctl for device <Pinentry>",
+            "gpg-agent no longer words a pinentry with no terminal as agent.rs expects"
+        );
+    }
+    let expected = match words {
+        words if words == "Inappropriate ioctl for device <Pinentry>" => {
+            agent::NO_TERMINAL_REASON.to_owned()
+        }
+        words => words,
+    };
+    let is_the_refusal = |what: &str, error: Error| match &error {
+        Error::AgentRefused { name, reason } => {
+            assert_eq!(name, "Alice <alice@example.org>", "{what}");
+            assert_eq!(reason, &expected, "{what}");
+            assert!(
+                error.to_string().starts_with("gpg-agent: "),
+                "{what}: {error}"
+            );
+        }
+        other => panic!("{what} was not reported as the agent's refusal: {other}"),
+    };
+
+    let signed = ops::sign_detached(&public, None, b"to be signed", Vec::new())
+        .expect_err("signed with no terminal for the prompt");
+    is_the_refusal("signing", signed);
+
+    let mut request = rpgp_core::certify::CertifyRequest::new(
+        alice.fingerprint().to_hex(),
+        bob.fingerprint().to_hex(),
+    );
+    request.user_ids = vec!["Bob <bob@example.org>".to_string()];
+    let certified = rpgp_core::certify::certify(&store, &request)
+        .expect_err("certified with no terminal for the prompt");
+    is_the_refusal("certifying", certified);
+
+    let mut ciphertext = Vec::new();
+    ops::encrypt(
+        std::slice::from_ref(&alice),
+        &[],
+        None,
+        b"for alice",
+        &mut ciphertext,
+    )
+    .unwrap();
+    let decrypted = ops::decrypt(&store, &ciphertext, &[], &mut Vec::new())
+        .expect_err("opened with no terminal for the prompt");
+    is_the_refusal("decrypting", decrypted);
 }
 
 /// Signing and certifying through the agent, with a key whose secret is only

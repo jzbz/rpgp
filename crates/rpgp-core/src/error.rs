@@ -4,8 +4,10 @@
 /// wrapper that keeps the original chain intact for the details pane.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Made by `?` on Sequoia's errors, through the conversion below, which
+    /// takes a refusal from gpg-agent out first.
     #[error("OpenPGP operation failed: {0:#}")]
-    OpenPgp(#[from] anyhow::Error),
+    OpenPgp(#[source] anyhow::Error),
 
     #[error("{context}: {source}")]
     Io {
@@ -63,20 +65,24 @@ pub enum Error {
     #[error("{name} has been revoked — {reason}")]
     Revoked { name: String, reason: String },
 
-    /// gpg-agent was asked to decrypt with a key it holds, and did not.
+    /// gpg-agent was asked to decrypt, sign or certify with a key it holds,
+    /// and did not.
     ///
     /// `reason` is the agent's own answer as it gave it, such as "Operation
     /// cancelled <Pinentry>" when the user pressed Cancel, or what scdaemon
     /// said about a card that was not there, or else why the agent could not
     /// be reached. It is not sorted into kinds, because sequoia-gpg-agent
     /// passes on the words of the answer and not its code, and gpg-agent words
-    /// it in the user's language. `name` is whose key the agent was asked
-    /// about, as [`Error::Revoked`] names one.
+    /// it in the user's language. The one exception is an agent whose
+    /// pinentry needs a terminal, which `reason` says in so many words, when
+    /// the agent answered in English (see `agent::NO_TERMINAL`). `name` is
+    /// whose key the agent was asked about, as [`Error::Revoked`] names one.
     ///
     /// The reason comes first because the status bar elides what goes past
     /// its last line, and the reason is what the user acts on. It used to be
     /// dropped altogether, and the decryption reported that no secret key
-    /// opened the message.
+    /// opened the message; a signature or a certification read "OpenPGP
+    /// operation failed: Operation failed:" ahead of it.
     #[error("gpg-agent: {reason} (the key of {name})")]
     AgentRefused { name: String, reason: String },
 
@@ -230,6 +236,24 @@ fn key_locked(name: &str, tried: bool, or_password: bool) -> String {
             "this message is for a passphrase-protected key and a password, and what was \
              entered neither unlocks the key nor opens the message ({name})"
         ),
+    }
+}
+
+/// Sequoia's error as this crate's: [`Error::OpenPgp`], unless it carries a
+/// refusal from gpg-agent.
+///
+/// [`crate::agent::AgentSigner`] makes a signature that the agent turns down
+/// fail with [`Error::AgentRefused`], and Sequoia hands that back from the
+/// signing stream or the signature builder inside its `anyhow::Error`. Left
+/// there, it would read "OpenPGP operation failed:" ahead of "gpg-agent:",
+/// as the agent's answer did before it was named a refusal at all. Every
+/// other error is kept whole, its chain included.
+impl From<anyhow::Error> for Error {
+    fn from(error: anyhow::Error) -> Self {
+        match error.downcast_ref::<Error>() {
+            Some(Error::AgentRefused { .. }) => error.downcast().unwrap_or_else(Error::OpenPgp),
+            _ => Error::OpenPgp(error),
+        }
     }
 }
 
