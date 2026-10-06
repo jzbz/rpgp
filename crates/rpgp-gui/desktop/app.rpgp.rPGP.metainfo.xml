@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Copyright 2026 Jonathan Zeppettini -->
 <component type="desktop-application">
-  <id>app.rpgp.rpgp</id>
+  <id>app.rpgp.rPGP</id>
 
   <name>rPGP</name>
   <summary>Manage OpenPGP certificates and keys</summary>
@@ -48,7 +48,7 @@
     </p>
   </description>
 
-  <launchable type="desktop-id">app.rpgp.rpgp.desktop</launchable>
+  <launchable type="desktop-id">app.rpgp.rPGP.desktop</launchable>
 
   <screenshots>
     <screenshot type="default">

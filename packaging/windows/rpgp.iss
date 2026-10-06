@@ -76,7 +76,7 @@ SetupArchitecture=x64
 ; let Windows 7 install a program that cannot start there.
 MinVersion=10.0
 
-SetupIconFile=..\..\crates\rpgp-gui\desktop\app.rpgp.rpgp.ico
+SetupIconFile=..\..\crates\rpgp-gui\desktop\app.rpgp.rPGP.ico
 WizardStyle=modern dynamic
 ; The default, written out because the installer's bytes depend on it, and
 ; the release checks that two compiles of the same exe come out identical.

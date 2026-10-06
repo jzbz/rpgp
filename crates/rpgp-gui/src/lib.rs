@@ -292,9 +292,9 @@ fn lock(state: &Shared) -> std::sync::MutexGuard<'_, State> {
 
 // ------------------------------------------------------------------ renderer
 
-/// Matches the basename of `desktop/app.rpgp.rpgp.desktop`, which is how a
+/// Matches the basename of `desktop/app.rpgp.rPGP.desktop`, which is how a
 /// Wayland compositor finds the icon for this window.
-const APP_ID: &str = "app.rpgp.rpgp";
+const APP_ID: &str = "app.rpgp.rPGP";
 
 /// Clears the busy flag if a worker thread panics.
 ///
@@ -5059,7 +5059,7 @@ pub fn run_app() -> ExitCode {
     //
     // On Wayland an application cannot set its own taskbar icon at all. The
     // compositor matches this id against an installed .desktop file and takes
-    // the Icon= from there, so this and desktop/app.rpgp.rpgp.desktop have to
+    // the Icon= from there, so this and desktop/app.rpgp.rPGP.desktop have to
     // agree or the window gets a generic placeholder.
     if let Err(e) = slint::set_xdg_app_id(APP_ID) {
         eprintln!("rpgp: could not set the application id: {e}");
@@ -5677,7 +5677,7 @@ mod tests {
         assert!(!flatpak_sandbox(root.path()));
         std::fs::write(
             root.path().join(".flatpak-info"),
-            b"[Application]\nname=app.rpgp.rpgp\n",
+            b"[Application]\nname=app.rpgp.rPGP\n",
         )
         .unwrap();
         assert!(flatpak_sandbox(root.path()));

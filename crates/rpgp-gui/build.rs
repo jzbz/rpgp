@@ -82,10 +82,10 @@ fn windows_resources() {
         return;
     }
     println!("cargo:rerun-if-changed=rpgp.exe.manifest");
-    println!("cargo:rerun-if-changed=desktop/app.rpgp.rpgp.ico");
+    println!("cargo:rerun-if-changed=desktop/app.rpgp.rPGP.ico");
 
     let mut resource = winresource::WindowsResource::new();
-    resource.set_icon("desktop/app.rpgp.rpgp.ico");
+    resource.set_icon("desktop/app.rpgp.rPGP.ico");
     resource.set_manifest_file("rpgp.exe.manifest");
     // Shown on Explorer's Details tab. FileDescription is what Task Manager
     // lists the process as, so it is the name a user looks for, not "rpgp.exe".

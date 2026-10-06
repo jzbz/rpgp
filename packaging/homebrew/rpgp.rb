@@ -46,7 +46,7 @@ cask "rpgp" do
   # certificates. Removing it is a decision for the person, not for a package
   # manager flag.
   zap trash: [
-    "~/Library/Saved Application State/app.rpgp.rpgp.savedState",
+    "~/Library/Saved Application State/app.rpgp.rPGP.savedState",
   ]
 
   caveats <<~EOS

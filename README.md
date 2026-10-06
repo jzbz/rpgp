@@ -674,11 +674,11 @@ files instead. A private CA reaches the Flatpak through `SSL_CERT_FILE`, from a
 place the sandbox can read:
 
 ```bash
-mkdir -p ~/.var/app/app.rpgp.rpgp/config
-cp corp-ca.pem ~/.var/app/app.rpgp.rpgp/config/
+mkdir -p ~/.var/app/app.rpgp.rPGP/config
+cp corp-ca.pem ~/.var/app/app.rpgp.rPGP/config/
 flatpak override --user \
-  --env=SSL_CERT_FILE=$HOME/.var/app/app.rpgp.rpgp/config/corp-ca.pem \
-  app.rpgp.rpgp
+  --env=SSL_CERT_FILE=$HOME/.var/app/app.rpgp.rPGP/config/corp-ca.pem \
+  app.rpgp.rPGP
 ```
 
 What a WKD host serves is kept only where it **carries the address that was
@@ -782,13 +782,13 @@ app:
     $XDG_DATA_HOME/pgp.cert.d          (override with RPGP_CERT_STORE)
 
 That sharing is a property of a native build. The Flatpak keeps its store inside
-`~/.var/app/app.rpgp.rpgp/data` and shares it with nothing: `XDG_DATA_HOME`
+`~/.var/app/app.rpgp.rPGP/data` and shares it with nothing: `XDG_DATA_HOME`
 points into the sandbox there, and Flathub does not grant access to the real one
 without an exception.
 
 `RPGP_CERT_STORE` moves the public certificates and nothing else, so it cannot
 make the two builds share one store. A native build pointed at the Flatpak's
-`~/.var/app/app.rpgp.rpgp/data/pgp.cert.d`, which it can reach as it is, lists
+`~/.var/app/app.rpgp.rPGP/data/pgp.cert.d`, which it can reach as it is, lists
 the certificates the Flatpak does, though no longer the ones `sq` uses. Secret
 keys, the revocation certificates and the lists of trust roots, of imported
 keys and of certificates you accept SHA-1 from stay with each build, in its

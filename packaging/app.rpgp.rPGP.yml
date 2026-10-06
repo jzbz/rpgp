@@ -3,7 +3,7 @@
 # Flathub builds with no network access, so every crate is declared up front in
 # cargo-sources.json (generated from Cargo.lock by packaging/cargo-sources.py)
 # and cargo runs --offline against a vendored registry.
-app-id: app.rpgp.rpgp
+app-id: app.rpgp.rPGP
 runtime: org.freedesktop.Platform
 runtime-version: '26.08'
 sdk: org.freedesktop.Sdk
@@ -30,7 +30,7 @@ finish-args:
   - --share=network
 
   # No grant for the certificate store, so the Flatpak keeps its own inside
-  # ~/.var/app/app.rpgp.rpgp/data and does not share it with `sq` the way a
+  # ~/.var/app/app.rpgp.rPGP/data and does not share it with `sq` the way a
   # native build does. Two separate reasons, either sufficient:
   #
   # Flathub rejects it. Its linter flags any --filesystem=xdg-data/* as
@@ -94,22 +94,22 @@ modules:
       - cargo --offline fetch --manifest-path Cargo.toml --verbose
       - cargo --offline build --release --verbose -p rpgp-gui
       - install -Dm755 target/release/rpgp /app/bin/rpgp
-      - install -Dm644 crates/rpgp-gui/desktop/app.rpgp.rpgp.desktop
-        /app/share/applications/app.rpgp.rpgp.desktop
-      - install -Dm644 crates/rpgp-gui/desktop/app.rpgp.rpgp.metainfo.xml
-        /app/share/metainfo/app.rpgp.rpgp.metainfo.xml
+      - install -Dm644 crates/rpgp-gui/desktop/app.rpgp.rPGP.desktop
+        /app/share/applications/app.rpgp.rPGP.desktop
+      - install -Dm644 crates/rpgp-gui/desktop/app.rpgp.rPGP.metainfo.xml
+        /app/share/metainfo/app.rpgp.rPGP.metainfo.xml
       # PNG as well as the SVG. AppStream's catalogue generator rasterises the
       # icon itself and the freedesktop SDK's copy has no SVG loader, so an
       # SVG-only install fails the build with icon-file-read-error. The PNGs
       # are rendered from that same SVG by packaging/icons.sh.
-      - install -Dm644 crates/rpgp-gui/desktop/app.rpgp.rpgp-64.png
-        /app/share/icons/hicolor/64x64/apps/app.rpgp.rpgp.png
-      - install -Dm644 crates/rpgp-gui/desktop/app.rpgp.rpgp-128.png
-        /app/share/icons/hicolor/128x128/apps/app.rpgp.rpgp.png
-      - install -Dm644 crates/rpgp-gui/desktop/app.rpgp.rpgp-256.png
-        /app/share/icons/hicolor/256x256/apps/app.rpgp.rpgp.png
-      - install -Dm644 crates/rpgp-gui/desktop/app.rpgp.rpgp.svg
-        /app/share/icons/hicolor/scalable/apps/app.rpgp.rpgp.svg
+      - install -Dm644 crates/rpgp-gui/desktop/app.rpgp.rPGP-64.png
+        /app/share/icons/hicolor/64x64/apps/app.rpgp.rPGP.png
+      - install -Dm644 crates/rpgp-gui/desktop/app.rpgp.rPGP-128.png
+        /app/share/icons/hicolor/128x128/apps/app.rpgp.rPGP.png
+      - install -Dm644 crates/rpgp-gui/desktop/app.rpgp.rPGP-256.png
+        /app/share/icons/hicolor/256x256/apps/app.rpgp.rPGP.png
+      - install -Dm644 crates/rpgp-gui/desktop/app.rpgp.rPGP.svg
+        /app/share/icons/hicolor/scalable/apps/app.rpgp.rPGP.svg
     sources:
       - type: git
         url: https://github.com/jzbz/rpgp.git

@@ -266,7 +266,7 @@ jobs:
           python3 - "$head" "$BUILD_TAG" <<'PY'
           import pathlib, re, sys
           sha, tag = sys.argv[1], sys.argv[2]
-          p = pathlib.Path("packaging/app.rpgp.rpgp.yml")
+          p = pathlib.Path("packaging/app.rpgp.rPGP.yml")
           s = p.read_text()
           # Counted, so that each is found exactly once: a manifest that grew a
           # second git source, or lost its pin or its tag, stops here instead of
@@ -288,14 +288,14 @@ jobs:
         run: |
           flatpak-builder --force-clean --disable-rofiles-fuse \
             --arch=${{ matrix.arch }} --repo=repo build \
-            packaging/app.rpgp.rpgp.yml
+            packaging/app.rpgp.rPGP.yml
 
       - name: Bundle
         run: |
           set -euo pipefail
           NAME="rpgp-${TAG}-${{ matrix.arch }}.flatpak"
           flatpak build-bundle --arch=${{ matrix.arch }} \
-            repo "$NAME" app.rpgp.rpgp master
+            repo "$NAME" app.rpgp.rPGP master
           sha256sum "$NAME"
           ls -lh "$NAME"
 
@@ -692,7 +692,7 @@ jobs:
 
           # From the same SVG the Linux packaging renders, so the icon cannot
           # drift between platforms. iconutil wants every size present.
-          SVG=crates/rpgp-gui/desktop/app.rpgp.rpgp.svg
+          SVG=crates/rpgp-gui/desktop/app.rpgp.rPGP.svg
           mkdir -p rpgp.iconset
           for s in 16 32 128 256 512; do
             rsvg-convert -w "$s" -h "$s" "$SVG" -o "rpgp.iconset/icon_${s}x${s}.png"
@@ -712,7 +712,7 @@ jobs:
           <dict>
             <key>CFBundleName</key><string>rPGP</string>
             <key>CFBundleDisplayName</key><string>rPGP</string>
-            <key>CFBundleIdentifier</key><string>app.rpgp.rpgp</string>
+            <key>CFBundleIdentifier</key><string>app.rpgp.rPGP</string>
             <key>CFBundleExecutable</key><string>rpgp</string>
             <key>CFBundleIconFile</key><string>rpgp</string>
             <key>CFBundlePackageType</key><string>APPL</string>
