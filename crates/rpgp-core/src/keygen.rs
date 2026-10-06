@@ -51,10 +51,11 @@ impl KeyType {
 /// Argon2 for password hashing; RFC 4880 keys get CFB with an MDC and iterated
 /// SHA-256. The newer one is better cryptography.
 ///
-/// The cost falls on other people: a correspondent whose software predates
-/// RFC 9580 — GnuPG 2.4, which is still what Debian stable and Ubuntu LTS
-/// ship — cannot encrypt to a v6 key or verify its signatures. They see
-/// "unknown version 6" rather than anything helpful.
+/// The cost falls on other people: a correspondent whose software does not
+/// implement RFC 9580 cannot encrypt to a v6 key or verify its signatures.
+/// That is every version of GnuPG, 2.5 included, which follows LibrePGP and its
+/// v5 keys instead, as well as anything older. GnuPG 2.4 says "unknown version
+/// 6" rather than anything helpful.
 ///
 /// v6 is the default anyway, because that failure is loud and fixable while
 /// weaker cryptography is silent and permanent, and because keys outlive the
@@ -80,8 +81,8 @@ impl Standard {
 
     pub fn detail(self) -> &'static str {
         match self {
-            Standard::Rfc9580 => "Stronger. GnuPG 2.5 and later, and Sequoia.",
-            Standard::Rfc4880 => "Works with GnuPG 2.4 and everything older.",
+            Standard::Rfc9580 => "Stronger. Sequoia and other RFC 9580 software, not GnuPG.",
+            Standard::Rfc4880 => "Works with every version of GnuPG and everything older.",
         }
     }
 

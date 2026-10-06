@@ -153,10 +153,11 @@ export component KeygenDialog inherits DialogShell {
                     }
                     Text {
                         text: standard.current == 0
-                            ? "Stronger encryption. GnuPG 2.5 and later, and Sequoia. Older "
-                              + "software cannot encrypt to this key or check its signatures."
-                            : "Works with GnuPG 2.4 and everything older, using its weaker "
-                              + "encryption.";
+                            ? "Stronger encryption, for Sequoia and other software built to "
+                              + "RFC 9580. No version of GnuPG is, nor is older software: "
+                              + "they cannot encrypt to this key or check its signatures."
+                            : "Works with every version of GnuPG and with older software, "
+                              + "using its weaker encryption.";
                         color: Theme.text-dim;
                         font-size: Theme.t-sm;
                         wrap: word-wrap;
