@@ -109,6 +109,110 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.1.4" date="2026-10-06">
+      <description>
+        <p>Fixes for ways an ordinary import or edit could damage a key you
+        hold, for file output and Copy in the Flatpak, and for reaching
+        gpg-agent beyond Linux, plus a Windows installer.</p>
+        <ul>
+          <li>Importing a GnuPG export of a key you already held could replace
+          its secret with a stub, the placeholder GnuPG writes for a key kept
+          on a smartcard or offline. A stub no longer displaces a usable
+          secret, and signing passes over a stub to a key that can sign</li>
+          <li>Choosing the revocation certificate of a key you hold in Import
+          revoked the key at once and for good. rPGP now asks first, unless
+          the same file also holds the key</li>
+          <li>Add user ID wrote a binding with no key flags and no expiry. On a
+          key made by GnuPG that binding became the primary one, leaving the
+          primary key unable to certify or sign, and without an expiry. The
+          new binding is now copied from the primary user ID's</li>
+          <li>Upgrading does not repair a key damaged by any of the three
+          above. A secret replaced by a stub comes back by importing a full
+          secret export again. A key revoked through Import, or given a user
+          ID that way, has to be deleted from rPGP and imported again from a
+          backup or from GnuPG, after which Trust root needs ticking again;
+          until then, adding another user ID copies the damage. A revocation
+          already published cannot be withdrawn</li>
+          <li>A certificate revoked as a whole was still offered and used as a
+          recipient, and a revoked key of your own still signed. Revoked
+          certificates are now refused for encrypting, signing and certifying,
+          and changing the expiry or adding a user ID no longer brings a
+          retired key back into use</li>
+          <li>Changing a key's expiry failed outright when a subkey was on a
+          smartcard, and skipped signing and authentication subkeys whose
+          secret is on another machine, so they lapsed on their old date while
+          the details pane showed the new one. Both are now renewed, as long as
+          the primary key is on this machine</li>
+          <li>A secret key that GnuPG 2.3 or later exported with a passphrase
+          could not decrypt, and often could not sign, when it used elliptic
+          curves, as GnuPG's default keys do. It now unlocks, except on
+          Brainpool curves, which this build cannot use</li>
+          <li>gpg-agent is now found on Windows with Gpg4win, on macOS when
+          rPGP is opened from the Finder, and in the Flatpak when the host's
+          agent is running or started by systemd. Certify is offered for a key
+          whose primary is held only by the agent, and a message is decrypted
+          with the agent key it was encrypted to</li>
+          <li>Windows releases add a per-user installer that puts rPGP in the
+          Start Menu and in Apps &amp; Features without asking for an
+          administrator. When winget offers this version it installs that, and
+          a 0.1.3 install from winget will not upgrade to it: with rPGP closed,
+          uninstall jzbz.rPGP and install it again, once. Certificates and keys
+          stay where they are</li>
+          <li>In the Flatpak, Sign / Encrypt and Decrypt reported a file that
+          never appeared under its name. The output was left in the input's
+          folder as a hidden .xdp- file, which upgrading does not remove, and
+          after a decrypt that file holds the plaintext. They now ask where to
+          save through the desktop's save dialog</li>
+          <li>Copy in the Flatpak failed on sway, and is expected to have
+          failed on GNOME, since neither offers a sandboxed app the clipboard
+          protocol it used. It now falls back to the standard Wayland
+          clipboard there. The Flatpak also moves to the 26.08 freedesktop
+          runtime</li>
+          <li>Someone holding no key that can sign could not encrypt a file,
+          because Sign could not be unticked. A new key's passphrase is now
+          asked for twice, so a typo in one of the two is caught before it
+          becomes the key's</li>
+          <li>The Trust root box of an imported secret key was drawn ticked and
+          could not be changed, while the web of trust ignored the key. It now
+          works, so a restored backup can be made a trust root again</li>
+          <li>Control, formatting and direction-changing characters in a user
+          ID are shown as code points, so a name can no longer rearrange the
+          words around it. Where a key is chosen, identities that read alike
+          are told apart by key ID</li>
+          <li>A message rPGP signs and encrypts now names its intended
+          recipients, so when one of them encrypts it on to someone else, rPGP
+          shows that reader a signature that is not valid. A copy passed on
+          under a password is not caught</li>
+          <li>Key lookups no longer reach loopback, private or carrier-grade
+          NAT addresses, whether written as an address or reached through a
+          name that resolves to one, so a Web Key Directory inside a private
+          network is no longer reached. The configured keyserver is exempt. A
+          Web Key Directory reply keeps only the certificates carrying the
+          address asked for</li>
+          <li>Lookups and publishing ignore proxy settings in the environment,
+          so where a proxy is the only way out they stop working. Outside the
+          Flatpak they trust the system's certificate store as well as the
+          bundled roots. Two advisories in the HTTPS stack are fixed</li>
+          <li>A password-protected message can no longer make a decrypt spend
+          more than 2 GiB of memory, or minutes of Argon2 hashing, before the
+          password is even checked, and a truncated Keybox file no longer hangs
+          Import</li>
+          <li>rPGP's own copies of a passphrase are wiped once used, and
+          passphrase fields no longer copy or cut. What the notepad's Copy
+          button copies is marked private for clipboard managers that honour
+          the mark, except in the Flatpak on GNOME or sway, where the status
+          line says so</li>
+          <li>Two rPGP windows sharing a store no longer overwrite each other's
+          changes. The store now takes a lock when it opens, so rPGP cannot
+          open a store on a filesystem that refuses file locks. On Linux and
+          macOS, decrypted files are created readable by their owner only</li>
+          <li>Dialogs and the certificate list work from the keyboard, apart
+          from ticking recipients and user IDs. A disabled button can no longer
+          be pressed through a screen reader, and the window stays responsive
+          while a large store reloads</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.3" date="2026-08-31">
       <description>
         <p>A way to read signatures from certificates too old for the standard
