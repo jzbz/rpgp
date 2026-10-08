@@ -16,6 +16,8 @@ and signing, encrypting, decrypting and verifying both files and text all work
 from the window — including on a smartcard. Nothing here has been used in anger
 by anyone but its author.
 
+![rPGP's certificate list, with Carol verified through a certification from Trent](packaging/screenshots/01-main-window.png)
+
 ## Layout
 
 | Crate | Contents |
