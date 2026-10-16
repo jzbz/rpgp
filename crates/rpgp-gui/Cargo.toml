@@ -36,6 +36,13 @@ slint = { version = "1.17", default-features = false, features = [
     # wgpu's major version, so it will need revisiting when Slint moves to
     # wgpu 30.
     "unstable-wgpu-29",
+    # Needed only for the window-attributes hook that keeps the title bar
+    # painted on macOS; see `backend_selector` in src/lib.rs. Only macOS
+    # installs the hook, but the feature is on everywhere so that every
+    # platform type-checks it, and it adds no crate to the build. The API is
+    # unstable and tied to winit's major version. Drop it with the hook once
+    # the app is on Slint 1.18, which makes the same choice itself.
+    "unstable-winit-030",
     # Window::window_handle, which is how the clipboard learns whether the
     # window is on Wayland and reaches its connection; see src/clipboard.rs.
     "raw-window-handle-06",

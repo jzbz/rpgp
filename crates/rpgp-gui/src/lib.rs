@@ -409,8 +409,19 @@ static NO_GPU_ADAPTER: AtomicBool = AtomicBool::new(false);
 /// than reporting failure. A machine that would only have managed GL now gets
 /// the software renderer, which is slower but appears.
 fn configure_renderer() {
-    // An explicit choice by the user wins.
+    // An explicit choice by the user wins, and so does the software
+    // restart's, which comes back through the same variable. Left alone,
+    // Slint honors it when the first window needs a platform, and that
+    // window misses the hook `backend_selector` adds, so on macOS a selector
+    // honors it instead. A value naming a backend this build does not have
+    // fails there, and Slint then falls back to its default backend as it
+    // always has, without the hook.
     if std::env::var_os("SLINT_BACKEND").is_some() {
+        if cfg!(target_os = "macos")
+            && let Err(e) = backend_selector().select()
+        {
+            eprintln!("rpgp: could not select the backend SLINT_BACKEND names: {e}");
+        }
         return;
     }
 
@@ -420,7 +431,7 @@ fn configure_renderer() {
     let mut settings = WGPUSettings::default();
     settings.backends = wgpu::Backends::PRIMARY;
 
-    let gpu = slint::BackendSelector::new()
+    let gpu = backend_selector()
         .require_wgpu_29(WGPUConfiguration::Automatic(settings))
         .select();
 
@@ -429,12 +440,57 @@ fn configure_renderer() {
     };
 
     eprintln!("rpgp: no GPU renderer ({e}); using the software renderer.");
-    if let Err(e) = slint::BackendSelector::new()
-        .renderer_name("software".into())
-        .select()
-    {
+    if let Err(e) = backend_selector().renderer_name("software".into()).select() {
         eprintln!("rpgp: could not select the software renderer either: {e}");
     }
+}
+
+/// Start a backend selection that, on macOS, asks for an opaque window.
+///
+/// Slint 1.17 asks winit for a transparent window on every platform. On macOS
+/// winit carries that out by marking the `NSWindow` as not opaque and giving it
+/// a clear background color, and AppKit, at least on macOS 27
+/// (slint-ui/slint#12893), then leaves the whole window frame unpainted, the
+/// title bar included: the close, minimize and zoom buttons and the title
+/// still appear, over a strip that shows whatever is behind the window.
+/// [`opaque_window`] turns the transparency off before the window is created.
+/// Every selection in [`configure_renderer`] starts here. On macOS that
+/// includes the one it makes for `SLINT_BACKEND`, the variable the software
+/// restart comes back through; elsewhere that variable is left to Slint.
+///
+/// Nothing in this app needs to show through the window. `AppWindow` keeps its
+/// native frame, its background is `Theme.bg`, which is opaque in both color
+/// schemes, and its popups are drawn inside it rather than as windows of their
+/// own. The renderer reads the same attribute when it creates its surface, so
+/// femtovg on wgpu keeps an opaque Metal layer to match, and the software
+/// renderer draws opaque pixels either way. A translucent background or
+/// `no-frame` would need the transparency back.
+///
+/// Slint 1.18 makes the same choice itself: `wants_transparent` in
+/// i-slint-backend-winit 1.18 asks for transparency on macOS only for a
+/// translucent background or a frameless window, and applies its answer after
+/// this hook has run. Remove this function, [`opaque_window`] and the
+/// `unstable-winit-030` feature once the app is on a Slint release that has
+/// `wants_transparent`.
+///
+/// `cfg!` rather than `#[cfg]` so that every platform type-checks the macOS
+/// branch. Everywhere else the selector is returned as Slint made it, with no
+/// hook at all.
+fn backend_selector() -> slint::BackendSelector {
+    let selector = slint::BackendSelector::new();
+    if cfg!(target_os = "macos") {
+        selector.with_winit_window_attributes_hook(opaque_window)
+    } else {
+        selector
+    }
+}
+
+/// The window-attributes hook [`backend_selector`] adds on macOS: Slint's own
+/// attributes, with only the transparency turned off.
+fn opaque_window(
+    attributes: slint::winit_030::winit::window::WindowAttributes,
+) -> slint::winit_030::winit::window::WindowAttributes {
+    attributes.with_transparent(false)
 }
 
 fn install_panic_hook() {
@@ -10045,5 +10101,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The macOS hook changes the transparency and nothing else. It is handed
+    /// the attributes Slint starts every window from, and Slint keeps whatever
+    /// it returns, so a hook that built fresh ones would undo Slint's own: a
+    /// window Slint creates hidden, until the app shows it, would appear as
+    /// soon as the event loop starts.
+    ///
+    /// Only the mapping is tested. Installing it is up to `backend_selector`,
+    /// on macOS alone, and a selector can be neither inspected nor dropped
+    /// unselected in a test: its `Drop` selects a real backend.
+    #[test]
+    fn the_macos_window_hook_turns_off_only_the_transparency() {
+        use slint::winit_030::winit::window::WindowAttributes;
+
+        // What Slint 1.17's winit backend starts every window from.
+        let slint_defaults = WindowAttributes::default()
+            .with_transparent(true)
+            .with_visible(false)
+            .with_title("Slint Window");
+
+        let attributes = opaque_window(slint_defaults);
+        assert!(!attributes.transparent);
+        assert!(!attributes.visible);
+        assert!(attributes.decorations);
+        assert_eq!(attributes.title, "Slint Window");
     }
 }
