@@ -1,7 +1,7 @@
 fn main() {
     // Pin the widget style. The app draws its own controls, but std-widgets'
     // ListView and ScrollView still supply the scrollbars, and pinning keeps
-    // them alike on every platform. Slint 1.17 compiles with fluent when
+    // them alike on every platform. Slint 1.18 compiles with fluent when
     // nothing names a style, but SLINT_STYLE in the build's environment can
     // name another: `native` would give a macOS build cupertino scrollbars.
     // with_style takes precedence over that variable.
@@ -33,11 +33,13 @@ fn main() {
 
 /// Set `cfg(wayland_target)` on the targets where a window can be on Wayland.
 ///
-/// The clipboard has a Wayland half only there, and writing the whole
-/// condition out at every place that half is gated would bury the code it
-/// gates. The condition is the one copypasta puts on smithay-clipboard, and
-/// Cargo.toml gates the Wayland dependencies on the same one, written out,
-/// because a manifest cannot use a build script's cfg; the two have to agree.
+/// The clipboard has a Wayland half only there, and an X11 half, since they
+/// are the targets where a window can be on X11 as well. Writing the whole
+/// condition out at every place either is gated would bury the code it gates.
+/// The condition is the one copypasta put on smithay-clipboard, and
+/// Cargo.toml gates x11rb, which the X11 half uses, on the same one, written
+/// out, because a manifest cannot use a build script's cfg; the two have to
+/// agree.
 /// Read from CARGO_CFG_*, which describe the target rather than the host this
 /// script runs on.
 fn wayland_target() {

@@ -8,7 +8,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -386,53 +385,83 @@ fn refuse_while_busy(ui: &AppWindow) -> bool {
 /// Set on the restarted process so the software fallback can only happen once.
 const FALLBACK_GUARD: &str = "RPGP_SOFTWARE_FALLBACK";
 
-/// Raised by the panic hook when the panic was wgpu failing to find an adapter,
-/// so that an unrelated panic is not mistaken for a graphics problem.
-static NO_GPU_ADAPTER: AtomicBool = AtomicBool::new(false);
+/// The kind of renderer Slint gave the first window, as [`renderer_of`] reads
+/// it off the window.
+///
+/// It decides what a first window that could not be made leads to. On the GPU
+/// renderer that is a restart on the software renderer, since no probe made
+/// before the window can see every GPU that will fail; see
+/// [`configure_renderer`]. On the software renderer it is the error, in front
+/// of the user: a second try on the same renderer would fail the same way, and
+/// the dialog would then show the second attempt's error rather than the
+/// first's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Renderer {
+    /// femtovg on wgpu, the one GPU renderer this build has.
+    Gpu,
+    /// Slint's software renderer.
+    Software,
+}
 
-/// Choose the renderer up front, so a machine without a usable GPU gets a
-/// window instead of a crash.
+/// Select Slint's platform and renderer before anything else: `set_xdg_app_id`
+/// in [`run_app`] needs a platform to exist already, and choosing the renderer
+/// here lets rPGP say on stderr why the GPU was passed over, which Slint's own
+/// fallback does not.
 ///
-/// Asking for wgpu explicitly is what makes this possible: `select()` probes
-/// for an adapter and reports failure as an error, where leaving Slint to pick
-/// the renderer on its own defers the same question to window-creation time,
-/// where it is an `expect` and takes the process with it.
+/// Asking for wgpu explicitly makes `select()` probe for a GPU adapter before
+/// anything is built, and the software renderer is selected when it finds
+/// none. Slint 1.18 does as much by itself: when it builds the first window,
+/// femtovg's `new_suspended` makes the same surface-less probe, and a probe
+/// that finds no GPU sends Slint on to the software renderer
+/// (`try_create_window_with_fallback_renderer` in i-slint-backend-winit 1.18).
+/// What the probe here adds is a line on stderr saying why the GPU was passed
+/// over, which Slint's fallback does not print, and the backend set below.
 ///
-/// The probe cannot see everything. It asks wgpu for an adapter without a
-/// surface, so a driver that exists but cannot present to a window — a plain X
-/// server with no DRI3, some VMs — still satisfies it and still fails later.
-/// [`restart_with_software_renderer`] is the net under that case.
+/// What neither probe sees is a GPU that wgpu finds but that cannot present to
+/// a window: a plain X server with no DRI3, some VMs. It passes both, and the
+/// first window fails on it. Slint 1.17 met that failure with an `expect` that
+/// took the process with it. Since 1.18 it is an error the event loop keeps
+/// (slint-ui/slint#11580), and on Linux, where the first window is made from
+/// `about_to_wait`, keeping it is all the loop does: there is no window and
+/// the loop never returns. The net under that case is [`watch_first_window`],
+/// which gets the failure out of the event loop, and [`run_app`], which
+/// restarts on the software renderer when the window that failed was on the
+/// GPU. Which renderer that was is read off the window by [`renderer_of`]
+/// rather than taken from here: `SLINT_BACKEND`, a selection that fails and
+/// Slint's own fallback all settle it after this function has returned.
 ///
-/// The backend set is pinned to `PRIMARY` on purpose. `WGPUSettings::default()`
-/// asks for more than Slint does internally — the GL backend among them — and
-/// wgpu's GL backend *hangs indefinitely* on a display it cannot use rather
-/// than reporting failure. A machine that would only have managed GL now gets
-/// the software renderer, which is slower but appears.
+/// The backend set is pinned to `PRIMARY`. Slint 1.18 already takes GL out of
+/// the set its probe and its renderer's setup ask wgpu for, along with the
+/// backends other platforms use (`default_backends_to_avoid` and
+/// `mask_backends` in i-slint-core 1.18's graphics/wgpu_30.rs), so for the
+/// backends this build has the pin restates that, and keeps it should a later
+/// Slint stop. It also sets aside
+/// `WGPU_BACKEND`, which `WGPUSettings::default()` reads and which Slint's mask
+/// keeps when it names only backends the mask would drop, such as `gl`.
 fn configure_renderer() {
     // An explicit choice by the user wins, and so does the software
-    // restart's, which comes back through the same variable. Left alone,
-    // Slint honors it when the first window needs a platform, and that
-    // window misses the hook `backend_selector` adds, so on macOS a selector
-    // honors it instead. A value naming a backend this build does not have
-    // fails there, and Slint then falls back to its default backend as it
-    // always has, without the hook.
+    // restart's, which comes back through the same variable. A selector
+    // honors it here rather than leaving it to the first window, because the
+    // application id run_app sets next needs a platform to exist already:
+    // without one, set_xdg_app_id fails and the window goes without its id.
+    // A value naming a backend this build does not have fails here, and
+    // Slint then falls back to its default backend when the window is built,
+    // as it always has.
     if std::env::var_os("SLINT_BACKEND").is_some() {
-        if cfg!(target_os = "macos")
-            && let Err(e) = backend_selector().select()
-        {
+        if let Err(e) = slint::BackendSelector::new().select() {
             eprintln!("rpgp: could not select the backend SLINT_BACKEND names: {e}");
         }
         return;
     }
 
-    use slint::wgpu_29::{WGPUConfiguration, WGPUSettings, wgpu};
+    use slint::wgpu_30::{WGPUConfiguration, WGPUSettings, wgpu};
 
     // WGPUSettings is #[non_exhaustive], so it has to be built by mutation.
     let mut settings = WGPUSettings::default();
     settings.backends = wgpu::Backends::PRIMARY;
 
-    let gpu = backend_selector()
-        .require_wgpu_29(WGPUConfiguration::Automatic(settings))
+    let gpu = slint::BackendSelector::new()
+        .require_wgpu_30(WGPUConfiguration::Automatic(settings))
         .select();
 
     let Err(e) = gpu else {
@@ -440,90 +469,287 @@ fn configure_renderer() {
     };
 
     eprintln!("rpgp: no GPU renderer ({e}); using the software renderer.");
-    if let Err(e) = backend_selector().renderer_name("software".into()).select() {
+    if let Err(e) = slint::BackendSelector::new()
+        .renderer_name("software".into())
+        .select()
+    {
         eprintln!("rpgp: could not select the software renderer either: {e}");
+        // No platform was set, so Slint builds its default one for the first
+        // window and picks the renderer there, with the same probe and the
+        // same fallback. In practice this selection fails only where winit
+        // cannot make an event loop at all, and then so does the default
+        // platform, in AppWindow::new, which is not a failure the restart is
+        // for.
     }
 }
 
-/// Start a backend selection that, on macOS, asks for an opaque window.
+/// Which kind of renderer Slint gave `window`, asked of the window itself.
 ///
-/// Slint 1.17 asks winit for a transparent window on every platform. On macOS
-/// winit carries that out by marking the `NSWindow` as not opaque and giving it
-/// a clear background color, and AppKit, at least on macOS 27
-/// (slint-ui/slint#12893), then leaves the whole window frame unpainted, the
-/// title bar included: the close, minimize and zoom buttons and the title
-/// still appear, over a strip that shows whatever is behind the window.
-/// [`opaque_window`] turns the transparency off before the window is created.
-/// Every selection in [`configure_renderer`] starts here. On macOS that
-/// includes the one it makes for `SLINT_BACKEND`, the variable the software
-/// restart comes back through; elsewhere that variable is left to Slint.
+/// Of the two renderers this build has, femtovg on wgpu takes a rendering
+/// notifier and the software renderer refuses one as `Unsupported`, which is
+/// also how Slint's backend selector says a window that fell through from
+/// wgpu to another renderer shows it (`select_internal` in
+/// i-slint-backend-selector 1.18). `AlreadySet` can only come from a renderer
+/// that takes one. A window's renderer is fixed when the window is built, so
+/// the answer is the renderer the window failed on, however it got there:
+/// through the probe in [`configure_renderer`], through `SLINT_BACKEND`,
+/// through a selection that failed and left the window to Slint's default
+/// platform, or through Slint's own fallback when its probe finds no GPU.
 ///
-/// Nothing in this app needs to show through the window. `AppWindow` keeps its
-/// native frame, its background is `Theme.bg`, which is opaque in both color
-/// schemes, and its popups are drawn inside it rather than as windows of their
-/// own. The renderer reads the same attribute when it creates its surface, so
-/// femtovg on wgpu keeps an opaque Metal layer to match, and the software
-/// renderer draws opaque pixels either way. A translucent background or
-/// `no-frame` would need the transparency back.
-///
-/// Slint 1.18 makes the same choice itself: `wants_transparent` in
-/// i-slint-backend-winit 1.18 asks for transparency on macOS only for a
-/// translucent background or a frameless window, and applies its answer after
-/// this hook has run. Remove this function, [`opaque_window`] and the
-/// `unstable-winit-030` feature once the app is on a Slint release that has
-/// `wants_transparent`.
-///
-/// `cfg!` rather than `#[cfg]` so that every platform type-checks the macOS
-/// branch. Everywhere else the selector is returned as Slint made it, with no
-/// hook at all.
-fn backend_selector() -> slint::BackendSelector {
-    let selector = slint::BackendSelector::new();
-    if cfg!(target_os = "macos") {
-        selector.with_winit_window_attributes_hook(opaque_window)
-    } else {
-        selector
+/// Asked only once the first window has failed. The notifier it leaves behind
+/// does nothing, but on a window that works it would be called for every
+/// frame, and it would take the one place a window has for a notifier.
+fn renderer_of(window: &slint::Window) -> Renderer {
+    match window.set_rendering_notifier(|_, _| {}) {
+        Err(slint::SetRenderingNotifierError::Unsupported) => Renderer::Software,
+        _ => Renderer::Gpu,
     }
 }
 
-/// The window-attributes hook [`backend_selector`] adds on macOS: Slint's own
-/// attributes, with only the transparency turned off.
-fn opaque_window(
-    attributes: slint::winit_030::winit::window::WindowAttributes,
-) -> slint::winit_030::winit::window::WindowAttributes {
-    attributes.with_transparent(false)
+/// How long the first window may go without a native window, counted from
+/// the watch's first look, before [`watch_first_window`] stops the event loop
+/// to find out why.
+///
+/// Longer than the 500 ms Slint waits on Linux for the desktop portal's
+/// answer before it makes the first window without it (`xdg_desktop_settings`
+/// in i-slint-backend-winit 1.18), so that a portal that never answers costs
+/// no stop.
+const FIRST_WINDOW_GRACE: Duration = Duration::from_secs(1);
+
+/// How often the first-window watch looks. A healthy start usually has its
+/// window by the first look, and the watch ends there.
+const FIRST_WINDOW_TICK: Duration = Duration::from_millis(100);
+
+/// What the first-window watch has seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FirstWindow {
+    /// Still looking.
+    Waiting,
+    /// The window has its native window, and the watch has ended.
+    Up,
+    /// Still no native window two looks past the grace: the watch stopped the
+    /// event loop and ended.
+    GaveUp,
 }
 
-fn install_panic_hook() {
-    let inner = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let payload = info.payload();
-        let message = payload
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| payload.downcast_ref::<&str>().copied())
-            .unwrap_or_default();
+/// The first-window watch's bookkeeping, apart from the timer that drives it,
+/// so that the rule can be tested without an event loop.
+#[derive(Debug, Default)]
+struct FirstWindowLooks {
+    first: Option<std::time::Instant>,
+    misses: u32,
+}
 
-        if message.contains("Failed to find an appropriate adapter") {
-            NO_GPU_ADAPTER.store(true, Ordering::Relaxed);
-            // Swallow the backtrace: main turns this into a restart, and the
-            // wall of wgpu diagnostics would only look like a crash.
-            return;
+impl FirstWindowLooks {
+    /// One look at the window, at `now`. `Some` ends the watch.
+    ///
+    /// The watch gives up on the second look past `grace` without a window,
+    /// not the first. A process stopped or starved for longer than `grace`
+    /// before Slint made the window wakes to this look and to Slint's portal
+    /// timeout in the same pass of the event loop: Slint fires each expired
+    /// timer once per pass (i-slint-core 1.18's timers.rs) and makes the
+    /// window in `about_to_wait`, after that pass, so the window is there by
+    /// the next look. Giving up on the first such look would not restart
+    /// anything, since only an error from Slint leads to a restart (see
+    /// [`after_event_loop`]), but it would stop the loop and start it again
+    /// for nothing. With a portal that never answered and the process stopped
+    /// for 3 s before Slint had made the window, a one-look rule stopped the
+    /// loop on a healthy GPU; the two-look rule did not.
+    fn look(
+        &mut self,
+        now: std::time::Instant,
+        has_window: bool,
+        grace: Duration,
+    ) -> Option<FirstWindow> {
+        let first = *self.first.get_or_insert(now);
+        if has_window {
+            return Some(FirstWindow::Up);
         }
-        inner(info);
-    }));
+        if now.duration_since(first) < grace {
+            return None;
+        }
+        self.misses += 1;
+        (self.misses >= 2).then_some(FirstWindow::GaveUp)
+    }
 }
 
-/// Re-run this executable on the software renderer.
-///
-/// A fresh process rather than a retry in-place: Slint's platform can only be
-/// set once, and the failed attempt leaves the winit event loop half-built.
-fn restart_with_software_renderer() -> ExitCode {
-    if std::env::var_os(FALLBACK_GUARD).is_some() {
-        eprintln!("rpgp: the software renderer failed as well; giving up.");
-        return ExitCode::FAILURE;
-    }
+/// Keeps the first-window watch running for as long as it lives.
+struct FirstWindowWatch {
+    seen: std::rc::Rc<std::cell::Cell<FirstWindow>>,
+    _timer: std::rc::Rc<slint::Timer>,
+}
 
-    eprintln!("rpgp: no usable GPU adapter, restarting with the software renderer.");
+impl FirstWindowWatch {
+    fn seen(&self) -> FirstWindow {
+        self.seen.get()
+    }
+}
+
+/// Look for the first window's native window until it has one, and call
+/// `give_up` if it still has none two looks past `grace`. [`run`] has that
+/// stop the event loop, so that the error Slint keeps comes out of
+/// `run_event_loop`.
+///
+/// This is what turns Slint 1.18's hang into an error rPGP can act on. When
+/// the renderer cannot set itself up for the first window, Slint keeps the
+/// error and drops the window without trying it again (`about_to_wait` in
+/// i-slint-backend-winit 1.18's event_loop.rs, and `create_inactive_windows`).
+/// On Linux, where it makes the first window from `about_to_wait` once the
+/// desktop portal has answered, nothing then ends the loop: under Xvfb with no
+/// DRI3 the process had no window and was still running 20 s later. Windows
+/// and macOS make it from `resumed`, which ends the loop on that error itself,
+/// so there the watch never has to; that is read from Slint's source, and
+/// neither has been run with a GPU that fails this way. Stopping the loop with
+/// quit_event_loop brings out the kept error and puts the winit loop back for
+/// another run (`EventLoopState::run`).
+///
+/// The native window is the signal because Slint keeps it only once the
+/// window is fully set up: the renderer's `resume`, which makes the surface
+/// and, on native targets, finishes wgpu's setup before it returns, and then
+/// the first scale-factor dispatch. Either failing returns before the native
+/// window is kept, so a window that failed never has one (`resume` and
+/// `window_handle_06_rc` in i-slint-backend-winit 1.18's
+/// winitwindowadapter.rs). How long the GPU takes cannot set the watch off,
+/// and it does not read Slint's error, whose wording is not an API; see
+/// [`should_restart`].
+///
+/// Revisit at every Slint upgrade, since the premise is that setup finishes
+/// before `resume` returns. wgpu's is driven there by a `poll_once` that
+/// i-slint-core 1.18 marks "Remove once the suspension API uses async"
+/// (graphics/wgpu_30.rs), and on wasm the same setup already finishes later
+/// and only logs its errors. If native setup goes the same way, the native
+/// window could exist before the renderer is ready, the watch would take a
+/// window that never draws for one that did, and the failure would hang again.
+fn watch_first_window(
+    has_window: impl Fn() -> bool + 'static,
+    give_up: impl Fn() + 'static,
+    grace: Duration,
+) -> FirstWindowWatch {
+    let seen = std::rc::Rc::new(std::cell::Cell::new(FirstWindow::Waiting));
+    let timer = std::rc::Rc::new(slint::Timer::default());
+    let (stop, report) = (std::rc::Rc::downgrade(&timer), seen.clone());
+    let mut looks = FirstWindowLooks::default();
+    timer.start(slint::TimerMode::Repeated, FIRST_WINDOW_TICK, move || {
+        let Some(outcome) = looks.look(std::time::Instant::now(), has_window(), grace) else {
+            return;
+        };
+        if outcome == FirstWindow::GaveUp {
+            give_up();
+        }
+        report.set(outcome);
+        if let Some(timer) = stop.upgrade() {
+            timer.stop();
+        }
+    });
+    FirstWindowWatch {
+        seen,
+        _timer: timer,
+    }
+}
+
+/// Whether Slint has made `ui`'s native window, which it keeps only once the
+/// window is fully set up; see [`watch_first_window`].
+fn has_native_window(ui: &AppWindow) -> bool {
+    use raw_window_handle::HasWindowHandle;
+    ui.window().window_handle().window_handle().is_ok()
+}
+
+/// The event loop ended in an error and the first window never had a native
+/// window: it could not be made, most likely because its renderer could not
+/// set itself up for it. The text is Slint's.
+#[derive(Debug)]
+struct NoWindow {
+    error: slint::PlatformError,
+    /// The renderer the window was to be made with.
+    renderer: Renderer,
+}
+
+impl std::fmt::Display for NoWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for NoWindow {}
+
+/// What [`run`] does once the event loop has returned.
+#[derive(Debug)]
+enum AfterLoop {
+    /// The window was closed, and rPGP is done.
+    Done,
+    /// The watch stopped the loop before Slint had tried to make the window:
+    /// run it again.
+    Again,
+    Failed(Box<dyn std::error::Error>),
+}
+
+/// Decide what an event loop that returned `result` leads to, given what the
+/// watch saw and whether the window has a native window now.
+///
+/// An error is [`NoWindow`] only if the window never had one by either
+/// account. The watch's alone would not do: an error that ended the loop
+/// after the window was made but before the watch's first look, 100 ms in,
+/// such as one from the first frame, would count as a window that could not be
+/// made, and restart. Slint leaves a shown window in place when an error ends
+/// the loop (`window_event` in i-slint-backend-winit 1.18's event_loop.rs), so
+/// asking the window catches that. The watch's account catches a window that
+/// was made and then destroyed, which on Wayland hiding it does.
+///
+/// No error after the watch gave up means Slint had kept none, so it had not
+/// tried to make the window yet: the portal it waits for can be slow, and the
+/// process can have been stopped. That runs the loop again whatever the window
+/// looks like now. The window can be made in the very pass the watch stops the
+/// loop in, and leaving then would close it.
+///
+/// `renderer` is asked only for a [`NoWindow`], which carries its answer; see
+/// [`renderer_of`] for why no sooner.
+fn after_event_loop(
+    result: Result<(), slint::PlatformError>,
+    seen: FirstWindow,
+    has_window: bool,
+    renderer: impl FnOnce() -> Renderer,
+) -> AfterLoop {
+    match (result, seen) {
+        (Ok(()), FirstWindow::GaveUp) => AfterLoop::Again,
+        (Ok(()), _) => AfterLoop::Done,
+        (Err(e), FirstWindow::Up) => AfterLoop::Failed(e.into()),
+        (Err(e), _) if has_window => AfterLoop::Failed(e.into()),
+        (Err(error), _) => AfterLoop::Failed(Box::new(NoWindow {
+            error,
+            renderer: renderer(),
+        })),
+    }
+}
+
+/// Whether a startup failure calls for a restart on the software renderer: a
+/// first window that could not be made on the GPU renderer, the first time.
+///
+/// Any error that ends the loop before the window exists counts, not only
+/// wgpu's failure to find an adapter for the window's surface. The same setup
+/// fails with other texts as well, in making the native window, wgpu's device
+/// or the surface, and Slint's wording is not an API. It did change under
+/// 1.18, gaining a "WGPU initialization failed: " prefix, though the
+/// `contains` that caught Slint 1.17's panic would still have matched that
+/// error. A window that fails for a reason the software renderer does not get
+/// round costs one more start before the software attempt's own error is
+/// shown.
+fn should_restart(error: &(dyn std::error::Error + 'static), restarted: bool) -> bool {
+    !restarted
+        && error
+            .downcast_ref::<NoWindow>()
+            .is_some_and(|e| e.renderer == Renderer::Gpu)
+}
+
+/// Re-run this executable on the software renderer, after `cause` kept the
+/// first window from being made on the GPU.
+///
+/// A fresh process rather than a retry in place: Slint's platform, and the
+/// renderer chosen with it, can only be set once.
+fn restart_with_software_renderer(cause: &str) -> ExitCode {
+    eprintln!("rpgp: {cause}");
+    eprintln!(
+        "rpgp: the window could not be made on the GPU; restarting with the software renderer."
+    );
 
     let executable = match std::env::current_exe() {
         Ok(path) => path,
@@ -627,13 +853,46 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     wire_lifecycle(&ui, &state);
     wire_lookup(&ui, &state);
 
-    // Held across the event loop, and declared after `ui` so that it is dropped
-    // first on the way out of this function, on an error or an unwind as well:
-    // a clipboard on the window's own Wayland connection, where there is one,
-    // has to go while the window, whose connection it shares, still exists.
-    // See clipboard::attach.
+    // Held across the event loop, and dropped on the way out of this function
+    // however it is left, on an error or an unwind as well, so that a private
+    // copy still on the X11 clipboard is taken back even when the window got
+    // no close request. See clipboard::attach.
     let _clipboard = clipboard::attach(&ui);
-    ui.run()?;
+
+    // AppWindow::run taken apart into the show, run and hide it is made of
+    // (Slint's generated `run`, i-slint-compiler 1.18's generator/rust.rs), so
+    // that the first-window watch can be put around the event loop and the
+    // loop run again when the watch stopped it before Slint had tried to make
+    // the window. The watch goes on only once the window is shown: around a
+    // hidden one it would give up over and over, at a doubling grace.
+    ui.show()?;
+    let mut grace = FIRST_WINDOW_GRACE;
+    loop {
+        let ui_weak = ui.as_weak();
+        let watch = watch_first_window(
+            move || ui_weak.upgrade().is_some_and(|ui| has_native_window(&ui)),
+            // Fails only once the event loop is gone, and the watch runs on
+            // a timer of that loop's.
+            || {
+                let _ = slint::quit_event_loop();
+            },
+            grace,
+        );
+        let result = slint::run_event_loop();
+        match after_event_loop(result, watch.seen(), has_native_window(&ui), || {
+            renderer_of(ui.window())
+        }) {
+            AfterLoop::Done => break,
+            AfterLoop::Again => {
+                eprintln!("rpgp: the window has not appeared yet; waiting longer.");
+                grace = grace.saturating_mul(2);
+            }
+            AfterLoop::Failed(e) => return Err(e),
+        }
+    }
+    // Only after a normal return, as AppWindow::run does; on an error the
+    // window lasts until `ui` is dropped, after the clipboard.
+    ui.hide()?;
     Ok(())
 }
 
@@ -3356,7 +3615,7 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
             // case the clipboard refuses, which is otherwise invisible. A
             // fingerprint or a user ID is public, so it goes out unmarked, as
             // any other copy would.
-            match clipboard::copy(text.to_string(), clipboard::Content::Public) {
+            match clipboard::copy(&ui, text.to_string(), clipboard::Content::Public) {
                 Ok(_) => ui.set_status("Copied to the clipboard".into()),
                 Err(e) => ui.set_status(format!("Could not copy: {e}").into()),
             }
@@ -3371,7 +3630,7 @@ fn wire_notepad(ui: &AppWindow, state: &Shared) {
             };
             // Marked private whatever it holds: see clipboard::Content.
             let text = ui.get_np_output().to_string();
-            match clipboard::copy(text, clipboard::Content::Private) {
+            match clipboard::copy(&ui, text, clipboard::Content::Private) {
                 Ok(copied) => {
                     ui.set_np_copied(true);
                     ui.set_status(
@@ -3500,9 +3759,9 @@ fn finish_notepad(ui: &AppWindow, state: &Shared, outcome: NpOutcome) {
 /// the scale took the app down. Rows stay that far apart whatever font a
 /// character in them falls back to, since Slint pins every run's line height
 /// to the metrics of the font asked for (`ranged_builder` in i-slint-core
-/// 1.17's textlayout/sharedparley.rs). But how many rows a text wraps into
-/// depends on how wide its characters are, which the cut cannot see, so the
-/// limits are set for the widest text found.
+/// 1.18's textlayout/sharedparley/shaping.rs). But how many rows a text
+/// wraps into depends on how wide its characters are, which the cut cannot
+/// see, so the limits are set for the widest text found.
 ///
 /// Where the box wraps, the row it ends and the word it moves down are
 /// together wider than the box, so at worst every row holds one word just
@@ -3598,10 +3857,12 @@ fn np_shown(output: &str, scale: f32) -> &str {
 /// Whether the notepad's output box starts a new row at `c`, whatever its
 /// width: the characters Unicode's line breaking makes a mandatory break.
 /// These seven are every character parley_data 0.10's table marks as one,
-/// which is what parley, under Slint 1.17, breaks a row at; worth checking
-/// again when either is upgraded. A carriage return before a line feed makes
-/// one break with it, not two, since Slint drops it from the end of the
-/// paragraph the line feed closes; [`np_shown`] counts the pair once.
+/// which is what parley, under Slint 1.17, breaks a row at. Slint 1.18 moved
+/// to parley 0.11, whose parley_data 0.11.1 carries the same table byte for
+/// byte; worth checking again when either is upgraded. A carriage return
+/// before a line feed makes one break with it, not two, since Slint drops it
+/// from the end of the paragraph the line feed closes; [`np_shown`] counts the
+/// pair once.
 fn is_hard_break(c: char) -> bool {
     matches!(
         c,
@@ -5224,21 +5485,19 @@ pub fn run_app() -> ExitCode {
     if let Err(e) = slint::set_xdg_app_id(APP_ID) {
         eprintln!("rpgp: could not set the application id: {e}");
     }
-    install_panic_hook();
 
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
-        Ok(Ok(())) => ExitCode::SUCCESS,
-        Ok(Err(e)) => {
+    // No panic to catch any more. The one the restart used to come from, wgpu
+    // finding no adapter for the first window, is an error since Slint 1.18
+    // (slint-ui/slint#11580), and any other panic was always left to look like
+    // the crash it is.
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if should_restart(e.as_ref(), std::env::var_os(FALLBACK_GUARD).is_some()) => {
+            restart_with_software_renderer(&e.to_string())
+        }
+        Err(e) => {
             report_fatal(&e.to_string());
             ExitCode::FAILURE
-        }
-        Err(payload) => {
-            if NO_GPU_ADAPTER.load(Ordering::Relaxed) {
-                restart_with_software_renderer()
-            } else {
-                // Not a graphics failure: let it look like an ordinary crash.
-                std::panic::resume_unwind(payload)
-            }
         }
     }
 }
@@ -8310,7 +8569,7 @@ mod tests {
             "the notepad's output must be copied as private, and a fingerprint as public"
         );
 
-        // smithay-clipboard, which can mark nothing.
+        // Slint's clipboard, which can mark nothing.
         clipboard::record(false);
         ui.invoke_np_copy();
         assert!(
@@ -8327,6 +8586,92 @@ mod tests {
             ui.get_status(),
             "Copied to the clipboard",
             "a public copy is never marked, so it lacks nothing"
+        );
+    }
+
+    /// Where a window on Wayland has no arboard, the notepad's Copy puts the
+    /// whole output on Slint's own clipboard, through the window's copier,
+    /// and says it could not mark it private.
+    ///
+    /// This is the copy a Flatpak on GNOME, KDE Plasma or sway makes. The
+    /// testing backend stands in for Slint's platform, keeping what is put on
+    /// either of its clipboards. The output is longer than the output box is
+    /// given, so that the copy is seen to be of the whole and not of what is
+    /// shown. tests/accessibility.rs holds the copier itself to laying
+    /// nothing out and leaving no timer running, with megabytes of text.
+    #[cfg(wayland_target)]
+    #[test]
+    fn the_notepad_copies_through_slints_clipboard_where_arboard_cannot_be_built() {
+        use slint::platform::Clipboard;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        type Copies = Rc<RefCell<Vec<(Clipboard, String)>>>;
+        struct Recording(i_slint_backend_testing::TestingBackend, Copies);
+        impl slint::platform::Platform for Recording {
+            fn create_window_adapter(
+                &self,
+            ) -> Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
+                self.0.create_window_adapter()
+            }
+            fn duration_since_start(&self) -> Duration {
+                self.0.duration_since_start()
+            }
+            fn set_clipboard_text(&self, text: &str, clipboard: Clipboard) {
+                self.1.borrow_mut().push((clipboard, text.to_string()));
+            }
+        }
+        let copies = Copies::default();
+        slint::platform::set_platform(Box::new(Recording(
+            i_slint_backend_testing::TestingBackend::new(
+                i_slint_backend_testing::TestingBackendOptions {
+                    mock_time: true,
+                    ..Default::default()
+                },
+            ),
+            copies.clone(),
+        )))
+        .expect("no platform is set on a test's own thread");
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let state = state_for(store);
+        let ui = window_for(&state);
+        let output: String = (0..NP_SHOWN_BYTES / 4)
+            .map(|line| format!("{line:05} ünïcødé €\n"))
+            .collect();
+        assert!(output.len() > NP_SHOWN_BYTES, "the premise");
+        ui.set_np_output(output.as_str().into());
+
+        clipboard::through_slint();
+        ui.invoke_np_copy();
+        assert!(
+            ui.get_np_copied(),
+            "the copy went, so the button should say so"
+        );
+        let status = ui.get_status();
+        assert!(
+            status.contains("cannot be marked private here"),
+            "a decrypted message copied without the mark should say so: {status}"
+        );
+        {
+            let copies = copies.borrow();
+            assert_eq!(copies.len(), 1, "expected one copy, to one clipboard");
+            let (clipboard, copied) = &copies[0];
+            assert_eq!(*clipboard, Clipboard::DefaultClipboard);
+            assert!(
+                *copied == output,
+                "{} bytes reached the clipboard where the output is {}",
+                copied.len(),
+                output.len()
+            );
+        }
+
+        ui.invoke_copy_value("0123 4567".into());
+        assert_eq!(ui.get_status(), "Copied to the clipboard");
+        assert_eq!(
+            copies.borrow().last(),
+            Some(&(Clipboard::DefaultClipboard, "0123 4567".to_string()))
         );
     }
 
@@ -10103,29 +10448,210 @@ mod tests {
         }
     }
 
-    /// The macOS hook changes the transparency and nothing else. It is handed
-    /// the attributes Slint starts every window from, and Slint keeps whatever
-    /// it returns, so a hook that built fresh ones would undo Slint's own: a
-    /// window Slint creates hidden, until the app shows it, would appear as
-    /// soon as the event loop starts.
-    ///
-    /// Only the mapping is tested. Installing it is up to `backend_selector`,
-    /// on macOS alone, and a selector can be neither inspected nor dropped
-    /// unselected in a test: its `Drop` selects a real backend.
+    // The first-window watch and the restart. These test the decisions only:
+    // the rule the watch looks by, its timer under mock time, what a returned
+    // event loop leads to, when a failure restarts, and that the software
+    // renderer reads as software. None of them runs the event loop around a
+    // window that fails, which takes a GPU that passes the probe and cannot
+    // present, and the one event loop the testing backend gives a process is
+    // taken by a_reload_leaves_the_selection_where_the_user_moved_it. Nor can
+    // renderer_of be asked about femtovg on wgpu, which is built only by the
+    // winit backend, for a window. So `run`'s loop, run_app's restart and the
+    // GPU half of renderer_of were checked by hand: under Xvfb, which has no
+    // DRI3 and where femtovg on wgpu fails, and on a headless KWin, where it
+    // draws. Windows and macOS were not run.
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
     #[test]
-    fn the_macos_window_hook_turns_off_only_the_transparency() {
-        use slint::winit_030::winit::window::WindowAttributes;
+    fn the_first_window_watch_ends_once_the_window_is_up() {
+        let t0 = std::time::Instant::now();
+        let mut looks = FirstWindowLooks::default();
+        assert_eq!(looks.look(t0, false, ms(1000)), None);
+        assert_eq!(
+            looks.look(t0 + ms(400), true, ms(1000)),
+            Some(FirstWindow::Up)
+        );
+    }
 
-        // What Slint 1.17's winit backend starts every window from.
-        let slint_defaults = WindowAttributes::default()
-            .with_transparent(true)
-            .with_visible(false)
-            .with_title("Slint Window");
+    /// Inside the grace, which has to outlast the 500 ms Slint waits for the
+    /// desktop portal before it makes the window, no look is a miss.
+    #[test]
+    fn the_first_window_watch_waits_out_the_grace() {
+        let t0 = std::time::Instant::now();
+        let mut looks = FirstWindowLooks::default();
+        for at in [0, 100, 500, 999] {
+            assert_eq!(looks.look(t0 + ms(at), false, ms(1000)), None, "at {at} ms");
+        }
+    }
 
-        let attributes = opaque_window(slint_defaults);
-        assert!(!attributes.transparent);
-        assert!(!attributes.visible);
-        assert!(attributes.decorations);
-        assert_eq!(attributes.title, "Slint Window");
+    /// A process stopped for longer than the grace before Slint made the
+    /// window wakes to one look with no window, and Slint makes the window
+    /// before the next. Giving up on that look would cost no restart, since
+    /// the loop would return no error, but it would stop the loop and run it
+    /// again for nothing.
+    #[test]
+    fn the_first_window_watch_gives_up_on_the_second_miss_only() {
+        let t0 = std::time::Instant::now();
+        let mut looks = FirstWindowLooks::default();
+        assert_eq!(looks.look(t0, false, ms(1000)), None);
+        assert_eq!(looks.look(t0 + ms(3000), false, ms(1000)), None);
+        assert_eq!(
+            looks.look(t0 + ms(3100), true, ms(1000)),
+            Some(FirstWindow::Up)
+        );
+
+        let mut looks = FirstWindowLooks::default();
+        assert_eq!(looks.look(t0, false, ms(1000)), None);
+        assert_eq!(looks.look(t0 + ms(1000), false, ms(1000)), None);
+        assert_eq!(
+            looks.look(t0 + ms(1100), false, ms(1000)),
+            Some(FirstWindow::GaveUp)
+        );
+    }
+
+    /// The watch looks once a tick, stops looking once it knows, and gives
+    /// up once. Real time barely moves here, so the grace decides: a long one
+    /// is never used up, and none at all gives up on the second look.
+    #[test]
+    fn the_first_window_watch_looks_on_its_timer_and_stops_once_it_knows() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let tick = || i_slint_backend_testing::mock_elapsed_time(FIRST_WINDOW_TICK);
+        let watch = |window: bool, grace: Duration| {
+            let (looks, gave_up) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+            let watch = watch_first_window(
+                {
+                    let looks = looks.clone();
+                    move || {
+                        looks.set(looks.get() + 1);
+                        window
+                    }
+                },
+                {
+                    let gave_up = gave_up.clone();
+                    move || gave_up.set(gave_up.get() + 1)
+                },
+                grace,
+            );
+            (watch, looks, gave_up)
+        };
+
+        let (up, looks, gave_up) = watch(true, FIRST_WINDOW_GRACE);
+        assert_eq!(up.seen(), FirstWindow::Waiting, "it looked before a tick");
+        tick();
+        assert_eq!(up.seen(), FirstWindow::Up);
+        tick();
+        tick();
+        assert_eq!((looks.get(), gave_up.get()), (1, 0));
+        drop(up);
+
+        let (waiting, looks, gave_up) = watch(false, Duration::from_secs(60));
+        for _ in 0..5 {
+            tick();
+        }
+        assert_eq!(waiting.seen(), FirstWindow::Waiting);
+        assert_eq!((looks.get(), gave_up.get()), (5, 0));
+        drop(waiting);
+
+        let (given_up, looks, gave_up) = watch(false, Duration::ZERO);
+        tick();
+        assert_eq!((given_up.seen(), gave_up.get()), (FirstWindow::Waiting, 0));
+        tick();
+        assert_eq!((given_up.seen(), gave_up.get()), (FirstWindow::GaveUp, 1));
+        tick();
+        assert_eq!((looks.get(), gave_up.get()), (2, 1));
+    }
+
+    /// What the loop leads to, and that the window's renderer is asked only
+    /// for a window that was never made: asking leaves a notifier on the
+    /// renderer for good.
+    #[test]
+    fn after_the_event_loop_only_an_error_with_no_window_ever_is_no_window() {
+        use FirstWindow::{GaveUp, Up, Waiting};
+        let error = || {
+            Err(slint::PlatformError::Other(
+                "WGPU initialization failed".into(),
+            ))
+        };
+        let unasked = || -> Renderer { panic!("asked the renderer of a window that was made") };
+
+        assert!(matches!(
+            after_event_loop(Ok(()), Up, true, unasked),
+            AfterLoop::Done
+        ));
+        // Closed, and on Wayland destroyed with it, before the first look.
+        assert!(matches!(
+            after_event_loop(Ok(()), Waiting, false, unasked),
+            AfterLoop::Done
+        ));
+        // Stopped by the watch before Slint had tried, or in the very pass
+        // it made the window, which leaving would close.
+        for window in [false, true] {
+            assert!(
+                matches!(
+                    after_event_loop(Ok(()), GaveUp, window, unasked),
+                    AfterLoop::Again
+                ),
+                "window {window}"
+            );
+        }
+
+        for (seen, renderer) in [
+            (Waiting, Renderer::Gpu),
+            (GaveUp, Renderer::Gpu),
+            (GaveUp, Renderer::Software),
+        ] {
+            let AfterLoop::Failed(e) = after_event_loop(error(), seen, false, || renderer) else {
+                panic!("an error has to fail the run");
+            };
+            let no_window = e.downcast_ref::<NoWindow>();
+            assert_eq!(no_window.map(|e| e.renderer), Some(renderer), "{seen:?}");
+        }
+        // An error after the window was made: from its first frame, before
+        // the watch's first look, or after the watch saw it, whether the
+        // window is still there or, hidden on Wayland, gone.
+        for (seen, window) in [(Waiting, true), (GaveUp, true), (Up, true), (Up, false)] {
+            let AfterLoop::Failed(e) = after_event_loop(error(), seen, window, unasked) else {
+                panic!("an error has to fail the run");
+            };
+            assert!(!e.is::<NoWindow>(), "{seen:?}, window {window}");
+        }
+    }
+
+    #[test]
+    fn only_a_window_never_made_on_the_gpu_restarts_and_only_once() {
+        let no_window = |renderer| NoWindow {
+            error: slint::PlatformError::Other("x".into()),
+            renderer,
+        };
+        let drawn: Box<dyn std::error::Error> = slint::PlatformError::Other("x".into()).into();
+        let other: Box<dyn std::error::Error> = "the store could not be opened".into();
+
+        assert!(should_restart(&no_window(Renderer::Gpu), false));
+        // Software already, by SLINT_BACKEND, by the probe here or by Slint's
+        // own: the dialog shows the error that happened.
+        assert!(!should_restart(&no_window(Renderer::Software), false));
+        assert!(!should_restart(&no_window(Renderer::Gpu), true));
+        assert!(!should_restart(drawn.as_ref(), false));
+        assert!(!should_restart(other.as_ref(), false));
+    }
+
+    /// The software renderer refuses a rendering notifier, which is how
+    /// renderer_of tells it from the GPU. This is the renderer the winit
+    /// backend draws through when it draws in software, built here without a
+    /// window. A Slint that let it take a notifier would fail this rather than
+    /// have a window that failed in software restart in software.
+    #[test]
+    fn the_software_renderer_reads_as_software() {
+        use slint::platform::WindowAdapter;
+        use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+
+        let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        assert_eq!(renderer_of(window.window()), Renderer::Software);
     }
 }

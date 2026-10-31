@@ -196,10 +196,14 @@ another. And `renderer-femtovg` is FemtoVG over OpenGL, which is deprecated on
 macOS; `renderer-femtovg-wgpu` is the same renderer over Vulkan and Metal.
 `renderer-skia` is never enabled — it needs a C++ toolchain.
 
-A machine with no usable GPU falls back to the software renderer
-automatically. Slint left alone would abort instead; how that is handled, and
-two approaches that do not work, are documented above `configure_renderer` in
-`crates/rpgp-gui/src/lib.rs`.
+A machine with no usable GPU gets the software renderer. Slint does that by
+itself only when wgpu finds no GPU at all. A GPU that wgpu finds but that
+cannot draw into a window — an X server without DRI3, some VMs — leaves Slint
+with no window on Linux, and, going by Slint's source (neither has been run
+with such a GPU), with an error on Windows and macOS. rPGP then restarts
+itself once on the software renderer, unless the window that failed was
+already on it. How is documented above `configure_renderer` and
+`watch_first_window` in `crates/rpgp-gui/src/lib.rs`.
 
 ### OpenPGP: Sequoia with the RustCrypto backend
 
@@ -855,9 +859,42 @@ as the same user can open rPGP and read its memory, and nothing keeps key
 material out of a crash dump that Windows is set up to collect.
 
 Keeping passphrases off the accessibility bus and off the clipboard is not
-platform-specific and applies on all three. The bus publishes the contents of
-an ordinary text field verbatim and does not exempt password fields, and
-Slint's text fields copy and cut a selection unmasked, and on Linux put
+platform-specific and applies on all three.
+
+Slint publishes what an ordinary text field holds to assistive technology, as
+it should, and for a password field one bullet per character, with the caret
+and an event for every key: not the passphrase, but its length, to anything
+listening on the bus. GTK publishes as much for its own password entries, and
+Chromium a bullet per character too. rPGP's passphrase fields publish less. A
+screen reader is told each one's name, that it is a password field, whether it
+can be typed into and when it has focus, and nothing about what is in it: no
+characters, no count, no caret, and no event as keys are typed into it.
+`tests/atspi.rs` checks that on a real AT-SPI bus on Linux; on Windows and
+macOS it follows from AccessKit's and Slint's code, but has not been observed.
+The cost falls on screen-reader users: the field echoes no keys, there is no
+way to review how much has been typed, a braille display shows no dots, and a
+magnifier follows the field but not the caret inside it.
+
+That is what the fields themselves publish. Two things around them still
+tell the bus something:
+
+- In New key pair, the passphrase and its repeat are compared only when the
+  repeat field loses focus and when Create key pair is pressed. The note that
+  they do not match comes, goes and changes only then. It is announced as it
+  appears, and again, with its words changed, at each comparison that finds
+  the two still differing. A refused Create empties the repeat field and puts
+  focus in it, ready for the passphrase to be typed again. Typing the repeat
+  changes nothing that is published, so the passphrase's length cannot be
+  counted off it, but each comparison tells the bus whether the two matched.
+- While no recipient is chosen, whether a password has been typed for the
+  message is what enables Run in Sign / Encrypt, and Encrypt and Sign &
+  Encrypt in the notepad, so the bus learns whether that field is empty: the
+  buttons come on with its first character and go off when it is emptied.
+
+Nor does any of it hide that keys are being pressed: on X11 any program can
+watch the keyboard itself.
+
+Slint's text fields also copy and cut a selection unmasked, and on Linux put
 whatever the mouse selects in the primary selection. rPGP's passphrase fields
 refuse copy and cut, and a click only focuses them: the mouse does not select
 in them.
@@ -889,16 +926,31 @@ clipboard managers and clipboard history to leave it out:
 `x-kde-passwordManagerHint` on X11 and through the Wayland data-control
 protocols, `ExcludeClipboardContentFromMonitorProcessing` on Windows, and
 `org.nspasteboard.ConcealedType` on macOS. On X11 a private copy is also
-withdrawn when rPGP's window closes, rather than handed to a clipboard manager
-to keep.
+withdrawn when rPGP's window closes, if it is still what the clipboard holds,
+rather than left for a clipboard manager to keep; whatever has been copied
+since, in rPGP or anywhere else, is left alone. Telling the two apart takes
+a connection to the X server over a Unix-domain socket on the same machine,
+the server's X-Resource extension, which the X.Org server builds in by
+default, Xvfb and XWayland included, and a server that names rPGP's own
+process as the one at the other end of that connection. Where any of that is
+missing, rPGP leaves the clipboard as it is, and the copy goes only when rPGP
+exits: on a display reached over TCP, which is how ssh -X and -Y forward one;
+through any other forwarder, which the server sees in rPGP's place; without
+the extension; and in the Flatpak, whose sandbox numbers processes apart from
+the server. One case gets past those checks: a forwarder on a Unix socket in
+another PID namespace than rPGP's, a container's say, whose number in the
+server's namespace happens to be the one rPGP has in its own. A copy marked
+private that another program made through that forwarder would then be taken
+for rPGP's, and withdrawn.
 
 The mark is a request, and it has limits:
 
 - Any program can read the clipboard while the text is on it, and a clipboard
   manager that ignores the convention keeps it anyway.
-- In the Flatpak on GNOME or sway, where the app is not offered data-control,
-  rPGP copies over its window's own Wayland connection, which offers plain text
-  and nothing else. The copy goes out unmarked, and the status line says so.
+- In the Flatpak on GNOME, KDE Plasma or sway, where the app is not offered
+  data-control, the Copy buttons go through Slint's own clipboard, over the
+  window's own Wayland connection, which offers plain text and nothing else.
+  The copy goes out unmarked, and the status line says so.
 - Text selected in the notepad's output and copied with Ctrl+C goes through
   Slint's own clipboard, which marks nothing, and on Linux selecting it with
   the mouse puts it in the primary selection as well. The Copy button is the
@@ -995,6 +1047,13 @@ MIT — see [LICENSE](LICENSE).
 Two dependencies add obligations MIT does not, both relevant only when
 shipping binaries: Slint's royalty-free terms require the attribution in the
 About box, and `sequoia-openpgp` is LGPL-2.0-or-later linked statically.
+
+`vendor/i-slint-backend-winit` is not rPGP's code: it is Slint's winit
+backend, 1.18.1 with one fix from Slint's development branch applied until
+Slint 1.19 ships it (the root `Cargo.toml` says which, and why). It is under
+Slint's licence, as the rest of Slint is, and keeps its licence texts in its
+`LICENSES` directory and its SPDX headers. It goes with Slint 1.19, and this
+paragraph with it; the root `Cargo.toml` lists the rest of what goes.
 
 The bundled fonts (Geo, Source Code Pro, Geist) are SIL Open Font License
 1.1, which requires its text to ship with them; it sits beside them in

@@ -294,11 +294,17 @@ jobs:
             # pre-seeded lists, and the packages this needs come from release
             # pockets that are never superseded, so it is the one remaining
             # path from red back to green.
+            #
+            # The second line of packages is for tests/atspi.rs, which runs a
+            # window on a display and buses of its own: Xvfb, the AT-SPI bus
+            # launcher and registry, dbus-daemon, and the library winit loads
+            # for the keyboard on X11.
             if [ "$rc" -eq 0 ] || [ "$attempt" -eq "$attempts" ]; then
               rc=0
               sudo DEBIAN_FRONTEND=noninteractive timeout --kill-after=15s 180s \
                 apt-get "${opts[@]}" install -y \
-                capnproto libfontconfig-dev libsqlite3-dev || rc=$?
+                capnproto libfontconfig-dev libsqlite3-dev \
+                xvfb at-spi2-core dbus libxkbcommon-x11-0 || rc=$?
               # Only an interrupted install can leave dpkg mid-transaction,
               # and this is the last unbounded call in the block, so it is
               # bounded too rather than left to the step ceiling.
@@ -368,8 +374,13 @@ jobs:
           # one cache and restore each other's target directory.
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-${{ steps.toolchain.outputs.rustc }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.github/workflows/ci.yml') }}
 
-      # No display is set up, and none is needed: the GUI tests drive Slint
-      # through its testing backend with no event loop.
+      # The GUI tests drive Slint through its testing backend with no event
+      # loop, bar tests/atspi.rs, which starts an Xvfb display, a session bus
+      # and an AT-SPI bus of its own to read what a passphrase field publishes
+      # to a screen reader. It skips where those programs are missing, and
+      # RPGP_TEST_REQUIRE_ATSPI makes it fail instead on Linux, where the
+      # install step above provides them, so that it cannot quietly stop
+      # running. macOS builds it as an empty test.
       #
       # Six tests stay ignored: one hits the network, three ask the
       # developer's own gpg-agent about a key of theirs (two of them
@@ -390,6 +401,7 @@ jobs:
       - name: Test
         env:
           RPGP_TEST_REQUIRE_GPG_AGENT: ${{ runner.os == 'Linux' && '1' || '' }}
+          RPGP_TEST_REQUIRE_ATSPI: ${{ runner.os == 'Linux' && '1' || '' }}
         run: cargo test --workspace --locked
 
       # As in the lint job: only from master, and only when the restore missed.

@@ -3,7 +3,7 @@
 // tree publishes. Not part of the application.
 import { Palette } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
-import { Field, Btn, Check, Select, FieldRow, TextArea, TrustRootCheck, Variant } from "../widgets.slint";
+import { Field, SecretField, Btn, Check, Copier, Select, FieldRow, TextArea, TrustRootCheck, Variant } from "../widgets.slint";
 import { CertList, RevocationBanner, ScopeTabs, StatusBar } from "../widgets.slint";
 // The rule the details pane draws its Revoke button by, for a test to ask.
 export { RevokeOffer } from "../widgets.slint";
@@ -37,22 +37,64 @@ component Probe inherits Window {
     default-font-size: Theme.t-md;
 }
 
-// One passphrase Field and one ordinary Field.
+// One passphrase field and one ordinary Field. tests/atspi.rs runs this one
+// on a real window, under the winit backend, as well as the testing backend.
 export component FieldProbe inherits Probe {
     in-out property <string> secret-text <=> pass-field.text;
     in-out property <string> plain-text <=> plain-field.text;
+    // Whether the passphrase field can be typed into, so that a test can
+    // disable it.
+    in-out property <bool> secret-enabled: true;
+    // Whether the passphrase itself, inside the field, has keyboard focus:
+    // what focus given to the field's node through assistive technology has
+    // to reach.
+    out property <bool> secret-has-focus: pass-field.has-focus;
 
     width: 240px;
     height: 80px;
 
+    public function focus-secret() {
+        pass-field.focus();
+    }
+    public function focus-plain() {
+        plain-field.focus();
+    }
+
     VerticalLayout {
-        pass-field := Field {
+        pass-field := SecretField {
             placeholder: "Passphrase";
-            secret: true;
+            enabled: root.secret-enabled;
         }
         plain-field := Field {
             placeholder: "Search";
         }
+    }
+}
+
+// The copier behind the Copy buttons' route to Slint's own clipboard, as the
+// window has it, and an input of no size to paste into, so that a test can
+// read back what reached the clipboard without laying a long text out to do
+// it.
+export component CopierProbe inherits Probe {
+    out property <string> pasted: target.text;
+
+    width: 240px;
+    height: 80px;
+
+    public function copy(text: string) {
+        copier.copy(text);
+    }
+    public function focus-target() {
+        target.focus();
+    }
+
+    copier := Copier { }
+    target := TextInput {
+        x: 0;
+        y: 0;
+        width: 0px;
+        height: 0px;
+        single-line: false;
     }
 }
 

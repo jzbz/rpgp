@@ -24,27 +24,35 @@ rpgp-core.workspace = true
 # draws through wgpu (Vulkan on Linux, Metal on macOS) instead of femtovg's
 # OpenGL path, which is deprecated on macOS. renderer-software stays enabled as
 # a fallback for machines without a usable GPU: SLINT_BACKEND=winit-software.
-slint = { version = "1.17", default-features = false, features = [
+#
+# Exactly 1.18.1, as are slint-build and i-slint-backend-testing below, for as
+# long as the root Cargo.toml patches Slint's winit backend: the patch is that
+# version's crate, and cargo only warns when a newer slint leaves it unused,
+# which would quietly take copy and paste out of the Flatpak's text fields
+# again. With Slint 1.19 the patch goes, and the three go back to plain
+# version requirements; the root Cargo.toml says how.
+slint = { version = "=1.18.1", default-features = false, features = [
     "std",
     "compat-1-2",
     "accessibility",
     "backend-winit",
     "renderer-femtovg-wgpu",
     "renderer-software",
-    # Needed only to widen the backend set wgpu is allowed to pick from; see
-    # `configure_renderer` in src/lib.rs. The API is unstable and tied to
-    # wgpu's major version, so it will need revisiting when Slint moves to
-    # wgpu 30.
-    "unstable-wgpu-29",
-    # Needed only for the window-attributes hook that keeps the title bar
-    # painted on macOS; see `backend_selector` in src/lib.rs. Only macOS
-    # installs the hook, but the feature is on everywhere so that every
-    # platform type-checks it, and it adds no crate to the build. The API is
-    # unstable and tied to winit's major version. Drop it with the hook once
-    # the app is on Slint 1.18, which makes the same choice itself.
-    "unstable-winit-030",
-    # Window::window_handle, which is how the clipboard learns whether the
-    # window is on Wayland and reaches its connection; see src/clipboard.rs.
+    # Needed only for the explicit wgpu request in `configure_renderer` in
+    # src/lib.rs, which probes for a GPU up front and pins the backend set
+    # wgpu may pick from. The API is unstable and tied to
+    # wgpu's major version, which has to be the one femtovg draws through:
+    # wgpu 30 since Slint 1.18. A request for wgpu 29 still compiles, with
+    # unstable-wgpu-29, but nothing in this build gives wgpu 29 a backend: on
+    # Linux `select()` panics in Slint's wgpu 29 probe, and with that probe
+    # skipped (SLINT_WGPU_CPU) the window is femtovg's on wgpu 30, which
+    # refuses the request, and the event loop fails. Revisit it whenever Slint
+    # moves femtovg to another wgpu.
+    "unstable-wgpu-30",
+    # Window::window_handle, which is how the first-window watch in
+    # src/lib.rs learns whether Slint has made the native window yet, and how
+    # the clipboard learns whether the window is on Wayland; see
+    # src/clipboard.rs.
     "raw-window-handle-06",
 ] }
 
@@ -60,46 +68,77 @@ open = "5"
 # arboard can be built. wayland-data-control has it copy through the wlr or ext
 # data-control protocol whenever WAYLAND_DISPLAY is set and the compositor
 # offers the app either. Where none is offered it falls back to X11, which on a
-# Wayland session means XWayland, and which the Flatpak there does not have.
+# Wayland session means XWayland, and which the Flatpak there does not have:
+# there the Copy buttons go through Slint's own clipboard instead.
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 
 zeroize.workspace = true
 
-# Already in the dependency graph via slint's accesskit stack; named here to
-# use prctl and setrlimit directly. Uses its linux_raw backend on Linux, so it
-# adds no C dependency.
-[target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process"] }
-
-# Copy for a window on Wayland for which arboard cannot be built: the core
-# wl_data_device protocol, on the window's own connection, which is how Slint's
-# text fields copy and which every compositor offers every client. The
-# data-control protocols arboard uses are not: GNOME implements neither, and
-# sway hides both from a Flatpak, which has no X11 for arboard to fall back to
-# on a Wayland session. Both crates are already in the graph through Slint's
-# winit backend, and the cfg is copypasta's, so they come in on exactly the
-# targets that already have them. build.rs sets cfg(wayland_target) on the same
-# condition for the code that uses them; change both together.
-# smithay-clipboard's default feature loads libwayland at runtime, as the rest
-# of the graph already does, rather than linking it.
-[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios", target_os = "emscripten"))))'.dependencies]
-smithay-clipboard = "0.7"
+# The traits Window::window_handle's handle is read through. The first-window
+# watch in src/lib.rs needs them on every platform, and src/clipboard.rs on
+# the targets where a window can be on Wayland. Slint does not re-export them,
+# and raw-window-handle 0.6 is already in every platform's graph through
+# Slint, winit, wgpu, softbuffer and rfd, so naming it here adds nothing to
+# Cargo.lock.
 raw-window-handle = "0.6"
+
+# Already in the dependency graph via slint's accesskit stack; named here to
+# use prctl and setrlimit directly, and with `net` for src/clipboard.rs to ask
+# whether its connection to the X server is a Unix-domain socket. Uses its
+# linux_raw backend on Linux, so it adds no C dependency, and neither feature
+# adds a crate to Cargo.lock.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process", "net"] }
+
+# The X11 half of withdrawing a private copy when the window closes; see
+# `withdraw` in src/clipboard.rs. arboard does that itself when its last handle
+# is dropped, but since Slint 1.18 the winit backend holds two handles of its
+# own on X11 until the process exits, so rPGP's is never the last. `res` is
+# the X-Resource extension, through which the X server says which process owns
+# the clipboard. x11rb 0.13 is already in Cargo.lock through arboard, winit
+# and softbuffer, and a feature adds no crate. The cfg is the one that has
+# always gated the clipboard's Wayland half, the targets where a window can be
+# on Wayland, which are also the ones where it can be on X11. build.rs sets
+# cfg(wayland_target) on the same condition for the code that uses it; change
+# both together.
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios", target_os = "emscripten"))))'.dependencies]
+x11rb = { version = "0.13", default-features = false, features = ["res"] }
 
 [dev-dependencies]
 # ElementHandle::accessible_value, to assert on what the accessibility tree
 # actually publishes rather than trusting that input-type is enough.
-i-slint-backend-testing = "1.17"
+# Exactly 1.18.1 while Slint's winit backend is patched; see slint above.
+i-slint-backend-testing = "=1.18.1"
 # A real store on disk for the reload tests: read_store takes a Store, and the
 # badges it stitches come from four separate files in one.
 tempfile = "3"
+
+# tests/atspi.rs, which runs a window under winit and reads what reaches the
+# AT-SPI bus: atspi's proxies and zbus to talk to the bus, futures-lite to
+# wait on them, and x11rb for the window to take the X server's focus, without
+# which Slint publishes no focus at all. Every one is already in Cargo.lock,
+# atspi, zbus and futures-lite through accesskit_unix and x11rb through
+# arboard, softbuffer and winit, so nothing new is fetched, and the Flatpak,
+# which builds no tests, is untouched.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+atspi = { version = "0.29", default-features = false, features = ["proxies"] }
+zbus = { version = "5", default-features = false, features = ["async-io"] }
+futures-lite = "2"
+x11rb = { version = "0.13", default-features = false }
+
+# No harness, because winit wants the main thread. Off Linux its main does
+# nothing.
+[[test]]
+name = "atspi"
+harness = false
 
 [[bench]]
 name = "keystroke"
 harness = false
 
 [build-dependencies]
-slint-build = "1.17"
+# Exactly 1.18.1 while Slint's winit backend is patched; see slint above.
+slint-build = "=1.18.1"
 
 # Windows only, and a build dependency, so it never enters the shipped binary
 # or any other platform's graph. Without it the .exe has no resource section at

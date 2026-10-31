@@ -2,14 +2,30 @@
 //!
 //! Slint's `lower_accessibility` pass binds `accessible-value` to a
 //! TextInput's raw `text` for every TextInput, with no exception for
-//! `InputType.password`, and the AccessKit adapter publishes that verbatim to
-//! AT-SPI on Linux and NSAccessibility on macOS. `input-type` only masks the
-//! glyphs on screen. This crate enables Slint's `accessibility` feature, so
-//! without an explicit binding of our own a typed passphrase goes out in
-//! cleartext to anything watching the bus.
+//! `InputType.password`, and `input-type` only masks the glyphs on screen.
+//! Up to Slint 1.17 an `accessible-value` of our own pre-empted that, and was
+//! what the AccessKit adapter published. Since 1.18 the adapter no longer
+//! reads it for a text input: it publishes the displayed text instead, one
+//! bullet per character for a password field, with the caret and a text run
+//! carrying each character's position, and an event for every key, which
+//! tells anything on the bus how long the passphrase is. Passphrases are
+//! therefore typed into `SecretField`, whose one accessible node takes its
+//! role and text from an empty 0x0 password input placed ahead of the real
+//! one; `ui/widgets.slint` explains how.
 //!
-//! Verified to reproduce: before the `accessible-value` binding in
-//! `ui/widgets.slint`, this test reported the passphrase back verbatim.
+//! The testing backend reads the Slint properties, not what AccessKit makes
+//! of them, so the tests here hold the structure in place: one accessible
+//! node, publishing nothing, with the real input out of the tree and the
+//! decoy first and 0x0. Whether that structure keeps the passphrase off the
+//! bus is what `tests/atspi.rs` checks, on Linux, by reading the real AT-SPI
+//! bus while a passphrase is typed.
+//!
+//! Verified to reproduce: in Slint 1.17 days, before Field bound
+//! `accessible-value` for a secret, the first version of
+//! [`a_secret_field_does_not_publish_its_contents`] reported the passphrase
+//! back verbatim. The present one fails with SecretField's decoy 1px square,
+//! or placed after the real input, and the dialog test below with a
+//! passphrase back in a plain Field.
 //!
 //! Nor may it reach a clipboard, which `input-type` does not stop either; see
 //! [`a_secret_field_puts_nothing_on_either_clipboard`].
@@ -19,28 +35,79 @@ include!(concat!(env!("OUT_DIR"), "/field-probe.rs"));
 const PASSPHRASE: &str = "correct horse battery staple";
 const ORDINARY: &str = "alice@example.org";
 
-/// The two Fields in the probe, in declaration order: secret, then plain.
-fn probe_inputs(probe: &FieldProbe) -> Vec<i_slint_backend_testing::ElementHandle> {
-    let inputs: Vec<_> =
-        i_slint_backend_testing::ElementHandle::find_by_element_type_name(probe, "TextInput")
-            .collect();
-    assert_eq!(inputs.len(), 2, "expected two TextInputs in the probe");
-    inputs
+/// The probe's two text fields as assistive technology finds them, by name:
+/// the passphrase field's one node, then the ordinary field's input.
+///
+/// Found by name rather than as TextInputs, of which the passphrase field
+/// has two, neither of them accessible.
+fn probe_inputs(probe: &FieldProbe) -> [i_slint_backend_testing::ElementHandle; 2] {
+    ["Passphrase", "Search"].map(|label| {
+        let found: Vec<_> =
+            i_slint_backend_testing::ElementHandle::find_by_accessible_label(probe, label)
+                .filter(|element| {
+                    element.accessible_role()
+                        == Some(i_slint_backend_testing::AccessibleRole::TextInput)
+                })
+                .collect();
+        assert_eq!(found.len(), 1, "expected one text field called {label:?}");
+        found.into_iter().next().unwrap()
+    })
 }
 
+/// A passphrase field is one accessible node, which publishes nothing of what
+/// is typed into it, and the structure that keeps it so is in place.
 #[test]
 fn a_secret_field_does_not_publish_its_contents() {
     i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
 
     let probe = FieldProbe::new().unwrap();
+    probe.show().unwrap();
+    let named = || ElementHandle::find_by_accessible_label(&probe, "Passphrase").count();
+    assert_eq!(
+        named(),
+        1,
+        "an empty passphrase field should be one node, with no placeholder of the same name"
+    );
     probe.set_secret_text(PASSPHRASE.into());
+    assert_eq!(
+        named(),
+        1,
+        "the passphrase field's nodes changed as it filled"
+    );
 
-    let published = probe_inputs(&probe)[0]
-        .accessible_value()
-        .unwrap_or_default();
-    assert!(
-        !published.contains(PASSPHRASE),
-        "the passphrase is on the accessibility bus: accessible-value = {published:?}",
+    let [field, _] = probe_inputs(&probe);
+    let published = field.accessible_value().unwrap_or_default();
+    assert_eq!(
+        published, "",
+        "the passphrase field publishes a value: accessible-value = {published:?}",
+    );
+
+    // The passphrase itself is in a TextInput that is out of the tree, and so
+    // is the decoy, or either would be a node of its own, publishing its text.
+    let inputs = field
+        .query_descendants()
+        .match_inherits("TextInput")
+        .find_all();
+    assert_eq!(inputs.len(), 2, "expected the decoy and the real input");
+    for input in &inputs {
+        assert_eq!(
+            input.accessible_role(),
+            Some(AccessibleRole::None),
+            "{:?} is in the accessibility tree",
+            input.id()
+        );
+    }
+    // The adapter takes the node's role and text from the first TextInput
+    // under it, and lays nothing out for one of no size: no text runs, no
+    // caret. If the decoy stops being first or 0x0, the real input's text runs
+    // are what get published.
+    let first = &inputs[0];
+    assert_eq!(first.id().as_deref(), Some("SecretField::decoy"));
+    assert_eq!(
+        (first.size().width, first.size().height),
+        (0., 0.),
+        "the decoy has to stay 0x0"
     );
 }
 
@@ -53,17 +120,82 @@ fn an_ordinary_field_still_publishes_its_contents() {
     let probe = FieldProbe::new().unwrap();
     probe.set_plain_text(ORDINARY.into());
 
-    let inputs = probe_inputs(&probe);
+    let [secret, plain] = probe_inputs(&probe);
     assert_eq!(
-        inputs[1].accessible_value().unwrap_or_default().as_str(),
-        ORDINARY,
+        plain.accessible_value().unwrap_or_default().as_str(),
+        ORDINARY
     );
     // And a secret field is still announced by name, rather than as an
     // anonymous unlabelled control.
     assert_eq!(
-        inputs[0].accessible_label().unwrap_or_default().as_str(),
+        secret.accessible_label().unwrap_or_default().as_str(),
         "Passphrase",
     );
+}
+
+/// Assistive technology can fill in a passphrase field, as a password manager
+/// does on macOS, but not while it is disabled, and it is published as
+/// disabled then.
+#[test]
+fn a_secret_field_takes_text_from_assistive_technology_only_while_enabled() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let probe = FieldProbe::new().unwrap();
+    probe.show().unwrap();
+    let [field, _] = probe_inputs(&probe);
+
+    probe.set_secret_enabled(false);
+    assert_eq!(field.accessible_enabled(), Some(false));
+    assert_eq!(field.accessible_read_only(), Some(true));
+    field.set_accessible_value(PASSPHRASE);
+    assert_eq!(
+        probe.get_secret_text(),
+        "",
+        "a disabled passphrase field took text from assistive technology"
+    );
+
+    probe.set_secret_enabled(true);
+    assert_eq!(field.accessible_enabled(), Some(true));
+    assert_eq!(field.accessible_read_only(), Some(false));
+    field.set_accessible_value(PASSPHRASE);
+    assert_eq!(probe.get_secret_text(), PASSPHRASE);
+    assert_eq!(
+        field.accessible_value().unwrap_or_default().as_str(),
+        "",
+        "the text set through assistive technology is published back"
+    );
+}
+
+/// Tab and Shift+Tab move between the two fields, and never stop on the
+/// passphrase field's decoy, which is disabled for that reason: a stop there
+/// would take keys that go nowhere, with the field looking focused.
+#[test]
+fn tab_passes_between_the_fields_and_never_stops_on_the_decoy() {
+    i_slint_backend_testing::init_no_event_loop();
+    use slint::platform::Key;
+
+    let probe = FieldProbe::new().unwrap();
+    probe.show().unwrap();
+    probe.invoke_focus_secret();
+    assert!(probe.get_secret_has_focus());
+    press(&probe, Key::Tab);
+    assert!(!probe.get_secret_has_focus());
+    press(&probe, "x");
+    assert_eq!(
+        (
+            probe.get_secret_text().as_str(),
+            probe.get_plain_text().as_str()
+        ),
+        ("", "x"),
+        "Tab from the passphrase should reach the next field"
+    );
+    press(&probe, Key::Backtab);
+    assert!(
+        probe.get_secret_has_focus(),
+        "Shift+Tab from the next field should reach the passphrase itself"
+    );
+    press(&probe, "y");
+    assert_eq!(probe.get_secret_text().as_str(), "y");
 }
 
 /// The testing backend, with every text Slint puts on either clipboard kept.
@@ -192,6 +324,83 @@ fn a_secret_field_puts_nothing_on_either_clipboard() {
             );
         }
     }
+}
+
+/// The copier behind the Copy buttons' route to Slint's own clipboard puts
+/// all of a long text there, and leaves nothing behind: nothing laid out,
+/// nothing published, and no timer running.
+///
+/// That route is how a window on Wayland copies where arboard cannot be
+/// built, as in the Flatpak on GNOME, KDE Plasma or sway, and what it copies
+/// is the notepad's whole output: up to 64 MiB of decrypted message, of which
+/// the output box is given 8 KiB because laying out more is slow. `Copier` in
+/// ui/widgets.slint says why its input has to be 0x0, out of the tree, and
+/// selected with set-selection-offsets. What reached the clipboard is read
+/// back by pasting it into an input of no size, through the testing backend's
+/// clipboard, which stands in for Slint's.
+#[test]
+fn the_copier_copies_a_long_text_whole_and_leaves_nothing_behind() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+    use slint::platform::{Key, WindowEvent};
+
+    let probe = CopierProbe::new().unwrap();
+    probe.show().unwrap();
+    let input = ElementHandle::find_by_element_id(&probe, "Copier::input")
+        .next()
+        .expect("the copier has its input");
+    assert_eq!(
+        (input.size().width, input.size().height),
+        (0., 0.),
+        "the copier's input has to stay 0x0, or every copy lays the text out"
+    );
+    assert_eq!(
+        input.accessible_role(),
+        Some(AccessibleRole::None),
+        "the copier's input is in the accessibility tree"
+    );
+
+    // Megabytes of short lines with characters of two and three bytes, as a
+    // decrypted message can be.
+    let text: String = (0..200_000)
+        .map(|line| format!("{line:06} ünïcødé €\n"))
+        .collect();
+    assert!(text.len() > 4 << 20, "the premise");
+    // A second of mock time fires whatever is due once, so that only a timer
+    // that repeats is left: the cursor blink's repeats every 500 ms.
+    let a_second_later = || {
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_secs(1));
+        slint::platform::duration_until_next_timer_update()
+    };
+    assert_eq!(
+        a_second_later(),
+        None,
+        "the premise: no timer is running before the copy"
+    );
+    probe.invoke_copy(text.as_str().into());
+    assert_eq!(
+        a_second_later(),
+        None,
+        "the copy left a timer running, which wakes the event loop for as long as the \
+         window lasts"
+    );
+
+    probe.invoke_focus_target();
+    let window = probe.window();
+    window.dispatch_event(WindowEvent::KeyPressed {
+        text: Key::Control.into(),
+    });
+    press(&probe, "v");
+    window.dispatch_event(WindowEvent::KeyReleased {
+        text: Key::Control.into(),
+    });
+    let pasted = probe.get_pasted();
+    assert!(
+        pasted == text.as_str(),
+        "Ctrl+V gave {} bytes where {} were copied",
+        pasted.len(),
+        text.len()
+    );
 }
 
 /// Every interactive control says what it is, what it is called, and can be
@@ -1089,61 +1298,255 @@ fn the_notepad_output_can_be_selected_but_not_rewritten_by_assistive_technology(
     );
 }
 
-/// Create key pair does nothing, however it is reached, until the passphrase
-/// has been typed twice alike, and says so when the two differ.
+/// Create key pair makes no key until the passphrase has been typed twice
+/// alike. When the two differ it says so in a note, which is announced as it
+/// appears and, in other words, at each comparison that finds them differing
+/// while it is shown, and a refusal empties the repeat and puts focus there.
 ///
 /// A passphrase mistyped behind the mask used to become the key's, with no
 /// way in the app to learn what it was or to set another, so the key was
 /// locked for good. A key with no passphrase needs nothing repeated.
+///
+/// Create is offered whatever the passphrases hold, and refuses when pressed:
+/// its enabled state is published, and it used to come on at the key that
+/// made the repeat match, which gave the passphrase's length away; see
+/// [`nothing_published_follows_the_repeated_passphrase_as_it_is_typed`]. A
+/// refusal then showed the note and did nothing else, and nothing announced
+/// the note, so a screen reader had nothing to say when Create was pressed.
+/// AccessKit announces a live node only when it is added or its name changes,
+/// so a note that stayed as it was went unheard at every refusal after the
+/// first. And focus put back in the repeat left the caret after the text that
+/// did not match, where the passphrase typed again in full went on the end of
+/// it and was refused again.
 #[test]
 fn a_new_key_waits_for_its_passphrase_to_be_typed_twice_alike() {
     i_slint_backend_testing::init_no_event_loop();
-    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+    use i_slint_backend_testing::{AccessibleLiveness, AccessibleRole, ElementHandle};
+    use slint::platform::{Key, PointerEventButton};
+    const DIFFER: &str = "The passphrases do not match.";
+    const STILL: &str = "The passphrases still do not match.";
 
     let probe = KeygenProbe::new().unwrap();
     probe.show().unwrap();
     let field = |label: &str| control(&probe, label, AccessibleRole::TextInput);
     let create = || control(&probe, "Create key pair", AccessibleRole::Button);
-    let differ = || {
-        ElementHandle::find_by_accessible_label(&probe, "The passphrases do not match.")
+    let note = || {
+        ElementHandle::find_by_accessible_label(&probe, DIFFER)
+            .chain(ElementHandle::find_by_accessible_label(&probe, STILL))
             .next()
-            .is_some()
     };
+    let differ = || note().is_some();
+    // Focus in the name field, away from the repeat, so that a refusal has to
+    // move it there. Then what Slint runs where it runs timers, the `changed`
+    // handler comparing on leaving the repeat among them.
+    let away = || {
+        field("Name").mock_single_click(PointerEventButton::Left);
+        slint::platform::update_timers_and_animations();
+    };
+    let name = || field("Name").accessible_value().unwrap_or_default();
+    // How many of the two passphrase fields are empty, by their placeholders,
+    // which are out of the accessibility tree.
+    let empty = || ElementHandle::find_by_element_id(&probe, "SecretField::hint").count();
 
     field("Name").set_accessible_value("Alice");
     field("name@example.org").set_accessible_value("alice@example.org");
-    assert_eq!(
-        create().accessible_enabled(),
-        Some(true),
-        "a key with no passphrase has nothing to repeat"
-    );
+    assert_eq!(create().accessible_enabled(), Some(true));
 
     field("Passphrase (optional)").set_accessible_value(PASSPHRASE);
     assert_eq!(
         create().accessible_enabled(),
-        Some(false),
-        "Create key pair was offered with the passphrase typed once"
+        Some(true),
+        "Create key pair followed the passphrase, which tells the bus one was typed"
     );
-    assert!(!differ(), "nothing has been typed twice yet to disagree");
+    assert!(!differ(), "nothing has been compared yet");
+    away();
+    create().invoke_accessible_default_action();
+    assert_eq!(
+        probe.get_runs(),
+        0,
+        "a key was made with the passphrase typed once"
+    );
+    // Kept, to tell the note's words changing from its going and coming back.
+    let first = note().expect("pressing Create with the repeat empty should say so");
+    assert_eq!(first.accessible_label().as_deref(), Some(DIFFER));
+    assert_eq!(
+        first.accessible_live_region(),
+        Some(AccessibleLiveness::Assertive),
+        "the note is not announced, so nothing tells a screen reader of the refusal"
+    );
+    assert_eq!(empty(), 1);
+    press(&probe, "x");
+    assert_eq!(
+        (empty(), name().as_str()),
+        (0, "Alice"),
+        "the refusal should have put focus in the repeat, for the key typed next"
+    );
+
+    // Leaving the repeat empty is a comparison as well, and must find the two
+    // differing, as Create did, or leaving it would undo Create's note.
+    press(&probe, Key::Backspace);
+    assert_eq!(empty(), 1);
+    away();
+    assert!(
+        differ(),
+        "leaving an empty repeat should not clear the note"
+    );
+    assert_eq!(
+        first.accessible_label().as_deref(),
+        Some(STILL),
+        "a comparison finding the two differing with the note shown should change the \
+         note's words, without which AccessKit does not announce it again"
+    );
 
     field("Repeat the passphrase").set_accessible_value("correct horse battery stapel");
-    assert!(differ(), "two passphrases that differ should say so");
-    assert_eq!(create().accessible_enabled(), Some(false));
     create().invoke_accessible_default_action();
     assert_eq!(
         probe.get_runs(),
         0,
         "a key was made with two passphrases that differ"
     );
+    assert_eq!(
+        first.accessible_label().as_deref(),
+        Some(DIFFER),
+        "a refusal with the note shown should change its words back, so that it is \
+         announced again"
+    );
+    assert_eq!(
+        empty(),
+        1,
+        "the refusal should have emptied the repeat, so that the passphrase typed again \
+         is not added to the end of the one that did not match"
+    );
 
-    field("Repeat the passphrase").set_accessible_value(PASSPHRASE);
-    assert!(!differ());
-    assert_eq!(create().accessible_enabled(), Some(true));
+    // Typed again in full, from the keyboard, where the refusal left focus.
+    for character in PASSPHRASE.chars() {
+        press(&probe, character.to_string());
+    }
+    assert_eq!(
+        name().as_str(),
+        "Alice",
+        "the refusal left focus in the name field"
+    );
     create().invoke_accessible_default_action();
     assert_eq!(
         (probe.get_runs(), probe.get_passphrase().as_str()),
         (1, PASSPHRASE),
         "with both alike the key should be made, with that passphrase"
+    );
+    assert!(!differ());
+
+    // A key with no passphrase at all is made as it always was.
+    field("Passphrase (optional)").set_accessible_value("");
+    field("Repeat the passphrase").set_accessible_value("");
+    create().invoke_accessible_default_action();
+    assert_eq!((probe.get_runs(), probe.get_passphrase().as_str()), (2, ""));
+}
+
+/// Everything the accessibility tree publishes about `root`: each accessible
+/// element's role, name, value, state and bounds, in tree order.
+fn published(root: &impl i_slint_backend_testing::ElementRoot) -> Vec<String> {
+    use i_slint_backend_testing::AccessibleRole;
+    root.root_element()
+        .query_descendants()
+        .match_predicate(|element| {
+            element
+                .accessible_role()
+                .is_some_and(|role| role != AccessibleRole::None)
+        })
+        .find_all()
+        .iter()
+        .map(|element| {
+            format!(
+                "{:?} {:?} value={:?} enabled={:?} read-only={:?} checked={:?} at={:?} size={:?}",
+                element.accessible_role(),
+                element.accessible_label(),
+                element.accessible_value(),
+                element.accessible_enabled(),
+                element.accessible_read_only(),
+                element.accessible_checked(),
+                element.absolute_position(),
+                element.size(),
+            )
+        })
+        .collect()
+}
+
+/// Nothing the new-key dialog publishes changes while the repeated
+/// passphrase is typed, not even at the key that makes it match.
+///
+/// The note that the two differ and Create's enabled state both used to
+/// follow the repeat key by key. Typed straight through, the note went and
+/// Create came on at the key that made the repeat match, so anything on the
+/// accessibility bus could count the passphrase's length off the repeat's
+/// keystrokes. The two are now compared only when the repeat loses focus and
+/// when Create is pressed.
+#[test]
+fn nothing_published_follows_the_repeated_passphrase_as_it_is_typed() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle};
+    use slint::platform::{Key, PointerEventButton};
+
+    let probe = KeygenProbe::new().unwrap();
+    probe.show().unwrap();
+    let field = |label: &str| control(&probe, label, AccessibleRole::TextInput);
+    let differ = || {
+        ElementHandle::find_by_accessible_label(&probe, "The passphrases do not match.")
+            .next()
+            .is_some()
+    };
+    // `changed` handlers, the one comparing on focus loss among them, run
+    // where Slint runs timers.
+    let settled = || {
+        slint::platform::update_timers_and_animations();
+        published(&probe)
+    };
+
+    field("Name").set_accessible_value("Alice");
+    field("Passphrase (optional)").set_accessible_value("hunter2");
+    // Into the repeat by a click, as a user would, so that leaving it is a
+    // real loss of focus.
+    field("Repeat the passphrase").mock_single_click(PointerEventButton::Left);
+    let before = settled();
+    assert!(!differ());
+    for key in ["h", "u", "n", "t", "e", "r"] {
+        press(&probe, key);
+        assert_eq!(
+            settled(),
+            before,
+            "what the dialog publishes changed as {key:?} was typed into the repeat"
+        );
+    }
+
+    // Leaving the repeat is when the two are compared.
+    press(&probe, Key::Tab);
+    slint::platform::update_timers_and_animations();
+    assert!(
+        differ(),
+        "leaving the repeat one key short should say they differ"
+    );
+
+    // Back in, and the key that makes the two agree changes nothing either,
+    // the note that they differ included: it waits for the next comparison.
+    field("Repeat the passphrase").mock_single_click(PointerEventButton::Left);
+    let before = settled();
+    press(&probe, "2");
+    assert_eq!(
+        settled(),
+        before,
+        "what the dialog publishes changed at the key that made the repeat match"
+    );
+    press(&probe, Key::Tab);
+    slint::platform::update_timers_and_animations();
+    assert!(
+        !differ(),
+        "leaving the repeat once it matches should clear the note"
+    );
+
+    control(&probe, "Create key pair", AccessibleRole::Button).invoke_accessible_default_action();
+    assert_eq!(
+        (probe.get_runs(), probe.get_passphrase().as_str()),
+        (1, "hunter2"),
+        "the repeat should have been typed into, and the key made with it"
     );
 }
 
@@ -1162,9 +1565,12 @@ fn the_new_key_dialog_keeps_its_buttons_in_the_smallest_window() {
     // The main window's minimum height, all of which the dialog's scrim covers.
     probe.set_probe_height(520.);
     probe.show().unwrap();
+    control(&probe, "Name", AccessibleRole::TextInput).set_accessible_value("Alice");
     control(&probe, "Passphrase (optional)", AccessibleRole::TextInput)
         .set_accessible_value(PASSPHRASE);
     control(&probe, "Repeat the passphrase", AccessibleRole::TextInput).set_accessible_value("x");
+    // The note shows once the two have been compared.
+    control(&probe, "Create key pair", AccessibleRole::Button).invoke_accessible_default_action();
     assert!(
         ElementHandle::find_by_accessible_label(&probe, "The passphrases do not match.")
             .next()
@@ -1310,10 +1716,12 @@ fn choosing_another_message_empties_the_passphrase_field() {
     let probe = DecryptProbe::new().unwrap();
     probe.show().unwrap();
     let field = || control(&probe, LABEL, AccessibleRole::TextInput);
-    // The field's placeholder is a Text of the same name, drawn only while
-    // the field is empty; a secret field's value is published as nothing
-    // either way, so this is how an empty one is told from a full one.
-    let looks_empty = || ElementHandle::find_by_accessible_label(&probe, LABEL).count() == 2;
+    // The field's placeholder, drawn only while the field is empty. It is
+    // out of the accessibility tree, as is everything else that would tell
+    // the bus whether the field holds a passphrase, so it is found by its id
+    // in the element tree.
+    let looks_empty =
+        || ElementHandle::find_by_element_id(&probe, "SecretField::hint").count() == 1;
     let decrypt = || {
         control(&probe, "Decrypt", AccessibleRole::Button).invoke_accessible_default_action();
         probe.get_sent()
@@ -1362,7 +1770,9 @@ fn a_file_of_the_same_name_from_another_folder_still_empties_the_passphrase_fiel
     probe.show().unwrap();
     let shows = |text: &str| ElementHandle::find_by_accessible_label(&probe, text).count() > 0;
     let field = || control(&probe, LABEL, AccessibleRole::TextInput);
-    let looks_empty = || ElementHandle::find_by_accessible_label(&probe, LABEL).count() == 2;
+    // As in the test above: the placeholder, by its id.
+    let looks_empty =
+        || ElementHandle::find_by_element_id(&probe, "SecretField::hint").count() == 1;
     let decrypt = || {
         control(&probe, "Decrypt", AccessibleRole::Button).invoke_accessible_default_action();
         probe.get_sent()
@@ -1385,33 +1795,56 @@ fn a_file_of_the_same_name_from_another_folder_still_empties_the_passphrase_fiel
     assert_eq!(decrypt(), "");
 }
 
-/// The suppression has two halves: the binding inside `Field`, which the two
-/// tests at the top cover, and the `secret: true` at each call site, which they
-/// do not — they exercise the probe's own copy of a passphrase field, so every
-/// dialog in the app could have lost its flag with all three still passing.
+/// The suppression has two halves: `SecretField` itself, which the tests at
+/// the top cover, and the choice of a SecretField over a Field at each call
+/// site, which they do not — they exercise the probe's own passphrase field,
+/// so every dialog in the app could have gone back to a plain Field with all
+/// of them still passing.
 ///
-/// This drives the shipped dialogs. It types into every text input each one
+/// This drives the shipped dialogs. It types into every text field each one
 /// has, through the same accessibility action a screen reader would use, and
 /// asks what the bus was told: a field the dialog itself labels as taking a
-/// passphrase must answer nothing, and every other field must still answer.
+/// passphrase must answer nothing and be a SecretField, and every other field
+/// must still answer.
 #[test]
 fn every_passphrase_field_in_the_real_dialogs_suppresses_its_value() {
     i_slint_backend_testing::init_no_event_loop();
-    use i_slint_backend_testing::{ElementHandle, ElementRoot};
+    use i_slint_backend_testing::{AccessibleRole, ElementRoot};
 
     fn check(dialog: &str, probe: &impl ElementRoot) -> usize {
         let mut suppressed = 0;
-        for field in ElementHandle::find_by_element_type_name(probe, "TextInput") {
+        // By role, as assistive technology finds them: a SecretField's
+        // TextInputs are not in the tree, and its one node is a Rectangle.
+        let fields = probe
+            .root_element()
+            .query_descendants()
+            .match_accessible_role(AccessibleRole::TextInput)
+            .find_all();
+        for field in fields {
             let label = field.accessible_label().unwrap_or_default().to_string();
-            // Slint gives every TextInput an accessible-action-set-value that
-            // assigns `text`, so this is the field being typed into.
+            // Every text field has a set-value action, Slint's own or the one
+            // Field and SecretField declare, so this is the field being typed
+            // into.
             field.set_accessible_value(PASSPHRASE);
             let published = field.accessible_value().unwrap_or_default();
             let lower = label.to_lowercase();
             if lower.contains("passphrase") || lower.contains("password") {
-                assert!(
-                    !published.contains(PASSPHRASE),
-                    "{dialog}: {label:?} takes a passphrase and publishes it: {published:?}"
+                assert_eq!(
+                    published, "",
+                    "{dialog}: {label:?} takes a passphrase and publishes a value"
+                );
+                // The value alone is what a Field binding used to hold back,
+                // and no longer does since Slint 1.18; the decoy is what keeps
+                // the length off the bus.
+                let first = field
+                    .query_descendants()
+                    .match_inherits("TextInput")
+                    .find_first()
+                    .and_then(|input| input.id());
+                assert_eq!(
+                    first.as_deref(),
+                    Some("SecretField::decoy"),
+                    "{dialog}: {label:?} takes a passphrase but is not a SecretField"
                 );
                 suppressed += 1;
             } else {
@@ -1449,11 +1882,12 @@ fn every_passphrase_field_in_the_real_dialogs_suppresses_its_value() {
 
     // A passphrase field in a dialog no probe instantiates, or behind a
     // condition no probe satisfies, is never reached above. Counting
-    // `secret: true` in the source, as this used to, could not make up for
-    // that where it matters: a field that forgot the flag adds nothing to the
-    // count, and passed unseen. So every Field is read from the source too,
-    // and the flag has to agree with the placeholder, which is the label the
-    // check above classifies by, wherever the field is.
+    // SecretFields in the source could not make up for that where it
+    // matters: a passphrase typed into a plain Field adds nothing to the
+    // count, and passes unseen. So every Field and SecretField is read from
+    // the source too, and which of the two it is has to agree with its
+    // placeholder, which is the label the check above classifies by,
+    // wherever the field is.
     let mut declared = 0;
     for file in ["ui/dialogs.slint", "ui/app-window.slint"] {
         let source = std::fs::read_to_string(format!("{}/{file}", env!("CARGO_MANIFEST_DIR")))
@@ -1463,14 +1897,14 @@ fn every_passphrase_field_in_the_real_dialogs_suppresses_its_value() {
             let takes_passphrase = lower.contains("passphrase") || lower.contains("password");
             assert!(
                 field.secret || !takes_passphrase,
-                "{file}:{}: the Field {} takes a passphrase but is not marked `secret: true`",
+                "{file}:{}: the field {} takes a passphrase but is a Field, not a SecretField",
                 field.line,
                 field.placeholder
             );
             assert!(
                 takes_passphrase || !field.secret,
-                "{file}:{}: the Field {} is marked secret, but its placeholder does not say \
-                 it takes a passphrase or a password, which is all it is announced by",
+                "{file}:{}: the SecretField {} has a placeholder that does not say it takes \
+                 a passphrase or a password, which is all it is announced by",
                 field.line,
                 field.placeholder
             );
@@ -1488,34 +1922,48 @@ fn every_passphrase_field_in_the_real_dialogs_suppresses_its_value() {
     );
 }
 
-/// A `Field` as a `.slint` file declares it.
+/// A `Field` or `SecretField` as a `.slint` file declares it.
 struct DeclaredField {
     /// The line it starts on, from 1.
     line: usize,
     /// What its `placeholder:` is set to, as written: a string literal, or
     /// the expression it is bound to.
     placeholder: String,
+    /// Whether it is a SecretField.
     secret: bool,
 }
 
-/// Every `Field` instantiated in `source`.
+/// Every `Field` and `SecretField` instantiated in `source`.
 ///
 /// Read from the text rather than parsed, which is enough for how this
-/// interface is written: a placeholder is one statement, and a Field's block
+/// interface is written: a placeholder is one statement, and a field's block
 /// holds no string with a brace of its own outside an interpolation.
 fn fields_in(source: &str) -> Vec<DeclaredField> {
+    let ident = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
     let mut fields = Vec::new();
-    for (start, _) in source.match_indices("Field") {
+    for (at, _) in source.match_indices("Field") {
+        // The whole name "Field" is part of: Field, SecretField, or another
+        // component, FieldRow among them.
+        let start = source[..at]
+            .char_indices()
+            .rev()
+            .take_while(|&(_, c)| ident(c))
+            .last()
+            .map_or(at, |(i, _)| i);
+        let end = source[at..]
+            .char_indices()
+            .find(|&(_, c)| !ident(c))
+            .map_or(source.len(), |(i, _)| at + i);
+        let secret = match &source[start..end] {
+            "Field" => false,
+            "SecretField" => true,
+            _ => continue,
+        };
         let line_start = source[..start].rfind('\n').map_or(0, |at| at + 1);
         let commented = source[line_start..start].contains("//");
-        // A name that only ends in Field is another component, and one that
-        // only starts with it, FieldRow, has no brace straight after.
-        let named = source[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '_');
-        let rest = source[start + "Field".len()..].trim_start();
-        if commented || named || !rest.starts_with('{') {
+        // An import or a declaration has no brace straight after the name.
+        let rest = source[end..].trim_start();
+        if commented || !rest.starts_with('{') {
             continue;
         }
         let open = source.len() - rest.len();
@@ -1529,7 +1977,7 @@ fn fields_in(source: &str) -> Vec<DeclaredField> {
         fields.push(DeclaredField {
             line: source[..start].matches('\n').count() + 1,
             placeholder,
-            secret: body.contains("secret: true"),
+            secret,
         });
     }
     fields

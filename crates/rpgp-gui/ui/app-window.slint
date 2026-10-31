@@ -1,8 +1,8 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Theme, Icons, Icon } from "theme.slint";
 import {
-    Btn, CertList, Check, Divider, Field, FieldRow, Monogram, Pill, RevocationBanner, RevokeOffer,
-    ScopeTabs, SectionLabel, Select, StatusBar, Tone, TrustRootCheck, Variant,
+    Btn, CertList, Check, Copier, Divider, Field, FieldRow, Monogram, Pill, RevocationBanner,
+    RevokeOffer, ScopeTabs, SectionLabel, Select, StatusBar, Tone, TrustRootCheck, Variant,
 } from "widgets.slint";
 import { CertRow, CertificationRow, LookupRow, PendingRevocationRow, RecipientRow, SignatureRow, SubkeyRow, UserIdDetailRow, UserIdRow } from "types.slint";
 import { AboutDialog, CertifyDialog, DecryptVerifyDialog, DetailsDialog, ImportRevocationDialog, KeygenDialog, LifecycleDialog, LookupDialog, NotepadDialog, DeleteDialog, RevokeDialog, SignEncryptDialog } from "dialogs.slint";
@@ -67,6 +67,14 @@ export component AppWindow inherits Window {
     // window lays it out. Change them together.
     default-font-family: "Geist";
     default-font-size: Theme.t-md;
+    // Opaque in both color schemes, and it has to stay so, as does the native
+    // frame (no `no-frame`). On macOS, Slint's winit backend makes a window
+    // transparent when its background is translucent or it has no frame
+    // (`wants_transparent` in i-slint-backend-winit 1.18), and AppKit, at
+    // least on macOS 27, then leaves a transparent window's whole frame
+    // unpainted, the title bar included (slint-ui/slint#12893). Nothing here
+    // needs to show through: the dialogs' scrims and the popups are drawn
+    // inside this window, over its own background.
     background: Theme.bg;
 
     // --- Certificate list -------------------------------------------------
@@ -285,6 +293,11 @@ export component AppWindow inherits Window {
     callback open-revoke();
     /// Put a detail value on the clipboard.
     callback copy-value(string);
+    /// Put `text` on Slint's own clipboard, for the Copy buttons of a window
+    /// on Wayland that arboard cannot serve; see src/clipboard.rs.
+    public function copy-through-slint(text: string) {
+        copier.copy(text);
+    }
     callback filter-recipients(string);
     callback open-delete();
     callback delete-run();
@@ -1110,4 +1123,8 @@ export component AppWindow inherits Window {
         pick-data => { root.dv-pick-data(); }
         run(password) => { root.dv-run(password); }
     }
+
+    // Outside every layout and drawn nowhere; Copier says why it is built as
+    // it is.
+    copier := Copier { }
 }

@@ -7,7 +7,7 @@ version = "0.1.4"
 edition = "2024"
 # What cargo will actually build, not what the edition alone asks for. 1.85 was
 # the edition's own floor and stopped being true twice over: this workspace uses
-# let-chains, stable in 1.88, and slint 1.17 declares 1.92 throughout its tree,
+# let-chains, stable in 1.88, and slint 1.18 declares 1.92 throughout its tree,
 # which cargo enforces whatever the source needs. rpgp-core on its own still
 # checks on 1.89 — the toolkit is the whole of the difference.
 rust-version = "1.92"
@@ -101,6 +101,77 @@ anyhow = "1"
 thiserror = "2"
 dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# Slint's winit backend: 1.18.1 as crates.io serves it, plus the one change
+# from Slint's master that puts copy and paste back into the text fields of
+# the Flatpak on a Wayland session, slint-ui/slint#14248 (merged 2026-10-20 as
+# cb91c1927c, due in Slint 1.19; no 1.18.x carries it). Slint 1.18 gave its
+# text fields arboard and nothing behind it, and arboard needs a data-control
+# protocol or X11. The Flatpak on a Wayland session has neither: GNOME offers
+# no data-control, KDE Plasma and sway hide it from a sandboxed client, and
+# --socket=fallback-x11 grants no X11 there. Its text fields then copied and
+# pasted nothing, with no error. The change has Slint copy over the core
+# wl_data_device protocol, which every compositor offers every client, on the
+# event loop's own connection, as Slint 1.17 did through copypasta.
+#
+# vendor/i-slint-backend-winit is crates.io's archive of 1.18.1, unpacked,
+# with vendor/i-slint-backend-winit.patch applied and nothing else. The
+# archive is
+#   https://static.crates.io/crates/i-slint-backend-winit/i-slint-backend-winit-1.18.1.crate
+# with sha256
+#   dae4fcf1b19e9cb109984d2af87d2b9485388c619265bff71dd523133888bee2
+# as crates.io's index records it. Unpack it, run `patch -p1` in it with that
+# file, and `diff -r` against vendor/i-slint-backend-winit finds nothing. The
+# lines the patch adds and removes are upstream's own, in clipboard.rs and in
+# the manifest the archive keeps as Cargo.toml.orig. Only the context
+# differs, as upstream's create_clipboard had moved from cfg_if to cfg_select
+# by then, and the same manifest change is written out again in Cargo.toml,
+# the normalised manifest cargo reads. The dependency graph is not upstream's
+# to the letter:
+# upstream's lockfile took smithay-clipboard 0.7.2, which keeps to winit's
+# smithay-client-toolkit 0.19, where Cargo.lock here has 0.7.3, on 0.20, the
+# smithay-clipboard rPGP 0.1.4 shipped with. The crate is not a workspace
+# member, so fmt and clippy leave it alone. Its licence is Slint's, under
+# which rPGP uses Slint: its LICENSES directory and SPDX headers stay with it,
+# and README.md's Licence section says so.
+#
+# The patched clipboard keeps a thread on the event loop's Wayland connection,
+# and upstream's SAFETY comment rests on Slint keeping that connection for as
+# long as the clipboard. rPGP's restart on the software renderer, when the
+# first window cannot be made on the GPU, keeps to that: the first-window
+# watch in src/lib.rs ends the loop normally, and Slint puts the winit event
+# loop back before it returns the error it kept (EventLoopState::run in the
+# crate's event_loop.rs), so the connection lasts until exec replaces the
+# process. Traced under gdb on a nested KWin, reached through a proxy that
+# hid linux-dmabuf so that the GPU renderer failed at the first window:
+# nothing disconnected the event loop's display before the exec. 24 such
+# restarts, on KWin, KWin with the Flatpak's sandbox and mutter, each went on
+# to paste into a text field.
+#
+# cargo applies a [patch] only while the graph asks for the version it names,
+# and otherwise only warns, so a newer slint would quietly drop it. That is
+# why crates/rpgp-gui/Cargo.toml pins slint, slint-build and
+# i-slint-backend-testing to =1.18.1, and why src/clipboard.rs has a test that
+# fails when Cargo.lock shows the patch going unused.
+#
+# Drop it with Slint 1.19:
+# - delete vendor/ and this table with this comment;
+# - delete that test (`the_winit_backend_is_the_patched_one_until_slint_1_19`,
+#   which fails on 1.19 to say so) with the LockTable and lock_tables helpers
+#   only it uses, and its mention in the comment over src/clipboard.rs's
+#   tests module;
+# - turn the three =1.18.1 pins in crates/rpgp-gui/Cargo.toml (slint,
+#   i-slint-backend-testing and slint-build) back into plain 1.19
+#   requirements, and take out the comments there that explain the pins;
+# - reword the sentence in src/clipboard.rs's module doc that says Slint's
+#   clipboard is the patched winit backend until 1.19;
+# - remove the vendor/ paragraph from README.md's Licence section, and the
+#   vendor/ mention in packaging/cargo-sources.py.
+# smithay-clipboard stays in the graph, through Slint's own backend.
+# src/clipboard.rs's route to Slint's clipboard for the Copy buttons stays
+# too: it is what 1.19 needs.
+[patch.crates-io]
+i-slint-backend-winit = { path = "vendor/i-slint-backend-winit" }
 
 [profile.release]
 opt-level = 3

@@ -214,8 +214,9 @@ export component Btn inherits Rectangle {
 }
 
 // Single-line text entry. Built on the TextInput primitive rather than
-// std-widgets' LineEdit so that focus, placeholder and password masking all
-// follow the app's own palette instead of the platform style's.
+// std-widgets' LineEdit so that focus and placeholder follow the app's own
+// palette instead of the platform style's. A passphrase or password goes in a
+// SecretField, below, never in one of these.
 //
 // Nothing here sits in a layout. A TextInput reports its content size as a
 // minimum and a layout honours a minimum over the space it was given, so a
@@ -225,12 +226,15 @@ export component Btn inherits Rectangle {
 // the box the size the caller asked for.
 export component Field inherits Rectangle {
     in property <string> placeholder;
-    in property <bool> secret: false;
     in property <bool> enabled: true;
     in property <image> glyph;
     in-out property <string> text <=> input.text;
     callback edited(string);
     callback accepted();
+
+    // So that `focus()` on a Field reaches its input; a Rectangle cannot take
+    // focus itself.
+    forward-focus: input;
 
     property <length> text-x: root.glyph.width > 0
         ? Theme.s3 + 16px + Theme.s2
@@ -272,17 +276,9 @@ export component Field inherits Rectangle {
         // cannot gain focus. No Field is shown only to be read, so nothing is
         // lost by the text no longer being selectable while it is disabled.
         enabled: root.enabled;
-        input-type: root.secret ? InputType.password : InputType.text;
-        // input-type only masks the glyphs on screen. Slint's accessibility
-        // pass binds accessible-value to `text` for every TextInput with no
-        // exception for password fields, and AccessKit publishes that
-        // verbatim to AT-SPI and NSAccessibility, so a passphrase would go
-        // out in cleartext to anything watching the bus. Binding it here
-        // pre-empts that pass, which only fills in what is not already set.
-        // tests/accessibility.rs holds this shut.
-        accessible-value: root.secret ? "" : self.text;
-        // The pass sets no accessible-label for a TextInput, so a secret
-        // field would otherwise be announced with neither name nor value.
+        // The pass sets no accessible-label for a TextInput, so a field would
+        // otherwise be announced by its contents alone, and an empty one with
+        // no name at all.
         accessible-label: root.placeholder;
         // The same pass also gives every TextInput a set-value action that
         // writes `text` and fires `edited` without looking at either flag.
@@ -299,20 +295,6 @@ export component Field inherits Rectangle {
         selection-foreground-color: Theme.accent-ink;
         edited => { root.edited(self.text); }
         accepted => { root.accepted(); }
-        // input-type does not stop Copy and Cut either: Slint puts the
-        // selected text itself on the clipboard, unmasked, where any program
-        // can read it and a clipboard manager keeps it. This runs before Slint
-        // acts on a key, and swallows the two it copies on, by the test Slint
-        // itself applies: control without shift, and "c" or "x". On macOS
-        // that is Cmd, which Slint reports as control. Paste is left alone:
-        // pasting from a password manager is how many people fill this in.
-        key-pressed(event) => {
-            if (root.secret && event.modifiers.control && !event.modifiers.shift
-                && (event.text == "c" || event.text == "x")) {
-                return accept;
-            }
-            return reject;
-        }
     }
 
     if input.text == "": Text {
@@ -326,17 +308,169 @@ export component Field inherits Rectangle {
         vertical-alignment: center;
         overflow: elide;
     }
+}
 
-    // Over a secret field's input, so the pointer never reaches it. When the
-    // left button comes up over a TextInput, Slint copies whatever it has
-    // selected to the primary selection on Linux, which any program can read
-    // and clipboard managers record, again without looking at input-type: a
-    // double or triple click, or a drag, put the passphrase there. Here a click
-    // only focuses the field. The pointer no longer places the caret, selects
-    // or pastes the primary selection with the middle button in a secret
-    // field; the keyboard still does all but the last, and selecting with it
-    // copies nothing anywhere.
-    if root.secret: TouchArea {
+// A passphrase or password field. It looks and behaves as a Field does, but
+// assistive technology is told the field's name, that it is a password field,
+// whether it can be typed into and whether it has focus, and nothing else:
+// nothing of what is in it, not even how long it is, and nothing as it is
+// typed. tests/atspi.rs checks that on the real AT-SPI bus.
+//
+// Why it is built this way. Since Slint 1.18 the winit backend's AccessKit
+// adapter publishes a text input's displayed text, which for a password input
+// is one bullet per character, with a text run per line carrying where each
+// character sits and how wide it is, and the caret and selection
+// (slint-ui/slint#12750, which keeps the length available on purpose). It
+// writes that over the input's `accessible-value`, so the empty value Field
+// used to bind for a secret no longer did anything. Measured on AT-SPI after
+// "hunter2" and a Backspace: a character count of 6, six bullets, the caret at
+// 6, and an insert or delete event and a caret event for every key. GTK 3 and
+// 4 publish as much for their own password entries, and Chromium documents
+// doing the same.
+//
+// The Rectangle is the one node assistive technology sees. `input`, which
+// holds the passphrase, is taken out of the accessibility tree
+// (accessible-role: none), so its focus is reported on this node, the nearest
+// accessible item to it. For a node with the text-input role the adapter takes
+// two things from the first TextInput below it, depth first: the role, which
+// for a password input is a password field (PasswordText on AT-SPI, and on
+// Windows and macOS, by AccessKit's code, IsPassword and the secure text field
+// subrole), and the value and text runs, taken only if this node is that
+// input's nearest accessible item. `decoy` is that first TextInput, and two
+// things about it are load-bearing:
+// - It has to stay first, ahead of `input`, in depth-first order.
+// - It has to stay 0x0. Its zero size is what stops the adapter laying it out,
+//   so that no text runs, caret or selection are published, and AT-SPI shows
+//   the node with no Text interface at all. Its being empty only supplies the
+//   "" the adapter sets as the node's value before that layout.
+// Both rest on Slint internals rather than API: `find_text_input` and
+// `find_exposed_text_input` in i-slint-core's accessibility.rs, and the early
+// return for a zero size in `with_text_input_layout_impl` in
+// textlayout/sharedparley.rs (1.18.1). A release that changes either could
+// start publishing `input` again. tests/atspi.rs would see that on Linux;
+// tests/accessibility.rs holds the structure itself in place. What macOS and
+// Windows are given is read from AccessKit's and Slint's code, not observed.
+export component SecretField inherits Rectangle {
+    in property <string> placeholder;
+    in property <bool> enabled: true;
+    in-out property <string> text <=> input.text;
+    // Whether the passphrase itself has keyboard focus, for a dialog to act
+    // when it is left.
+    out property <bool> has-focus: input.has-focus;
+    callback edited(string);
+    callback accepted();
+
+    // So that `focus()` on a SecretField reaches its input. AT-SPI's
+    // GrabFocus on this node gets there without it: Slint passes focus given
+    // to the Rectangle along the focus chain, past the disabled decoy.
+    forward-focus: input;
+
+    accessible-role: text-input;
+    accessible-label: root.placeholder;
+    // Set, although the adapter overwrites it from the decoy, for the testing
+    // backend and anything else that reads the property.
+    accessible-value: "";
+    accessible-enabled: root.enabled;
+    accessible-read-only: !root.enabled;
+    // What the pass would give a TextInput, with the check Field's carries:
+    // the macOS adapter passes a set-value on to a disabled field.
+    accessible-action-set-value(value) => {
+        if (root.enabled) {
+            input.text = value;
+            root.edited(input.text);
+        }
+    }
+
+    height: 34px;
+    min-width: 0px;
+    clip: true;
+    background: Theme.surface-sunken;
+    border-radius: Theme.r-sm;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.border;
+    opacity: root.enabled ? 1.0 : 0.5;
+
+    animate border-color { duration: Theme.fast; }
+
+    // See above: first, 0x0 and empty. Disabled, so that it cannot take focus
+    // and Tab passes over it, and read-only for good measure.
+    decoy := TextInput {
+        accessible-role: none;
+        x: 0;
+        y: 0;
+        width: 0;
+        height: 0;
+        text: "";
+        input-type: password;
+        single-line: true;
+        enabled: false;
+        read-only: true;
+    }
+
+    input := TextInput {
+        accessible-role: none;
+        x: Theme.s3;
+        y: 0;
+        width: root.width - 2 * Theme.s3;
+        height: root.height;
+        vertical-alignment: center;
+        color: Theme.text;
+        font-size: Theme.t-md;
+        single-line: true;
+        // Masks the glyphs on screen and tells the input method it is a
+        // password. It keeps nothing off the accessibility bus or the
+        // clipboard; the rest of this component does that.
+        input-type: password;
+        read-only: !root.enabled;
+        // Disabled as well as read-only, as in Field.
+        enabled: root.enabled;
+        selection-background-color: Theme.accent;
+        selection-foreground-color: Theme.accent-ink;
+        edited => { root.edited(self.text); }
+        accepted => { root.accepted(); }
+        // input-type does not stop Copy and Cut either: Slint puts the
+        // selected text itself on the clipboard, unmasked, where any program
+        // can read it and a clipboard manager keeps it. This runs before Slint
+        // acts on a key, and swallows the two it copies on, by the test Slint
+        // itself applies: control without shift, and "c" or "x". On macOS
+        // that is Cmd, which Slint reports as control. Paste is left alone:
+        // pasting from a password manager is how many people fill this in.
+        key-pressed(event) => {
+            if (event.modifiers.control && !event.modifiers.shift
+                && (event.text == "c" || event.text == "x")) {
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    // Out of the accessibility tree too. Field's placeholder is an accessible
+    // Text named as the field is, and its leaving on the first key and coming
+    // back once the field is emptied would tell the bus whether there is a
+    // passphrase. Named so that a test can tell an empty field from a full one
+    // through the element tree instead.
+    if input.text == "": hint := Text {
+        accessible-role: none;
+        x: Theme.s3;
+        y: 0;
+        width: root.width - 2 * Theme.s3;
+        height: root.height;
+        text: root.placeholder;
+        color: Theme.text-faint;
+        font-size: Theme.t-md;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    // Over the input, so the pointer never reaches it. When the left button
+    // comes up over a TextInput, Slint copies whatever it has selected to the
+    // primary selection on Linux, which any program can read and clipboard
+    // managers record, again without looking at input-type: a double or
+    // triple click, or a drag, put the passphrase there. Here a click only
+    // focuses the field. The pointer no longer places the caret, selects or
+    // pastes the primary selection with the middle button; the keyboard still
+    // does all but the last, and selecting with it copies nothing anywhere.
+    TouchArea {
         x: input.x;
         y: input.y;
         width: input.width;
@@ -348,6 +482,59 @@ export component Field inherits Rectangle {
                 input.focus();
             }
         }
+    }
+}
+
+// The Copy buttons' way onto Slint's own clipboard, for a window on Wayland
+// that arboard cannot serve; src/clipboard.rs says when. Slint has no API for
+// its clipboard (slint-ui/slint#2570), but a TextInput's copy() puts its
+// selection there, so `copy` fills a TextInput nobody sees with the text,
+// selects all of it, copies, and empties it again, in one call. Slint keeps
+// the copied text, which can be a decrypted message, in a string it does not
+// scrub, as it does the notepad's output already.
+//
+// Three things about `input` are load-bearing on Slint 1.18.1, and the
+// copier test in tests/accessibility.rs fails without any one of them:
+// - It is 0x0. Selecting places the cursor, and placing a cursor lays the
+//   whole text out unless the input has no size (the early return in
+//   `text_input_cursor_rect_for_byte_offset_impl`, textlayout/sharedparley.rs),
+//   and the renderer keeps what it laid out in its layout cache. In the
+//   test build, on the testing backend, a 400x300 input took 18 s to copy
+//   1 MiB and 73 s to copy 4 MiB; at 0x0, 4 MiB took 24 ms, and 64 MiB, the
+//   most a run can produce, 0.4 s.
+// - It selects with set-selection-offsets, not select-all. select-all moves
+//   the cursor as a key does, which starts the window's cursor-blink timer,
+//   and only focus leaving the input stops that again, so for an input that
+//   never has focus the event loop went on waking twice a second for as long
+//   as the window lasted. The offsets are clamped to the text.
+// - It is out of the accessibility tree. A text input there would be a node
+//   publishing its text, with Slint's default set-value action and focus,
+//   and only the deferral of the tree's rebuild to a later turn of the event
+//   loop would keep the copied text off the bus.
+// It is disabled, as SecretField's decoy is, so that it cannot take focus and
+// Tab passes over it; copy() and set-selection-offsets are not keys, and work
+// on it all the same. It is not made invisible instead, which would take it
+// out of the testing backend's element tree, where the test finds it.
+export component Copier {
+    width: 0px;
+    height: 0px;
+
+    public function copy(text: string) {
+        input.text = text;
+        input.set-selection-offsets(0, 2147483647);
+        input.copy();
+        input.text = "";
+    }
+
+    input := TextInput {
+        accessible-role: none;
+        enabled: false;
+        read-only: true;
+        single-line: false;
+        x: 0;
+        y: 0;
+        width: 0px;
+        height: 0px;
     }
 }
 
@@ -654,8 +841,8 @@ export component Select inherits Rectangle {
                 y: Theme.s1;
                 width: parent.width - 2 * Theme.s1;
                 height: parent.height - 2 * Theme.s1;
-                viewport-width: self.visible-width;
-                viewport-height: root.model.length * root.option-height;
+                content-width: self.visible-width;
+                content-height: root.model.length * root.option-height;
                 // Opened at the current option, scrolled as little as shows
                 // it. Set as the list is made, which is every time it opens:
                 // Slint makes a popup's contents afresh on each show. Held to
@@ -663,8 +850,8 @@ export component Select inherits Rectangle {
                 // over from a longer list scrolling it past its last option
                 // and opening it empty.
                 init => {
-                    self.viewport-y = -max(0px, min(
-                        self.viewport-height - self.visible-height,
+                    self.content-y = -max(0px, min(
+                        self.content-height - self.visible-height,
                         (root.current + 1) * root.option-height - self.visible-height
                     ));
                 }
@@ -1346,15 +1533,15 @@ export component CertList inherits Rectangle {
     // which shows the last row whole. A jump up already goes to a whole row.
     function reveal(row: int) {
         let top = row * root.row-height;
-        let wanted = top < -list.viewport-y ? -top
-            : top + root.row-height > list.visible-height - list.viewport-y
+        let wanted = top < -list.content-y ? -top
+            : top + root.row-height > list.visible-height - list.content-y
                 ? list.visible-height - top - root.row-height
-                : list.viewport-y;
-        if (wanted < list.viewport-y - list.visible-height) {
-            list.viewport-y = -ceil((top + root.row-height - list.visible-height) / root.row-height)
+                : list.content-y;
+        if (wanted < list.content-y - list.visible-height) {
+            list.content-y = -ceil((top + root.row-height - list.visible-height) / root.row-height)
                 * root.row-height;
         } else {
-            list.viewport-y = wanted;
+            list.content-y = wanted;
         }
     }
 
@@ -1677,10 +1864,10 @@ export component TextArea inherits Rectangle {
         y: Theme.s3;
         width: root.width - 2 * Theme.s3;
         height: root.height - 2 * Theme.s3;
-        viewport-width: self.visible-width;
+        content-width: self.visible-width;
         // Without a viewport taller than the visible area the ScrollView has
         // nothing to scroll and shows no scrollbar.
-        viewport-height: max(self.visible-height, input.preferred-height);
+        content-height: max(self.visible-height, input.preferred-height);
 
         input := TextInput {
             width: scroll.visible-width;

@@ -1,6 +1,6 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Theme, Icons, Icon } from "theme.slint";
-import { Btn, Check, DialogError, DialogShell, Divider, Field, FieldRow, Monogram, Pill, RevocationNote, SectionLabel, Select, TextArea, Tone, Variant } from "widgets.slint";
+import { Btn, Check, DialogError, DialogShell, Divider, Field, FieldRow, Monogram, Pill, RevocationNote, SecretField, SectionLabel, Select, TextArea, Tone, Variant } from "widgets.slint";
 import { CertRow, CertificationRow, LookupRow, PendingRevocationRow, RecipientRow, SignatureRow, SubkeyRow, UserIdDetailRow, UserIdRow } from "types.slint";
 
 // A file slot: label, the chosen path (or a hint), and a Choose button.
@@ -60,6 +60,44 @@ component FilePick inherits VerticalLayout {
 export component KeygenDialog inherits DialogShell {
     callback accepted(string, string, string, int, int, int);
 
+    // Whether the passphrase and its repeat differed when they were last
+    // compared. They are compared only when the repeat field loses focus and
+    // when Create key pair is pressed, never as either is typed. The note
+    // below and Create's enabled state used to follow the two keystroke by
+    // keystroke, and both are published to assistive technology: the note
+    // went and Create came on at the very key that made the repeat match, so
+    // anything on the bus learned how long the passphrase was by counting the
+    // repeat's keys up to then. Now nothing published changes while the repeat
+    // is typed, and a note shown for a mismatch stays until the next
+    // comparison, even once the two agree. A refused Create also empties the
+    // repeat field and puts focus in it, which says nothing the note does not.
+    property <bool> mismatch: false;
+    // Whether the note says the two still differ. Each comparison that finds
+    // them differing with the note shown already turns this over, so the
+    // note's words change and it is announced again: AccessKit announces a
+    // live node when it appears and when its text changes, and a note left as
+    // it was went unheard at every refusal after the first. Changing the words
+    // rather than hiding the note and showing it again keeps it from
+    // blinking, and the words follow the comparisons alone.
+    property <bool> still: false;
+
+    // Compare the passphrase with its repeat, at either of the two moments
+    // `mismatch` names: whether they differ. Both go through here, so they
+    // give the same answer, an empty repeat differing from a passphrase that
+    // was typed, and neither can undo the other's note.
+    function compare() -> bool {
+        if (pass-input.text == repeat-input.text) {
+            root.mismatch = false;
+            root.still = false;
+        } else {
+            if (root.mismatch) {
+                root.still = !root.still;
+            }
+            root.mismatch = true;
+        }
+        return root.mismatch;
+    }
+
     title: "New key pair";
     subtitle: "The passphrase protects the secret key on disk. It cannot be recovered.";
     card-width: 470px;
@@ -80,15 +118,15 @@ export component KeygenDialog inherits DialogShell {
             min-height: 0px;
             preferred-height: form.preferred-height;
             vertical-stretch: 1;
-            viewport-width: self.visible-width;
-            viewport-height: max(self.visible-height, form.preferred-height);
+            content-width: self.visible-width;
+            content-height: max(self.visible-height, form.preferred-height);
 
             form := VerticalLayout {
                 spacing: Theme.s3;
 
                 name-input := Field { placeholder: "Name"; enabled: !root.busy; }
                 email-input := Field { placeholder: "name@example.org"; enabled: !root.busy; }
-                pass-input := Field { placeholder: "Passphrase (optional)"; secret: true; enabled: !root.busy; }
+                pass-input := SecretField { placeholder: "Passphrase (optional)"; enabled: !root.busy; }
                 // Asked for twice, because a passphrase mistyped here cannot
                 // be put right: the field shows nothing of what was typed,
                 // the key is stored encrypted under whatever it was, and
@@ -97,13 +135,36 @@ export component KeygenDialog inherits DialogShell {
                 // text: a field inside an `if` cannot be read from the button
                 // below, so its text would be held in a property of the
                 // dialog, and that property would keep what had been typed
-                // after the field went away with the first one emptied,
-                // holding Create back with nothing on screen to say why.
-                repeat-input := Field { placeholder: "Repeat the passphrase"; secret: true; enabled: !root.busy; }
-                if repeat-input.text != "" && repeat-input.text != pass-input.text: Text {
-                    text: "The passphrases do not match.";
+                // after the field went away with the first one emptied, and
+                // Create would refuse the key over a repeat no longer on
+                // screen.
+                repeat-input := SecretField {
+                    placeholder: "Repeat the passphrase";
+                    enabled: !root.busy;
+                    // Leaving the field by any means, Tab, a click elsewhere
+                    // or the window losing focus, is one of the two moments
+                    // the passphrases are compared.
+                    changed has-focus => {
+                        if (!self.has-focus) {
+                            root.compare();
+                        }
+                    }
+                }
+                // Announced, as DialogError is and for the same reason: Create
+                // key pair is offered whatever the passphrases hold, and when
+                // it refused two that differ, this line appeared and nothing
+                // announced it. It is announced as it appears and, in other
+                // words (see `still`), at each comparison that finds the two
+                // differing while it is shown, and changes only at a
+                // comparison, so the bus hears no more than that the two
+                // differed when they were compared.
+                if root.mismatch: Text {
+                    text: root.still
+                        ? "The passphrases still do not match."
+                        : "The passphrases do not match.";
                     color: Theme.warn;
                     font-size: Theme.t-sm;
+                    accessible-live-region: assertive;
                 }
 
                 HorizontalLayout {
@@ -186,12 +247,31 @@ export component KeygenDialog inherits DialogShell {
                 // A name alone or an address alone makes a user ID, as it does
                 // in GnuPG. Slint has no trim, so a field of spaces passes
                 // here, and the handler in Rust refuses it along with anything
-                // else that makes no user ID. The two passphrase fields have
-                // to agree, which two empty ones do, for a key with none.
+                // else that makes no user ID. Nothing about the passphrases
+                // enables or disables it, not even whether one was typed; see
+                // `mismatch`. They have to agree when it is pressed, which two
+                // empty ones do, for a key with none.
                 enabled: !root.busy
-                    && (name-input.text != "" || email-input.text != "")
-                    && pass-input.text == repeat-input.text;
+                    && (name-input.text != "" || email-input.text != "");
                 clicked => {
+                    if (root.compare()) {
+                        // Into the field to put right, so that what is typed
+                        // next goes there and a screen reader says where
+                        // focus landed, and emptied first: focus given this
+                        // way selects nothing and leaves the caret after the
+                        // repeat that did not match, so the passphrase typed
+                        // again in full went on the end of it and was refused
+                        // again, with nothing on the bus to show why. Emptying
+                        // it publishes nothing, as neither the field's input
+                        // nor its placeholder is in the accessibility tree.
+                        // When focus is in the repeat already, as when Create
+                        // is clicked while typing there, a click on a button
+                        // does not take focus, and the note is all a screen
+                        // reader hears.
+                        repeat-input.text = "";
+                        repeat-input.focus();
+                        return;
+                    }
                     root.accepted(
                         name-input.text,
                         email-input.text,
@@ -242,6 +322,11 @@ export component SignEncryptDialog inherits DialogShell {
     // and Run, which wanted `want-sign` off or a signer, stayed disabled for
     // good: nobody without a signing key could encrypt a file here at all.
     property <bool> signing: root.want-sign && root.signers.length > 0;
+    // With no recipient chosen, Run comes on with the password's first
+    // character and goes off when it is emptied, and its enabled state is
+    // published, so assistive technology learns whether the password field is
+    // empty, though nothing more. That is kept, unlike the new-key dialog's
+    // comparison of its two passphrases, and README.md says so.
     property <bool> can-run:
         root.input-path != ""
         && (root.want-encrypt || root.signing)
@@ -268,8 +353,8 @@ export component SignEncryptDialog inherits DialogShell {
             min-height: 0px;
             preferred-height: form.preferred-height;
             vertical-stretch: 1;
-            viewport-width: self.visible-width;
-            viewport-height: max(self.visible-height, form.preferred-height);
+            content-width: self.visible-width;
+            content-height: max(self.visible-height, form.preferred-height);
 
             form := VerticalLayout {
                 spacing: Theme.s4;
@@ -451,9 +536,8 @@ export component SignEncryptDialog inherits DialogShell {
                 }
             }
 
-            if root.want-encrypt: Field {
+            if root.want-encrypt: SecretField {
                 placeholder: "Or a password — anyone with it can open the file";
-                secret: true;
                 enabled: !root.busy;
                 edited(text) => { root.secret = text; }
             }
@@ -475,9 +559,8 @@ export component SignEncryptDialog inherits DialogShell {
                 }
             }
 
-            if root.signing: Field {
+            if root.signing: SecretField {
                 placeholder: "Passphrase for the signing key (if any)";
-                secret: true;
                 enabled: !root.busy;
                 edited(text) => { root.password = text; }
             }
@@ -579,9 +662,8 @@ export component DecryptVerifyDialog inherits DialogShell {
             pick => { root.pick-data(); }
         }
 
-        if !root.needs-data && root.input-path != "": Field {
+        if !root.needs-data && root.input-path != "": SecretField {
             placeholder: "Passphrase for the secret key (if any)";
-            secret: true;
             enabled: !root.busy;
             text <=> root.password;
         }
@@ -766,8 +848,8 @@ export component CertifyDialog inherits DialogShell {
             min-height: 0px;
             preferred-height: form.preferred-height;
             vertical-stretch: 1;
-            viewport-width: self.visible-width;
-            viewport-height: max(self.visible-height, form.preferred-height);
+            content-width: self.visible-width;
+            content-height: max(self.visible-height, form.preferred-height);
 
             form := VerticalLayout {
                 // Clear of the scrollbar, which the fluent style draws over
@@ -918,9 +1000,8 @@ export component CertifyDialog inherits DialogShell {
                     }
                 }
 
-                Field {
+                SecretField {
                     placeholder: "Passphrase for your certifying key (if any)";
-                    secret: true;
                     enabled: !root.busy;
                     edited(text) => { root.password = text; }
                 }
@@ -1058,9 +1139,8 @@ export component RevokeDialog inherits DialogShell {
             edited(text) => { root.message = text; }
         }
 
-        Field {
+        SecretField {
             placeholder: "Passphrase for the key (if any)";
-            secret: true;
             enabled: !root.busy;
             edited(text) => { root.password = text; }
         }
@@ -1128,8 +1208,8 @@ export component ImportRevocationDialog inherits DialogShell {
             min-height: 0px;
             preferred-height: rows.preferred-height;
             vertical-stretch: 1;
-            viewport-width: self.visible-width;
-            viewport-height: max(self.visible-height, rows.preferred-height);
+            content-width: self.visible-width;
+            content-height: max(self.visible-height, rows.preferred-height);
 
             rows := VerticalLayout {
                 // Clear of the scrollbar, which the fluent style draws over
@@ -1322,8 +1402,8 @@ export component NotepadDialog inherits DialogShell {
             min-height: 0px;
             preferred-height: form.preferred-height;
             vertical-stretch: 1;
-            viewport-width: self.visible-width;
-            viewport-height: max(self.visible-height, form.preferred-height);
+            content-width: self.visible-width;
+            content-height: max(self.visible-height, form.preferred-height);
 
             form := VerticalLayout {
                 // Bound to the scroller's width, as the details pane's
@@ -1493,15 +1573,13 @@ export component NotepadDialog inherits DialogShell {
                         current: root.signer-index;
                         changed(index) => { root.signer-index = index; }
                     }
-                    Field {
+                    SecretField {
                         placeholder: "Key passphrase";
-                        secret: true;
                         enabled: !root.busy;
                         edited(text) => { root.password = text; }
                     }
-                    Field {
+                    SecretField {
                         placeholder: "Or a password";
-                        secret: true;
                         enabled: !root.busy;
                         edited(text) => { root.secret = text; }
                     }
@@ -1635,6 +1713,9 @@ export component NotepadDialog inherits DialogShell {
                 enabled: !root.busy && editor.text != "" && root.signers.length > 0;
                 clicked => { root.run(0, editor.text, root.signer-index, root.password, root.secret); }
             }
+            // These two, like Sign / Encrypt's Run, publish whether the
+            // password field is empty while no recipient is chosen; see
+            // `can-run` there.
             Btn {
                 text: "Encrypt";
                 glyph: Icons.lock;
@@ -1695,10 +1776,10 @@ export component DetailsDialog inherits DialogShell {
             // round, and the whole dialog becomes a letterbox.
             preferred-height: sections.preferred-height;
             min-height: 220px;
-            viewport-width: self.visible-width;
+            content-width: self.visible-width;
             // Taller than the visible area is what gives the ScrollView
             // something to scroll; without it there is no scrollbar at all.
-            viewport-height: max(self.visible-height, sections.preferred-height);
+            content-height: max(self.visible-height, sections.preferred-height);
 
             sections := VerticalLayout {
                 // Keeps content clear of the scrollbar, which the fluent style
@@ -2068,9 +2149,8 @@ export component LifecycleDialog inherits DialogShell {
             edited(text) => { root.value = text; }
         }
 
-        if root.mode != 3: Field {
+        if root.mode != 3: SecretField {
             placeholder: "Passphrase for the key (if any)";
-            secret: true;
             enabled: !root.busy;
             edited(text) => { root.password = text; }
         }
@@ -2165,8 +2245,8 @@ export component LookupDialog inherits DialogShell {
             min-height: 0px;
             preferred-height: found.preferred-height;
             vertical-stretch: 1;
-            viewport-width: self.visible-width;
-            viewport-height: max(self.visible-height, found.preferred-height);
+            content-width: self.visible-width;
+            content-height: max(self.visible-height, found.preferred-height);
 
             found := VerticalLayout {
                 // Clear of the scrollbar, as in Certify.

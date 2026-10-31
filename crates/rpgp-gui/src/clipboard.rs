@@ -1,42 +1,53 @@
 //! The clipboard behind the Copy buttons.
 //!
-//! Slint exposes no clipboard API, only a platform trait for backend authors,
-//! so rPGP keeps a clipboard of its own. It is arboard wherever arboard can be
-//! built, as it always was: through the data-control protocols on a Wayland
-//! compositor that offers them to the app, through X11 (XWayland included)
-//! otherwise, and on Windows and macOS.
+//! Slint exposes no clipboard API, only a platform trait for backend authors
+//! (slint-ui/slint#2570), so rPGP keeps a clipboard of its own. It is arboard
+//! wherever arboard can be built, as it always was: through the data-control
+//! protocols on a Wayland compositor that offers them to the app, through X11
+//! (XWayland included) otherwise, and on Windows and macOS.
 //!
 //! A window on Wayland for which arboard cannot be built copies through
-//! smithay-clipboard instead, on the window's own connection, over the core
-//! `wl_data_device` protocol. That is how Slint's own text fields copy, and
-//! every compositor offers it to every client. In practice it is the Flatpak
-//! on a compositor that withholds data-control from it: GNOME implements
-//! neither protocol, and sway hides both from any client in a Flatpak.
+//! Slint's own clipboard instead, reached through a TextInput nobody sees
+//! (`Copier` in ui/widgets.slint). In practice it is the Flatpak on a
+//! compositor that withholds data-control from it: GNOME implements neither
+//! protocol, and KDE Plasma and sway hide both from a sandboxed client.
 //! arboard falls back to X11 there, which the Flatpak does not have on a
 //! Wayland session, because `--socket=fallback-x11` grants X11 only where
 //! there is no Wayland, so every Copy used to fail.
 //!
-//! smithay-clipboard comes second rather than first because it needs what
-//! arboard does not: its own keyboard to have been told the window has focus,
-//! and the serial of a key or pointer button event (see [`attach`]). Wherever
-//! arboard can be built, Copy works as it did before smithay-clipboard came
-//! in, and smithay-clipboard's gaps are confined to where every Copy failed.
+//! On Wayland, Slint's clipboard is smithay-clipboard on the event loop's own
+//! connection, over the core `wl_data_device` protocol, which every
+//! compositor offers every client. Slint 1.17 copied that way, and 1.19 does
+//! again; 1.18 gave its text fields arboard with nothing behind it, so until
+//! 1.19 it is the patched winit backend the root Cargo.toml names. Going
+//! through it, rather than through a smithay-clipboard of rPGP's own as the
+//! Copy buttons once did, keeps the process to one `wl_data_device`, which is
+//! all mutter serves: it keeps only a client's newest data device, and offers
+//! the clipboard only to the devices there when the window took focus. With
+//! the Copy buttons' second device, Slint's text fields could copy out but
+//! not paste in, which is how the Flatpak shipped with Slint 1.17.1 behaved
+//! on GNOME (measured on a nested mutter 51.1).
 //!
 //! What the notepad copies can be a decrypted message, so it goes out marked
 //! private: with each platform's hint asking clipboard managers to leave it
 //! out of their history (see [`Content::Private`]). A fingerprint or a user ID
 //! from the details pane is public and goes out as any other copy does. The
 //! mark only asks. It cannot stop a program reading the clipboard while the
-//! text is on it, and smithay-clipboard cannot give it at all, which the
-//! notepad then says. Nothing takes a private copy back off the clipboard
-//! after a while, as a password manager does with a password. History records
-//! a copy the moment it is made, so a timer would not keep it out of that; a
-//! message is copied to be pasted somewhere, perhaps minutes later; and
-//! clearing only what is still this copy means reading the clipboard back
-//! first, which reads whatever the user has copied since, from any program.
+//! text is on it, and Slint's clipboard cannot give it at all, which the
+//! notepad then says. On X11 a private copy is taken back when the window
+//! closes, if nothing has been copied over it since and the X server can show
+//! that the clipboard is still rPGP's (see `withdraw`), rather than left for a
+//! clipboard manager to keep. Nothing takes one back after a while, as a
+//! password manager does with a password. History records a copy the moment
+//! it is made, so a timer would not keep it out of that, and a message is
+//! copied to be pasted somewhere, perhaps minutes later. Off X11 there is
+//! also no telling whether the clipboard still holds the copy: arboard has no
+//! way to say short of reading it back, which reads whatever the user has
+//! copied since, from any program.
 //!
-//! The Wayland half exists only under `cfg(wayland_target)`, which build.rs
-//! sets on the targets where a window can be on Wayland.
+//! The Wayland half, and the X11 withdrawal, exist only under
+//! `cfg(wayland_target)`, which build.rs sets on the targets where a window
+//! can be on Wayland. They are the targets where it can be on X11 as well.
 
 use std::cell::RefCell;
 
@@ -46,9 +57,7 @@ use crate::AppWindow;
 use {
     raw_window_handle::{HandleError, HasDisplayHandle, RawDisplayHandle},
     slint::ComponentHandle,
-    std::ffi::c_void,
-    std::ptr::NonNull,
-    std::rc::Rc,
+    std::cell::Cell,
     std::time::Duration,
 };
 
@@ -60,27 +69,22 @@ use {
 /// callback loses the text immediately on any session without one running.
 /// Through data-control arboard serves each copy from a thread and connection
 /// of its own, which last until another client takes the selection, whatever
-/// becomes of the handle. smithay-clipboard serves it from a thread of its
-/// own, which stops when the handle is dropped, so there rPGP serves the text
-/// only while the handle lives.
+/// becomes of the handle.
 enum Clipboard {
-    /// There is no window to copy from. Either the windowing system has not
-    /// created it yet, so which display server it is on is not known yet
-    /// either, or it has closed.
+    /// There is no window to copy from: it has not been given its clipboard
+    /// yet, or it has closed.
     NoWindow,
-    /// A window on Wayland for which arboard could not be built; see
-    /// [`attach`] for why this handle is safe to hold.
+    /// A window on Wayland for which arboard could not be built: Slint's own
+    /// clipboard, through the window's copier. Once settled on, it stays for
+    /// as long as the window does.
     #[cfg(wayland_target)]
-    Wayland(smithay_clipboard::Clipboard),
-    /// Every other window: one on Wayland for which arboard could be built,
-    /// and one on anything else, whether it could or not. Where a window can
-    /// be on Wayland, [`attach`] builds it as soon as the window exists;
-    /// elsewhere the first copy does. After a failure, the next copy builds
-    /// it again.
+    Slint,
+    /// arboard, built at the first copy, and again at the copy after one that
+    /// failed; see [`attach`] for why not sooner.
     Arboard(Option<arboard::Clipboard>),
     /// Stands in for either in the tests, none of which has a display server:
     /// it keeps each copy and what it was asked to be, and marks a private one
-    /// as arboard does, or leaves it unmarked as smithay-clipboard does.
+    /// as arboard does, or leaves it unmarked as Slint's clipboard does.
     #[cfg(test)]
     Recording {
         copies: Vec<(String, Content)>,
@@ -102,14 +106,15 @@ pub enum Content {
     ///
     /// On X11 and through data-control the mark is the
     /// `x-kde-passwordManagerHint` type, which KDE's Klipper honours, as do
-    /// some other clipboard managers; on X11 it also has arboard withdraw the
-    /// copy when rPGP lets go of the clipboard, rather than hand it to a
-    /// clipboard manager to keep. On Windows it is
-    /// `ExcludeClipboardContentFromMonitorProcessing`, which keeps a copy out
-    /// of Windows' clipboard history and its cloud sync alike, and which
-    /// arboard advises against combining with its narrower history and cloud
-    /// marks. On macOS it is `org.nspasteboard.ConcealedType`, which the
-    /// clipboard managers that follow nspasteboard.org's conventions honour.
+    /// some other clipboard managers. On X11 it is also what `withdraw` looks
+    /// for when the window closes, and what has arboard withdraw a copy
+    /// rather than hand it to a clipboard manager when its last handle goes.
+    /// On Windows it is `ExcludeClipboardContentFromMonitorProcessing`, which
+    /// keeps a copy out of Windows' clipboard history and its cloud sync
+    /// alike, and which arboard advises against combining with its narrower
+    /// history and cloud marks. On macOS it is
+    /// `org.nspasteboard.ConcealedType`, which the clipboard managers that
+    /// follow nspasteboard.org's conventions honour.
     Private,
 }
 
@@ -119,35 +124,38 @@ pub enum Copied {
     /// On the clipboard, marked private if it was asked to be.
     AsAsked,
     /// On the clipboard, but without the private mark it asked for, which
-    /// smithay-clipboard has no way to give: it offers plain text alone.
+    /// Slint's clipboard has no way to give: it offers plain text alone.
     ///
-    /// Only a window on Wayland can have smithay-clipboard, so on Windows and
-    /// macOS nothing makes this, and the notepad's arm for it is never taken.
-    /// The arm stays rather than being gated as well, so that the notepad's
-    /// handling of a copy reads the same on every platform.
+    /// Only a window on Wayland goes through Slint's clipboard, so on Windows
+    /// and macOS nothing makes this, and the notepad's arm for it is never
+    /// taken. The arm stays rather than being gated as well, so that the
+    /// notepad's handling of a copy reads the same on every platform.
     #[cfg_attr(
         not(any(wayland_target, test)),
         expect(
             dead_code,
-            reason = "only smithay-clipboard, on Wayland, copies without the mark"
+            reason = "only Slint's clipboard, on Wayland, copies without the mark"
         )
     )]
     Unmarked,
 }
 
 thread_local! {
-    // Both copy callbacks, the timer in `attach` that fills this, and the
-    // close handler and the guard that empty it all run on the event loop's
-    // thread, so a thread-local is enough.
+    // Both copy callbacks, and the close handler and the guard that empty it,
+    // all run on the event loop's thread, so a thread-local is enough.
     static CLIPBOARD: RefCell<Clipboard> = const { RefCell::new(Clipboard::NoWindow) };
+    // Whether the last copy that went through arboard was private and made
+    // from a window on X11, and so whether `withdraw` may have a private copy
+    // on the X11 clipboard to take back. Kept apart from CLIPBOARD so that it
+    // outlives the arboard handle, which a failed copy drops, while the
+    // private copy before it can still be on the clipboard.
+    #[cfg(wayland_target)]
+    static PRIVATE_COPY: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Keeps the clipboard for as long as it lives; see [`attach`].
 #[must_use = "the clipboard is dropped with this guard"]
-pub struct Attached {
-    #[cfg(wayland_target)]
-    _wait: Rc<slint::Timer>,
-}
+pub struct Attached(());
 
 impl Drop for Attached {
     fn drop(&mut self) {
@@ -158,276 +166,277 @@ impl Drop for Attached {
     }
 }
 
-/// Let go of the clipboard, whichever kind it is.
+/// Let go of the clipboard, whichever kind it is, after taking a private copy
+/// back off the X11 clipboard if one may still be there.
 ///
-/// Dropping smithay-clipboard's handle tells its thread to stop and joins it.
-/// Dropping arboard's, where it copies through X11, makes the handover to a
-/// clipboard manager, which belongs where the window closes or the process
-/// exits anyway, of a public copy; a private one it withdraws instead. Through
-/// data-control it holds nothing to let go of.
+/// Dropping arboard's handle, where it copies through X11 and the handle is
+/// the last in the process, makes the handover to a clipboard manager of a
+/// public copy, which belongs where the window closes or the process exits
+/// anyway, and withdraws a private one instead. Since Slint 1.18 it is never
+/// the last on an X11 session, which is why `withdraw` exists; it is the last
+/// for a window on Wayland whose copies went through XWayland, as Slint's
+/// clipboard there is not arboard. Through data-control it holds nothing to
+/// let go of, and Slint's clipboard is Slint's to let go of.
+///
+/// Where any of that talks to an X server, it runs on a thread of its own,
+/// and the close waits for it for at most [`RELEASE_LIMIT`]; see [`within`].
 fn release() {
     let clipboard = CLIPBOARD.with(|slot| slot.replace(Clipboard::NoWindow));
+    #[cfg(wayland_target)]
+    {
+        let private = PRIVATE_COPY.take();
+        if private || matches!(clipboard, Clipboard::Arboard(Some(_))) {
+            // Whether it finished in time changes nothing here: the window
+            // closes either way.
+            let _ = within(RELEASE_LIMIT, move || {
+                if private {
+                    withdraw();
+                }
+                drop(clipboard);
+            });
+            return;
+        }
+    }
     drop(clipboard);
 }
 
-/// Choose the clipboard for `ui`'s window once the windowing system has
-/// created it, and keep it until the window closes or the returned guard is
-/// dropped, whichever comes first.
+/// The longest a closing window waits for its clipboard to be let go of.
 ///
-/// The choice waits for the window because only its display handle says which
-/// display server it is on. WAYLAND_DISPLAY does not: a window can be on
-/// XWayland with it set. Nothing tells the application when winit has created
-/// the window, which happens in a later turn of the event loop than `show`,
-/// and up to half a second later while Slint waits on the desktop portal for
-/// the colour scheme, so a timer asks until there is an answer, then stops.
+/// That is `withdraw`'s round trips to the X server and the answer from
+/// arboard's thread, which put about 3 ms more between a close and the
+/// window's unmapping on Xvfb, then arboard's own work as its last handle
+/// goes, which waits up to 100 ms for a clipboard manager to take a public
+/// copy. The limit is for an X server that has stopped answering, or that
+/// another client keeps grabbed, either of which would otherwise hold the
+/// window open for as long as it lasted.
+#[cfg(wayland_target)]
+const RELEASE_LIMIT: Duration = Duration::from_secs(1);
+
+/// Run `work` on a thread of its own, and wait for it to finish for at most
+/// `limit`: whether it did.
 ///
-/// With the answer the timer builds arboard, and keeps it wherever that
-/// works, whatever the display server. Where it does not, a window on Wayland
-/// gets smithay-clipboard, and any other window an empty arboard slot, so that
-/// the first Copy tries again and reports why it cannot, as every Copy after
-/// a failure always has.
+/// None of `release`'s work can be given a deadline of its own. x11rb waits
+/// for a reply for as long as it takes, and arboard, as its last handle goes,
+/// waits on the X server too and then joins its own thread. Past the limit
+/// the work goes on until it finishes or the process exits, and `withdraw`'s
+/// checks hold however late it runs. A thread that cannot be started drops
+/// what `work` holds without running it, which leaves a private copy where it
+/// is.
+#[cfg(wayland_target)]
+fn within(limit: Duration, work: impl FnOnce() + Send + 'static) -> bool {
+    let (finished, done) = std::sync::mpsc::channel();
+    let started = std::thread::Builder::new()
+        .name("rpgp-clipboard".to_string())
+        .spawn(move || {
+            work();
+            let _ = finished.send(());
+        });
+    started.is_ok() && done.recv_timeout(limit).is_ok()
+}
+
+/// Give `ui`'s window its clipboard, and keep it until the window closes or
+/// the returned guard is dropped, whichever comes first.
 ///
-/// The choice is not revisited. A Copy that fails through arboard later on,
-/// once the X server behind XWayland has gone, say, reports that, and the
-/// next Copy builds arboard again, as before. Moving a window on Wayland to
-/// smithay-clipboard then would build it inside a Copy, which is too late for
-/// that Copy, for the reasons below, and would trade a failure that is
-/// reported for gaps that are not.
+/// Which clipboard it is gets settled at the first copy, not here. Only the
+/// window's display handle says whether it is on Wayland, since a window can
+/// be on XWayland with WAYLAND_DISPLAY set, and winit has not made the window
+/// yet when this runs; by the time a Copy button can be pressed, it has.
+/// Building arboard waits as well, since it connects to a display server,
+/// which a launch that never copies anything has no need of.
 ///
-/// None of this can wait for the first Copy. Whether smithay-clipboard is
-/// needed is known only once arboard has been tried, and smithay-clipboard
-/// offers the selection with the serial of the last key or pointer button
-/// event its own seat listeners saw, and only once its own keyboard listener
-/// has been told the window has focus. One created inside a Copy callback has
-/// seen neither, and silently sets nothing. It takes no serial from touch
-/// events, so a Copy tapped on a touchscreen offers whatever serial came
-/// before, and on a seat with no keyboard sets nothing at all.
-///
-/// Nor can smithay-clipboard count on being there by the time the window
-/// takes focus. The first frame can map the window, and the compositor focus
-/// it, before the timer next runs, and asking every millisecond does not
-/// change that. It is an ordinary start rather than an edge case, and a Copy
-/// then rests on the compositor telling a keyboard created while its client
-/// already has focus that it has it. mutter and KWin do; wlroots does only
-/// while the seat has an active keyboard. On a wlroots seat with none, which
-/// is how sway leaves a seat whose active keyboard was removed, every Copy
-/// reports success and sets nothing until the window next takes focus.
-///
-/// Trying arboard costs the event loop once what the first Copy used to cost
-/// it, now paid at start whether or not anything is ever copied. With
-/// WAYLAND_DISPLAY set that is a data-control probe, a round trip or two on a
-/// connection of its own that is closed again, and without data-control, or
-/// WAYLAND_DISPLAY, an X11 connection and the thread that serves it. With no
-/// X server that fails at once: before any I/O with DISPLAY unset, as in the
-/// Flatpak on a Wayland session, and on refused connections with DISPLAY
-/// naming a local display nothing serves.
+/// The Copy buttons' smithay-clipboard could not wait: it had to be told the
+/// window had focus, so it had to exist before the window took it, and a
+/// timer built it, and arboard to decide whether it was needed, as soon as
+/// the window existed. Slint's clipboard exists from the moment its event
+/// loop does, and has seen the focus by the time a Copy button is pressed.
 ///
 /// Call this before the event loop runs, and drop the guard before `run`
 /// returns.
 #[cfg(wayland_target)]
 pub fn attach(ui: &AppWindow) -> Attached {
-    let wait = Rc::new(slint::Timer::default());
-    let (weak_ui, stop) = (ui.as_weak(), Rc::downgrade(&wait));
-    wait.start(
-        slint::TimerMode::Repeated,
-        Duration::from_millis(10),
-        move || {
-            let Some(ui) = weak_ui.upgrade() else {
-                return;
-            };
-            let handle = ui.window().window_handle();
-            let route = route(handle.display_handle().map(|d| d.as_raw()));
-            let clipboard = match choose(route, arboard::Clipboard::new) {
-                Choice::Wait => return,
-                Choice::Arboard(arboard) => Clipboard::Arboard(arboard),
-                // SAFETY: smithay-clipboard needs this `wl_display` to stay
-                // valid for as long as the handle lives. It is the display of
-                // the connection winit opened: its Wayland window hands out
-                // that connection's own display object as the display handle
-                // (winit 0.30, wayland/window/mod.rs). winit opened the
-                // connection rather than adopting one, so wayland-backend
-                // disconnects it, freeing the display, only when the last
-                // clone of the connection is dropped (0.3, the sys client's
-                // ConnectionState::drop). winit's event loop holds one clone,
-                // and the state of each winit window another
-                // (wayland/window/state.rs).
-                //
-                // The window's clone is the one this rests on. The event
-                // loop's is not enough: Slint's winit backend puts the event
-                // loop back in its platform, a thread-local that lasts until
-                // exit, when winit's run returns normally, but drops it when
-                // winit's run fails or a panic unwinds through it
-                // (i-slint-backend-winit 1.17, EventLoopState::run). The
-                // window exists now, since this handle came from it, and
-                // lasts until Slint hides it, which on Wayland destroys it
-                // (the adapter's set_visibility). Nothing in rPGP hides it,
-                // so while the event loop runs only a close request does,
-                // and the close handler below lets go of this handle first.
-                // AppWindow::run hides the window itself only once the loop
-                // has returned normally, by which time the event loop is back
-                // in the platform. On an error or an unwind it skips that, so
-                // the window, which `ui` holds in `run`, is still there when
-                // the guard lets go of this handle on the way out. Either way
-                // this handle, and the thread using the display, are gone
-                // before the display is. A process killed or aborted runs no
-                // destructors, so it disconnects nothing.
-                Choice::Wayland(display) => Clipboard::Wayland(unsafe {
-                    smithay_clipboard::Clipboard::new(display.as_ptr())
-                }),
-            };
-            CLIPBOARD.with(|slot| *slot.borrow_mut() = clipboard);
-            if let Some(wait) = stop.upgrade() {
-                wait.stop();
-            }
-        },
-    );
+    CLIPBOARD.with(|slot| *slot.borrow_mut() = Clipboard::Arboard(None));
 
-    // Let go of the clipboard, whichever kind it is, as the window closes and
-    // before Slint hides it, which on Wayland destroys it: see the SAFETY
-    // comment above for why that order matters. Nothing can be copied from a
-    // closed window, and there is no window left to choose a clipboard for, so
-    // the timer stops as well if it is still asking. Slint keeps one close
-    // handler per window, so this has to stay the only one.
-    let stop = Rc::downgrade(&wait);
-    ui.window().on_close_requested(move || {
-        if let Some(wait) = stop.upgrade() {
-            wait.stop();
-        }
+    // Let go of the clipboard as the window closes, which on X11 takes a
+    // private copy back then rather than when the process gets round to
+    // exiting. Nothing can be copied from a closed window. Slint keeps one
+    // close handler per window, so this has to stay the only one.
+    ui.window().on_close_requested(|| {
         release();
         slint::CloseRequestResponse::HideWindow
     });
 
-    Attached { _wait: wait }
+    Attached(())
 }
 
-/// Choose the clipboard for `ui`'s window, and keep it until the returned
-/// guard is dropped.
+/// Give `ui`'s window its clipboard, and keep it until the returned guard is
+/// dropped.
 ///
-/// No window here can be on Wayland, so the choice is arboard from the start,
-/// built on the first copy, and nothing has to be let go of before the window
-/// closes.
+/// No window here can be on Wayland or X11, so the clipboard is arboard, built
+/// on the first copy, and nothing has to be done as the window closes.
 #[cfg(not(wayland_target))]
 pub fn attach(_ui: &AppWindow) -> Attached {
     CLIPBOARD.with(|slot| *slot.borrow_mut() = Clipboard::Arboard(None));
-    Attached {}
+    Attached(())
 }
 
-/// What a window's display handle says about it.
-#[cfg(wayland_target)]
-#[derive(Debug, PartialEq, Eq)]
-enum Route {
-    /// No answer yet: winit has not created the window.
-    Wait,
-    /// The window is on Wayland, through this `wl_display`.
-    Wayland(NonNull<c_void>),
-    /// The window is on anything else, which on these targets is X11,
-    /// XWayland included.
-    Other,
-}
-
-#[cfg(wayland_target)]
-fn route(display: Result<RawDisplayHandle, HandleError>) -> Route {
-    match display {
-        Ok(RawDisplayHandle::Wayland(wayland)) => Route::Wayland(wayland.display),
-        Ok(_) => Route::Other,
-        // Every error means the window does not exist yet, whichever error it
-        // is. Until winit has created it, Slint's handle falls back to asking
-        // the window adapter, which the winit backend does not implement, so
-        // it reports NotSupported rather than Unavailable. Settling then would
-        // take a window about to appear on Wayland for one that is not, and
-        // leave the Flatpak's window with only the arboard that fails there.
-        Err(_) => Route::Wait,
-    }
-}
-
-/// What the timer in [`attach`] settles on, if anything.
-#[cfg(wayland_target)]
-#[derive(Debug, PartialEq, Eq)]
-enum Choice<A> {
-    /// Ask again: winit has not created the window.
-    Wait,
-    /// arboard, built, or left for the first copy to build.
-    Arboard(Option<A>),
-    /// smithay-clipboard, on the window's own connection through this
-    /// `wl_display`.
-    Wayland(NonNull<c_void>),
-}
-
-/// Choose between arboard and smithay-clipboard for a window on `route`, from
-/// what building arboard gives.
+/// Whether a window with this display handle is on Wayland.
 ///
-/// `arboard` builds it, and is called only once the route is known: while the
-/// timer waits it would otherwise open and close a connection every tick. The
-/// handle is generic so that the tests can stand in for arboard, which none of
-/// them can build without a display server.
+/// An error means winit has not made the window yet, which no Copy button can
+/// be pressed before. It counts as not being on Wayland, so that the copy
+/// reports why arboard could not be built rather than settling on Slint's
+/// clipboard for a window whose display server is not known, and the next
+/// copy asks again. Until winit has made it, Slint's handle falls back to
+/// asking the window adapter, which the winit backend does not implement, so
+/// the error is NotSupported rather than Unavailable.
 #[cfg(wayland_target)]
-fn choose<A, E>(route: Route, arboard: impl FnOnce() -> Result<A, E>) -> Choice<A> {
-    match route {
-        Route::Wait => Choice::Wait,
-        Route::Wayland(display) => match arboard() {
-            Ok(arboard) => Choice::Arboard(Some(arboard)),
-            Err(_) => Choice::Wayland(display),
-        },
-        // arboard is all there is off Wayland, so its error is not kept: the
-        // first copy builds it again and reports what it gets then.
-        Route::Other => Choice::Arboard(arboard().ok()),
+fn on_wayland(display: Result<RawDisplayHandle, HandleError>) -> bool {
+    matches!(display, Ok(RawDisplayHandle::Wayland(_)))
+}
+
+/// Whether a window with this display handle is on X11, XWayland included,
+/// which is the only kind of window whose private copy `withdraw` takes back.
+///
+/// A window on Wayland needs nothing of it. Slint's clipboard there is
+/// smithay-clipboard rather than arboard, so rPGP's arboard handle is the
+/// only one in the process: where arboard copies through XWayland, dropping
+/// it as the window closes has arboard take a private copy back itself, and
+/// through data-control arboard serves each copy from a thread of its own,
+/// which nothing on X11 can stand in for. Asking X11 anyway would connect to
+/// DISPLAY as the window closes, which on a compositor that starts XWayland
+/// only for its first client would start it, and keep the close waiting on
+/// it, for nothing. A window whose display handle cannot be read counts as
+/// on neither, and nothing is taken back for it.
+#[cfg(wayland_target)]
+fn on_x11(display: Result<RawDisplayHandle, HandleError>) -> bool {
+    matches!(
+        display,
+        Ok(RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_))
+    )
+}
+
+/// Build arboard with `arboard`, or, for a window on Wayland for which that
+/// fails, choose Slint's clipboard instead, which is `Ok(None)`.
+///
+/// `on_wayland` is asked only once arboard has failed, and arboard's error is
+/// what comes back off Wayland, where arboard is all there is. Both are
+/// closures so that the tests can stand in for arboard and for the window,
+/// neither of which they can have without a display server.
+#[cfg(wayland_target)]
+fn build<A, E>(
+    arboard: impl FnOnce() -> Result<A, E>,
+    on_wayland: impl FnOnce() -> bool,
+) -> Result<Option<A>, E> {
+    match arboard() {
+        Ok(arboard) => Ok(Some(arboard)),
+        Err(_) if on_wayland() => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
-/// Put `text` on the clipboard chosen by [`attach`], marked private if it is
+/// Where a copy went, or, for Slint's clipboard, has yet to go.
+enum Step {
+    Done(std::result::Result<Copied, String>),
+    #[cfg(wayland_target)]
+    ThroughSlint(String),
+}
+
+/// Put `text` on the clipboard of `ui`'s window, marked private if it is
 /// [`Content::Private`] and the clipboard can mark it.
-pub fn copy(text: String, content: Content) -> std::result::Result<Copied, String> {
-    CLIPBOARD.with(|slot| match &mut *slot.borrow_mut() {
-        // No Copy button can be pressed before its window exists or after it
-        // has closed, so this is not expected. It is refused rather than
-        // handed to arboard because the window may yet turn out to be on
-        // Wayland, with no arboard to be had.
-        Clipboard::NoWindow => Err("there is no window to copy from".to_string()),
+pub fn copy(
+    #[cfg_attr(
+        not(wayland_target),
+        expect(
+            unused_variables,
+            reason = "only a window that can be on Wayland copies through Slint's clipboard"
+        )
+    )]
+    ui: &AppWindow,
+    text: String,
+    content: Content,
+) -> std::result::Result<Copied, String> {
+    let step = CLIPBOARD.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match &mut *slot {
+            // No Copy button can be pressed before its window exists or after
+            // it has closed, so this is not expected.
+            Clipboard::NoWindow => Step::Done(Err("there is no window to copy from".to_string())),
+            #[cfg(wayland_target)]
+            Clipboard::Slint => Step::ThroughSlint(text),
+            Clipboard::Arboard(handle) => {
+                #[cfg(wayland_target)]
+                let display = || {
+                    ui.window()
+                        .window_handle()
+                        .display_handle()
+                        .map(|d| d.as_raw())
+                };
+                if handle.is_none() {
+                    #[cfg(wayland_target)]
+                    match build(arboard::Clipboard::new, || on_wayland(display())) {
+                        Ok(Some(built)) => *handle = Some(built),
+                        Ok(None) => {
+                            *slot = Clipboard::Slint;
+                            return Step::ThroughSlint(text);
+                        }
+                        Err(e) => return Step::Done(Err(e.to_string())),
+                    }
+                    #[cfg(not(wayland_target))]
+                    match arboard::Clipboard::new() {
+                        Ok(built) => *handle = Some(built),
+                        Err(e) => return Step::Done(Err(e.to_string())),
+                    }
+                }
+                // A clipboard that has stopped working — the X server went
+                // away, say — is dropped so the next copy builds a fresh one
+                // rather than failing forever. A copy that failed leaves on
+                // the clipboard whatever was there, so only one that went
+                // says whether a private copy is there now, and only one from
+                // a window on X11 can be taken back at the close (see
+                // `on_x11`).
+                let result = set(handle.as_mut().expect("just populated"), text, content)
+                    .map(|()| Copied::AsAsked)
+                    .map_err(|e| e.to_string());
+                match result {
+                    #[cfg(wayland_target)]
+                    Ok(_) => PRIVATE_COPY.set(content == Content::Private && on_x11(display())),
+                    #[cfg(not(wayland_target))]
+                    Ok(_) => {}
+                    Err(_) => *handle = None,
+                }
+                Step::Done(result)
+            }
+            #[cfg(test)]
+            Clipboard::Recording { copies, marks } => {
+                copies.push((text, content));
+                Step::Done(Ok(if *marks {
+                    Copied::AsAsked
+                } else {
+                    unmarked(content)
+                }))
+            }
+        }
+    });
+    match step {
+        Step::Done(result) => result,
+        // Out here, once the clipboard is no longer borrowed: the copier runs
+        // Slint code, and nothing it sets off may find the clipboard borrowed.
+        //
+        // Nothing comes back: Slint hands the text to smithay-clipboard's
+        // thread, which offers it to the compositor, and reports nothing if
+        // that thread has stopped, as none of it is reported for Slint's own
+        // text fields either. A copy of nothing sets nothing, but no Copy
+        // button offers one.
+        //
+        // The text goes as plain text and nothing else, so a private copy
+        // goes without its mark, and the caller is told. It still goes rather
+        // than being refused, since nothing else would take it: Ctrl+C on the
+        // notepad's output goes through this same clipboard.
         #[cfg(wayland_target)]
-        Clipboard::Wayland(clipboard) => {
-            // Nothing comes back: this hands the text to smithay-clipboard's
-            // thread, which offers it to the compositor, or drops it if it has
-            // not been told the window has focus (see `attach`). If that
-            // thread has stopped, as it does when its connection fails, or
-            // when a store finds the seat's keyboard gone while it still
-            // believes the window has focus, which panics it, nothing receives
-            // the text, and this and every later Copy set nothing. None of it
-            // is reported, as none of it is for Slint's own text fields.
-            //
-            // smithay-clipboard offers the text as plain text and nothing
-            // else, so a private copy goes without its mark, and the caller is
-            // told. It still goes rather than being refused: the notepad's
-            // output can be selected and copied with Ctrl+C through Slint's
-            // own clipboard, which on this same connection cannot mark it
-            // either, so refusing would only move the copy there.
-            clipboard.store(text);
+        Step::ThroughSlint(text) => {
+            ui.invoke_copy_through_slint(text.into());
             Ok(unmarked(content))
         }
-        Clipboard::Arboard(handle) => {
-            if handle.is_none() {
-                *handle = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
-            }
-            // A clipboard that has stopped working — the X server went away,
-            // say — is dropped so the next copy builds a fresh one rather than
-            // failing forever.
-            let result = set(handle.as_mut().expect("just populated"), text, content)
-                .map(|()| Copied::AsAsked)
-                .map_err(|e| e.to_string());
-            if result.is_err() {
-                *handle = None;
-            }
-            result
-        }
-        #[cfg(test)]
-        Clipboard::Recording { copies, marks } => {
-            copies.push((text, content));
-            Ok(if *marks {
-                Copied::AsAsked
-            } else {
-                unmarked(content)
-            })
-        }
-    })
+    }
 }
 
 /// How a copy of `content` went on a clipboard that cannot mark anything.
@@ -475,6 +484,210 @@ fn mark_private(set: arboard::Set<'_>) -> arboard::Set<'_> {
     set.exclude_from_history()
 }
 
+/// Take rPGP's private copy back off the X11 clipboard if the clipboard still
+/// holds it, so that no clipboard manager keeps it once the window is gone.
+///
+/// arboard does this itself as its last handle in the process is dropped. But
+/// Slint 1.18's winit backend keeps two arboard handles of its own on an X11
+/// session, its text fields' clipboard and primary selection, until the
+/// process exits, and every handle in a process shares the one X11 clipboard,
+/// so rPGP's is never the last any more. Slint 1.17's text fields had an X11
+/// clipboard of their own, so rPGP's handle used to be the last. Measured on
+/// Xvfb, watching from another process: without this, a private copy stayed
+/// on the clipboard after rPGP's window had been unmapped and destroyed, and
+/// went only as the process exited, about 20 ms later, when the thread-local
+/// destructors dropped Slint's platform and with it the last arboard handle.
+/// A process that outlived its window, or ended without running thread-local
+/// destructors, would have left it there. With this it goes before the
+/// window is unmapped.
+///
+/// Clearing the clipboard regardless would wipe whatever anyone has copied
+/// since, so it is cleared only if all of this holds, asked on a connection of
+/// this function's own:
+/// - That connection is over a Unix-domain socket, so the X server is on this
+///   machine and the kernel can tell it which process is at the other end. A
+///   display reached over TCP is left alone, as is any display ssh -X or -Y
+///   forwards, which sshd offers over TCP alone: what the X server sees
+///   behind it is the ssh client, the same for every client forwarded through
+///   it, rPGP and whatever else alike. A private copy there goes only as rPGP
+///   exits, with the last arboard handle in the process.
+/// - The X server names this process for that connection. It says which
+///   process a client is through the X-Resource extension, and what it gives
+///   is the process that opened the client's connection, as the kernel tells
+///   the server. Through a forwarder on a Unix socket that is the forwarder,
+///   again the same for every client it forwards, so a program forwarded
+///   alongside rPGP would pass for rPGP and could have its copy wiped. So the
+///   server's number for this connection has to be this process's own, and
+///   where it is not, nothing is cleared: through such a forwarder; without
+///   the extension, where the server names no process at all; and in a
+///   sandbox with a PID namespace of its own, such as the Flatpak's, whose
+///   numbers are not the server's. That leaves one case open: a forwarder on
+///   a Unix socket in another PID namespace than rPGP's, whose number in the
+///   server's namespace happens to be rPGP's in its own. A copy marked
+///   private that another program made through that forwarder would then
+///   pass for rPGP's.
+/// - The window that owns the clipboard belongs to this process too, by the
+///   server's account, which is then the kernel's. Nothing in rPGP but arboard
+///   takes the clipboard, so that window is arboard's.
+/// - What it holds is offered with the private mark. That tells rPGP's
+///   private copy from a later Ctrl+C in one of Slint's text fields, which
+///   goes through the same arboard, and so the same window, unmarked. Asking
+///   reads the list of types offered and nothing else, and asks only this
+///   process's own arboard.
+/// - The owner is still the same when the clipboard is cleared, which is done
+///   under a grab of the X server, so that no other client can take the
+///   clipboard between the two.
+///
+/// Nothing of what was copied is read, from rPGP or from anyone else, and any
+/// failure leaves the clipboard as it is. It runs only when the last copy
+/// through arboard was private and made from a window on X11 (see
+/// [`on_x11`]), so a window that never copied anything private, and any
+/// window on Wayland, never connects to X11 for it. It runs on a thread of
+/// its own, and the close waits for it for at most [`RELEASE_LIMIT`].
+#[cfg(wayland_target)]
+fn withdraw() {
+    let Ok((connection, screen)) = x11rb::rust_connection::RustConnection::connect(None) else {
+        return;
+    };
+    if !over_unix_socket(connection.stream()) {
+        return;
+    }
+    let _ = withdraw_on(&connection, screen);
+}
+
+/// Whether `stream` is a Unix-domain socket, the only kind of connection to
+/// the X server that [`withdraw`] goes on over. Not being able to tell counts
+/// as not.
+#[cfg(wayland_target)]
+fn over_unix_socket(stream: impl std::os::fd::AsFd) -> bool {
+    matches!(
+        rustix::net::sockopt::socket_domain(stream),
+        Ok(rustix::net::AddressFamily::UNIX)
+    )
+}
+
+/// [`withdraw`]'s work on an open connection: whether it cleared the
+/// clipboard, or why it could not tell.
+#[cfg(wayland_target)]
+fn withdraw_on(
+    connection: &impl x11rb::connection::Connection,
+    screen: usize,
+) -> std::result::Result<bool, Box<dyn std::error::Error>> {
+    use std::time::{Duration, Instant};
+    use x11rb::protocol::Event;
+    use x11rb::protocol::res::{ClientIdMask, ClientIdSpec, ConnectionExt as _};
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, CreateWindowAux, WindowClass};
+    use x11rb::{COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, CURRENT_TIME, NONE};
+
+    let clipboard = connection.intern_atom(false, b"CLIPBOARD")?.reply()?.atom;
+    let owner = connection.get_selection_owner(clipboard)?.reply()?.owner;
+    if owner == NONE {
+        return Ok(false);
+    }
+
+    // The process the X server has for the client that made `resource`, any
+    // of that client's IDs naming the client.
+    let process = |resource: u32| -> std::result::Result<Option<u32>, Box<dyn std::error::Error>> {
+        let spec = ClientIdSpec {
+            client: resource,
+            mask: ClientIdMask::LOCAL_CLIENT_PID,
+        };
+        let reply = connection.res_query_client_ids(&[spec])?.reply()?;
+        Ok(reply
+            .ids
+            .iter()
+            .find(|id| id.spec.mask == ClientIdMask::LOCAL_CLIENT_PID)
+            .and_then(|id| id.value.first().copied()))
+    };
+    let ours = process(connection.setup().resource_id_base)?;
+    if !same_process(std::process::id(), ours, process(owner)?) {
+        return Ok(false);
+    }
+
+    // Whether the owner, this process's arboard, offers the copy with the
+    // private mark. Only interned if something has offered it, which arboard
+    // does as it starts.
+    let mark = connection
+        .intern_atom(true, b"x-kde-passwordManagerHint")?
+        .reply()?
+        .atom;
+    if mark == NONE {
+        return Ok(false);
+    }
+    let targets = connection.intern_atom(false, b"TARGETS")?.reply()?.atom;
+    let requestor = connection.generate_id()?;
+    // Indexed with get: this runs on the clipboard thread as the window
+    // closes, and nothing here should panic.
+    let Some(root) = connection.setup().roots.get(screen).map(|s| s.root) else {
+        return Ok(false);
+    };
+    connection.create_window(
+        COPY_DEPTH_FROM_PARENT,
+        requestor,
+        root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_ONLY,
+        COPY_FROM_PARENT,
+        &CreateWindowAux::new(),
+    )?;
+    connection.convert_selection(requestor, clipboard, targets, targets, CURRENT_TIME)?;
+    connection.flush()?;
+    // arboard answers from a thread of its own, within milliseconds. The
+    // limit is for an arboard whose thread has stopped, and costs the close
+    // that long.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let answered = loop {
+        match connection.poll_for_event()? {
+            Some(Event::SelectionNotify(event)) if event.requestor == requestor => {
+                break event.property != NONE;
+            }
+            Some(_) => {}
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(2)),
+            None => break false,
+        }
+    };
+    let marked = answered && {
+        let reply = connection
+            .get_property(true, requestor, targets, AtomEnum::ATOM, 0, 1024)?
+            .reply()?;
+        reply
+            .value32()
+            .is_some_and(|mut offered| offered.any(|atom| atom == mark))
+    };
+    connection.destroy_window(requestor)?;
+    if !marked {
+        return Ok(false);
+    }
+
+    // The grab is released with the connection should anything below fail.
+    connection.grab_server()?;
+    let still = connection.get_selection_owner(clipboard)?.reply()?.owner == owner;
+    if still {
+        connection.set_selection_owner(NONE, clipboard, CURRENT_TIME)?;
+    }
+    connection.ungrab_server()?;
+    // A round trip, so that the server has done all of the above before the
+    // connection closes.
+    connection.get_input_focus()?.reply()?;
+    Ok(still)
+}
+
+/// Whether the clipboard's owner is in this process, numbered `this`, from the
+/// process the X server has for `withdraw`'s own connection and for the
+/// owner's, where it knows one.
+///
+/// Its number for its own connection has to be `this`, not merely equal to
+/// the owner's: a forwarder opens every connection it forwards, and then the
+/// server gives its number for all of them.
+#[cfg(wayland_target)]
+fn same_process(this: u32, ours: Option<u32>, theirs: Option<u32>) -> bool {
+    ours == Some(this) && theirs == Some(this)
+}
+
 /// Have [`copy`] record what it is given instead of copying it, marking a
 /// private copy only if `marks` says to.
 #[cfg(test)]
@@ -496,8 +709,16 @@ pub(crate) fn recorded() -> Vec<(String, Content)> {
     })
 }
 
-// Where no window can be on Wayland only the guard's test runs: the choice and
-// the close handler exist only where one can.
+/// Have [`copy`] go through Slint's clipboard, as a window on Wayland does
+/// when arboard cannot be built for it; on the testing backend, that is the
+/// backend's own clipboard.
+#[cfg(all(test, wayland_target))]
+pub(crate) fn through_slint() {
+    CLIPBOARD.with(|slot| *slot.borrow_mut() = Clipboard::Slint);
+}
+
+// Where no window can be on Wayland only the guard's test and the lockfile's
+// run: the rest exists only where one can.
 #[cfg(test)]
 mod tests {
     use super::{CLIPBOARD, Clipboard, attach};
@@ -505,13 +726,12 @@ mod tests {
     use slint::ComponentHandle;
     #[cfg(wayland_target)]
     use {
-        super::{Choice, Route, choose, route},
+        super::{build, on_wayland, on_x11, over_unix_socket, same_process, within},
         raw_window_handle::{
             HandleError, RawDisplayHandle, WaylandDisplayHandle, XcbDisplayHandle,
             XlibDisplayHandle,
         },
         std::cell::Cell,
-        std::ffi::c_void,
         std::ptr::NonNull,
     };
 
@@ -521,114 +741,228 @@ mod tests {
     const ARBOARD: &str = "arboard";
 
     /// A display handle tells a window on Wayland from one on anything else,
-    /// and a window that does not exist yet has no answer to give.
+    /// and one winit has not made yet counts as anything else.
     ///
-    /// A window winit has not created yet reports NotSupported, so settling on
-    /// anything for an error would choose for a window whose display server is
-    /// not known.
+    /// A window winit has not made yet reports NotSupported, and settling on
+    /// Slint's clipboard for it would settle for a window whose display
+    /// server is not known.
     #[cfg(wayland_target)]
     #[test]
-    fn a_display_handle_tells_a_wayland_window_from_any_other_and_an_error_waits() {
-        // Never dereferenced: route only passes it along.
-        let display = NonNull::<c_void>::dangling();
+    fn a_display_handle_tells_a_wayland_window_from_any_other() {
+        // Never dereferenced: on_wayland only looks at which kind it is.
+        let display = NonNull::dangling();
         let wayland = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(display));
-        assert_eq!(
-            route(Ok(wayland)),
-            Route::Wayland(display),
-            "a window on Wayland must be told apart, with its own connection"
+        assert!(
+            on_wayland(Ok(wayland)),
+            "a window on Wayland must be told apart"
         );
 
         let xlib = RawDisplayHandle::Xlib(XlibDisplayHandle::new(None, 0));
-        assert_eq!(route(Ok(xlib)), Route::Other);
+        assert!(!on_wayland(Ok(xlib)));
         let xcb = RawDisplayHandle::Xcb(XcbDisplayHandle::new(None, 0));
-        assert_eq!(route(Ok(xcb)), Route::Other);
+        assert!(!on_wayland(Ok(xcb)));
 
-        assert_eq!(
-            route(Err(HandleError::NotSupported)),
-            Route::Wait,
-            "a window winit has not created yet must not be settled on"
+        assert!(
+            !on_wayland(Err(HandleError::NotSupported)),
+            "a window winit has not made yet must not be taken for one on Wayland"
         );
-        assert_eq!(route(Err(HandleError::Unavailable)), Route::Wait);
+        assert!(!on_wayland(Err(HandleError::Unavailable)));
     }
 
-    /// A window on Wayland keeps arboard wherever arboard can be built.
+    /// Only a window on X11 has its private copy taken back by `withdraw`,
+    /// and one whose display handle cannot be read is not taken for one.
     ///
-    /// That is wherever Copy worked before smithay-clipboard came in: through
-    /// data-control where the compositor offers it, and through XWayland where
-    /// it does not. smithay-clipboard there would bring in its gaps, a touch
-    /// Copy and a keyboard bound after the focus, where arboard has neither.
+    /// On Wayland arboard takes its own copy back, or serves it from a thread
+    /// of its own, and asking X11 at the close would connect to DISPLAY for
+    /// nothing.
+    #[cfg(wayland_target)]
+    #[test]
+    fn only_a_window_on_x11_has_its_private_copy_taken_back_at_the_close() {
+        let xlib = RawDisplayHandle::Xlib(XlibDisplayHandle::new(None, 0));
+        assert!(on_x11(Ok(xlib)));
+        let xcb = RawDisplayHandle::Xcb(XcbDisplayHandle::new(None, 0));
+        assert!(on_x11(Ok(xcb)));
+
+        // Never dereferenced: on_x11 only looks at which kind it is.
+        let wayland = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(NonNull::dangling()));
+        assert!(
+            !on_x11(Ok(wayland)),
+            "a window on Wayland must never have X11 asked about its copies"
+        );
+        assert!(!on_x11(Err(HandleError::NotSupported)));
+        assert!(!on_x11(Err(HandleError::Unavailable)));
+    }
+
+    /// A window on Wayland keeps arboard wherever arboard can be built, and
+    /// is not asked where it is.
+    ///
+    /// That is wherever Copy has always worked: through data-control where
+    /// the compositor offers it, and through XWayland where it does not.
+    /// Only arboard can mark a private copy there.
     #[cfg(wayland_target)]
     #[test]
     fn a_wayland_window_keeps_arboard_wherever_arboard_can_be_built() {
-        let display = NonNull::<c_void>::dangling();
+        let asked = Cell::new(false);
+        let built = build(
+            || Ok::<_, ()>(ARBOARD),
+            || {
+                asked.set(true);
+                true
+            },
+        );
         assert_eq!(
-            choose(Route::Wayland(display), || Ok::<_, ()>(ARBOARD)),
-            Choice::Arboard(Some(ARBOARD)),
+            built,
+            Ok(Some(ARBOARD)),
             "a window on Wayland must keep an arboard that could be built"
         );
+        assert!(
+            !asked.get(),
+            "with arboard built, where the window is is moot"
+        );
     }
 
-    /// A window on Wayland for which arboard cannot be built copies over its
-    /// own connection.
+    /// A window on Wayland for which arboard cannot be built copies through
+    /// Slint's clipboard.
     ///
     /// That is the Flatpak on a compositor that withholds data-control from
-    /// it, where arboard's X11 fallback has no X server to reach and every
-    /// Copy failed.
+    /// it, where arboard's X11 fallback has no X server to reach. Before, it
+    /// was given a smithay-clipboard of rPGP's own, a second data device
+    /// that cost Slint's text fields their paste on GNOME.
     #[cfg(wayland_target)]
     #[test]
-    fn a_wayland_window_copies_over_its_own_connection_where_arboard_cannot_be_built() {
-        let display = NonNull::<c_void>::dangling();
+    fn a_wayland_window_copies_through_slints_clipboard_where_arboard_cannot_be_built() {
         assert_eq!(
-            choose(Route::Wayland(display), || Err::<&str, _>(())),
-            Choice::Wayland(display),
-            "a window on Wayland without arboard must copy over its own connection"
+            build(|| Err::<&str, _>("no data-control and no X11"), || true),
+            Ok(None),
+            "a window on Wayland without arboard must copy through Slint's clipboard"
         );
     }
 
-    /// A window on anything else keeps arboard whether it can be built or not.
+    /// Any other window reports why arboard cannot be built.
     ///
-    /// arboard is all there is off Wayland. Where it cannot be built yet, the
-    /// slot is left empty, so that the first Copy builds it again and reports
-    /// why it cannot, as a Copy after any failure does.
+    /// arboard is all there is off Wayland: Slint's own clipboard there is
+    /// arboard too. The slot stays empty, so the next Copy builds it again
+    /// and reports why it cannot, as a Copy after any failure does.
     #[cfg(wayland_target)]
     #[test]
-    fn any_other_window_keeps_arboard_and_builds_it_again_at_a_copy_after_failing() {
+    fn any_other_window_reports_why_arboard_cannot_be_built() {
         assert_eq!(
-            choose(Route::Other, || Ok::<_, ()>(ARBOARD)),
-            Choice::Arboard(Some(ARBOARD))
+            build(|| Err::<&str, _>("no X server"), || false),
+            Err("no X server")
         );
-        assert_eq!(
-            choose(Route::Other, || Err::<&str, _>(())),
-            Choice::Arboard(None),
-            "a window off Wayland must keep arboard even when it cannot be built"
+        assert_eq!(build(|| Ok::<_, ()>(ARBOARD), || false), Ok(Some(ARBOARD)));
+    }
+
+    /// The X11 clipboard is only ever cleared for an owner the X server
+    /// numbers as this process, and only where it numbers `withdraw`'s own
+    /// connection as this process too.
+    ///
+    /// Two clients through one forwarder, as with ssh -X, both get the
+    /// forwarder's number, and two the server cannot number, as over TCP,
+    /// would both be None: either way they would compare equal, and anyone's
+    /// copy could be wiped.
+    #[cfg(wayland_target)]
+    #[test]
+    fn only_an_owner_the_x_server_numbers_as_this_process_counts_as_this_one() {
+        const THIS: u32 = 4242;
+        assert!(same_process(THIS, Some(THIS), Some(THIS)));
+        assert!(!same_process(THIS, Some(THIS), Some(4243)));
+        assert!(!same_process(THIS, Some(THIS), None));
+        assert!(
+            !same_process(THIS, Some(777), Some(777)),
+            "a forwarder's number, the same for every client it forwards, is not this process's"
+        );
+        assert!(
+            !same_process(2, Some(THIS), Some(THIS)),
+            "inside a PID namespace the server's numbers are not this process's"
+        );
+        assert!(!same_process(THIS, None, Some(THIS)));
+        assert!(
+            !same_process(THIS, None, None),
+            "two processes the X server cannot name are not this one"
         );
     }
 
-    /// A window winit has not created yet waits, without building arboard.
+    /// `over_unix_socket`, which `withdraw` asks right after connecting, counts
+    /// a Unix-domain socket as local and a TCP one, as with ssh -X, as not.
     ///
-    /// The timer asks every 10ms until the window exists, and building arboard
-    /// on each of those ticks would open and close a connection every time.
+    /// sshd offers a forwarded display over TCP alone, and behind it the X
+    /// server sees the ssh client for every client forwarded through it, which
+    /// could pass the process check whenever the ssh client's number on one
+    /// machine was rPGP's on the other, and have another program's private
+    /// copy wiped. The Unix socket is wrapped as x11rb wraps the one it
+    /// connects over. The TCP socket needs no network to tell, and none to be
+    /// made: it is never connected. This checks the predicate only; that
+    /// `withdraw` returns on its answer was checked against a live X server,
+    /// where taking the check out let a forwarded program's copy be wiped.
     #[cfg(wayland_target)]
     #[test]
-    fn a_window_winit_has_not_created_yet_waits_without_building_arboard() {
-        let built = Cell::new(false);
-        let choice = choose(Route::Wait, || {
-            built.set(true);
-            Ok::<_, ()>(ARBOARD)
+    fn only_a_unix_domain_socket_counts_as_local() {
+        use rustix::net::{AddressFamily, SocketType};
+        use x11rb::rust_connection::DefaultStream;
+
+        let (unix, _peer) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
+        let (unix, _) = DefaultStream::from_unix_stream(unix).expect("x11rb wraps a Unix socket");
+        assert!(
+            over_unix_socket(&unix),
+            "a connection over a Unix-domain socket must go on to the process check"
+        );
+
+        let tcp = rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None)
+            .expect("a TCP socket");
+        assert!(
+            !over_unix_socket(&tcp),
+            "a connection over TCP, as ssh -X forwards a display, must be left alone"
+        );
+        // IPv6 can be compiled out of a kernel, or turned off at boot.
+        if let Ok(tcp6) = rustix::net::socket(AddressFamily::INET6, SocketType::STREAM, None) {
+            assert!(!over_unix_socket(&tcp6));
+        }
+    }
+
+    /// Letting go of the clipboard holds a closing window for no longer than
+    /// the limit, however long the work takes, and the work still finishes.
+    ///
+    /// The work stands in for `withdraw` waiting on an X server that does not
+    /// answer, which x11rb would wait on for as long as it took.
+    #[cfg(wayland_target)]
+    #[test]
+    fn letting_go_of_the_clipboard_holds_the_close_for_no_longer_than_the_limit() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let (answer, answered) = mpsc::channel::<()>();
+        let (finish, finished) = mpsc::channel();
+        let start = Instant::now();
+        // Waiting at most 10 s, so that a `within` that waited for the work
+        // itself fails the assertions below rather than hanging the test.
+        let in_time = within(Duration::from_millis(50), move || {
+            let _ = answered.recv_timeout(Duration::from_secs(10));
+            let _ = finish.send(());
         });
-        assert_eq!(choice, Choice::Wait);
-        assert!(!built.get(), "waiting must not build arboard");
+        let waited = start.elapsed();
+        assert!(!in_time, "work still waiting must not count as finished");
+        assert!(
+            (Duration::from_millis(50)..Duration::from_secs(5)).contains(&waited),
+            "the close must wait for the limit and no longer, not {waited:?}"
+        );
+
+        answer.send(()).expect("the work is still waiting");
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the work must go on past the limit");
+        assert!(
+            within(Duration::from_secs(5), || {}),
+            "work that finishes in time must count as finished"
+        );
     }
 
     /// A close request lets go of the clipboard, and still closes the window.
     ///
-    /// On Wayland hiding the window destroys it, and after that nothing but
-    /// Slint's event loop may be keeping the connection open, which Slint
-    /// drops when winit's run fails or a panic unwinds through it. The
-    /// clipboard's thread has to be gone by then, so it goes in the close
-    /// handler, which Slint runs before it hides the window. The testing
-    /// backend has no display, so an arboard slot stands in for the clipboard
-    /// the timer would have chosen; letting go does not depend on the kind.
+    /// The close handler is where a private copy is taken back off the X11
+    /// clipboard, as the window closes. The testing backend has no display,
+    /// so an arboard slot stands in for whatever the first copy would have
+    /// chosen; letting go does not depend on the kind.
     #[cfg(wayland_target)]
     #[test]
     fn a_close_request_lets_go_of_the_clipboard_and_still_closes_the_window() {
@@ -636,7 +970,10 @@ mod tests {
         let ui = AppWindow::new().expect("the window builds on the testing backend");
         ui.show().expect("the testing backend shows a window");
         let _attached = attach(&ui);
-        CLIPBOARD.with(|slot| *slot.borrow_mut() = Clipboard::Arboard(None));
+        assert!(
+            CLIPBOARD.with(|slot| matches!(*slot.borrow(), Clipboard::Arboard(None))),
+            "a shown window has a clipboard to settle at its first copy"
+        );
 
         ui.window()
             .dispatch_event(slint::platform::WindowEvent::CloseRequested);
@@ -654,20 +991,13 @@ mod tests {
     /// Dropping the guard lets go of the clipboard, with no close request.
     ///
     /// That is how `run` lets go of it when winit's run fails or a panic
-    /// unwinds through the event loop. No close request comes then, and Slint
-    /// may have dropped the event loop, and with it the loop's clone of the
-    /// connection, so the clipboard has to go while the window, which holds a
-    /// clone of its own, still exists: `run` drops the guard before the
-    /// window. As in the close request's test, an arboard slot stands in for
-    /// the Wayland handle; where no window can be on Wayland, it is the slot
-    /// `attach` fills anyway.
+    /// unwinds through the event loop, when no close request comes.
     #[test]
     fn dropping_the_guard_lets_go_of_the_clipboard_without_a_close_request() {
         i_slint_backend_testing::init_no_event_loop();
         let ui = AppWindow::new().expect("the window builds on the testing backend");
         ui.show().expect("the testing backend shows a window");
         let attached = attach(&ui);
-        CLIPBOARD.with(|slot| *slot.borrow_mut() = Clipboard::Arboard(None));
 
         drop(attached);
 
@@ -675,5 +1005,117 @@ mod tests {
             CLIPBOARD.with(|slot| matches!(*slot.borrow(), Clipboard::NoWindow)),
             "dropping the guard must let go of the clipboard"
         );
+    }
+
+    /// Slint's winit backend is the patched one under vendor/ for as long as
+    /// rPGP is on Slint 1.18, and the patch is gone once it is on 1.19.
+    ///
+    /// cargo applies a [patch] only while the graph asks for the very version
+    /// it names, and otherwise warns and records it in Cargo.lock as
+    /// `[[patch.unused]]`. A slint that moved to a 1.18.x without
+    /// slint-ui/slint#14248 would quietly take copy and paste out of the
+    /// Flatpak's text fields again, which this catches on top of the =1.18.1
+    /// pins. Only `[[package]]` tables count as the package: an unused patch's
+    /// table also names the crate with no source line. On 1.19, which carries
+    /// the fix itself, it fails until vendor/ and the [patch] are gone, as
+    /// the root Cargo.toml asks.
+    #[test]
+    fn the_winit_backend_is_the_patched_one_until_slint_1_19() {
+        let lock = include_str!("../../../Cargo.lock");
+        let tables = lock_tables(lock);
+        let packages = |name: &str| -> Vec<&LockTable> {
+            tables
+                .iter()
+                .filter(|table| table.kind == "package" && table.name == name)
+                .collect()
+        };
+        let unused = tables
+            .iter()
+            .any(|table| table.kind == "patch.unused" && table.name == "i-slint-backend-winit");
+
+        let slint = packages("slint");
+        assert_eq!(slint.len(), 1, "expected one slint in Cargo.lock");
+        let mut version = slint[0].version.split('.').map(|part| part.parse::<u32>());
+        let (major, minor) = match (version.next(), version.next()) {
+            (Some(Ok(major)), Some(Ok(minor))) => (major, minor),
+            _ => panic!("slint's version in Cargo.lock reads {:?}", slint[0].version),
+        };
+        let winit = packages("i-slint-backend-winit");
+        assert_eq!(
+            winit.len(),
+            1,
+            "expected one i-slint-backend-winit in Cargo.lock"
+        );
+
+        if (major, minor) < (1, 19) {
+            assert!(
+                !unused,
+                "Cargo.lock records the patched winit backend under vendor/ as unused, so the \
+                 graph has crates.io's, without slint-ui/slint#14248, and the Flatpak's text \
+                 fields cannot copy or paste: the patch has to be the very version slint {} \
+                 asks for",
+                slint[0].version
+            );
+            assert_eq!(
+                (winit[0].version, winit[0].source),
+                ("1.18.1", None),
+                "i-slint-backend-winit must be the patched crate under vendor/, not crates.io's"
+            );
+        } else {
+            let vendored = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../vendor/i-slint-backend-winit");
+            assert!(
+                !unused && !vendored.exists(),
+                "slint {} carries slint-ui/slint#14248 itself: delete vendor/ and the root \
+                 Cargo.toml's [patch.crates-io] table with the comment above it; delete this \
+                 test with the LockTable and lock_tables helpers only it uses, and its \
+                 mention in the comment over this tests module; turn the three =1.18.1 pins \
+                 in crates/rpgp-gui/Cargo.toml (slint, i-slint-backend-testing, slint-build) \
+                 back into plain 1.19 requirements, and take out the comments there that \
+                 explain the pins; reword the sentence in this file's module doc that says \
+                 Slint's clipboard is the patched winit backend until 1.19; and remove the \
+                 vendor/ paragraph from README.md's Licence section and the vendor/ mention \
+                 in packaging/cargo-sources.py",
+                slint[0].version
+            );
+        }
+    }
+
+    /// One `[[...]]` table of Cargo.lock, with the fields the lockfile test
+    /// reads.
+    struct LockTable<'a> {
+        kind: &'a str,
+        name: &'a str,
+        version: &'a str,
+        source: Option<&'a str>,
+    }
+
+    /// The `[[package]]` and `[[patch.unused]]` tables of a lockfile, read
+    /// line by line, which is all its format needs.
+    fn lock_tables(lock: &str) -> Vec<LockTable<'_>> {
+        let mut tables: Vec<LockTable<'_>> = Vec::new();
+        for line in lock.lines() {
+            if let Some(kind) = line.strip_prefix("[[").and_then(|l| l.strip_suffix("]]")) {
+                tables.push(LockTable {
+                    kind,
+                    name: "",
+                    version: "",
+                    source: None,
+                });
+                continue;
+            }
+            let (Some(table), Some((key, value))) = (tables.last_mut(), line.split_once(" = "))
+            else {
+                continue;
+            };
+            let value = value.trim_matches('"');
+            match key {
+                "name" => table.name = value,
+                "version" => table.version = value,
+                "source" => table.source = Some(value),
+                _ => {}
+            }
+        }
+        tables
     }
 }

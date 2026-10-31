@@ -40,7 +40,10 @@ def main() -> int:
         source = package.get("source")
         if source is None:
             # No source means a path dependency: the workspace's own crates,
-            # which arrive with the git source rather than from the registry.
+            # and the patched crate under vendor/ that the root Cargo.toml's
+            # [patch.crates-io] names, all of which arrive with the git source
+            # rather than from the registry. The vendor/ crate goes with Slint
+            # 1.19, and its mention here with it, as the root Cargo.toml says.
             continue
         if source != CRATES_IO_SOURCE:
             # A git source has no .crate at static.crates.io and no checksum
