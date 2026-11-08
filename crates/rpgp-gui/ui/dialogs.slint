@@ -2443,9 +2443,11 @@ export component AboutDialog inherits DialogShell {
         SectionLabel { text: "BUILT WITH"; }
         VerticalLayout {
             spacing: Theme.s2;
-            // Slint's royalty-free licence requires attribution in the
-            // application, which is what this line is for. Removing it would
-            // mean falling back to its GPLv3 or commercial terms.
+            // A courtesy, not the attribution Slint's royalty-free licence
+            // asks for: that is its AboutSlint widget in an About screen, or
+            // the Made with Slint badge on a public page, and rPGP's is the
+            // badge in the README's Licence section. Take the badge out and
+            // this line does not stand in for it.
             FieldRow { label: "Made with Slint"; value: "slint.dev — royalty-free desktop licence"; }
             FieldRow { label: "Sequoia-PGP"; value: "sequoia-pgp.org — LGPL-2.0-or-later"; }
             FieldRow { label: "Lucide"; value: "lucide.dev — ISC licence"; }
