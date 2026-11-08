@@ -1045,8 +1045,13 @@ How each part of `~/.gnupg` comes across:
 MIT — see [LICENSE](LICENSE).
 
 Two dependencies add obligations MIT does not, both relevant only when
-shipping binaries: Slint's royalty-free terms require the attribution in the
-About box, and `sequoia-openpgp` is LGPL-2.0-or-later linked statically.
+shipping binaries: Slint's royalty-free terms require attribution, which is
+the badge below, and `sequoia-openpgp` is LGPL-2.0-or-later linked statically.
+
+<a href="https://slint.dev"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/made-with-slint-dark.svg">
+  <img src="docs/made-with-slint-light.svg" alt="Made with Slint" width="110">
+</picture></a>
 
 `vendor/i-slint-backend-winit` is not rPGP's code: it is Slint's winit
 backend, 1.18.1 with one fix from Slint's development branch applied until
