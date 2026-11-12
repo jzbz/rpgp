@@ -150,11 +150,13 @@ exe's bytes exactly, which release.yml checks by installing the setup on its
 runner, so the bare exe's line vouches for what ends up on disk as well.
 
 `manifest/` here holds what was actually submitted, for review before it is sent
-and as the starting point for the next version: 0.1.4's, the first with the
-installer, submitted as microsoft/winget-pkgs#447335. Those went in without
-Komac: written by hand to the list above, checked with `winget validate
---manifest` on Windows, and committed, signed, on a branch of a fork of
-winget-pkgs. Replace them with what goes in each time. Keep
+and as the starting point for the next version: 0.1.5's, submitted as
+microsoft/winget-pkgs#478899. 0.1.4's, the first with the installer, went in as
+microsoft/winget-pkgs#447335 without Komac: written by hand to the list above,
+checked with `winget validate --manifest` on Windows, and committed, signed, on
+a branch of a fork of winget-pkgs. 0.1.5's are 0.1.4's as merged with the
+version, date, URLs and hash changed, sent the same way but not run through
+`winget validate`. Replace them with what goes in each time. Keep
 `InstallerSha256` in step with the release's signed `SHA256SUMS` rather than
 recomputing it: pinning the hash that signature covers is the only thread
 connecting a winget install back to key 249738C8641C3359.

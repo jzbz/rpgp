@@ -13,19 +13,19 @@
 # was the bare exe as InstallerType portable, which winget will not upgrade to
 # an installer; those installs move by uninstalling and installing once.
 PackageIdentifier: jzbz.rPGP
-PackageVersion: 0.1.4
+PackageVersion: 0.1.5
 InstallerType: inno
 Scope: user
 UpgradeBehavior: install
 Commands:
 - rpgp
 ProductCode: jzbz.rPGP_is1
-ReleaseDate: 2026-10-06
+ReleaseDate: 2026-11-12
 Installers:
 - Architecture: x64
-  InstallerUrl: https://github.com/jzbz/rpgp/releases/download/v0.1.4/rpgp-v0.1.4-x86_64-setup.exe
+  InstallerUrl: https://github.com/jzbz/rpgp/releases/download/v0.1.5/rpgp-v0.1.5-x86_64-setup.exe
   # Taken from the release's PGP-signed SHA256SUMS rather than computed here,
   # so the hash winget pins is the one covered by that signature.
-  InstallerSha256: A71225514620BC48FC359C1C80B78C02409208A6FE16B49903F8989AFE427534
+  InstallerSha256: 1D4FC332D02AD3685EDB3F9648793792F4638B9AE039EAEAE8FB3D4AE0FB2D0B
 ManifestType: installer
 ManifestVersion: 1.12.0
