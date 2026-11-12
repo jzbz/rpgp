@@ -5323,7 +5323,7 @@ dependencies = [
 
 [[package]]
 name = "rpgp-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5349,7 +5349,7 @@ dependencies = [
 
 [[package]]
 name = "rpgp-gui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "arboard",
  "atspi",

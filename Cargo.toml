@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/rpgp-core", "crates/rpgp-gui"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 # The newest Rust that every build of the release has, rather than the oldest
 # the source would take. The Flatpak builds with Flathub's rust-stable

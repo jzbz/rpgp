@@ -124,6 +124,42 @@
   </content_rating>
 
   <releases>
+    <release version="0.1.5" date="2026-11-12">
+      <description>
+        <p>Keyboard access to the lists in the dialogs, fixes to
+        authentication and to withdrawing certifications, and a title bar
+        fix on macOS.</p>
+        <ul>
+          <li>The recipient lists in Sign / Encrypt and the notepad, and the
+          user ID list in Certify, now work from the keyboard: Tab reaches the
+          list, the arrow keys move through it, and Space or Enter ticks a
+          row</li>
+          <li>A certification made with a key that only gpg-agent or a
+          smartcard holds is now shown as yours and can be withdrawn, also
+          after that key has expired</li>
+          <li>A signature from a key whose primary user ID changed since the
+          list was last read no longer shows the new name as verified, and
+          two user IDs that read alike no longer lend each other a verified
+          badge</li>
+          <li>Changing an expiry or adding a user ID no longer brings back a
+          subkey or user ID retired on another machine, when the retirement
+          reached rPGP only through an import or a keyserver refresh</li>
+          <li>Saving a revocation certificate over an existing file replaces
+          it whole or not at all</li>
+          <li>A detached signature or a GnuPG Keybox made to be enormous is
+          refused instead of closing rPGP</li>
+          <li>On macOS the title bar is painted rather than left
+          transparent</li>
+          <li>A terminal pinentry that has no terminal to draw in, and a
+          signature gpg-agent refuses, are now reported with what to
+          change</li>
+          <li>File names carrying control or direction-changing characters
+          are shown as code points, as user IDs already were, and in the
+          Flatpak a chosen file is shown by its name rather than by a portal
+          path</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.4" date="2026-10-06">
       <description>
         <p>Fixes for ways an ordinary import or edit could damage a key you
