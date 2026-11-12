@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag whose release assets to hash (e.g. v0.1.2)"
+        description: "Tag whose release assets to hash, as vX.Y.Z (e.g. v0.1.2)"
         required: true
 
 # The group release.yml runs in for the same tag, so a hash waits for an
@@ -52,6 +52,21 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+
+          # The tag is typed into the dispatch form, and it ends up unquoted in
+          # the commands the summary below hands over for pasting on the
+          # machine with the key, and in the delete hint further down. Git
+          # allows `$`, `(` and `;` in a tag name, so a tag that is not the
+          # plain vX.Y.Z every release uses stops here rather than reaching a
+          # shell on the far side of a paste. It is the same grammar
+          # release.yml holds the installer's version to, so a pre-release
+          # tag, which could not ship an installer, is refused here too. The
+          # error does not repeat the tag, which is the text this distrusts:
+          # the run's inputs show what was typed.
+          if ! [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::the tag must be vX.Y.Z, such as v0.1.2"
+            exit 1
+          fi
 
           # One read, into a variable, and any failure of it stops the run.
           # Piped from gh straight into the condition of the `if` below, a gh
