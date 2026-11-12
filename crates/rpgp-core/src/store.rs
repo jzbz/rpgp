@@ -885,7 +885,11 @@ impl Store {
 
     /// The second write of [`Store::insert_secret`] and
     /// [`Store::insert_imported_secret`], made once the secret key is written.
-    fn insert_public_half(&self, merged: &Cert) -> Result<()> {
+    ///
+    /// Also made on its own, with the secret key file as it stands, by
+    /// [`crate::lifecycle::add_user_id`] when a retry finds the first write
+    /// made and this one not.
+    pub(crate) fn insert_public_half(&self, merged: &Cert) -> Result<()> {
         self.insert(merged)
             .map_err(|e| Error::PublicCertNotUpdated(Box::new(e)))
     }

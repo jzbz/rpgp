@@ -289,6 +289,41 @@ pub fn add_user_id(
                 )
         })
     {
+        // Unless the name is live only because the secret key file says so:
+        // the last attempt to add it wrote the secret file, cert-d then
+        // refused the public half, and the dialog stayed open for another try
+        // on the strength of [`Error::PublicCertNotUpdated`]. That try met
+        // this refusal every time, since `merged` carries the secret half and
+        // the binding with it, and "already on this key" was beside a list,
+        // read off cert-d, that did not show the name at all. What is left of
+        // the add is the second write of [`Store::insert_secret`], so that is
+        // what the retry makes: nothing is signed, the secret file is not
+        // touched, and a cert-d that refuses again says so as it did the first
+        // time.
+        //
+        // Only for these exact bytes, live in both halves together and not in
+        // cert-d's: a look-alike is still refused, and a name retired on the
+        // owner's other machine, whose retirement reached cert-d alone, is not
+        // live in `merged` and goes on to be bound again below.
+        let live = |c: &Cert| {
+            c.userids().any(|ua| {
+                ua.userid() == &userid
+                    && !matches!(
+                        ua.revocation_status(&policy, None),
+                        RevocationStatus::Revoked(_)
+                    )
+            })
+        };
+        // `lookup` searches subkeys as well and can answer with another
+        // certificate, which is no answer about this one's public half.
+        let public = store
+            .lookup(fingerprint)
+            .ok()
+            .filter(|public| public.fingerprint() == cert.fingerprint());
+        if live(&merged) && !public.as_ref().is_some_and(live) {
+            store.insert_public_half(&cert)?;
+            return Ok(cert);
+        }
         return Err(Error::invalid(format!("{user_id} is already on this key")));
     }
 
@@ -2002,6 +2037,65 @@ mod tests {
             .map_err(|e| e.to_string())
             .expect("a name retired elsewhere must be possible to bind again");
         assert_eq!(live(&store.lookup(&fingerprint).unwrap()), [true]);
+    }
+
+    /// A retry after an add that wrote the secret key file, and whose public
+    /// certificate cert-d then refused, finishes the add rather than refusing
+    /// the name as already on the key.
+    ///
+    /// The GUI keeps the dialog open on [`Error::PublicCertNotUpdated`] for
+    /// another try, and that try was refused every time: the duplicate guard
+    /// asks both halves, and the secret half already carried the name. The
+    /// partial write is made here by a second store over the same secrets
+    /// directory with a cert-d of its own, so the add reaches this store's
+    /// secret key file and not its cert-d. Then the same over a name retired
+    /// and bound again, where cert-d still shows the retirement.
+    #[test]
+    fn a_retry_finishes_an_add_whose_certificate_was_not_written() {
+        const WORK: &str = "Alice <alice@work.example>";
+        let (dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let live = |cert: &Cert| -> Vec<bool> {
+            cert::user_ids(cert)
+                .into_iter()
+                .filter(|u| u.text == WORK)
+                .map(|u| !u.revoked)
+                .collect()
+        };
+        let secret_only =
+            Store::open(dir.path().join("elsewhere.d"), dir.path().join("secrets")).unwrap();
+        let retry = || {
+            let before = store.secret_cert(&fingerprint).unwrap();
+            let updated = add_user_id(&store, &fingerprint, WORK, None)
+                .map_err(|e| e.to_string())
+                .expect("the retry must finish the add");
+            assert_eq!(
+                store.secret_cert(&fingerprint).unwrap(),
+                before,
+                "finishing the add signs nothing and leaves the secret key as it was"
+            );
+            for reloaded in [updated, store.lookup(&fingerprint).unwrap()] {
+                assert_eq!(live(&reloaded), [true], "the name must be there, once");
+            }
+        };
+
+        add_user_id(&secret_only, &fingerprint, WORK, None).unwrap();
+        assert_eq!(live(&store.secret_cert(&fingerprint).unwrap()), [true]);
+        assert!(
+            live(&store.lookup(&fingerprint).unwrap()).is_empty(),
+            "cert-d not knowing is the premise of this test"
+        );
+        retry();
+
+        // Finished, so adding it once more is refused as it always was.
+        let refused = add_user_id(&store, &fingerprint, WORK, None).unwrap_err();
+        assert!(refused.to_string().contains("already on this key"));
+
+        revoke_user_id(&store, &fingerprint, WORK, "wrong row", None).unwrap();
+        add_user_id(&secret_only, &fingerprint, WORK, None).unwrap();
+        assert_eq!(live(&store.secret_cert(&fingerprint).unwrap()), [true]);
+        assert_eq!(live(&store.lookup(&fingerprint).unwrap()), [false]);
+        retry();
     }
 
     /// A new user ID is held to the rules a new key's are, and nothing is
