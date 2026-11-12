@@ -154,6 +154,21 @@ jobs:
           echo "::error::apt failed twice; the Ubuntu mirrors are not answering"
           exit 1
 
+      # The newest stable Rust rather than whatever the runner image was built
+      # with, which trails a release by a week or two: 1.99.1 three days after
+      # 1.100.0 came out. rust-version, 1.98, is the oldest compiler a build
+      # uses, set by the Flatpak's; this is the newest, so a lint or a break a
+      # new release brings shows up here before a contributor meets it, as
+      # Azzurro's CI has it through dtolnay/rust-toolchain, which this
+      # workflow, keeping to official actions, does through rustup itself.
+      # rustup retries its own downloads, and the step is bounded as apt is.
+      # --no-self-update leaves the image's rustup alone; the components the
+      # image installed, clippy and rustfmt among them, are updated with it.
+      - name: Update Rust
+        timeout-minutes: 5
+        shell: bash
+        run: rustup update stable --no-self-update && rustup default stable
+
       # The compiler's version, for the cache key below: cargo rebuilds what
       # another rustc compiled rather than reuse it. `shell: bash` is what
       # brings pipefail, so a rustc that fails stops the job here rather than
@@ -363,6 +378,12 @@ jobs:
         run: brew install capnp
 
       # The lint job's, and for the same reason.
+      - name: Update Rust
+        timeout-minutes: 5
+        shell: bash
+        run: rustup update stable --no-self-update && rustup default stable
+
+      # The lint job's, and for the same reason.
       - name: Toolchain
         id: toolchain
         shell: bash
@@ -447,6 +468,12 @@ jobs:
         timeout-minutes: 10
         run: choco install capnproto -y --no-progress
 
+      # The lint job's, under bash as its toolchain step below is.
+      - name: Update Rust
+        timeout-minutes: 5
+        shell: bash
+        run: rustup update stable --no-self-update && rustup default stable
+
       # The lint job's, and for the same reason. Under Git's bash, which every
       # Windows image carries, so that it is the same step on every runner.
       - name: Toolchain
@@ -509,6 +536,12 @@ jobs:
       - name: Install capnproto
         timeout-minutes: 10
         run: choco install capnproto -y --no-progress
+
+      # The lint job's, under bash as in the job above.
+      - name: Update Rust
+        timeout-minutes: 5
+        shell: bash
+        run: rustup update stable --no-self-update && rustup default stable
 
       # The lint job's, under bash as in the job above.
       - name: Toolchain

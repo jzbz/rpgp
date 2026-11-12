@@ -58,7 +58,7 @@ slint = { version = "=1.18.1", default-features = false, features = [
 
 # Defaults are xdg-portal + wayland + pollster: no GTK, so no C dependency on
 # Linux. macOS uses the AppKit bindings.
-rfd = "0.17"
+rfd = "0.18"
 
 # Hands a URL to the desktop's own opener: xdg-open on Linux, open on macOS.
 open = "5"

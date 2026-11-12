@@ -5,12 +5,15 @@ members = ["crates/rpgp-core", "crates/rpgp-gui"]
 [workspace.package]
 version = "0.1.4"
 edition = "2024"
-# What cargo will actually build, not what the edition alone asks for. 1.85 was
-# the edition's own floor and stopped being true twice over: this workspace uses
-# let-chains, stable in 1.88, and slint 1.18 declares 1.92 throughout its tree,
-# which cargo enforces whatever the source needs. rpgp-core on its own still
-# checks on 1.89 — the toolkit is the whole of the difference.
-rust-version = "1.92"
+# The newest Rust that every build of the release has, rather than the oldest
+# the source would take. The Flatpak builds with Flathub's rust-stable
+# extension for its runtime, which is the oldest of them: 1.98.0 for 26.08,
+# while GitHub's runners and a developer's rustup are usually a release or two
+# ahead. Cargo's resolver picks dependencies that declare a Rust no newer than
+# this, so it is also how far `cargo update` may move them; raise it when the
+# extension moves, and not past it, or the Flatpak refuses to build. The source
+# itself asks less: let-chains need 1.88, and slint 1.18 declares 1.92.
+rust-version = "1.98"
 license = "MIT"
 repository = "https://github.com/jzbz/rpgp"
 
@@ -99,7 +102,7 @@ z-base-32 = "0.1"
 
 anyhow = "1"
 thiserror = "2"
-dirs = "6"
+dirs = "7"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # Slint's winit backend: 1.18.1 as crates.io serves it, plus the one change
