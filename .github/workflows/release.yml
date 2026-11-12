@@ -299,7 +299,7 @@ jobs:
           sha256sum "$NAME"
           ls -lh "$NAME"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: flatpak-${{ matrix.arch }}
           path: '*.flatpak'
@@ -383,6 +383,12 @@ jobs:
       # checked all four ways on 2026-10-02, and the three steps below were
       # first run with it on a Windows 11 machine, under Windows PowerShell 5.1
       # where the runner has pwsh 7, which is why they keep to what both share.
+      # 7.1.1 was checked on 2026-11-12 from Linux: the digest against a
+      # download, the .issig against def02.ispublickey, and the attestation,
+      # but of the Authenticode signature only that its certificate chain
+      # names Pyrsys B.V., under Sectigo's code-signing CA; the signature over
+      # the file was not checked, which takes Windows. Nothing in its revision
+      # history touches what rpgp.iss uses.
       #
       # Installed under RUNNER_TEMP and never in the workspace: upload-artifact
       # below takes every .exe at the top of the workspace, and anything else
@@ -401,8 +407,8 @@ jobs:
         timeout-minutes: 5
         shell: pwsh
         env:
-          INNO_URL: https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe
-          INNO_SHA256: 0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f
+          INNO_URL: https://github.com/jrsoftware/issrc/releases/download/is-7_1_1/innosetup-7.1.1-x64.exe
+          INNO_SHA256: 8a5a6711c3766a6e5fb74f280ba0e3551e719ce94538d901fdbd1f8f9920b3f0
         run: |
           $ProgressPreference = 'SilentlyContinue'
           $installer = Join-Path $env:RUNNER_TEMP 'innosetup.exe'
@@ -614,7 +620,7 @@ jobs:
           }
           'the bare exe and the setup exe are the bytes their steps hashed'
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-x86_64
           path: '*.exe'
@@ -743,7 +749,7 @@ jobs:
           ls -lh "$NAME"
           shasum -a 256 "$NAME"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-universal
           path: 'rpgp-*-macos-universal.zip'
@@ -798,12 +804,12 @@ jobs:
       # Trash" and nothing else. That bundle detours through the machine
       # holding the Developer ID key and is uploaded to this draft by hand.
       # See packaging/macos-sign.sh.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: flatpak-*
           merge-multiple: true
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: windows-*
           merge-multiple: true
