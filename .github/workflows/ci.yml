@@ -231,7 +231,17 @@ jobs:
         # Flatpak for that architecture and had never once been compiled for
         # it — macOS covers arm64 the language sees, but not Linux/aarch64 with
         # wgpu and Vulkan underneath. Free on public repositories.
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        #
+        # ubuntu-24.04 rather than ubuntu-latest, which is now 26.04. Its
+        # gpg-agent links libgcrypt 1.12.0, whose check of an ECC secret key
+        # rejects a valid Curve25519 one at random (dev.gnupg.org/T8094), so
+        # every decryption through the agent with a cv25519 key can fail with
+        # "Bad secret key", whatever rPGP does: gpg-agent runs that check on
+        # first use of a key imported unattended, and gpg's own import ends
+        # the same way. Fixed in libgcrypt 1.12.1. Go back to ubuntu-latest
+        # once its libgcrypt20 is 1.12.1 or later, or carries the T8094
+        # commits, rather than skip the agent tests there.
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
