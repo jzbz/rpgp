@@ -4432,8 +4432,10 @@ fn wire_revoke(ui: &AppWindow, state: &Shared) {
                     return;
                 };
                 let sandboxed = lock(&state).choose_outputs;
+                // Staged and renamed, never copied in place; see
+                // copy_private_file.
                 ui.set_status(
-                    match std::fs::copy(&source, file.path()) {
+                    match ops::copy_private_file(&source, file.path()) {
                         Ok(_) => format!(
                             "Saved to {}. Keep it somewhere you can reach without this key.",
                             shown_path(sandboxed, file.path())

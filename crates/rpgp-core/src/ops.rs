@@ -1785,6 +1785,41 @@ pub fn verify_detached_files(
     })
 }
 
+/// Copy a private file the store keeps, such as a revocation certificate, to
+/// `output`, a path the user chose in a save dialog.
+///
+/// Staged and renamed like every other output rather than copied in place.
+/// `fs::copy` truncates the file at its destination before it writes, so a
+/// copy that failed part-way left the file the user agreed to replace
+/// neither what it was nor the copy. And when the destination was the source
+/// itself, picked by mistake in the store's own directory, the truncation
+/// emptied the store's only copy before a byte of it had been read. The
+/// source is read whole first, since it is a few kilobytes at most, and a
+/// destination that is the source is refused rather than written at all.
+///
+/// The copy is readable by its owner alone, as the store's file is: anyone
+/// holding a revocation certificate can retire the key it belongs to.
+pub fn copy_private_file(source: &Path, output: &Path) -> Result<()> {
+    let bytes = read(source)?;
+    // Compared by where each name leads, so that a symlink or a `..` that
+    // ends at the source is caught too. A destination that does not exist yet
+    // cannot be the source; a hard link to it can, and is not caught, but
+    // the source has been read by now and the rename replaces only the
+    // destination's name, so the store's file comes through either way.
+    if let (Ok(from), Ok(to)) = (fs::canonicalize(source), fs::canonicalize(output))
+        && from == to
+    {
+        return Err(Error::invalid(format!(
+            "{} is the file being copied",
+            output.display()
+        )));
+    }
+    write_staged(output, Existing::Replace, Readers::Owner, |sink| {
+        sink.write_all(&bytes)
+            .map_err(|e| Error::io(format!("writing {}", output.display()), e))
+    })
+}
+
 fn read(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).map_err(|e| Error::io(format!("reading {}", path.display()), e))
 }
@@ -3325,6 +3360,63 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read(&output).unwrap(), b"a plaintext");
         assert!(!staging.exists(), "a finished output left its staging file");
+    }
+
+    /// Saving the store's revocation certificate replaces a chosen file by a
+    /// rename, and refuses to copy the store's file onto itself.
+    ///
+    /// It was an `fs::copy`, which truncates its destination first: picked as
+    /// the destination, the store's own certificate was emptied before it was
+    /// read, and the key lost the one thing that could retire it.
+    #[test]
+    fn a_private_copy_replaces_by_rename_and_never_empties_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("ABCD.rev");
+        fs::write(&source, b"the only revocation certificate").unwrap();
+
+        let output = dir.path().join("saved.asc");
+        fs::write(&output, b"a file the user agreed to replace").unwrap();
+        copy_private_file(&source, &output).unwrap();
+        assert_eq!(
+            fs::read(&output).unwrap(),
+            b"the only revocation certificate"
+        );
+        assert!(
+            !append_extension(&output, "part").exists(),
+            "the copy left its staging file behind"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&output).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the copy is readable by others");
+        }
+
+        // The source itself, by its own name and by a roundabout one.
+        let roundabout = dir.path().join(".").join("ABCD.rev");
+        for same in [&source, &roundabout] {
+            let error = copy_private_file(&source, same)
+                .expect_err("copying the store's file onto itself was not refused");
+            assert!(
+                error.to_string().contains("is the file being copied"),
+                "{error}"
+            );
+            assert_eq!(
+                fs::read(&source).unwrap(),
+                b"the only revocation certificate",
+                "the source was touched"
+            );
+        }
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.asc");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            assert!(copy_private_file(&source, &link).is_err());
+            assert_eq!(
+                fs::read(&source).unwrap(),
+                b"the only revocation certificate"
+            );
+        }
     }
 
     /// A rename that fails leaves no staging file behind either.
