@@ -106,7 +106,15 @@ pub fn set_expiry(
     let policy = policy();
     let mut signer = unlock_primary(&cert, password)?;
 
-    let valid = cert
+    // Which components are still standing, and which binding each one is
+    // re-issued from, are read off both halves of the store, for the reason
+    // the refusal above is: a subkey or an identity retired on the owner's
+    // other machine can reach cert-d alone, and the secret key file would
+    // still show it live. Every binding below is dated `when`, after that
+    // retirement, so a soft one — the app's default — would be overridden and
+    // the retired component published back into service. See [`standing`].
+    let view = standing(&cert, &merged);
+    let valid = view
         .with_policy(&policy, None)
         .map_err(|_| Error::invalid("this certificate is not valid under the standard policy"))?;
 
@@ -175,7 +183,10 @@ pub fn set_expiry(
     // [A] subkey at all, which is why the requirement must not be read off
     // `needs_backsig`.
     //
-    // Revoked subkeys are left alone: a new expiry on a revoked key is noise.
+    // Revoked subkeys are left alone: a new expiry on a revoked key is noise,
+    // and for a soft revocation it is worse than noise, since the new binding
+    // would override it. Revoked as both halves of the store see it, which is
+    // what `valid` was built from.
     for ka in valid.keys().subkeys().revoked(false) {
         let needs_backsig = ka.for_signing() || ka.for_certification() || ka.for_authentication();
 
@@ -358,8 +369,18 @@ pub fn add_user_id(
     // That is sequoia's own move when it re-issues a binding — `set_expiry`
     // goes through the same template — and what it copies is exactly what the
     // key claims about itself.
+    //
+    // Read off both halves of the store, as the refusal above is, and for more
+    // than tidiness. The pin below is skipped for a retired identity, and an
+    // identity retired on the owner's other machine can reach cert-d alone;
+    // read off the secret key file it looked live, was pinned, and was
+    // re-issued dated `when`, after its retirement, which brought it back. A
+    // binding in force only in cert-d — an expiry extended elsewhere — would
+    // likewise lose to a stale template copied out of the secret key file.
+    // See [`standing`].
     let (template, pin) = {
-        let valid = cert.with_policy(&policy, None).map_err(|_| {
+        let view = standing(&cert, &merged);
+        let valid = view.with_policy(&policy, None).map_err(|_| {
             Error::invalid("this certificate is not valid under the standard policy")
         })?;
         let primary = valid.primary_userid().ok();
@@ -453,18 +474,25 @@ pub fn add_user_id(
     let mut packets = vec![Packet::from(userid), Packet::from(binding)];
     if let Some((primary, binding)) = pin {
         // Re-issued from its own binding, so it keeps the type it had and every
-        // subpacket it carried; only the claim and the date are new. Including
-        // the unhashed area, unlike the binding above, because the subject here
-        // is the very identity that binding was already made over and this is
-        // what sequoia's own re-issue does. It does leave this the one place
-        // where a packet appended in flight is carried into a signature this key
-        // makes, which is a question for whoever revisits the re-issue.
-        packets.push(Packet::from(
-            SignatureBuilder::from(binding)
-                .set_signature_creation_time(when)?
-                .set_primary_userid(true)?
-                .sign_userid_binding(&mut signer, cert.primary_key().key(), &primary)?,
-        ));
+        // hashed subpacket it carried; only the claim and the date are new.
+        //
+        // Not the unhashed area, though sequoia's own re-issue keeps it. The
+        // binding is the one in force across both halves of the store, so it
+        // can be cert-d's copy, and `Signature::merge` folds into that copy
+        // the unhashed subpackets of every copy an import or a keyserver
+        // refresh brought in: anyone who handled the certificate on the way.
+        // Keeping the area made this the one place a packet appended in flight
+        // was carried into a signature this key makes. Emptying it loses
+        // nothing for the reason given for the binding above.
+        let mut reissue = SignatureBuilder::from(binding)
+            .set_signature_creation_time(when)?
+            .set_primary_userid(true)?;
+        reissue.unhashed_area_mut().clear();
+        packets.push(Packet::from(reissue.sign_userid_binding(
+            &mut signer,
+            cert.primary_key().key(),
+            &primary,
+        )?));
     }
 
     // secret_cert is where `cert` came from, so the certificate always has a
@@ -497,6 +525,7 @@ pub fn revoke_user_id(
     password: Option<&str>,
 ) -> Result<Cert> {
     let cert = store.secret_cert(fingerprint)?;
+    let merged = store.full_cert(fingerprint)?;
 
     // Exactly one user ID, or none. Taking the first row whose lossy rendering
     // matched retired whichever sorted first — which, since the GUI hides the
@@ -505,9 +534,23 @@ pub fn revoke_user_id(
     // revocation of one already retired while the row they clicked stayed live
     // and the status bar said it had been revoked. `cert::resolve_user_id`
     // carries the reasoning.
-    let userid = crate::cert::resolve_user_id(&cert, user_id)?
+    //
+    // Resolved among both halves of the store, because that is the list the
+    // user picked from: a name that reached cert-d alone and renders like one
+    // in the secret key file is two rows that read the same, and resolving
+    // among the secret key file's names alone picked one of them without a
+    // word. A name cert-d alone carries is still refused, as it always was:
+    // the revocation is written into the secret key file, which has no such
+    // name for it to attach to.
+    let userid = crate::cert::resolve_user_id(&merged, user_id)?
         .userid()
         .clone();
+    if !cert.userids().any(|ua| ua.userid() == &userid) {
+        return Err(Error::invalid(format!(
+            "{user_id} reached this store only as part of a public certificate, \
+             and the secret key has no such user ID to retire"
+        )));
+    }
 
     // Which identities are actually standing. The count used to be
     // `cert.userids()`, which is every user ID the certificate carries,
@@ -522,8 +565,20 @@ pub fn revoke_user_id(
     // over a name already withdrawn, which leaves the certificate saying
     // exactly what it said before, and the GUI hides the button on those rows
     // in any case.
+    //
+    // Standing as both halves of the store judge it, over the names the
+    // secret key file carries. An identity retired on the owner's other
+    // machine can reach cert-d alone, and counted from the secret key file it
+    // was still live, so the last name the key really had left could go. One
+    // that cert-d alone carries does not count, as it never did: nothing this
+    // app does afterwards re-binds it, so with every name the secret key file
+    // has retired, the next expiry change would re-issue no user ID binding,
+    // and the primary user ID's old binding, which is where the key's expiry
+    // is read first, would keep the old date while the change reported
+    // success. See [`standing`].
     let policy = policy();
-    let refuse = match cert.with_policy(&policy, None) {
+    let view = standing(&cert, &merged);
+    let refuse = match view.with_policy(&policy, None) {
         Ok(valid) => {
             let mut target_is_live = false;
             let mut others_live = 0usize;
@@ -544,7 +599,7 @@ pub fn revoke_user_id(
         // retiring an address on it. `set_expiry` refuses such a certificate,
         // but that is a different case — it has to read the key's own account
         // of itself in order to rewrite it, while nothing here does.
-        Err(_) => cert.userids().count() < 2,
+        Err(_) => view.userids().count() < 2,
     };
     if refuse {
         return Err(Error::invalid(
@@ -564,7 +619,6 @@ pub fn revoke_user_id(
     // Measured against both halves of the store, because `store_both` writes
     // into cert-d as well, where a binding that arrived by import or refresh,
     // and never reached the secret key file, would otherwise outrank it.
-    let merged = store.full_cert(fingerprint)?;
     let when = crate::signature_time(
         merged
             .userids()
@@ -635,6 +689,39 @@ pub fn revoke_subkey(
         .build(&mut signer, &cert, &subkey, None)?;
 
     store_both(store, cert, vec![signature])
+}
+
+/// The secret key file's certificate, judged by everything the store holds.
+///
+/// `merged` is [`Store::full_cert`]: the secret half with cert-d's signatures
+/// folded in, so it already carries the secret key material, and whatever it
+/// says about a component's revocation or its binding in force is what the
+/// list shows and what everyone the key was published to sees. Reading those
+/// off `cert` alone missed a subkey or an identity retired on the owner's
+/// other machine and met here only as a public certificate — Import, or a
+/// keyserver refresh, writes cert-d and never the secret key file — and the
+/// lifecycle operations then signed a new binding over it, dated after the
+/// retirement, which overrides a soft one.
+///
+/// Cut back to the components `cert` carries, because the signatures made from
+/// this view are written into `cert`, by [`store_both`] or by
+/// [`Store::insert_secret`]: a binding over a subkey or a user ID that reached
+/// cert-d alone has nothing in the secret key file to attach to, and folding
+/// cert-d's components into that file is a separate question from this one.
+/// Such a component is left alone, as it always was.
+fn standing(cert: &Cert, merged: &Cert) -> Cert {
+    merged
+        .clone()
+        .retain_userids(|ua| cert.userids().any(|own| own.userid() == ua.userid()))
+        .retain_user_attributes(|ua| {
+            cert.user_attributes()
+                .any(|own| own.user_attribute() == ua.user_attribute())
+        })
+        .retain_subkeys(|ka| {
+            cert.keys()
+                .subkeys()
+                .any(|own| own.key().fingerprint() == ka.key().fingerprint())
+        })
 }
 
 /// Merge new self-signatures into both halves of the store.
@@ -970,6 +1057,357 @@ mod tests {
             CertSummary::from_cert(&public).expires,
             before,
             "and a refused change must not reach the store"
+        );
+    }
+
+    /// Soft retirements of `secret`'s components, signed as the owner's other
+    /// machine would and handed to `store` as a public certificate, which is
+    /// all Import or a refresh ever writes: cert-d learns of them and the
+    /// secret key file never does. Returns the newest retirement's date.
+    fn retire_in_cert_d_only(
+        store: &Store,
+        secret: &Cert,
+        subkey: Option<&Key<PublicParts, SubordinateRole>>,
+        userid: Option<&UserID>,
+    ) -> SystemTime {
+        let mut signer = unlock_primary(secret, None).unwrap();
+        let mut retirements = Vec::new();
+        if let Some(subkey) = subkey {
+            retirements.push(
+                SubkeyRevocationBuilder::new()
+                    .set_reason_for_revocation(ReasonForRevocation::KeyRetired, b"")
+                    .unwrap()
+                    .build(&mut signer, secret, subkey, None)
+                    .unwrap(),
+            );
+        }
+        if let Some(userid) = userid {
+            retirements.push(
+                UserIDRevocationBuilder::new()
+                    .set_reason_for_revocation(ReasonForRevocation::UIDRetired, b"left the job")
+                    .unwrap()
+                    .build(&mut signer, secret, userid, None)
+                    .unwrap(),
+            );
+        }
+        let retired_at = retirements
+            .iter()
+            .filter_map(|sig| sig.signature_creation_time())
+            .max()
+            .unwrap();
+        store
+            .insert(
+                &secret
+                    .clone()
+                    .insert_packets(retirements)
+                    .unwrap()
+                    .0
+                    .strip_secret_key_material(),
+            )
+            .unwrap();
+        retired_at
+    }
+
+    /// No self-signature over `userid` or `subkey` on `cert` is dated after
+    /// `retired_at`.
+    fn nothing_signed_over_since(
+        cert: &Cert,
+        subkey: Option<&Key<PublicParts, SubordinateRole>>,
+        userid: Option<&UserID>,
+        retired_at: SystemTime,
+    ) -> bool {
+        let subkey_sigs = cert
+            .keys()
+            .subkeys()
+            .filter(|ka| subkey.is_some_and(|k| k.fingerprint() == ka.key().fingerprint()))
+            .flat_map(|ka| ka.self_signatures().cloned().collect::<Vec<_>>());
+        let userid_sigs = cert
+            .userids()
+            .filter(|ua| userid == Some(ua.userid()))
+            .flat_map(|ua| ua.self_signatures().cloned().collect::<Vec<_>>());
+        subkey_sigs
+            .chain(userid_sigs)
+            .all(|sig| sig.signature_creation_time() <= Some(retired_at))
+    }
+
+    /// A subkey and an identity retired on the owner's other machine, and met
+    /// here only in cert-d, stay retired through a new expiry.
+    ///
+    /// `set_expiry` writes a fresh binding over every subkey and every
+    /// identity it takes to be standing, dated after everything already on the
+    /// key, and sequoia lets a binding newer than a soft revocation override
+    /// it. Which ones were standing used to be read off the secret key file,
+    /// which an import never reaches, so both came back into service and were
+    /// written into cert-d, ready to be published. The refusal for a revoked
+    /// certificate already asked both halves; the components did not.
+    #[test]
+    fn a_new_expiry_does_not_revive_what_was_retired_only_in_cert_d() {
+        const WORK: &str = "Alice <alice@work.example>";
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let policy = policy();
+        let before = CertSummary::from_cert(&cert).expires;
+        add_user_id(&store, &fingerprint, WORK, None).unwrap();
+
+        let secret = store.secret_cert(&fingerprint).unwrap();
+        let work = UserID::from(WORK);
+        let subkeys: Vec<Key<PublicParts, SubordinateRole>> =
+            secret.keys().subkeys().map(|ka| ka.key().clone()).collect();
+        assert!(
+            subkeys.len() > 1,
+            "the test key should have several subkeys"
+        );
+        let retired = &subkeys[0];
+
+        // A retirement tying with the binding it retracts still stands, but
+        // the wait keeps the premise from resting on that.
+        std::thread::sleep(Duration::from_millis(1100));
+        let retired_at = retire_in_cert_d_only(&store, &secret, Some(retired), Some(&work));
+
+        let subkey_revoked = |cert: &Cert| {
+            cert.keys()
+                .subkeys()
+                .find(|ka| ka.key().fingerprint() == retired.fingerprint())
+                .is_some_and(|ka| {
+                    matches!(
+                        ka.bundle().revocation_status(&policy, None),
+                        RevocationStatus::Revoked(_)
+                    )
+                })
+        };
+        let work_revoked = |cert: &Cert| {
+            cert.userids()
+                .find(|ua| ua.userid() == &work)
+                .is_some_and(|ua| {
+                    matches!(
+                        ua.revocation_status(&policy, None),
+                        RevocationStatus::Revoked(_)
+                    )
+                })
+        };
+        let unaware = store.secret_cert(&fingerprint).unwrap();
+        assert!(
+            !subkey_revoked(&unaware) && !work_revoked(&unaware),
+            "the secret half not knowing is the premise of this test"
+        );
+
+        // Without this the new bindings could tie with the retirements, and
+        // they would survive a missing fix on the tie.
+        std::thread::sleep(Duration::from_millis(1100));
+        let ten_years = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        set_expiry(&store, &fingerprint, Some(ten_years), None).unwrap();
+
+        for reloaded in [
+            store.lookup(&fingerprint).unwrap(),
+            store.full_cert(&fingerprint).unwrap(),
+        ] {
+            assert!(
+                subkey_revoked(&reloaded),
+                "a new expiry brought back a subkey retired elsewhere"
+            );
+            assert!(
+                work_revoked(&reloaded),
+                "a new expiry brought back an identity retired elsewhere"
+            );
+            assert_ne!(
+                CertSummary::from_cert(&reloaded).expires,
+                before,
+                "the rest of the key still takes the new expiry"
+            );
+            assert!(
+                !nothing_signed_over_since(&reloaded, Some(&subkeys[1]), None, retired_at),
+                "a subkey still standing is re-dated as before"
+            );
+        }
+        for reloaded in [
+            store.lookup(&fingerprint).unwrap(),
+            store.full_cert(&fingerprint).unwrap(),
+            store.secret_cert(&fingerprint).unwrap(),
+        ] {
+            assert!(
+                nothing_signed_over_since(&reloaded, Some(retired), Some(&work), retired_at),
+                "no binding may be written over a component its owner has retired"
+            );
+        }
+    }
+
+    /// The same over `add_user_id`, on the shape that re-issues the primary
+    /// identity's binding: a key whose bindings claim no primary user ID, as
+    /// GnuPG's do. The re-issue is skipped for a retired identity, which
+    /// `adding_a_user_id_does_not_bring_a_retired_identity_back` covers, but
+    /// "retired" was read off the secret key file. A retirement that reached
+    /// cert-d alone left the name looking live there, so it was pinned,
+    /// re-signed after its retirement and put back in service as the primary
+    /// identity.
+    #[test]
+    fn adding_a_user_id_does_not_revive_an_identity_retired_only_in_cert_d() {
+        const NEW: &str = "Alice <alice@newjob.example>";
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        let policy = policy();
+
+        // The wait is what makes this binding the active one rather than a tie
+        // with the one keygen made.
+        std::thread::sleep(Duration::from_millis(1100));
+        let secret = store.secret_cert(&fingerprint).unwrap();
+        let userid = secret.userids().next().unwrap().userid().clone();
+        let mut signer = unlock_primary(&secret, None).unwrap();
+        let unflagged = SignatureBuilder::new(SignatureType::PositiveCertification)
+            .sign_userid_binding(&mut signer, secret.primary_key().key(), &userid)
+            .unwrap();
+        let reshaped = secret
+            .insert_packets(vec![Packet::from(unflagged)])
+            .unwrap()
+            .0;
+        store.insert_secret(&reshaped).unwrap();
+
+        let retired_at = retire_in_cert_d_only(&store, &reshaped, None, Some(&userid));
+        let revoked = |cert: &Cert| {
+            cert.userids()
+                .find(|ua| ua.userid() == &userid)
+                .is_some_and(|ua| {
+                    matches!(
+                        ua.revocation_status(&policy, None),
+                        RevocationStatus::Revoked(_)
+                    )
+                })
+        };
+        assert!(
+            !revoked(&store.secret_cert(&fingerprint).unwrap())
+                && revoked(&store.lookup(&fingerprint).unwrap()),
+            "a retirement in cert-d alone is the premise of this test"
+        );
+
+        // A binding written in the same second as the retirement ties with it
+        // and the retirement stands, fix or no fix.
+        std::thread::sleep(Duration::from_millis(1100));
+        add_user_id(&store, &fingerprint, NEW, None).unwrap();
+
+        for reloaded in [
+            store.lookup(&fingerprint).unwrap(),
+            store.full_cert(&fingerprint).unwrap(),
+        ] {
+            assert!(
+                revoked(&reloaded),
+                "an identity retired elsewhere came back"
+            );
+            let ids = cert::user_ids(&reloaded);
+            assert!(
+                ids.iter()
+                    .any(|u| u.text == NEW && u.is_primary && !u.revoked),
+                "the name just added is the only one standing, so it is the primary one"
+            );
+        }
+        for reloaded in [
+            store.lookup(&fingerprint).unwrap(),
+            store.full_cert(&fingerprint).unwrap(),
+            store.secret_cert(&fingerprint).unwrap(),
+        ] {
+            assert!(
+                nothing_signed_over_since(&reloaded, None, Some(&userid), retired_at),
+                "no binding may be written over an identity its owner has retired"
+            );
+        }
+    }
+
+    /// And the last-live-identity guard in `revoke_user_id`, which counted
+    /// what was standing in the secret key file. With the second identity
+    /// retired elsewhere and the retirement in cert-d alone, the count found
+    /// two live names where the key everyone else holds has one, and retiring
+    /// that one left the key with none.
+    #[test]
+    fn the_last_live_user_id_counts_a_retirement_that_reached_only_cert_d() {
+        const WORK: &str = "Alice <alice@work.example>";
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+        add_user_id(&store, &fingerprint, WORK, None).unwrap();
+
+        std::thread::sleep(Duration::from_millis(1100));
+        let secret = store.secret_cert(&fingerprint).unwrap();
+        retire_in_cert_d_only(&store, &secret, None, Some(&UserID::from(WORK)));
+
+        let refused = revoke_user_id(&store, &fingerprint, "Alice <alice@example.org>", "", None)
+            .map(|_| ())
+            .expect_err("retired the only identity the key had left");
+        assert!(
+            refused.to_string().contains("only user ID"),
+            "the refusal must say why: {refused}"
+        );
+        let ids = cert::user_ids(&store.lookup(&fingerprint).unwrap());
+        assert!(
+            ids.iter()
+                .any(|u| u.text == "Alice <alice@example.org>" && !u.revoked),
+            "a refused revocation must not reach the store"
+        );
+    }
+
+    /// But an identity cert-d alone carries does not count towards the guard,
+    /// and cannot be retired here.
+    ///
+    /// Bound and live on the key everyone else holds, it still reads like a
+    /// second name, but nothing this app does afterwards re-binds it: retiring
+    /// the secret key file's last name would leave the next expiry change
+    /// with no user ID binding to re-issue, and the key's expiry, read first
+    /// off the primary user ID's binding, keeping the old date. Retiring it is
+    /// refused because the revocation is written into the secret key file,
+    /// which has no such name to attach it to.
+    #[test]
+    fn an_identity_only_cert_d_carries_is_not_counted_or_retired() {
+        const WORK: &str = "Alice <alice@work.example>";
+        let (_dir, store, cert) = scratch();
+        let fingerprint = cert.fingerprint().to_hex();
+
+        let secret = store.secret_cert(&fingerprint).unwrap();
+        let mut signer = unlock_primary(&secret, None).unwrap();
+        let work = UserID::from(WORK);
+        let binding = work
+            .bind(
+                &mut signer,
+                &secret,
+                SignatureBuilder::new(SignatureType::PositiveCertification),
+            )
+            .unwrap();
+        store
+            .insert(
+                &secret
+                    .clone()
+                    .insert_packets(vec![Packet::from(work), Packet::from(binding)])
+                    .unwrap()
+                    .0
+                    .strip_secret_key_material(),
+            )
+            .unwrap();
+        assert!(
+            cert::user_ids(&store.lookup(&fingerprint).unwrap())
+                .iter()
+                .any(|u| u.text == WORK && !u.revoked),
+            "cert-d must carry the second identity, or nothing here is tested"
+        );
+        assert!(
+            !store
+                .secret_cert(&fingerprint)
+                .unwrap()
+                .userids()
+                .any(|ua| ua.userid().value() == WORK.as_bytes()),
+            "the secret key file must not, or nothing here is tested"
+        );
+
+        let refused = revoke_user_id(&store, &fingerprint, "Alice <alice@example.org>", "", None)
+            .map(|_| ())
+            .expect_err("retired the secret key file's only identity");
+        assert!(
+            refused.to_string().contains("only user ID"),
+            "the refusal must say why: {refused}"
+        );
+
+        let refused = revoke_user_id(&store, &fingerprint, WORK, "", None)
+            .map(|_| ())
+            .expect_err("retired a name the secret key file does not have");
+        assert!(
+            refused
+                .to_string()
+                .contains("only as part of a public certificate"),
+            "the refusal must say why: {refused}"
         );
     }
 
