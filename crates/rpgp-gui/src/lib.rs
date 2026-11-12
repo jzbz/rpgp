@@ -4975,6 +4975,17 @@ fn read_store(store: &Store) -> std::result::Result<Loaded, String> {
 /// The signer's user ID, and the reason a bad signature is bad, go through
 /// [`display::text`]: the notepad draws the name in one line with its
 /// verdict, and an override left open in the name turned the verdict round.
+///
+/// The verdict is borrowed only when the name matches too, not on the
+/// fingerprint alone. What `known` holds was worked out at the last reload,
+/// for the primary User ID the certificate had then; the report's signer is
+/// that of the certificate the store holds now. When `sq` or a second window
+/// has written a new primary User ID to the shared store since, joining on the
+/// fingerprint showed the new name under a "verified" earned by the old one.
+/// A mismatch for any other reason, such as a summary made under the SHA-1
+/// opt-in that names the certificate differently from the standard policy,
+/// falls back to unverified as well, which is the safe way to be wrong; the
+/// next reload puts the right verdict on the right name.
 fn signature_rows(known: &[CertSummary], signatures: &[ops::SignatureReport]) -> Vec<SignatureRow> {
     signatures
         .iter()
@@ -4987,6 +4998,7 @@ fn signature_rows(known: &[CertSummary], signatures: &[ops::SignatureReport]) ->
                         .iter()
                         .find(|c| c.fingerprint.eq_ignore_ascii_case(fingerprint))
                 })
+                .filter(|c| c.primary_user_id == s.signer)
                 .map(|c| c.authentication)
                 .unwrap_or_default();
             SignatureRow {
@@ -5842,6 +5854,38 @@ mod tests {
         let rows = signature_rows(&[], &[report(&fingerprint, true)]);
         assert_eq!(rows[0].authentication, "unverified");
         assert!(!rows[0].authenticated);
+    }
+
+    /// The verdict cached for a certificate belongs to the name it had at the
+    /// last reload. A signature from the same key, reported under a primary
+    /// User ID the store has gained since, must not inherit it: the row and the
+    /// banner both fall back to unverified until a reload works out the new
+    /// name's own verdict.
+    #[test]
+    fn a_signer_renamed_since_the_reload_does_not_inherit_its_verdict() {
+        let fingerprint = "9A".repeat(20);
+        let store = [known(&fingerprint, Authentication::Full)];
+        let mut renamed = report(&fingerprint, true);
+        renamed.signer = "Alice (new) <alice@example.net>".to_string();
+        assert_ne!(store[0].primary_user_id, renamed.signer);
+
+        let rows = signature_rows(&store, std::slice::from_ref(&renamed));
+        assert_eq!(rows[0].authentication, "unverified");
+        assert!(!rows[0].authenticated);
+
+        let result = ops::VerifyResult {
+            signatures: vec![renamed],
+            decrypted_with: None,
+            encrypted: true,
+        };
+        let (text, tone) = signature_verdict(&store, &result);
+        assert_eq!(tone, 2, "{text}");
+        assert!(text.contains("not verified"), "{text}");
+
+        // The same key under the name the verdict was earned for still reads
+        // as verified, so the guard is the name and nothing else.
+        let rows = signature_rows(&store, &[report(&fingerprint, true)]);
+        assert!(rows[0].authenticated);
     }
 
     /// A `State` holding nothing but the store, with everything else as `run`
