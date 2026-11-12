@@ -1755,9 +1755,10 @@ pub fn verify_detached_files(
     signature_path: &Path,
     data_path: &Path,
 ) -> Result<VerifyResult> {
-    let signature = read(signature_path)?;
+    let signature = read_signature(signature_path)?;
     // The signed file is streamed rather than read whole: it is unbounded and
-    // caller-supplied, while the signature beside it is a few hundred bytes.
+    // caller-supplied, while the signature beside it is a few hundred bytes,
+    // and read_signature refuses one past MAX_DETACHED_SIGNATURE.
     //
     // It is read through a file handle rather than handed to verify_file,
     // which on Unix maps a file of 64 KiB or more into memory. A mapped file
@@ -1822,6 +1823,39 @@ pub fn copy_private_file(source: &Path, output: &Path) -> Result<()> {
 
 fn read(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).map_err(|e| Error::io(format!("reading {}", path.display()), e))
+}
+
+/// The most [`verify_detached_files`] reads of a detached signature file.
+///
+/// The signature is held whole while the file it covers is hashed, and it is
+/// a file somebody else made: classify_file sends a file here on what it sees
+/// in its first 64 KiB, and nothing looked at how much came after, so the size
+/// of an allocation was the sender's choice. Keyserver replies and revocation
+/// certificates have a cap for the same reason. A signature is a few hundred
+/// bytes, and a file of them, one from each of several signers, a few
+/// kilobytes; the cap is generous by thousands so that no real one meets it.
+const MAX_DETACHED_SIGNATURE: u64 = 16 * 1024 * 1024;
+
+/// Read a detached signature file, refusing one larger than
+/// [`MAX_DETACHED_SIGNATURE`].
+///
+/// Counted on the open handle, one byte past the cap, rather than asked of the
+/// file's metadata first, so that a file that grows between the two is caught
+/// as well, and so is one, such as a pipe, that has no size to ask.
+fn read_signature(path: &Path) -> Result<Vec<u8>> {
+    let reading = |e| Error::io(format!("reading {}", path.display()), e);
+    let file = fs::File::open(path).map_err(reading)?;
+    let mut signature = Vec::new();
+    file.take(MAX_DETACHED_SIGNATURE + 1)
+        .read_to_end(&mut signature)
+        .map_err(reading)?;
+    if signature.len() as u64 > MAX_DETACHED_SIGNATURE {
+        return Err(Error::invalid(format!(
+            "{} is too large to be a detached signature",
+            path.display()
+        )));
+    }
+    Ok(signature)
 }
 
 #[cfg(test)]
@@ -3769,6 +3803,37 @@ mod tests {
             read >= size as u64,
             "{read} bytes were read to verify a file of {size}, so it was mapped"
         );
+    }
+
+    /// A detached signature file larger than [`MAX_DETACHED_SIGNATURE`] is
+    /// refused as too large, before it is parsed, and one at the cap is read
+    /// and parsed as any other, here to fail as the zeros it holds.
+    ///
+    /// Sparse files, so that neither costs the disk what it claims to hold.
+    #[test]
+    fn an_oversized_detached_signature_is_refused() {
+        let (dir, store) = scratch_store();
+        let data = dir.path().join("notes.txt");
+        std::fs::write(&data, b"signed text").unwrap();
+        for (size, too_large) in [
+            (MAX_DETACHED_SIGNATURE + 1, true),
+            (MAX_DETACHED_SIGNATURE, false),
+        ] {
+            let signature = dir.path().join(format!("notes-{size}.txt.sig"));
+            std::fs::File::create(&signature)
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+            let message = match verify_detached_files(&store, &signature, &data) {
+                Err(e) => e.to_string(),
+                Ok(result) => panic!("{size} bytes verified: {:?}", result.signatures),
+            };
+            assert_eq!(
+                message.ends_with(" is too large to be a detached signature"),
+                too_large,
+                "{size} bytes: {message}"
+            );
+        }
     }
 
     /// A streamed output reaches its file in large writes rather than a write

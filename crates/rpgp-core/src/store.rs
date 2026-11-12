@@ -1070,15 +1070,36 @@ impl Store {
     /// OpenPGP, is passed over as the header and an X.509 record are, and the
     /// rest still comes in. One that is not there whole, because the file ends
     /// part way through it or it gives a length no record can have, stops the
-    /// import, since no record after it can be found. What was stored before
-    /// it stays, and the error is [`Error::ImportStopped`], as for a
-    /// certificate that cannot be stored.
+    /// import, since no record after it can be found. So does one that gives a
+    /// length past any GnuPG writes, which is not read; see `MAX_RECORD`. What
+    /// was stored before it stays, and the error is [`Error::ImportStopped`],
+    /// as for a certificate that cannot be stored.
     pub fn import_keybox(&self, path: impl AsRef<Path>) -> Result<Vec<Cert>> {
         use sequoia_ipc::keybox::{Keybox, KeyboxRecord, KeyboxRecordType};
 
+        /// The longest record this reads, and so the most of the file it
+        /// holds at once.
+        ///
+        /// The file is read a record at a time rather than whole, because a
+        /// pubring.kbx that has gathered keys for years runs to hundreds of
+        /// megabytes, so no cap on the file would both pass every real one
+        /// and bound what a file someone else made can make this allocate.
+        /// A record is one certificate, and GnuPG neither writes nor reads
+        /// one past 5 MiB (`IMAGELEN_LIMIT` in its kbx/keybox-file.c), which
+        /// is what refused the certificates flooded with signatures in 2019
+        /// as too large. So a length past this, more than three times that,
+        /// is not one GnuPG wrote, and is read as damage, as a length too
+        /// short for any record is.
+        const MAX_RECORD: usize = 16 * 1024 * 1024;
+
         let path = path.as_ref();
-        let bytes =
-            fs::read(path).map_err(|e| Error::io(format!("reading {}", path.display()), e))?;
+        let reading = |e| Error::io(format!("reading {}", path.display()), e);
+        let mut file = std::io::BufReader::new(fs::File::open(path).map_err(reading)?);
+        // Up to `limit` bytes from where the file is, onto the end of
+        // `into`, fewer only where the file ends.
+        let mut read_up_to = |into: &mut Vec<u8>, limit: usize| {
+            std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, limit as u64), into)
+        };
 
         // Each record is found here and handed to sequoia-ipc on its own,
         // rather than walking sequoia-ipc's iterator over the whole file. That
@@ -1092,36 +1113,49 @@ impl Store {
         // sequoia-ipc makes of a record.
         let mut imported = Vec::new();
         let mut at = 0;
-        while at < bytes.len() {
-            let rest = &bytes[at..];
+        loop {
             // A record opens with its own length, four bytes big-endian that
             // count themselves, and then a byte each for its type and version.
-            let length = rest
-                .first_chunk::<4>()
-                .map(|length| u32::from_be_bytes(*length) as usize);
-            let record = match length {
-                Some(length) if length < 6 => {
-                    return Err(stopped_after(
-                        &imported,
-                        Error::invalid(format!(
-                            "{} is damaged at byte {at}: a Keybox record cannot be {length} \
-                             bytes long",
-                            path.display()
-                        )),
-                    ));
-                }
-                Some(length) if length <= rest.len() => &rest[..length],
-                _ => {
-                    return Err(stopped_after(
-                        &imported,
-                        Error::invalid(format!(
-                            "{} ends before the end of the Keybox record that starts at byte {at}",
-                            path.display()
-                        )),
-                    ));
-                }
+            let mut record = Vec::with_capacity(4);
+            read_up_to(&mut record, 4).map_err(|e| stopped_after(&imported, reading(e)))?;
+            if record.is_empty() {
+                break;
+            }
+            let cut_short = || {
+                stopped_after(
+                    &imported,
+                    Error::invalid(format!(
+                        "{} ends before the end of the Keybox record that starts at byte {at}",
+                        path.display()
+                    )),
+                )
             };
+            let Some(length) = record
+                .first_chunk::<4>()
+                .map(|length| u32::from_be_bytes(*length) as usize)
+            else {
+                return Err(cut_short());
+            };
+            if !(6..=MAX_RECORD).contains(&length) {
+                return Err(stopped_after(
+                    &imported,
+                    Error::invalid(format!(
+                        "{} is damaged at byte {at}: a Keybox record cannot be {length} \
+                         bytes long",
+                        path.display()
+                    )),
+                ));
+            }
+            // Allocated for the length the record gives only now that it is
+            // known to be one a record can have.
+            record.reserve_exact(length - 4);
+            read_up_to(&mut record, length - 4)
+                .map_err(|e| stopped_after(&imported, reading(e)))?;
+            if record.len() < length {
+                return Err(cut_short());
+            }
             at += record.len();
+            let record = record.as_slice();
 
             // An OpenPGP record that sequoia-ipc would panic on, rather than
             // refuse, is passed over before it gets there.
@@ -3140,6 +3174,40 @@ mod tests {
     fn a_keybox_record_with_an_impossible_length_stops_the_import() {
         let second = keybox_records(KEYBOX)[2].clone();
         for length in [0u32, 5] {
+            let mut damaged = KEYBOX.to_vec();
+            damaged[second.start..second.start + 4].copy_from_slice(&length.to_be_bytes());
+            let (imported, kept) = import_keybox_bytes(&damaged);
+            match imported {
+                Err(e @ Error::ImportStopped { stored: 1, .. }) => {
+                    let message = e.to_string();
+                    assert!(
+                        message.ends_with(&format!(
+                            " is damaged at byte {}: a Keybox record cannot be {length} bytes long",
+                            second.start
+                        )),
+                        "{message}"
+                    );
+                }
+                other => panic!("a length of {length}: {other:?}"),
+            }
+            assert_eq!(kept, BTreeSet::from([KEYBOX_CERTS[0].to_string()]));
+        }
+    }
+
+    /// A Keybox record that gives a length past the longest this reads stops
+    /// the import there, keeping what came before it, and is not read.
+    ///
+    /// The Keybox used to be read whole, so that a file of any size, of
+    /// someone else's making and chosen in Import, was an allocation of that
+    /// size. It is now read a record at a time, and a record's length is what
+    /// is allocated, so the length a record gives is held to what GnuPG could
+    /// have written. Here the length is past what the file holds as well, so a
+    /// reader that took it at its word would stop at the cut instead, and say
+    /// so: the message tells the two apart.
+    #[test]
+    fn a_keybox_record_longer_than_any_gnupg_writes_stops_the_import() {
+        let second = keybox_records(KEYBOX)[2].clone();
+        for length in [16 * 1024 * 1024 + 1, u32::MAX] {
             let mut damaged = KEYBOX.to_vec();
             damaged[second.start..second.start + 4].copy_from_slice(&length.to_be_bytes());
             let (imported, kept) = import_keybox_bytes(&damaged);
