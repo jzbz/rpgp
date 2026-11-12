@@ -17,6 +17,7 @@
 //! why rPGP is held at 0.15.2.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use sequoia_openpgp::{Cert, Fingerprint};
 use sequoia_wot::Network;
@@ -102,6 +103,7 @@ where
     // re-attached it to whichever name it happened to be printing — so the
     // pseudonym wore the work address's badge.
     let mut result: HashMap<(String, String), Authentication> = HashMap::new();
+    let mut filed: HashMap<String, Filed<'_>> = HashMap::new();
     for cert in certs {
         let fingerprint = cert.fingerprint();
         // Not asked about at all, a certificate that is not a root and that
@@ -138,17 +140,73 @@ where
                 fingerprint.clone(),
                 sequoia_wot::FULLY_TRUSTED,
             );
-            result.insert(
-                (
-                    key.clone(),
-                    String::from_utf8_lossy(ua.userid().value()).into_owned(),
-                ),
-                Authentication::from_amount(paths.amount()),
-            );
+            let verdict = Authentication::from_amount(paths.amount());
+            // Settled here, per certificate, when another user ID already
+            // has this name.
+            //
+            // The question is asked of the raw user ID, but the answer is
+            // filed under its lossy rendering, which is all a display site
+            // has to look it up by, and that rendering is not injective:
+            // every invalid byte becomes U+FFFD, so `them@\xFF` and a literal
+            // `them@\u{FFFD}` file under the same name. A plain insert let
+            // whichever came last in `cert.userids()`, which sorts by raw
+            // bytes, decide for both: an authenticated variant sorting last
+            // lent its badge to a name that reads the same and has no path of
+            // its own, and an unsigned variant sorting last, which anyone can
+            // append to a certificate in flight, took an authenticated one's
+            // badge away.
+            //
+            // The name cannot say which of the two the user is looking at, so
+            // it gets the lower verdict, whatever the order, with one
+            // exception: a variant the certificate has not signed for itself
+            // gives way to one it has. It is never the name on a row while a
+            // signed one exists (`primary_user_id` in cert.rs), so it cannot
+            // be what the user is reading, and letting it pull the shared
+            // verdict down would hand the stranger who appended it the power
+            // to strip a badge. Whether a variant is signed is a signature
+            // check, so it is asked only on a collision, which almost no
+            // certificate has.
+            match filed.entry(String::from_utf8_lossy(ua.userid().value()).into_owned()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(Filed {
+                        verdict,
+                        first: ua,
+                        signed: None,
+                    });
+                }
+                Entry::Occupied(mut slot) => {
+                    let held = slot.get_mut();
+                    let held_signed = *held
+                        .signed
+                        .get_or_insert_with(|| held.first.self_signatures().next().is_some());
+                    let signed = ua.self_signatures().next().is_some();
+                    if signed == held_signed {
+                        held.verdict = held.verdict.min(verdict);
+                    } else if signed {
+                        held.verdict = verdict;
+                        held.signed = Some(true);
+                    }
+                }
+            }
         }
+        result.extend(
+            filed
+                .drain()
+                .map(|(name, filed)| ((key.clone(), name), filed.verdict)),
+        );
     }
 
     result
+}
+
+/// What `authenticate_all` has filed under one rendered name of one
+/// certificate: the verdict so far, and whether the user IDs it came from are
+/// ones the certificate signed for itself, found out only once a second user
+/// ID renders the same.
+struct Filed<'a> {
+    verdict: Authentication,
+    first: sequoia_openpgp::cert::amalgamation::UserIDAmalgamation<'a>,
+    signed: Option<bool>,
 }
 
 /// The verdict for one identity, which is the only question this answers.
@@ -167,7 +225,10 @@ pub fn for_user_id(
         .unwrap_or_default()
 }
 
-// Ordering so `if found > best` above means "more authenticated".
+// Ordering so that a greater verdict means "more authenticated", and so
+// `min` in `authenticate_all` keeps the less authenticated of two: spelled
+// out by rank rather than derived, so that reordering the variants above
+// cannot turn that fail-closed merge into a fail-open one.
 impl PartialOrd for Authentication {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -259,6 +320,129 @@ mod tests {
             Authentication::Unknown,
             "an identity nobody certified must not inherit the other's verdict"
         );
+    }
+
+    /// Two user IDs that render alike share one verdict: the lower of the two
+    /// when the certificate signed both for itself, and the signed one's when
+    /// it signed only one, whichever of them sorts last.
+    ///
+    /// Verdicts are filed under the lossy rendering of each user ID, and
+    /// `them@\xFF` and a literal `them@\u{FFFD}` render the same. A plain
+    /// insert let the later of the two in `cert.userids()` win: an unsigned
+    /// variant anyone can append took an authenticated identity's badge away
+    /// when it sorted after it, and an authenticated variant sorting after a
+    /// variant with no path of its own lent it its badge. Raw bytes sort 0xFF
+    /// after the 0xEF that starts U+FFFD, so each case below is run with the
+    /// authenticated variant first and then last.
+    ///
+    /// The certificate is a trust root, its own self-signature authenticating
+    /// the variant it binds, because that is the one way sequoia-wot 0.15.2
+    /// authenticates a user ID that is not UTF-8: it reads no third-party
+    /// certification of one (`redges` in its store.rs), and a
+    /// trust signature reaches none either, since sequoia-openpgp's
+    /// `RegexSet::matches_userid` never matches one, even with no regex set.
+    /// The variant with no path of its own is signed too in the second case,
+    /// by a self-signature dated a day ahead: a real signature, so the
+    /// certificate did sign it, that binds nothing until that day, so nothing
+    /// authenticates it now.
+    ///
+    /// Restore the plain insert and the unsigned case fails when the unsigned
+    /// variant sorts last, and the second case when the future-dated variant
+    /// sorts first.
+    #[test]
+    fn user_ids_that_render_alike_share_the_lower_verdict() {
+        use sequoia_openpgp::Packet;
+        use sequoia_openpgp::packet::UserID;
+        use sequoia_openpgp::packet::signature::SignatureBuilder;
+        use sequoia_openpgp::types::SignatureType;
+        use std::time::{Duration, SystemTime};
+
+        let literal = "Them <them@\u{FFFD}.example>".as_bytes().to_vec();
+        let invalid = [b"Them <them@".as_slice(), &[0xFF], b".example>"].concat();
+        let displayed = String::from_utf8_lossy(&invalid).into_owned();
+        assert_eq!(
+            displayed.as_bytes(),
+            literal,
+            "the two must render alike, or nothing here is tested"
+        );
+        let verdict = |them: &Cert| {
+            let fingerprint = them.fingerprint().to_hex();
+            let authenticated = authenticate_all(&[them], std::slice::from_ref(&fingerprint));
+            for_user_id(&authenticated, &fingerprint, &displayed)
+        };
+        // `name` bound to `them` by its own self-signature, dated `when`.
+        let bind = |them: Cert, name: &[u8], when: SystemTime| {
+            let mut holder = them
+                .primary_key()
+                .key()
+                .clone()
+                .parts_into_secret()
+                .unwrap()
+                .into_keypair()
+                .unwrap();
+            let name = UserID::from(name.to_vec());
+            let binding = SignatureBuilder::new(SignatureType::PositiveCertification)
+                .set_signature_creation_time(when)
+                .unwrap()
+                .sign_userid_binding(&mut holder, them.primary_key().key(), &name)
+                .unwrap();
+            them.insert_packets(vec![Packet::from(name), Packet::from(binding)])
+                .unwrap()
+                .0
+        };
+
+        for (good, other) in [(&literal, &invalid), (&invalid, &literal)] {
+            let root = || {
+                let them = generate(&KeyGenRequest::new("Them <them@example.org>"))
+                    .unwrap()
+                    .cert;
+                let them = bind(them, good, SystemTime::now());
+                assert_eq!(
+                    verdict(&them),
+                    Authentication::Full,
+                    "on its own, the bound identity is authenticated by the root"
+                );
+                them
+            };
+
+            // The other variant with no signature at all: what anyone can
+            // append to a certificate they do not hold. It is never the name
+            // on the row, so it must not take the badge away.
+            let them = root()
+                .insert_packets(Some(Packet::from(UserID::from(other.clone()))))
+                .unwrap()
+                .0;
+            assert_eq!(
+                them.userids().count(),
+                3,
+                "the unsigned variant must be kept, or nothing here is tested"
+            );
+            assert_eq!(
+                verdict(&them),
+                Authentication::Full,
+                "a variant the certificate never signed must give way to the one it did, \
+                 whichever sorts last"
+            );
+
+            // The other variant signed by the holder, but dated a day ahead,
+            // so that no path reaches it yet. Either could be the name on the
+            // row.
+            let tomorrow = SystemTime::now() + Duration::from_secs(24 * 60 * 60);
+            let them = bind(root(), other, tomorrow);
+            assert_eq!(
+                them.userids()
+                    .filter(|ua| ua.self_signatures().next().is_some())
+                    .count(),
+                3,
+                "the future-dated variant must count as signed, or nothing here is tested"
+            );
+            assert_eq!(
+                verdict(&them),
+                Authentication::Unknown,
+                "of two variants the certificate signed, the one with no path of its own \
+                 must pull the shared verdict down, whichever sorts last"
+            );
+        }
     }
 
     #[test]
