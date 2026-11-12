@@ -1614,6 +1614,153 @@ export component CertList inherits Rectangle {
     }
 }
 
+// A list of rows that are each ticked or not, which the keyboard works as
+// well as the pointer: the recipients in Sign / Encrypt and in the notepad,
+// and the user IDs in Certify.
+//
+// Those rows had only a pointer path and an assistive-technology one, as the
+// certificate list's had, so without a screen reader the notepad could
+// encrypt to no one, Sign / Encrypt to no one but the certificate chosen in
+// the main list, and Certify could not leave a user ID out. Now Tab stops at
+// the list, Up and Down move a current row, Page Up and Page Down a
+// screenful, Home and End to either end, scrolling it into view, and Space
+// or Enter ticks or unticks it. Unlike the certificate list's, the current
+// row here is only where the keys act, not a choice of its own: the ticks are
+// the choice, and moving changes none of them.
+//
+// One FocusScope for the whole list, for the reasons CertList gives. The rows
+// stay with each dialog, since each draws them its own way, and go in as the
+// ListView this wraps. Slint lets a ListView hold one `for` and nothing else,
+// and builds rows lazily only for a `for` whose parent is a plain ListView,
+// so the scope cannot go inside the list as CertList's does, and a component
+// derived from this one could not hold the rows either. The scope sits beside
+// the list instead, in this element, which is the list as assistive
+// technology knows it: the ListView inside says it is none. Each dialog binds
+// the ListView's `content-y` to this one's both ways, and its
+// `visible-height` to this one's, so that a key can scroll it. Every row is
+// `row-height` tall, and where one is follows from its index.
+export component TickList inherits Rectangle {
+    /// How many rows the list holds.
+    in property <int> count;
+    in property <length> row-height;
+    /// Whether the keys and `pick` do anything: off while an operation runs,
+    /// as each dialog's rows are, when its handler would refuse a tick
+    /// anyway. As in CertList, the list can still be scrolled.
+    in property <bool> enabled: true;
+    in-out property <length> content-y;
+    in property <length> visible-height;
+    /// Asked to tick or untick the row at this index.
+    callback toggled(int);
+
+    // The row the keys act on. It is kept when the rows change under it, as
+    // the notepad's filter changes them, and `active-row` is where it falls
+    // within the rows there are now. (Not `row`, which every element has
+    // already, for a GridLayout.)
+    property <int> current-row: 0;
+    property <int> active-row: max(0, min(root.current-row, root.count - 1));
+    // Whole rows in view, which Page Up and Page Down move by.
+    property <int> page: max(1, floor(root.visible-height / root.row-height));
+    // Whether focus came from the keyboard, which is when the ring is drawn,
+    // for the reason CertList gives.
+    property <bool> keyboard: false;
+
+    accessible-role: list;
+
+    /// What a click on the row at `index` does: tick or untick it, and make
+    /// it the current row, focusing the list so that the keys go on from
+    /// there.
+    public function pick(index: int) {
+        if (!root.enabled) {
+            return;
+        }
+        root.keyboard = false;
+        key.focus();
+        root.current-row = index;
+        root.toggled(index);
+    }
+
+    // Make the row at `index`, clamped to the list, the current one, and
+    // scroll it into view.
+    function move-to(index: int) {
+        root.current-row = max(0, min(root.count - 1, index));
+        root.reveal(root.current-row);
+    }
+
+    // CertList's, which says why a long jump down goes to a whole row.
+    function reveal(index: int) {
+        let top = index * root.row-height;
+        let wanted = top < -root.content-y ? -top
+            : top + root.row-height > root.visible-height - root.content-y
+                ? root.visible-height - top - root.row-height
+                : root.content-y;
+        if (wanted < root.content-y - root.visible-height) {
+            root.content-y = -ceil((top + root.row-height - root.visible-height) / root.row-height)
+                * root.row-height;
+        } else {
+            root.content-y = wanted;
+        }
+    }
+
+    @children
+
+    key := FocusScope {
+        x: 0;
+        y: 0;
+        width: 0px;
+        height: 0px;
+        // Not `enabled`, for the reason Btn gives.
+        focus-on-tab-navigation: root.enabled && root.count > 0;
+        focus-on-click: root.enabled;
+        focus-gained(reason) => {
+            if (reason == FocusReason.tab-navigation) {
+                root.keyboard = true;
+            }
+        }
+        key-pressed(event) => {
+            // Rejected while disabled, for the reasons Btn gives.
+            if (!root.enabled || root.count == 0) {
+                return reject;
+            }
+            if (event.text == " " || event.text == "\n") {
+                root.move-to(root.active-row);
+                root.toggled(root.active-row);
+            } else if (event.text == Key.DownArrow) {
+                root.move-to(root.active-row + 1);
+            } else if (event.text == Key.UpArrow) {
+                root.move-to(root.active-row - 1);
+            } else if (event.text == Key.PageDown) {
+                root.move-to(root.active-row + root.page);
+            } else if (event.text == Key.PageUp) {
+                root.move-to(root.active-row - root.page);
+            } else if (event.text == Key.Home) {
+                root.move-to(0);
+            } else if (event.text == Key.End) {
+                root.move-to(root.count - 1);
+            } else {
+                return reject;
+            }
+            root.keyboard = true;
+            return accept;
+        }
+    }
+
+    // On the current row, where it is drawn over the row's own content, or
+    // around the list when it has no rows to draw it on. This element clips,
+    // as the list does, so that the ring of a row scrolled partly out of view
+    // is cut off with it.
+    if key.has-focus && root.keyboard: ring := Rectangle {
+        x: root.count > 0 ? 2px : 1px;
+        y: root.count > 0 ? root.content-y + root.active-row * root.row-height + 2px : 1px;
+        width: root.width - (root.count > 0 ? 4px : 2px);
+        height: root.count > 0 ? root.row-height - 4px : root.height - 2px;
+        border-width: 2px;
+        border-color: Theme.accent;
+        border-radius: Theme.r-sm;
+    }
+
+    clip: true;
+}
+
 // The line along the foot of the window: what is under way, and how the last
 // operation went.
 //

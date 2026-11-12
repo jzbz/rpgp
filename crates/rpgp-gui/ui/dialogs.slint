@@ -1,6 +1,6 @@
 import { ListView, ScrollView } from "std-widgets.slint";
 import { Theme, Icons, Icon } from "theme.slint";
-import { Btn, Check, DialogError, DialogShell, Divider, Field, FieldRow, Monogram, Pill, RevocationNote, SecretField, SectionLabel, Select, TextArea, Tone, Variant } from "widgets.slint";
+import { Btn, Check, DialogError, DialogShell, Divider, Field, FieldRow, Monogram, Pill, RevocationNote, SecretField, SectionLabel, Select, TextArea, TickList, Tone, Variant } from "widgets.slint";
 import { CertRow, CertificationRow, LookupRow, PendingRevocationRow, RecipientRow, SignatureRow, SubkeyRow, UserIdDetailRow, UserIdRow } from "types.slint";
 
 // A file slot: label, the chosen path (or a hint), and a Choose button.
@@ -438,98 +438,110 @@ export component SignEncryptDialog inherits DialogShell {
                         width: parent.width - 2 * Theme.s4;
                     }
 
-                    if root.recipients.length > 0: ListView {
-                        for entry[index] in root.recipients: Rectangle {
-                            height: 42px;
-                            background: pick.has-hover ? Theme.hover : transparent;
+                    // Worked from the keyboard as well; TickList says how.
+                    if root.recipients.length > 0: recipient-ticks := TickList {
+                        count: root.recipients.length;
+                        row-height: 42px;
+                        enabled: !root.busy;
+                        accessible-label: "Recipients";
+                        content-y <=> recipient-list.content-y;
+                        visible-height: recipient-list.visible-height;
+                        toggled(index) => { root.toggle-recipient(index); }
 
-                            // The row draws a tick box but is not one: without these a screen
-                            // reader sees an unlabelled rectangle and cannot tell a chosen
-                            // recipient from an unchosen one. Check declares the same set.
-                            // The key ID is in the label as it is on the row, for the reason
-                            // given there.
-                            accessible-role: checkbox;
-                            accessible-label: entry.label
-                                + (entry.sublabel == "" ? "" : ", " + entry.sublabel)
-                                + ", key ID " + entry.key-id;
-                            accessible-checkable: true;
-                            accessible-checked: entry.selected;
-                            // Inert while a run is in flight, as Check is when disabled. Inside
-                            // a Flatpak the run reads its recipients only once the save dialog
-                            // has answered, and that dialog leaves this list live behind it.
-                            accessible-enabled: !root.busy;
-                            accessible-action-default => {
-                                if (!root.busy) {
-                                    root.toggle-recipient(index);
-                                }
-                            }
+                        recipient-list := ListView {
+                            accessible-role: none;
+                            for entry[index] in root.recipients: Rectangle {
+                                height: recipient-ticks.row-height;
+                                background: pick.has-hover ? Theme.hover : transparent;
 
-                            HorizontalLayout {
-                                padding-left: Theme.s3;
-                                padding-right: Theme.s3;
-                                spacing: Theme.s3;
-
-                                Rectangle {
-                                    width: 17px;
-                                    height: 17px;
-                                    y: (parent.height - self.height) / 2;
-                                    border-radius: 5px;
-                                    background: entry.selected ? Theme.accent : Theme.surface;
-                                    border-width: 1px;
-                                    border-color: entry.selected ? Theme.accent : Theme.border-strong;
-                                    if entry.selected: Icon {
-                                        glyph: Icons.check;
-                                        tint: Theme.accent-ink;
-                                        width: 12px;
-                                        height: 12px;
+                                // The row draws a tick box but is not one: without these a screen
+                                // reader sees an unlabelled rectangle and cannot tell a chosen
+                                // recipient from an unchosen one. Check declares the same set.
+                                // The key ID is in the label as it is on the row, for the reason
+                                // given there.
+                                accessible-role: checkbox;
+                                accessible-label: entry.label
+                                    + (entry.sublabel == "" ? "" : ", " + entry.sublabel)
+                                    + ", key ID " + entry.key-id;
+                                accessible-checkable: true;
+                                accessible-checked: entry.selected;
+                                // Inert while a run is in flight, as Check is when disabled. Inside
+                                // a Flatpak the run reads its recipients only once the save dialog
+                                // has answered, and that dialog leaves this list live behind it.
+                                accessible-enabled: !root.busy;
+                                accessible-action-default => {
+                                    if (!root.busy) {
+                                        root.toggle-recipient(index);
                                     }
                                 }
 
-                                Monogram {
-                                    initials: entry.initials;
-                                    tint: Theme.monograms[entry.tint-index];
-                                    size: 26px;
-                                    y: (parent.height - self.height) / 2;
-                                }
+                                HorizontalLayout {
+                                    padding-left: Theme.s3;
+                                    padding-right: Theme.s3;
+                                    spacing: Theme.s3;
 
-                                VerticalLayout {
-                                    alignment: center;
-                                    horizontal-stretch: 1;
+                                    Rectangle {
+                                        width: 17px;
+                                        height: 17px;
+                                        y: (parent.height - self.height) / 2;
+                                        border-radius: 5px;
+                                        background: entry.selected ? Theme.accent : Theme.surface;
+                                        border-width: 1px;
+                                        border-color: entry.selected ? Theme.accent : Theme.border-strong;
+                                        if entry.selected: Icon {
+                                            glyph: Icons.check;
+                                            tint: Theme.accent-ink;
+                                            width: 12px;
+                                            height: 12px;
+                                        }
+                                    }
+
+                                    Monogram {
+                                        initials: entry.initials;
+                                        tint: Theme.monograms[entry.tint-index];
+                                        size: 26px;
+                                        y: (parent.height - self.height) / 2;
+                                    }
+
+                                    VerticalLayout {
+                                        alignment: center;
+                                        horizontal-stretch: 1;
+                                        Text {
+                                            text: entry.label;
+                                            color: Theme.text;
+                                            font-size: Theme.t-md;
+                                            overflow: elide;
+                                        }
+                                        // Left out where there is no address: an
+                                        // empty line still takes its height, and
+                                        // would hold the name above the middle.
+                                        if entry.sublabel != "": Text {
+                                            text: entry.sublabel;
+                                            color: Theme.text-dim;
+                                            font-size: Theme.t-xs;
+                                            overflow: elide;
+                                        }
+                                    }
+
+                                    // The key ID, which is what tells apart two
+                                    // certificates with the same name and address,
+                                    // as a person's old and new key usually are. It
+                                    // does not elide, so a long name or address
+                                    // gives way to it.
                                     Text {
-                                        text: entry.label;
-                                        color: Theme.text;
-                                        font-size: Theme.t-md;
-                                        overflow: elide;
-                                    }
-                                    // Left out where there is no address: an
-                                    // empty line still takes its height, and
-                                    // would hold the name above the middle.
-                                    if entry.sublabel != "": Text {
-                                        text: entry.sublabel;
+                                        text: entry.key-id;
                                         color: Theme.text-dim;
                                         font-size: Theme.t-xs;
-                                        overflow: elide;
+                                        font-family: "Source Code Pro";
+                                        vertical-alignment: center;
                                     }
                                 }
 
-                                // The key ID, which is what tells apart two
-                                // certificates with the same name and address,
-                                // as a person's old and new key usually are. It
-                                // does not elide, so a long name or address
-                                // gives way to it.
-                                Text {
-                                    text: entry.key-id;
-                                    color: Theme.text-dim;
-                                    font-size: Theme.t-xs;
-                                    font-family: "Source Code Pro";
-                                    vertical-alignment: center;
+                                pick := TouchArea {
+                                    enabled: !root.busy;
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => { recipient-ticks.pick(index); }
                                 }
-                            }
-
-                            pick := TouchArea {
-                                enabled: !root.busy;
-                                mouse-cursor: MouseCursor.pointer;
-                                clicked => { root.toggle-recipient(index); }
                             }
                         }
                     }
@@ -883,55 +895,81 @@ export component CertifyDialog inherits DialogShell {
                         border-color: Theme.border;
                         clip: true;
 
-                        ListView {
-                            for entry[index] in root.user-ids: Rectangle {
-                                height: 34px;
-                                background: pick.has-hover ? Theme.hover : transparent;
+                        // Worked from the keyboard as well; TickList says
+                        // how.
+                        user-id-ticks := TickList {
+                            count: root.user-ids.length;
+                            row-height: 34px;
+                            enabled: !root.busy;
+                            accessible-label: "User IDs";
+                            content-y <=> user-id-list.content-y;
+                            visible-height: user-id-list.visible-height;
+                            toggled(index) => { root.toggle-user-id(index); }
 
-                                // The row draws a tick box but is not one: without
-                                // these a screen reader sees an unlabelled rectangle
-                                // and cannot tell a chosen recipient from an
-                                // unchosen one. Check declares the same set.
-                                accessible-role: checkbox;
-                                accessible-label: entry.text;
-                                accessible-checkable: true;
-                                accessible-checked: entry.selected;
-                                accessible-action-default => { root.toggle-user-id(index); }
+                            user-id-list := ListView {
+                                accessible-role: none;
+                                for entry[index] in root.user-ids: Rectangle {
+                                    height: user-id-ticks.row-height;
+                                    background: pick.has-hover ? Theme.hover : transparent;
 
-                                HorizontalLayout {
-                                    padding-left: Theme.s3;
-                                    padding-right: Theme.s3;
-                                    spacing: Theme.s3;
-
-                                    Rectangle {
-                                        width: 17px;
-                                        height: 17px;
-                                        y: (parent.height - self.height) / 2;
-                                        border-radius: 5px;
-                                        background: entry.selected ? Theme.accent : Theme.surface;
-                                        border-width: 1px;
-                                        border-color: entry.selected ? Theme.accent : Theme.border-strong;
-                                        if entry.selected: Icon {
-                                            glyph: Icons.check;
-                                            tint: Theme.accent-ink;
-                                            width: 12px;
-                                            height: 12px;
+                                    // The row draws a tick box but is not one: without
+                                    // these a screen reader sees an unlabelled rectangle
+                                    // and cannot tell a chosen recipient from an
+                                    // unchosen one. Check declares the same set.
+                                    accessible-role: checkbox;
+                                    accessible-label: entry.text;
+                                    accessible-checkable: true;
+                                    accessible-checked: entry.selected;
+                                    // Inert while the certification runs, as
+                                    // the recipient rows are while theirs
+                                    // does. The run reads which user IDs to
+                                    // certify as it starts, and a tick
+                                    // changed after that, during a wait at a
+                                    // card's PIN prompt say, showed a choice
+                                    // other than the one being signed.
+                                    accessible-enabled: !root.busy;
+                                    accessible-action-default => {
+                                        if (!root.busy) {
+                                            root.toggle-user-id(index);
                                         }
                                     }
 
-                                    Text {
-                                        text: entry.text;
-                                        color: Theme.text;
-                                        font-size: Theme.t-md;
-                                        vertical-alignment: center;
-                                        horizontal-stretch: 1;
-                                        overflow: elide;
-                                    }
-                                }
+                                    HorizontalLayout {
+                                        padding-left: Theme.s3;
+                                        padding-right: Theme.s3;
+                                        spacing: Theme.s3;
 
-                                pick := TouchArea {
-                                    mouse-cursor: MouseCursor.pointer;
-                                    clicked => { root.toggle-user-id(index); }
+                                        Rectangle {
+                                            width: 17px;
+                                            height: 17px;
+                                            y: (parent.height - self.height) / 2;
+                                            border-radius: 5px;
+                                            background: entry.selected ? Theme.accent : Theme.surface;
+                                            border-width: 1px;
+                                            border-color: entry.selected ? Theme.accent : Theme.border-strong;
+                                            if entry.selected: Icon {
+                                                glyph: Icons.check;
+                                                tint: Theme.accent-ink;
+                                                width: 12px;
+                                                height: 12px;
+                                            }
+                                        }
+
+                                        Text {
+                                            text: entry.text;
+                                            color: Theme.text;
+                                            font-size: Theme.t-md;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                            overflow: elide;
+                                        }
+                                    }
+
+                                    pick := TouchArea {
+                                        enabled: !root.busy;
+                                        mouse-cursor: MouseCursor.pointer;
+                                        clicked => { user-id-ticks.pick(index); }
+                                    }
                                 }
                             }
                         }
@@ -1475,87 +1513,100 @@ export component NotepadDialog inherits DialogShell {
                                 x: Theme.s3;
                                 y: Theme.s3;
                             }
-                            ListView {
-                                for entry[index] in root.recipients: Rectangle {
-                                    height: 34px;
-                                    background: pick.has-hover ? Theme.hover : transparent;
+                            // Worked from the keyboard as well; TickList
+                            // says how.
+                            notepad-ticks := TickList {
+                                count: root.recipients.length;
+                                row-height: 34px;
+                                enabled: !root.busy;
+                                accessible-label: "Recipients";
+                                content-y <=> notepad-list.content-y;
+                                visible-height: notepad-list.visible-height;
+                                toggled(index) => { root.toggle-recipient(index); }
 
-                                    // The row draws a tick box but is not one:
-                                    // without these a screen reader sees an
-                                    // unlabelled rectangle and cannot tell a
-                                    // chosen recipient from an unchosen one.
-                                    // Check declares the same set.
-                                    accessible-role: checkbox;
-                                    accessible-label: entry.label
-                                        + (entry.sublabel == "" ? "" : ", " + entry.sublabel)
-                                        + ", key ID " + entry.key-id;
-                                    accessible-checkable: true;
-                                    accessible-checked: entry.selected;
-                                    // Inert while a run is in flight, as in
-                                    // Sign / Encrypt, whose recipients these
-                                    // are too.
-                                    accessible-enabled: !root.busy;
-                                    accessible-action-default => {
-                                        if (!root.busy) {
-                                            root.toggle-recipient(index);
-                                        }
-                                    }
-                                    HorizontalLayout {
-                                        padding-left: Theme.s2;
-                                        padding-right: Theme.s2;
-                                        spacing: Theme.s2;
-                                        Rectangle {
-                                            width: 15px;
-                                            height: 15px;
-                                            y: (parent.height - self.height) / 2;
-                                            border-radius: 4px;
-                                            background: entry.selected ? Theme.accent : Theme.surface;
-                                            border-width: 1px;
-                                            border-color: entry.selected ? Theme.accent : Theme.border-strong;
-                                            if entry.selected: Icon {
-                                                glyph: Icons.check;
-                                                tint: Theme.accent-ink;
-                                                width: 11px;
-                                                height: 11px;
+                                notepad-list := ListView {
+                                    accessible-role: none;
+                                    for entry[index] in root.recipients: Rectangle {
+                                        height: notepad-ticks.row-height;
+                                        background: pick.has-hover ? Theme.hover : transparent;
+
+                                        // The row draws a tick box but is not one:
+                                        // without these a screen reader sees an
+                                        // unlabelled rectangle and cannot tell a
+                                        // chosen recipient from an unchosen one.
+                                        // Check declares the same set.
+                                        accessible-role: checkbox;
+                                        accessible-label: entry.label
+                                            + (entry.sublabel == "" ? "" : ", " + entry.sublabel)
+                                            + ", key ID " + entry.key-id;
+                                        accessible-checkable: true;
+                                        accessible-checked: entry.selected;
+                                        // Inert while a run is in flight, as in
+                                        // Sign / Encrypt, whose recipients these
+                                        // are too.
+                                        accessible-enabled: !root.busy;
+                                        accessible-action-default => {
+                                            if (!root.busy) {
+                                                root.toggle-recipient(index);
                                             }
                                         }
-                                        Text {
-                                            text: entry.label;
-                                            color: Theme.text;
-                                            font-size: Theme.t-sm;
-                                            vertical-alignment: center;
-                                            overflow: elide;
+                                        HorizontalLayout {
+                                            padding-left: Theme.s2;
+                                            padding-right: Theme.s2;
+                                            spacing: Theme.s2;
+                                            Rectangle {
+                                                width: 15px;
+                                                height: 15px;
+                                                y: (parent.height - self.height) / 2;
+                                                border-radius: 4px;
+                                                background: entry.selected ? Theme.accent : Theme.surface;
+                                                border-width: 1px;
+                                                border-color: entry.selected ? Theme.accent : Theme.border-strong;
+                                                if entry.selected: Icon {
+                                                    glyph: Icons.check;
+                                                    tint: Theme.accent-ink;
+                                                    width: 11px;
+                                                    height: 11px;
+                                                }
+                                            }
+                                            Text {
+                                                text: entry.label;
+                                                color: Theme.text;
+                                                font-size: Theme.t-sm;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                            }
+                                            // The address, beside the name rather
+                                            // than under it: these rows are 34px
+                                            // and a second line would halve how
+                                            // many fit. It stretches, so it is the
+                                            // first to give way when the row is
+                                            // short of room.
+                                            Text {
+                                                text: entry.sublabel;
+                                                color: Theme.text-dim;
+                                                font-size: Theme.t-xs;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                                horizontal-stretch: 1;
+                                            }
+                                            // The key ID never gives way: it, and
+                                            // not the address, is what tells a
+                                            // person's old and new key apart, since
+                                            // both usually carry the same one.
+                                            Text {
+                                                text: entry.key-id;
+                                                color: Theme.text-dim;
+                                                font-size: Theme.t-xs;
+                                                font-family: "Source Code Pro";
+                                                vertical-alignment: center;
+                                            }
                                         }
-                                        // The address, beside the name rather
-                                        // than under it: these rows are 34px
-                                        // and a second line would halve how
-                                        // many fit. It stretches, so it is the
-                                        // first to give way when the row is
-                                        // short of room.
-                                        Text {
-                                            text: entry.sublabel;
-                                            color: Theme.text-dim;
-                                            font-size: Theme.t-xs;
-                                            vertical-alignment: center;
-                                            overflow: elide;
-                                            horizontal-stretch: 1;
+                                        pick := TouchArea {
+                                            enabled: !root.busy;
+                                            mouse-cursor: MouseCursor.pointer;
+                                            clicked => { notepad-ticks.pick(index); }
                                         }
-                                        // The key ID never gives way: it, and
-                                        // not the address, is what tells a
-                                        // person's old and new key apart, since
-                                        // both usually carry the same one.
-                                        Text {
-                                            text: entry.key-id;
-                                            color: Theme.text-dim;
-                                            font-size: Theme.t-xs;
-                                            font-family: "Source Code Pro";
-                                            vertical-alignment: center;
-                                        }
-                                    }
-                                    pick := TouchArea {
-                                        enabled: !root.busy;
-                                        mouse-cursor: MouseCursor.pointer;
-                                        clicked => { root.toggle-recipient(index); }
                                     }
                                 }
                             }

@@ -229,6 +229,7 @@ export component CertifyProbe inherits Probe {
     in-out property <[string]> certifiers;
     in-out property <[string]> certifier-key-ids;
     in-out property <int> toggled-user-id: -1;
+    in-out property <bool> busy: false;
     in-out property <string> error;
     in-out property <length> probe-height: 720px;
 
@@ -242,6 +243,7 @@ export component CertifyProbe inherits Probe {
         user-ids: root.user-ids;
         certifiers: root.certifiers;
         certifier-key-ids: root.certifier-key-ids;
+        busy: root.busy;
         error: root.error;
         toggle-user-id(index) => { root.toggled-user-id = index; }
     }

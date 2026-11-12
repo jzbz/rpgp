@@ -880,6 +880,7 @@ fn a_recipient_row_takes_no_toggle_while_a_run_is_in_flight() {
     row_is_inert_while_busy(
         "Sign / Encrypt",
         &probe,
+        "Alice, alice@example.org, key ID A11CE00000000001",
         |busy| probe.set_busy(busy),
         || probe.get_toggled_recipient(),
         || probe.set_toggled_recipient(-1),
@@ -892,19 +893,21 @@ fn a_recipient_row_takes_no_toggle_while_a_run_is_in_flight() {
     row_is_inert_while_busy(
         "the notepad",
         &probe,
+        "Alice, alice@example.org, key ID A11CE00000000001",
         |busy| probe.set_busy(busy),
         || probe.get_toggled_recipient(),
         || probe.set_toggled_recipient(-1),
     );
 }
 
-/// Click Alice's recipient row and activate it as assistive technology does,
-/// once with `busy` set and once without, and check that only the second
-/// pair reached the dialog's toggle. `toggled` reads which row was toggled,
-/// and `reset` forgets it.
+/// Click the first row, the one called `label`, and activate it as assistive
+/// technology does, once with `busy` set and once without, and check that
+/// only the second pair reached the dialog's toggle. `toggled` reads which
+/// row was toggled, and `reset` forgets it.
 fn row_is_inert_while_busy(
     dialog: &str,
     root: &impl i_slint_backend_testing::ElementRoot,
+    label: &str,
     set_busy: impl Fn(bool),
     toggled: impl Fn() -> i32,
     reset: impl Fn(),
@@ -912,31 +915,25 @@ fn row_is_inert_while_busy(
     use i_slint_backend_testing::AccessibleRole;
     use slint::platform::PointerEventButton;
 
-    let row = || {
-        control(
-            root,
-            "Alice, alice@example.org, key ID A11CE00000000001",
-            AccessibleRole::Checkbox,
-        )
-    };
+    let row = || control(root, label, AccessibleRole::Checkbox);
 
     set_busy(true);
     assert_eq!(
         row().accessible_enabled(),
         Some(false),
-        "{dialog}: a recipient row said it could be changed during a run"
+        "{dialog}: a row said it could be changed during a run"
     );
     row().mock_single_click(PointerEventButton::Left);
     assert_eq!(
         toggled(),
         -1,
-        "{dialog}: a click changed a recipient during a run"
+        "{dialog}: a click changed a row during a run"
     );
     row().invoke_accessible_default_action();
     assert_eq!(
         toggled(),
         -1,
-        "{dialog}: assistive technology changed a recipient during a run"
+        "{dialog}: assistive technology changed a row during a run"
     );
 
     // The same click and the same action with nothing in flight, so that the
@@ -944,13 +941,229 @@ fn row_is_inert_while_busy(
     set_busy(false);
     assert_eq!(row().accessible_enabled(), Some(true));
     row().mock_single_click(PointerEventButton::Left);
-    assert_eq!(toggled(), 0, "{dialog}: a click should toggle a recipient");
+    assert_eq!(toggled(), 0, "{dialog}: a click should toggle a row");
     reset();
     row().invoke_accessible_default_action();
     assert_eq!(
         toggled(),
         0,
-        "{dialog}: assistive technology should toggle a recipient"
+        "{dialog}: assistive technology should toggle a row"
+    );
+}
+
+/// A user ID row in Certify takes no toggle while the certification runs,
+/// whether it is clicked or activated by assistive technology, as a recipient
+/// row takes none while its run does.
+///
+/// Every other control in the dialog was disabled while it ran, and the rows
+/// were not: during a wait at a card's PIN prompt a user ID could be unticked
+/// while it was being signed, and the dialog then showed a choice other than
+/// the one that was certified. The handler in Rust refuses too.
+#[test]
+fn a_user_id_row_takes_no_toggle_while_a_certification_runs() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let probe = CertifyProbe::new().unwrap();
+    probe.set_user_ids(slint::ModelRc::new(slint::VecModel::from(vec![
+        UserIdRow {
+            text: "Alice <alice@example.org>".into(),
+            selected: true,
+        },
+    ])));
+    probe.show().unwrap();
+    row_is_inert_while_busy(
+        "Certify",
+        &probe,
+        "Alice <alice@example.org>",
+        |busy| probe.set_busy(busy),
+        || probe.get_toggled_user_id(),
+        || probe.set_toggled_user_id(-1),
+    );
+}
+
+/// A recipient for the tick lists, told apart by its number.
+fn ticked(number: usize) -> RecipientRow {
+    RecipientRow {
+        fingerprint: format!("{number:040X}").into(),
+        label: format!("User {number:02}").into(),
+        sublabel: format!("user{number:02}@example.org").into(),
+        key_id: format!("{number:016X}").into(),
+        initials: "U".into(),
+        tint_index: 0,
+        selected: false,
+    }
+}
+
+/// What a recipient row from [`ticked`] is called.
+fn ticked_label(number: usize) -> String {
+    format!("User {number:02}, user{number:02}@example.org, key ID {number:016X}")
+}
+
+/// Work a tick list of `count` rows from the keyboard, Tab having been
+/// pressed `tabs` times to reach it, and check which row each key reached by
+/// the toggle it asked for. `label` names a row, `list` the list,
+/// `toggled` reads which row was last toggled and `reset` forgets it.
+#[allow(clippy::too_many_arguments)]
+fn tick_list_is_worked_from_the_keyboard<P: slint::ComponentHandle>(
+    dialog: &str,
+    probe: &P,
+    tabs: usize,
+    list: &str,
+    count: usize,
+    label: impl Fn(usize) -> String,
+    set_busy: impl Fn(bool),
+    toggled: impl Fn() -> i32,
+    reset: impl Fn(),
+) {
+    use i_slint_backend_testing::AccessibleRole;
+    use slint::platform::{Key, PointerEventButton};
+
+    let row = |number: usize| control(probe, &label(number), AccessibleRole::Checkbox);
+    let list = control(probe, list, AccessibleRole::List);
+    // Wholly inside the list.
+    let in_view = |number: usize| {
+        let (row, top, height) = (row(number), list.absolute_position().y, list.size().height);
+        let at = row.absolute_position().y;
+        at >= top && at + row.size().height <= top + height
+    };
+    let tick = |key: Key, expected: i32, what: &str| {
+        reset();
+        press(probe, key);
+        assert_eq!(toggled(), expected, "{dialog}: {what}");
+    };
+    let last = count as i32 - 1;
+
+    for _ in 0..tabs {
+        press(probe, Key::Tab);
+    }
+    tick(
+        Key::Space,
+        0,
+        "Tab should reach the list, and Space tick its first row",
+    );
+    press(probe, Key::DownArrow);
+    press(probe, Key::DownArrow);
+    tick(Key::Return, 2, "Down should move a row, and Enter tick it");
+    press(probe, Key::End);
+    tick(Key::Space, last, "End should go to the last row");
+    assert!(
+        in_view(count - 1),
+        "{dialog}: the last row should be scrolled into view"
+    );
+    press(probe, Key::Home);
+    press(probe, Key::UpArrow);
+    tick(
+        Key::Space,
+        0,
+        "Home should go to the first row, and Up no further",
+    );
+    assert!(
+        in_view(0),
+        "{dialog}: the first row should be scrolled back into view"
+    );
+    // Four whole rows fit in each of the lists.
+    press(probe, Key::PageDown);
+    tick(Key::Space, 4, "Page Down should move a screenful");
+    assert!(in_view(4), "{dialog}: Page Down should scroll");
+    press(probe, Key::PageUp);
+    tick(Key::Space, 0, "Page Up should move a screenful back");
+
+    // A click makes its row the current one, so the keys go on from there.
+    reset();
+    row(1).mock_single_click(PointerEventButton::Left);
+    assert_eq!(toggled(), 1, "{dialog}: a click should tick its row");
+    press(probe, Key::DownArrow);
+    tick(
+        Key::Space,
+        2,
+        "Down after a click should go on from the row clicked",
+    );
+
+    // While an operation runs, with focus left on the list.
+    set_busy(true);
+    for key in [Key::Space, Key::Return, Key::DownArrow, Key::Space] {
+        tick(key, -1, "the list took a key while an operation ran");
+    }
+    set_busy(false);
+    tick(
+        Key::Space,
+        2,
+        "the keys refused while busy should have left the current row where it was",
+    );
+}
+
+/// The three tick lists take focus from Tab, move a current row with the
+/// arrow keys, Page Up and Down, Home and End, keeping it in view, tick it
+/// with Space and Enter, and do none of it while an operation runs.
+///
+/// Their rows had only a pointer path and an assistive-technology one, as the
+/// certificate list's had, so without a screen reader the notepad could
+/// encrypt to no one, Sign / Encrypt to no one but the certificate chosen in
+/// the main list, and Certify could not leave a user ID out.
+#[test]
+fn the_tick_lists_are_worked_from_the_keyboard() {
+    i_slint_backend_testing::init_no_event_loop();
+    let recipients = || {
+        slint::ModelRc::new(slint::VecModel::from(
+            (0..10).map(ticked).collect::<Vec<_>>(),
+        ))
+    };
+
+    // Choose, Encrypt and Sign come first.
+    let probe = SelectionProbe::new().unwrap();
+    probe.set_recipients(recipients());
+    probe.show().unwrap();
+    tick_list_is_worked_from_the_keyboard(
+        "Sign / Encrypt",
+        &probe,
+        4,
+        "Recipients",
+        10,
+        ticked_label,
+        |busy| probe.set_busy(busy),
+        || probe.get_toggled_recipient(),
+        || probe.set_toggled_recipient(-1),
+    );
+    probe.hide().unwrap();
+
+    // The list is the first thing in Certify.
+    let probe = CertifyProbe::new().unwrap();
+    probe.set_user_ids(slint::ModelRc::new(slint::VecModel::from(
+        (0..10)
+            .map(|number| UserIdRow {
+                text: format!("User {number:02} <user{number:02}@example.org>").into(),
+                selected: false,
+            })
+            .collect::<Vec<_>>(),
+    )));
+    probe.show().unwrap();
+    tick_list_is_worked_from_the_keyboard(
+        "Certify",
+        &probe,
+        1,
+        "User IDs",
+        10,
+        |number| format!("User {number:02} <user{number:02}@example.org>"),
+        |busy| probe.set_busy(busy),
+        || probe.get_toggled_user_id(),
+        || probe.set_toggled_user_id(-1),
+    );
+    probe.hide().unwrap();
+
+    // The input and the filter come first.
+    let probe = NotepadProbe::new().unwrap();
+    probe.set_recipients(recipients());
+    probe.show().unwrap();
+    tick_list_is_worked_from_the_keyboard(
+        "the notepad",
+        &probe,
+        3,
+        "Recipients",
+        10,
+        ticked_label,
+        |busy| probe.set_busy(busy),
+        || probe.get_toggled_recipient(),
+        || probe.set_toggled_recipient(-1),
     );
 }
 

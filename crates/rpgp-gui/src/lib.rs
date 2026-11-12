@@ -365,19 +365,19 @@ fn after_a_panic(ui: &AppWindow, report: fn(&AppWindow, String)) {
 ///
 /// So the rule is kept where the work starts. Every handler that sets `busy`
 /// asks here first, Import's included, which gets there only once its file
-/// dialog has answered. So do the pickers that choose an operation's input,
-/// and the recipient toggle, whose rows are drawn by hand rather than built
-/// from the app's widgets and choose who a run encrypts to. So do the two
-/// details-pane toggles, which write the store without setting `busy`
-/// because they finish before they return. Export and Save revocation
-/// certificate do not ask once their dialogs answer, and that is deliberate:
-/// they start no operation and change nothing in the store, only copying out
-/// of it into the file the user chose. Sign / Encrypt and Decrypt, whose save
-/// dialog in a Flatpak is part of the operation, ask before it opens and set
-/// `busy` as it does, since it asks where to write a run already settled on
-/// screen; see [`ask_where_to_save`]. Nothing can come between a handler
-/// asking and it setting `busy`, since both happen on the event loop, which
-/// runs one callback at a time.
+/// dialog has answered. So do the pickers that choose an operation's input, and
+/// the recipient and user-ID toggles, whose rows are drawn by hand rather than
+/// built from the app's widgets and choose who a run encrypts to or which user
+/// IDs it certifies. So do the two details-pane toggles, which write the store
+/// without setting `busy` because they finish before they return. Export and
+/// Save revocation certificate do not ask once their dialogs answer, and that
+/// is deliberate: they start no operation and change nothing in the store, only
+/// copying out of it into the file the user chose. Sign / Encrypt and Decrypt,
+/// whose save dialog in a Flatpak is part of the operation, ask before it opens
+/// and set `busy` as it does, since it asks where to write a run already
+/// settled on screen; see [`ask_where_to_save`]. Nothing can come between a
+/// handler asking and it setting `busy`, since both happen on the event loop,
+/// which runs one callback at a time.
 fn refuse_while_busy(ui: &AppWindow) -> bool {
     ui.get_busy()
 }
@@ -2567,6 +2567,14 @@ fn wire_certify(ui: &AppWindow, state: &Shared) {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
+            // The run reads which user IDs to certify as its worker starts,
+            // and a tick changed while it is in flight, during a wait at a
+            // card's PIN prompt say, would show a choice other than the one
+            // being signed. The rows refuse too; this is the half that holds
+            // whatever reaches the callback.
+            if refuse_while_busy(&ui) {
+                return;
+            }
             let mut guard = lock(&state);
             if let Some(entry) = usize::try_from(index)
                 .ok()
@@ -9639,6 +9647,47 @@ mod tests {
             })
         };
         wait_for("the user ID to be revoked", retired);
+    }
+
+    /// Certify's user-ID ticks stay as they are while a certification runs,
+    /// whatever reaches the toggle, and change again once it is over.
+    ///
+    /// The run reads which user IDs to certify as its worker starts, so a
+    /// tick changed during a wait at a card's PIN prompt showed a choice
+    /// other than the one being signed. The dialog's rows refuse too, as
+    /// tests/accessibility.rs checks.
+    #[test]
+    fn certify_takes_no_user_id_toggle_while_a_certification_runs() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        let alice = generated("Alice <alice@example.org>").cert;
+        store.insert(&alice).unwrap();
+        store
+            .insert_secret(&generated("Me <me@example.org>").cert)
+            .unwrap();
+        let alice = alice.fingerprint().to_hex();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        click_row(&ui, &state, &alice);
+        ui.invoke_open_certify();
+        assert_eq!(ui.get_certify_chosen(), 1, "the one user ID starts ticked");
+
+        ui.set_busy(true);
+        ui.invoke_certify_toggle_user_id(0);
+        assert_eq!(
+            ui.get_certify_chosen(),
+            1,
+            "a user ID was unticked under a certification in flight"
+        );
+        assert!(lock(&state).certify_user_ids[0].1);
+
+        // With nothing in flight the same toggle goes through, so the refusal
+        // above is the only thing that kept it out.
+        ui.set_busy(false);
+        ui.invoke_certify_toggle_user_id(0);
+        assert_eq!(ui.get_certify_chosen(), 0);
     }
 
     /// A failure that quotes a user ID shows it written out as well, on
