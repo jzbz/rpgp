@@ -133,13 +133,22 @@ pub struct AgentHolds {
     /// it is still in use: decrypting asks every one a message could be for,
     /// retired and expired ones too.
     pub decrypt: Option<AgentKey>,
+    /// The primary key again, whether or not it is still alive, which is what
+    /// withdrawing a certification asks for. See
+    /// [`certification_withdrawer_for`]. It is `certify` and more: a key that
+    /// has expired certifies nothing new, but what it certified before stands
+    /// and is still the user's to take back, so this, not `certify`, is what
+    /// says a certification is theirs.
+    pub withdraw: Option<AgentKey>,
 }
 
 impl AgentHolds {
-    /// Whether the agent holds nothing of the certificate for any of the
-    /// three.
+    /// Whether the agent holds nothing of the certificate for any of the four.
     pub fn is_empty(&self) -> bool {
-        self.sign.is_none() && self.certify.is_none() && self.decrypt.is_none()
+        self.sign.is_none()
+            && self.certify.is_none()
+            && self.decrypt.is_none()
+            && self.withdraw.is_none()
     }
 }
 
@@ -462,7 +471,7 @@ where
 /// [`decryption_keys`], as [`decryption_attempts`] does, so that what the
 /// pickers offer on the strength of this is what the operation behind them
 /// will find. Nothing for a certificate that is not valid under the policy,
-/// which none of the three will use.
+/// which none of them will use.
 fn holds(cert: &Cert, held: &[AgentKey]) -> AgentHolds {
     let policy = crate::policy();
     let Ok(valid) = cert.with_policy(&policy, None) else {
@@ -475,6 +484,7 @@ fn holds(cert: &Cert, held: &[AgentKey]) -> AgentHolds {
         sign: held_of(usable_keys(&valid, Purpose::Sign)),
         certify: held_of(usable_keys(&valid, Purpose::Certify)),
         decrypt: held_of(decryption_keys(&valid).collect()),
+        withdraw: held_of(usable_keys(&valid, Purpose::WithdrawCertification)),
     }
 }
 
@@ -1509,6 +1519,43 @@ mod tests {
         assert!(
             found.certify.as_ref().is_some_and(|key| !key.is_on_card()),
             "certifying was put on the card that holds the signing key: {found:?}"
+        );
+    }
+
+    /// The survey says the agent holds an expired primary, though it will
+    /// certify nothing with it: `withdraw` is answered whatever the key's
+    /// state, as withdrawing a certification is, and `certify` only while it
+    /// is alive. The GUI takes `withdraw` to mean a certification is the
+    /// user's, and took `certify`, which left everything an agent-only key
+    /// certified before it expired unclaimed and beyond withdrawing.
+    #[test]
+    fn the_survey_finds_an_expired_primary_to_withdraw_with() {
+        let day = Duration::from_secs(24 * 60 * 60);
+        let (lapsed, _) = CertBuilder::new()
+            .add_userid("Lapsed <lapsed@example.org>")
+            .set_creation_time(SystemTime::now() - 2 * day)
+            .set_validity_period(day)
+            .generate()
+            .unwrap();
+        let primary = lapsed.primary_key().key().clone().role_into_unspecified();
+
+        let found = holds(&lapsed, &listing([&primary], Some("D2760001240100000006")));
+        assert!(
+            found.certify.is_none(),
+            "an expired key was offered to certify with: {found:?}"
+        );
+        assert!(
+            found.withdraw.as_ref().is_some_and(AgentKey::is_on_card),
+            "the expired primary on the card was not found to withdraw with: {found:?}"
+        );
+        assert!(!found.is_empty());
+
+        let alice = generated("Alice <alice@example.org>");
+        let primary = alice.primary_key().key().clone().role_into_unspecified();
+        let found = holds(&alice, &listing([&primary], None));
+        assert!(
+            found.certify.is_some() && found.withdraw.is_some(),
+            "a live primary answers both: {found:?}"
         );
     }
 

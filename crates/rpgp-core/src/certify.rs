@@ -6,7 +6,7 @@
 //! really do belong to this key". It is the raw material the web of trust in
 //! [`crate::wot`] reasons over.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use sequoia_openpgp::Cert;
@@ -101,7 +101,9 @@ pub struct Certification {
     /// Whether the signature checks out against the certifier's key. `None`
     /// when the certifier is not in the store and it could not be checked.
     pub verified: Option<bool>,
-    /// Made by a certificate whose secret key this store holds.
+    /// Made by one of the user's own keys: a certificate whose secret key
+    /// this store holds, or, through [`certifications_with_agent`], one whose
+    /// primary key the user's gpg-agent or smartcard holds.
     pub by_me: bool,
     /// This entry withdraws an earlier certification rather than making one.
     pub is_revocation: bool,
@@ -727,7 +729,34 @@ impl Certifier {
 
 /// Every third-party certification on `cert`, and every withdrawal of one,
 /// verified where possible and, where verified, judged by [`standing`].
+///
+/// Ownership, and with it [`withdrawable`], goes by the secret key files alone;
+/// [`certifications_with_agent`] counts the agent's keys too.
 pub fn certifications(store: &Store, cert: &Cert) -> Result<Vec<Certification>> {
+    certifications_with_agent(store, cert, &BTreeSet::new())
+}
+
+/// [`certifications`], with `agent_held` naming, by fingerprint, the
+/// certificates whose primary key the user's gpg-agent holds, in its own store
+/// or on a smartcard, whether or not it is still alive: what
+/// [`crate::agent::annotate`] reports as
+/// [`crate::agent::AgentHolds::withdraw`].
+///
+/// A certification any of those made is the user's as much as one a secret
+/// key file made, and is marked `by_me`. It was not: ownership came from the
+/// secrets directory alone, so a certification made with a key only the agent
+/// or a card holds, which [`certify`] accepts and the GUI offers, earned no
+/// "(you)" and no way to withdraw it, though `revoke_certification` has signed
+/// such withdrawals through the agent all along. The agent is asked by the
+/// caller, which already has the answer for its key list, rather than here,
+/// where every listing would cost a round trip to it. Ownership is still
+/// credited only once the signature has verified against that key, as for a
+/// secret key file.
+pub fn certifications_with_agent(
+    store: &Store,
+    cert: &Cert,
+    agent_held: &BTreeSet<String>,
+) -> Result<Vec<Certification>> {
     let mut out = Vec::new();
     // Which user ID, as an index into `userids`, and which signature each
     // entry of `out` was read from, index for index, for the standing pass
@@ -844,7 +873,7 @@ pub fn certifications(store: &Store, cert: &Cert) -> Result<Vec<Certification>> 
                             .role_into_unspecified(),
                         subkeys,
                         name: primary_user_id(&certifier),
-                        by_me: secrets.contains(&fingerprint),
+                        by_me: secrets.contains(&fingerprint) || agent_held.contains(&fingerprint),
                         fingerprint,
                     })
                 });
@@ -1119,6 +1148,58 @@ mod tests {
         assert!(found[0].exportable);
         assert_eq!(found[0].amount, FULL);
         assert_eq!(found[0].depth, 0);
+    }
+
+    /// A certification made with a key only the agent or a card holds, the
+    /// store having nothing of it but the public certificate, is the user's
+    /// when the caller says the agent holds that key, and offered for
+    /// withdrawal; and only once it verifies, so a broken signature naming the
+    /// same key earns nothing for being named.
+    #[test]
+    fn a_key_the_agent_holds_owns_its_certifications() {
+        let (_dir, store) = scratch();
+        let carded = key("Carded <carded@example.org>");
+        let them = key("Them <them@example.org>");
+        let user_id = "Them <them@example.org>";
+        // Public halves only: no secret key file for either.
+        store.insert(&carded).unwrap();
+        store.insert(&them).unwrap();
+        let carded_fp = carded.fingerprint().to_hex();
+        assert!(!store.secret_fingerprints().unwrap().contains(&carded_fp));
+
+        let mut signer = primary_signer(&carded);
+        let builder = || SignatureBuilder::new(SignatureType::GenericCertification);
+        let good = signed(&mut signer, builder(), &them, user_id);
+        let stored = plant(&store, &them, vec![good]);
+
+        // By the secret key files alone it is nobody's, as before.
+        let listed = certifications(&store, &stored).unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!((listed[0].verified, listed[0].by_me), (Some(true), false));
+        assert!(withdrawable(&listed).is_empty());
+
+        // With the agent holding its primary, it is the user's to withdraw.
+        let agent_held = BTreeSet::from([carded_fp.clone()]);
+        let listed = certifications_with_agent(&store, &stored, &agent_held).unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!((listed[0].verified, listed[0].by_me), (Some(true), true));
+        assert_eq!(listed[0].certifier, "Carded <carded@example.org>");
+        assert_eq!(
+            withdrawable(&listed),
+            BTreeMap::from([(carded_fp.clone(), vec![user_id.to_string()])])
+        );
+
+        // A signature that names the agent's key but does not verify against
+        // it is not credited to it, agent or no agent.
+        let (_dir, store) = scratch();
+        store.insert(&carded).unwrap();
+        store.insert(&them).unwrap();
+        let broken = damaged(signed(&mut signer, builder(), &them, user_id));
+        let stored = plant(&store, &them, vec![broken]);
+        let listed = certifications_with_agent(&store, &stored, &agent_held).unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!((listed[0].verified, listed[0].by_me), (Some(false), false));
+        assert!(withdrawable(&listed).is_empty());
     }
 
     /// Certifying is a public claim that a name belongs to someone. Once the

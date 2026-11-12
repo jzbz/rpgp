@@ -606,7 +606,10 @@ from `gpg --export-secret-subkeys`, unless the agent holds its primary. What the
 agent holds is learnt by the survey after each reload of the list, so a key only
 the agent holds opens Certify once the agent has answered, which is at once
 unless the agent has hung; a dialog opened before then lists only the keys in
-rPGP's store.
+rPGP's store. The details pane counts the same keys as yours, and an expired
+one too, since what it certified before it expired still stands: a
+certification one of them made is marked as yours and offered for withdrawal,
+which signs through the agent, once the agent has answered.
 
 A message the keys in rPGP's own store do not open is taken to the agent, and
 only to a key it could be for: the key each of its session-key packets names,

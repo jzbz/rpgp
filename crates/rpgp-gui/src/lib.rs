@@ -6,6 +6,7 @@
 //! measuring. `main.rs` is now a wrapper around [`run_app`]; this module is
 //! unchanged otherwise.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -2854,6 +2855,9 @@ struct AskedCertifications {
     show_user_id: bool,
     /// [`State::certifications_generation`] as this reading set it.
     generation: u64,
+    /// The user's keys the agent holds, from [`agent_certifiers`], so that what
+    /// those made is marked as theirs and offered for withdrawal.
+    agent_held: BTreeSet<String>,
 }
 
 /// Start showing `summary`'s certifications in the details pane, until
@@ -2903,7 +2907,25 @@ fn ask_for_certifications(
         fingerprint: summary.fingerprint.clone(),
         show_user_id: summary.user_ids.len() > 1,
         generation: state.certifications_generation,
+        agent_held: agent_certifiers(&state.all),
     }
+}
+
+/// The certificates whose primary key the agent holds, in its own store or on
+/// a smartcard, by fingerprint: the user's own keys that have no secret key
+/// file to say so. They come from the survey the list already made, the
+/// certifier list's source too, so that a certification the app let the user
+/// make with one of them is one it lets them withdraw.
+///
+/// From `withdraw`, not `certify`, which is the certifier list's question and
+/// holds a primary only while it is alive: a key that has since expired
+/// certifies nothing new, but what it certified before stands, and core
+/// withdraws it through the agent whatever the key's state.
+fn agent_certifiers(all: &[CertSummary]) -> BTreeSet<String> {
+    all.iter()
+        .filter(|c| c.agent.withdraw.is_some())
+        .map(|c| c.fingerprint.clone())
+        .collect()
 }
 
 /// Read the certifications [`ask_for_certifications`] asked for on a worker,
@@ -2911,7 +2933,7 @@ fn ask_for_certifications(
 fn read_certifications_for(ui: &AppWindow, state: &Shared, asked: AskedCertifications) {
     let (ui_weak, state) = (ui.as_weak(), state.clone());
     std::thread::spawn(move || {
-        let certifications = read_certifications(&asked.store, &asked.fingerprint);
+        let certifications = read_certifications(&asked);
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = ui_weak.upgrade() {
                 land_certifications(&ui, &state, &asked, &certifications);
@@ -2922,9 +2944,10 @@ fn read_certifications_for(ui: &AppWindow, state: &Shared, asked: AskedCertifica
 
 /// The blocking half of showing a certificate's certifications: every
 /// certification on it, verified and judged.
-fn read_certifications(store: &Store, fingerprint: &str) -> Vec<Certification> {
-    match store.lookup_ref(fingerprint) {
-        Ok(cert) => certify::certifications(store, &cert).unwrap_or_default(),
+fn read_certifications(asked: &AskedCertifications) -> Vec<Certification> {
+    match asked.store.lookup_ref(&asked.fingerprint) {
+        Ok(cert) => certify::certifications_with_agent(&asked.store, &cert, &asked.agent_held)
+            .unwrap_or_default(),
         Err(_) => Vec::new(),
     }
 }
@@ -4485,13 +4508,14 @@ fn run_revoke(
 ) -> Result<(String, String), String> {
     // Snapshot what is needed and release the lock: everything below is I/O,
     // and a card PIN prompt can hold it for a minute while the UI waits.
-    let (store, target, is_certification, upgrade) = {
+    let (store, target, is_certification, upgrade, agent_held) = {
         let guard = lock(state);
         (
             guard.store.clone(),
             guard.revoke_target.clone(),
             guard.revoke_certification,
             guard.revoke_upgrade,
+            agent_certifiers(&guard.all),
         )
     };
     let target = target.ok_or_else(|| "No certificate selected".to_string())?;
@@ -4500,11 +4524,13 @@ fn run_revoke(
 
     if is_certification {
         // Withdrawing our own endorsement: the certifier is whichever of our
-        // keys actually made a certification on this certificate.
+        // keys actually made a certification on this certificate, those the
+        // agent alone holds among them, as the button that opened this counted.
         let cert = store
             .lookup_ref(&target)
             .map_err(|e| format!("Certificate unavailable: {e}"))?;
-        let certifications = certify::certifications(&store, &cert).unwrap_or_default();
+        let certifications =
+            certify::certifications_with_agent(&store, &cert, &agent_held).unwrap_or_default();
 
         // Grouped by which of our keys made each certification, because a
         // revocation only retracts a certification made by the same key. This
@@ -5117,18 +5143,20 @@ fn land_survey(
     damaged: &[String],
 ) {
     if !agent_keys.is_empty() {
-        // Of what the survey sets, only the signing key's card serial reaches
-        // a row: CertRow carries card-serial, while the rest is read straight
-        // off State when the certify and sign dialogs build their key lists,
-        // and when the Certify button is decided just below. So the rows only
-        // need rebuilding when a card serial actually changed — otherwise
+        // Of what the survey sets, only the signing key's card serial reaches a
+        // row: CertRow carries card-serial, while the rest is read straight off
+        // State when the certify and sign dialogs build their key lists, when
+        // the Certify button is decided just below, and when the details pane's
+        // certifications are read, to know which are the user's. So the rows
+        // only need rebuilding when a card serial actually changed — otherwise
         // reload's own apply_filter already produced exactly the rows this
         // would produce again, and for anyone whose key is merely in gpg-agent
         // rather than on a card, that second pass rebuilt every row to no
         // effect.
         let mut rows_changed = false;
-        let can_certify = {
+        let (can_certify, certifiers_changed) = {
             let mut guard = lock(state);
+            let certifiers_before = agent_certifiers(&guard.all);
             for summary in guard.all.iter_mut() {
                 if let Some(holds) = agent_keys.get(&summary.fingerprint) {
                     let before = summary.card_serial().map(str::to_owned);
@@ -5136,7 +5164,10 @@ fn land_survey(
                     rows_changed |= summary.card_serial() != before.as_deref();
                 }
             }
-            guard.all.iter().any(can_certify_with)
+            (
+                guard.all.iter().any(can_certify_with),
+                agent_certifiers(&guard.all) != certifiers_before,
+            )
         };
         // The Certify button, whether or not a row changed. The reload that
         // spawned this survey decided it before the agent had answered, from
@@ -5169,6 +5200,24 @@ fn land_survey(
                 reselect(ui, state, &fingerprint);
             }
             ui.set_status(status);
+        } else if certifiers_changed && ui.get_has_selection() {
+            // The details pane was read, by the reload this follows, before
+            // the agent had answered, so a certification made with a key the
+            // agent alone holds was read as nobody's: no "(you)", and no
+            // Withdraw. Read again, keeping what it shows until the new
+            // reading lands. reselect, above, does this when the rows changed.
+            let fingerprint = ui.get_detail().fingerprint.to_string();
+            let mut guard = lock(state);
+            if let Some(summary) = guard
+                .all
+                .iter()
+                .find(|c| c.fingerprint == fingerprint)
+                .cloned()
+            {
+                let asked = ask_for_certifications(ui, &mut guard, &summary, true);
+                drop(guard);
+                read_certifications_for(ui, state, asked);
+            }
         }
     }
 
@@ -6552,7 +6601,7 @@ mod tests {
             .cloned()
             .expect("the certificate is in the list");
         let asked = ask_for_certifications(ui, &mut lock(state), &summary, false);
-        let certifications = read_certifications(&asked.store, &asked.fingerprint);
+        let certifications = read_certifications(&asked);
         land_certifications(ui, state, &asked, &certifications);
     }
 
@@ -7405,6 +7454,86 @@ mod tests {
         );
     }
 
+    /// A certification made with a key whose primary only the agent holds,
+    /// on a card here, is the user's to withdraw once the survey finds that
+    /// key: the row reads as theirs and Withdraw is offered, and the survey
+    /// asks for the pane, read before the agent answered, to be read again.
+    /// The survey here is the one an expired key gets, which holds the primary
+    /// to withdraw with and not to certify with, since what such a key
+    /// certified before it expired still stands.
+    ///
+    /// Ownership came from the secret key files alone, so the app that had
+    /// just certified with a key in the agent or on a card drew no "(you)"
+    /// beside the certification and offered no way to take it back, although
+    /// withdrawing one through the agent works.
+    #[test]
+    fn a_certification_by_a_key_only_the_agent_holds_can_be_withdrawn() {
+        use slint::Model;
+        i_slint_backend_testing::init_no_event_loop();
+        let me = generated("Me <me@example.org>").cert;
+        let them = generated("Them <them@example.org>").cert;
+        let (me_fp, them_fp) = (me.fingerprint().to_hex(), them.fingerprint().to_hex());
+
+        // Certified where the secret is at hand, then carried to a store that
+        // holds the public halves alone, as one whose key is on a card does.
+        let signing_dir = tempfile::tempdir().unwrap();
+        let signing = Store::open(
+            signing_dir.path().join("certs.d"),
+            signing_dir.path().join("secrets"),
+        )
+        .unwrap();
+        signing.insert_secret(&me).unwrap();
+        signing.insert(&them).unwrap();
+        let mut request = CertifyRequest::new(&me_fp, &them_fp);
+        request.user_ids = vec!["Them <them@example.org>".to_string()];
+        certify::certify(&signing, &request).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("certs.d"), dir.path().join("secrets")).unwrap();
+        store.insert(&me).unwrap();
+        store.insert(&signing.lookup(&them_fp).unwrap()).unwrap();
+
+        let state = state_for(store);
+        let ui = window_for(&state);
+        select_row(&ui, &state, &them_fp);
+        let mine = |ui: &AppWindow| {
+            ui.get_detail_certifications()
+                .iter()
+                .map(|c| (c.certifier.to_string(), c.by_me))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            mine(&ui),
+            [("Me <me@example.org>".to_string(), false)],
+            "premise: no secret key file says the key is the user's"
+        );
+        assert!(!ui.get_can_withdraw());
+
+        // The survey lands on the pane as the reload left it, and asks for it
+        // to be read again: there is no event loop here for that reading to
+        // land through, so it is landed by hand.
+        let asked_before = lock(&state).certifications_generation;
+        let survey = found(
+            &me_fp,
+            rpgp_core::agent::AgentHolds {
+                withdraw: agent_key(Some("D2760001240103040006123456780000")),
+                ..Default::default()
+            },
+        );
+        land_agent_survey(&ui, &state, &survey);
+        assert!(
+            lock(&state).certifications_generation > asked_before,
+            "the survey found the key that made a certification on the pane and left the pane as it was"
+        );
+
+        select_row(&ui, &state, &them_fp);
+        assert_eq!(mine(&ui), [("Me <me@example.org>".to_string(), true)]);
+        assert!(
+            ui.get_can_withdraw(),
+            "a certification made with a key the agent holds was not offered for withdrawal"
+        );
+    }
+
     /// A key whose card holds only its subkeys, the primary being kept
     /// offline as most YubiKey guides advise, is not offered to certify with:
     /// it opens no Certify button, and the dialog another key opens does not
@@ -7431,6 +7560,7 @@ mod tests {
             sign: agent_key(Some("D2760001240100000006")),
             decrypt: agent_key(Some("D2760001240100000006")),
             certify: None,
+            withdraw: None,
         };
         land_agent_survey(&ui, &state, &found(&card_fp, subkeys_only.clone()));
         assert!(
@@ -10162,11 +10292,11 @@ mod tests {
         };
         let (of_alice, of_bob) = (summary(&alice), summary(&bob));
         let for_alice = ask_for_certifications(&ui, &mut lock(&state), &of_alice, false);
-        let alices = read_certifications(&for_alice.store, &for_alice.fingerprint);
+        let alices = read_certifications(&for_alice);
         assert_eq!(alices.len(), 1, "the premise: Alice is certified");
         click_row(&ui, &state, &bob);
         let for_bob = ask_for_certifications(&ui, &mut lock(&state), &of_bob, false);
-        let bobs = read_certifications(&for_bob.store, &for_bob.fingerprint);
+        let bobs = read_certifications(&for_bob);
 
         land_certifications(&ui, &state, &for_alice, &alices);
         assert_eq!(ui.get_detail().fingerprint, bob);
